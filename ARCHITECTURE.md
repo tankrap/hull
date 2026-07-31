@@ -81,6 +81,22 @@ PRs / objects.
   **nostr** when its code is touched — the requested code-owner feature *requires* this identity
   layer, so build them together.
 
+## Adoption: git-compatible, and mirror GitHub both ways
+
+Two properties make adoption incremental instead of all-or-nothing (the biggest risk for anything
+that competes with git/GitHub):
+
+- **Never reject a git-native client.** A plain `git push` to a hosted keel repo is accepted and
+  **bridges to native keel history** — the fused brief / provenance / status all work, and the user
+  never has to know keel is underneath. (Verified end-to-end at the `keel serve` level; platform
+  routing + auth = Hull M4.)
+- **Two-way GitHub mirroring** (`push to Hull → GitHub`, `push to GitHub → Hull`). A repo lives on
+  both at once, so teams keep GitHub's integrations/CI/network while adopting Hull incrementally. The
+  hard part is already built in keel (byte-identical git codec + `mirror-in`/`mirror-out` both
+  directions + receive-pack/bridge); the remaining work is the remote-sync + GitHub-App layer (loop
+  prevention, conflict policy, webhooks, tokens, accountability mapping). High priority — Linear
+  NEW-1170.
+
 ## Accountability — every agent cryptographically chains to a human
 
 **Non-negotiable invariant: no agent is ever an unaccountable actor.** Every agent's authority is a
