@@ -12,9 +12,19 @@ path = "src/main.rs"
 [dependencies]
 hull-core = { path = "../hull-core" }
 hull-scan = { path = "../hull-scan" }
+hull-plugin = { path = "../hull-plugin" }
+# Feature-gated reference plugin. This is the open-core seam: the HOSTED build swaps this for a
+# `hosted` feature pointing at a private plugin crate — the wiring is identical (see PLUGINS.md).
+hull-plugin-example = { path = "../../plugins/hull-plugin-example", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
+
+[features]
+default = []
+# Build with the reference example plugin registered (demonstrates the plugin path end-to-end).
+example-plugins = ["dep:hull-plugin-example"]
+# The hosted product enables its own feature here, pointing at a private plugin crate. Absent in OSS.

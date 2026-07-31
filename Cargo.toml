@@ -1,11 +1,19 @@
 [workspace]
 resolver = "2"
-members = ["crates/hull-core", "crates/hull-scan", "crates/hull-server"]
+members = [
+    "crates/hull-core",
+    "crates/hull-scan",
+    "crates/hull-plugin",
+    "crates/hull-server",
+    "plugins/hull-plugin-example",
+]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-license = "MIT"
+# Open core: the whole server + SDK is Apache-2.0. Closed hosted plugins link the SDK at build time
+# and live in a separate private tree — see PLUGINS.md.
+license = "Apache-2.0"
 repository = "https://github.com/tankrap/hull"
 
 [workspace.dependencies]

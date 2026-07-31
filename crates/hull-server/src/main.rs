@@ -11,6 +11,7 @@
 //! The feed is fed by a synthetic source for now; M3 replaces it with a keeld QUIC subscription.
 
 mod activity;
+mod plugins;
 
 use activity::{ActivityEvent, ActivityHub};
 use axum::{
@@ -22,6 +23,7 @@ use axum::{
 use futures::stream::Stream;
 use hull_core::store::{InMemory, Store};
 use hull_core::*;
+use hull_plugin::Registry;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -32,6 +34,7 @@ use tokio_stream::StreamExt;
 struct App {
     store: Arc<InMemory>,
     hub: Arc<ActivityHub>,
+    registry: Arc<Registry>,
 }
 
 #[tokio::main]
@@ -39,7 +42,10 @@ async fn main() {
     let store = Arc::new(InMemory::new());
     seed(&store);
     let hub = Arc::new(ActivityHub::new());
-    let app = App { store, hub: hub.clone() };
+    let registry = Arc::new(plugins::build_registry());
+    eprintln!("hull-server: {} plugin(s) loaded: {}", registry.plugins().len(),
+        registry.plugins().iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "));
+    let app = App { store, hub: hub.clone(), registry };
 
     // Scaffold: synthesize fleet activity so the home page is alive. M3 swaps this for a keeld
     // QUIC subscription (keel_net::Client::connect(addr).subscribe()).
@@ -52,6 +58,7 @@ async fn main() {
         .route("/api/repos", get(repos))
         .route("/api/repos/:repo/issues", get(issues))
         .route("/api/scan", post(scan))
+        .route("/api/plugins", get(plugins_list))
         .with_state(app);
 
     let addr = std::env::var("HULL_ADDR").unwrap_or_else(|_| "127.0.0.1:8930".into());
@@ -72,11 +79,18 @@ async fn issues(State(app): State<App>, Path(repo): Path<String>) -> Json<Value>
     Json(json!({ "issues": app.store.issues(&repo) }))
 }
 
-/// Server-side secret scan (the backstop). Body: `{ "text": "..." }`.
-async fn scan(Json(body): Json<Value>) -> Json<Value> {
+/// Server-side secret scan (the backstop) — built-in engine **plus** any plugin rulesets. Body:
+/// `{ "text": "..." }`.
+async fn scan(State(app): State<App>, Json(body): Json<Value>) -> Json<Value> {
     let text = body.get("text").and_then(Value::as_str).unwrap_or("");
-    let findings = hull_scan::scan(text);
+    let findings = app.registry.scan_secrets(text);
     Json(json!({ "ok": findings.is_empty(), "findings": findings }))
+}
+
+/// The loaded plugins (core built-ins + any hosted/example plugins) — makes the open-core seam
+/// observable.
+async fn plugins_list(State(app): State<App>) -> Json<Value> {
+    Json(json!({ "plugins": app.registry.plugins() }))
 }
 
 /// SSE: stream live activity events as they arrive.
