@@ -2,61 +2,63 @@
 
 **Hull's core server is open source (Apache-2.0) and fully functional on its own.** The hosted
 product adds value through **closed plugins** that extend the core via a stable SDK. This document is
-the contract that makes that split clean: the OSS core never depends on any closed plugin — it
-depends only on the plugin **SDK** (`hull-plugin`, also Apache-2.0).
+the contract that makes the split clean: the OSS core (this repo) never depends on any closed plugin
+— it only defines the plugin **SDK** (`hull-plugin`) and a **registration hook**. The closed plugins
+live in a **separate private repo** (`tankrap/hull-hosted`).
 
 ## How it works
 
-- **`hull-plugin`** (SDK, OSS) defines the extension points as traits — `SecretRuleset`, `Notifier`,
-  `AuthProvider`, … — plus a `Registry` and the `Plugin` trait.
-- The core server (`hull-server`) builds a `Registry`, installs its **built-in** capabilities (so
-  the OSS server works with zero plugins), then registers any plugins **behind a build feature**.
-  See `crates/hull-server/src/plugins.rs::build_registry` — that function is the seam.
-- A plugin is a crate that depends only on `hull-plugin`, implements capability traits, and exposes
-  a `register(&mut Registry)` entry point. `plugins/hull-plugin-example` is a working reference.
+- **`hull-plugin`** (SDK, in this repo) defines the extension points as traits — `SecretRuleset`,
+  `Notifier`, `AuthProvider`, … — plus a `Registry` and the `Plugin` trait.
+- **`hull-server`** is a **library** (`hull_server::run`) plus a thin OSS binary. `run` takes a
+  `register_plugins` closure — the seam. Core built-ins are installed first (so the OSS server is
+  self-sufficient), then the closure adds any extra plugins.
+- The OSS binary (`crates/hull-server/src/main.rs`) passes a **no-op** closure. A hosted binary (in
+  the private repo) passes a closure that registers its closed plugins. **The core never names a
+  hosted crate.**
 
-The server asks the registry for each capability and always gets a usable answer (built-in default
-if no plugin provides one). So the same binary shape runs with 0, 1, or N plugins.
+The server asks the registry for each capability and always gets a usable answer (a built-in default
+if no plugin provides one), so the same code runs with 0, 1, or N plugins.
 
-## Keeping hosted plugins closed while giving away the core
+## The two repos
 
-The core repo (`tankrap/hull`) contains the server, the SDK, and reference/example plugins. The
-hosted plugins live in a **separate private repo** and are pulled in only for the hosted build:
+| Repo | Visibility | Contents |
+|---|---|---|
+| `tankrap/hull` (this) | **public, Apache-2.0** | core: `hull-core`, `hull-scan`, `hull-plugin` SDK, `hull-server` (lib + OSS binary) |
+| `tankrap/hull-hosted` | **private** | `hull-hosted-plugins` (closed capabilities) + `hull-hosted-server` (the hosted binary) |
 
-```toml
-# in the PRIVATE hosted build's hull-server Cargo.toml override / workspace:
-hull-hosted = { git = "ssh://git@github.com/tankrap/hull-hosted", optional = true }
-
-[features]
-hosted = ["dep:hull-hosted"]
-```
+The private repo depends on this one (path dep for local dev; a pinned git rev in production). The
+entire hosted wiring is one closure:
 
 ```rust
-// build_registry(), behind the hosted feature — identical shape to the example:
-#[cfg(feature = "hosted")]
-hull_hosted::register(&mut reg);
+// crates/hull-hosted-server/src/main.rs (private repo)
+hull_server::run(hull_server::Options::default(), |reg| {
+    hull_hosted_plugins::register(reg);
+}).await;
 ```
 
-The public repo ships the exact same seam wired to the **example** feature:
+Because the public core only ever names the SDK, this repo builds and runs with no access to any
+private code, and the hosted binary is just `public core + private plugins` at build time.
 
 ```bash
-cargo run -p hull-server                          # OSS core only
-cargo run -p hull-server --features example-plugins   # core + the reference plugin
-```
+# OSS core (this repo):
+cargo run -p hull-server
 
-Because the core only ever names the SDK (never a hosted crate), the OSS tree builds and runs with
-no access to any private code, and the hosted binary is just `core + private plugins` at build time.
+# Hosted (private repo, with a sibling ../hull checkout):
+cd ../hull-hosted && cargo run -p hull-hosted-server
+```
 
 ## Writing a plugin
 
 1. New crate depending on `hull-plugin`.
 2. Implement one or more capability traits (`SecretRuleset`, `Notifier`, `AuthProvider`, …).
-3. Implement `Plugin` — `name()`, `description()`, and `register()` (add your capabilities to the
+3. Implement `Plugin` — `name()`, `description()`, `register()` (add your capabilities to the
    `Registry`).
 4. Expose `pub fn register(reg: &mut Registry) { reg.install(&MyPlugin); }`.
-5. Wire it into a server build behind a feature.
+5. From a server binary, pass it to the hook: `hull_server::run(opts, |reg| my_plugin::register(reg))`.
 
-See `plugins/hull-plugin-example/src/lib.rs` — a closed hosted plugin is structured identically.
+`tankrap/hull-hosted`'s `hull-hosted-plugins` is the reference — an open-source plugin looks the same
+(the only difference is where the crate lives and whether it's public).
 
 ## Capability roadmap
 
@@ -68,7 +70,7 @@ multi-region aggregation).
 
 ## Licensing
 
-- Core server + SDK + reference plugins: **Apache-2.0** (see `LICENSE`). Apache (not a copyleft
-  license) is the deliberate open-core choice — it lets the hosted plugins remain proprietary while
-  the core is freely usable and self-hostable.
-- Closed hosted plugins: proprietary, separately licensed, not distributed in this repo.
+- Core server + SDK: **Apache-2.0** (see `LICENSE`). Apache (not a copyleft license) is the
+  deliberate open-core choice — it lets the hosted plugins stay proprietary while the core is freely
+  usable and self-hostable.
+- Closed hosted plugins: proprietary, separately licensed, in the private `tankrap/hull-hosted` repo.

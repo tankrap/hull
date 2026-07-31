@@ -5,8 +5,9 @@ members = [
     "crates/hull-scan",
     "crates/hull-plugin",
     "crates/hull-server",
-    "plugins/hull-plugin-example",
 ]
+# Plugins are NOT in this public repo — closed hosted plugins live in a separate private repo that
+# depends on this one (the `hull-plugin` SDK + `hull-server` library). See PLUGINS.md.
 
 [workspace.package]
 version = "0.0.1"

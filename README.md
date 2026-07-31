@@ -16,12 +16,11 @@ requested features land and where I've added to them).
 ## Open core
 
 The core server is **Apache-2.0 and fully functional on its own**. The hosted product adds value
-through **closed plugins** that extend the core via the `hull-plugin` SDK — the core never depends on
-them. See **[PLUGINS.md](./PLUGINS.md)**.
+through **closed plugins** (in the separate private repo `tankrap/hull-hosted`) that extend the core
+via the `hull-plugin` SDK — the core never depends on them. See **[PLUGINS.md](./PLUGINS.md)**.
 
 ```bash
-cargo run -p hull-server                              # OSS core
-cargo run -p hull-server --features example-plugins   # core + reference plugin (the hosted seam)
+cargo run -p hull-server   # OSS core (built-in capabilities only)
 ```
 
 ## Layout
@@ -31,11 +30,11 @@ crates/
   hull-core     domain model (accounts, actors, repos, issues, projects) + storage seam
   hull-plugin   plugin SDK — extension-point traits + registry (the open-core seam)
   hull-scan     secret scanning — shared with the keel CLI (client-side) and Hull (server-side)
-  hull-server   axum HTTP/JSON API + the reactive activity feed (keeld QUIC → SSE)
-plugins/
-  hull-plugin-example   reference plugin (a closed hosted plugin is structured identically)
+  hull-server   axum server as a library (run + plugin hook) + the OSS binary
 web/            React + TypeScript + Vite frontend (the situation-room home page)
 ```
+
+Closed hosted plugins live in the private **tankrap/hull-hosted** repo (depends on this one).
 
 ## Run (M0 scaffold)
 

@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "Hull HTTP/JSON API + the reactive activity bridge (keeld QUIC coordination → SSE)."
 
+# A library (the reusable server, with a plugin-registration hook) + a thin OSS binary. A hosted
+# build lives in a SEPARATE PRIVATE repo: its own binary depends on this crate as a library and
+# calls `hull_server::run(opts, |reg| hosted_plugins::register(reg))`. See PLUGINS.md.
+[lib]
+name = "hull_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "hull-server"
 path = "src/main.rs"
@@ -13,18 +20,9 @@ path = "src/main.rs"
 hull-core = { path = "../hull-core" }
 hull-scan = { path = "../hull-scan" }
 hull-plugin = { path = "../hull-plugin" }
-# Feature-gated reference plugin. This is the open-core seam: the HOSTED build swaps this for a
-# `hosted` feature pointing at a private plugin crate — the wiring is identical (see PLUGINS.md).
-hull-plugin-example = { path = "../../plugins/hull-plugin-example", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
-
-[features]
-default = []
-# Build with the reference example plugin registered (demonstrates the plugin path end-to-end).
-example-plugins = ["dep:hull-plugin-example"]
-# The hosted product enables its own feature here, pointing at a private plugin crate. Absent in OSS.

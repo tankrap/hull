@@ -250,14 +250,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hull-plugin-example"
-version = "0.0.1"
-dependencies = [
- "hull-plugin",
- "hull-scan",
-]
-
-[[package]]
 name = "hull-scan"
 version = "0.0.1"
 dependencies = [
@@ -273,7 +265,6 @@ dependencies = [
  "futures",
  "hull-core",
  "hull-plugin",
- "hull-plugin-example",
  "hull-scan",
  "serde",
  "serde_json",

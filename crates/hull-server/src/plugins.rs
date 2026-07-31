@@ -5,18 +5,13 @@
 use hull_plugin::{AuthProvider, NotifyEvent, Notifier, Plugin, Registry};
 use std::sync::Arc;
 
-/// Build the registry the server runs with.
-pub fn build_registry() -> Registry {
+/// Build the registry: core built-ins first (so the OSS core is self-sufficient), then whatever
+/// `register_extra` adds. The OSS binary passes a no-op; a private hosted binary passes a closure
+/// that registers its closed plugins — the core never names them.
+pub fn build_registry(register_extra: impl FnOnce(&mut Registry)) -> Registry {
     let mut reg = Registry::new();
-
-    // Core built-ins — always present, keep the OSS core self-sufficient.
     reg.install(&CorePlugin);
-
-    // Reference example plugin (feature `example-plugins`). The HOSTED build instead enables a
-    // `hosted` feature that calls `hull_hosted::register(&mut reg)` — same shape, private crate.
-    #[cfg(feature = "example-plugins")]
-    hull_plugin_example::register(&mut reg);
-
+    register_extra(&mut reg);
     reg
 }
 

@@ -23,24 +23,26 @@ both show up in the same coordination stream — and the whole product is shaped
 | Frontend | **React + TypeScript + Vite** | Rich, real-time, generative UI. |
 | Agent identity | **Ed25519** (matches keel provenance) + **nostr (secp256k1) bridge** for notifications | Static or ephemeral agent keypairs; nostr for code-owner notification fan-out. |
 
-Crate layout:
+Crate layout (this **public** repo):
 - `crates/hull-core` — domain model + storage + keel integration (the seam to `keel-*`).
 - `crates/hull-plugin` — the **plugin SDK**: extension-point traits + registry (the open-core seam).
-- `crates/hull-server` — axum HTTP/JSON API, auth, the reactive event bridge; builds the registry.
+- `crates/hull-server` — axum HTTP/JSON API as a **library** (`run` with a plugin hook) + OSS binary.
 - `crates/hull-scan` — secret scanning, **shared with the keel CLI** so a scan can run client-side.
-- `plugins/hull-plugin-example` — reference plugin (a closed hosted plugin looks identical).
 - `web/` — the Vite/React frontend.
+
+Closed hosted plugins live in the **separate private repo `tankrap/hull-hosted`**.
 
 ## Open core (Apache-2.0 core + closed hosted plugins)
 
 **The entire server is open source and fully functional on its own.** The hosted product's extra
-value ships as **closed plugins** that extend the core through the `hull-plugin` SDK — and the core
-never depends on them, so it can be given away while the hosted plugins stay private. Capabilities
-(`SecretRuleset`, `Notifier`, `AuthProvider`, and a roadmap of `StorageBackend` / `CiRunner` /
-`AgentFlow` / `Metering` …) are trait objects registered into a `Registry`; the server always falls
-back to a built-in default, so 0, 1, or N plugins all run the same binary shape. The public repo
-wires the seam to a reference `example-plugins` feature; the hosted build swaps in a `hosted` feature
-pointing at a private crate — identical wiring. See **[PLUGINS.md](./PLUGINS.md)**.
+value ships as **closed plugins** in a separate private repo (`tankrap/hull-hosted`) that extend the
+core through the `hull-plugin` SDK — and the core never depends on them, so it can be given away while
+the hosted plugins stay private. Capabilities (`SecretRuleset`, `Notifier`, `AuthProvider`, and a
+roadmap of `StorageBackend` / `CiRunner` / `AgentFlow` / `Metering` …) are trait objects registered
+into a `Registry`; the server always falls back to a built-in default, so 0, 1, or N plugins run the
+same code. `hull-server` is a library whose `run(opts, register_plugins)` hook is the seam: the OSS
+binary passes a no-op; the hosted binary (private repo) passes a closure that registers its plugins.
+See **[PLUGINS.md](./PLUGINS.md)**.
 
 ---
 
