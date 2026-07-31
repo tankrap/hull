@@ -27,11 +27,13 @@ pub type KeelId = String;
 /// carry a [`Delegation`] whose first hop is a human principal. An agent with no human root cannot
 /// be minted and cannot author anything — "nothing is authored anonymously".
 ///
-/// This mirrors the model forge already ships: **attenuation-only, Ed25519/biscuit** delegation
-/// (org → account → machine → session/run, human at the root; each hop only narrows scope, TTL, and
-/// ref-glob, and is depth-capped). Hull reuses that scheme rather than inventing one. The chain is
-/// carried on every authored artifact, and agent work always enters the human review gate — it
-/// never self-merges. See `ARCHITECTURE.md` §"Accountability".
+/// This mirrors the model forge already ships: **attenuation-only, Ed25519/biscuit** delegation.
+/// The accountability chain roots at a **natural person** — `human → machine → session/run` — each
+/// hop only narrowing scope/TTL/ref-glob and depth-capped. Tenancy (org / account) is orthogonal
+/// *scope*, NOT an ancestor above the human. Hull reuses forge's scheme rather than inventing one.
+/// The chain is carried on every authored artifact; agent work always enters the human review gate
+/// and never self-merges; standing agents use short-TTL auto-renewed delegations with revocation
+/// that propagates to descendants. See `ARCHITECTURE.md` §"Accountability".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Actor {
     pub id: ActorId,

@@ -90,19 +90,32 @@ CI-triage bot, a fix agent, all of it. "Nothing is authored anonymously."
 This is not new to build — **forge already implements it**, and Hull reuses that scheme rather than
 inventing a parallel one:
 
-- **Attenuation-only delegation** with **Ed25519 / biscuit** tokens: `org → account → machine →
-  session/run`, a **human at the root**. Each hop can only *narrow* scope, TTL, and ref-glob, and is
-  **depth-capped** — a child can never hold more authority than its parent.
-- The **delegation chain is carried on every authored artifact** (commit, review verdict, comment,
-  issue transition), so any action resolves to the human it acts for.
+- **Attenuation-only delegation** with **Ed25519 / biscuit** tokens. The **accountability chain
+  roots at a natural person**: `human → machine → session / agent-run`. Each hop can only *narrow*
+  scope, TTL, and ref-glob, and is **depth-capped** — a child never holds more authority than its
+  parent.
+- **Tenancy is orthogonal, not an ancestor.** Org / account membership is *scope* (where a principal
+  may act), carried alongside the chain — **never above the human in it**. An org authors nothing on
+  its own; only a human, or an agent that human delegated, authors within an org. (So "human at the
+  root" and the org→account naming hierarchy are two different axes; don't conflate them.)
+- **No service/system escape hatch for authors.** Automation may exist, but an *authoring* agent
+  (one that produces a change, review verdict, comment, or issue transition) **must** root at a
+  human. There is no "service agent" that authors code without a human behind it.
+- The **delegation chain is carried on every authored artifact**, so any action resolves to the
+  human it acts for.
 - Agent work always enters the **human review gate** (`human_required`) — it **never self-merges**
-  (which is exactly the review system's protected-path rule, §D11).
+  (exactly the review system's protected-path rule, §D11).
+- **Standing/scheduled agents** (nightly triage, a cron reviewer) root at the human who *authorized*
+  them, via a **short-TTL delegation auto-renewed** by a machine credential that itself chains to
+  that human — never an eternal token. **Revocation propagates**: revoking a human or machine kills
+  every descendant agent credential (blast-radius = the subtree). Reuse forge's revocation +
+  provenance-bundle work.
 
 In the domain model this is a hard type-level + runtime gate: an `Actor` is accountable iff
 `human_principal()` resolves — a human is its own root; an agent MUST carry a `Delegation` whose root
 hop is a human, or it is rejected at mint and at every authoring boundary (`hull-core`, tested). The
-cryptographic verification (signatures + attenuation-subset checks) is the M1 identity layer, wiring
-to forge's existing biscuit/Ed25519 delegation issuer.
+cryptographic verification (signatures + attenuation-subset + depth-cap + **TTL/revocation** checks)
+is the M1 identity layer, wiring to forge's existing biscuit/Ed25519 delegation issuer.
 
 ### CI/CD
 Requested: custom runners, speed.

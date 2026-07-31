@@ -60,13 +60,36 @@ cd ../hull-hosted && cargo run -p hull-hosted-server
 `tankrap/hull-hosted`'s `hull-hosted-plugins` is the reference — an open-source plugin looks the same
 (the only difference is where the crate lives and whether it's public).
 
+## Two plugin classes: in-process policy vs out-of-process execution
+
+Not every capability may run in the server's address space. **A capability that executes untrusted
+code (a PR's tests, a reviewer's probe scripts) MUST NOT be an in-process trait object** — a
+prompt-injected or malicious change could escape into the core server.
+
+- **In-process capability plugins** (trait objects, called directly): `AuthProvider`, `Notifier`,
+  `SecretRuleset`, `Metering`, depth-policy. Pure logic, no untrusted execution.
+- **Out-of-process execution backends**: `CiRunner`, `Reviewer`. The trait is a **dispatch client**
+  — it hands work to an **isolated, sandboxed runner** (separate process/VM, no core-server memory,
+  no credentials, egress limited to the model API, ephemeral) and streams results back. The plugin
+  never runs the job in-process. This isolation IS the review design's §6.1 sandbox.
+
+When adding a capability, decide its class first; if it runs repo code, it's out-of-process.
+
 ## Capability roadmap
 
-The SDK starts with `SecretRuleset`, `Notifier`, `AuthProvider`. Planned extension points (added as
-the milestones land, each a natural closed/hosted seam): `StorageBackend` (sqlite/embedded → managed
-Postgres + object store), `CiRunner` (local sandbox → autoscaled runners), `AgentFlow`/`Reviewer`
-(BYO-key → managed AI review), `Metering`/`Billing` (no-op in OSS), `ActivitySource` (single keeld →
-multi-region aggregation).
+The SDK starts with the in-process trio `SecretRuleset`, `Notifier`, `AuthProvider`. Planned:
+`StorageBackend` (sqlite/embedded → managed Postgres + object store, in-process), `Metering`/`Billing`
+(no-op in OSS, in-process), `ActivitySource` (single keeld → multi-region aggregation, in-process),
+and the two **out-of-process** backends `CiRunner` (local sandbox → autoscaled runners) and
+`Reviewer`/`AgentFlow` (BYO-key → managed AI review).
+
+## Open-core integrity — the core must stay genuinely useful
+
+Open core degrades into "open-washing" if the free core is a hollow shell that forces the paid tier.
+**Rule: the OSS core must remain a complete, self-hostable product.** Every capability has a real
+built-in default — read-only review, local CI, built-in secret rules, keypair auth. Hosted plugins
+add **scale / managed / empirical** value; they never gate basic function. A capability whose absence
+makes the core non-functional is not allowed.
 
 ## Licensing
 
