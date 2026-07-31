@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 description = "Hull HTTP/JSON API + the reactive activity bridge (keeld QUIC coordination → SSE)."
 
+# A library (the reusable server, with a plugin-registration hook) + a thin OSS binary. A hosted
+# build lives in a SEPARATE PRIVATE repo: its own binary depends on this crate as a library and
+# calls `hull_server::run(opts, |reg| hosted_plugins::register(reg))`. See PLUGINS.md.
+[lib]
+name = "hull_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "hull-server"
 path = "src/main.rs"
@@ -12,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 hull-core = { path = "../hull-core" }
 hull-scan = { path = "../hull-scan" }
+hull-plugin = { path = "../hull-plugin" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = "0.7"

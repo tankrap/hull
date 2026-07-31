@@ -1,0 +1,12 @@
+[package]
+name = "hull-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hull's plugin SDK — the stable extension-point traits + registry. The open-core seam: closed hosted plugins implement these traits and register at build time, without the OSS core depending on them."
+
+[dependencies]
+hull-core = { path = "../hull-core" }
+hull-scan = { path = "../hull-scan" }
+serde = { workspace = true }
+serde_json = { workspace = true }

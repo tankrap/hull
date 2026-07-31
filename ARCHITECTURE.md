@@ -23,11 +23,26 @@ both show up in the same coordination stream — and the whole product is shaped
 | Frontend | **React + TypeScript + Vite** | Rich, real-time, generative UI. |
 | Agent identity | **Ed25519** (matches keel provenance) + **nostr (secp256k1) bridge** for notifications | Static or ephemeral agent keypairs; nostr for code-owner notification fan-out. |
 
-Crate layout:
+Crate layout (this **public** repo):
 - `crates/hull-core` — domain model + storage + keel integration (the seam to `keel-*`).
-- `crates/hull-server` — axum HTTP/JSON API, auth, the reactive event bridge.
+- `crates/hull-plugin` — the **plugin SDK**: extension-point traits + registry (the open-core seam).
+- `crates/hull-server` — axum HTTP/JSON API as a **library** (`run` with a plugin hook) + OSS binary.
 - `crates/hull-scan` — secret scanning, **shared with the keel CLI** so a scan can run client-side.
 - `web/` — the Vite/React frontend.
+
+Closed hosted plugins live in the **separate private repo `tankrap/hull-hosted`**.
+
+## Open core (Apache-2.0 core + closed hosted plugins)
+
+**The entire server is open source and fully functional on its own.** The hosted product's extra
+value ships as **closed plugins** in a separate private repo (`tankrap/hull-hosted`) that extend the
+core through the `hull-plugin` SDK — and the core never depends on them, so it can be given away while
+the hosted plugins stay private. Capabilities (`SecretRuleset`, `Notifier`, `AuthProvider`, and a
+roadmap of `StorageBackend` / `CiRunner` / `AgentFlow` / `Metering` …) are trait objects registered
+into a `Registry`; the server always falls back to a built-in default, so 0, 1, or N plugins run the
+same code. `hull-server` is a library whose `run(opts, register_plugins)` hook is the seam: the OSS
+binary passes a no-op; the hosted binary (private repo) passes a closure that registers its plugins.
+See **[PLUGINS.md](./PLUGINS.md)**.
 
 ---
 
@@ -61,9 +76,62 @@ PRs / objects.
   human). **Ephemeral** = minted for one session, attenuated scope + TTL, auto-expiring — exactly
   keel's delegation model. An action (comment, review, commit, close) is **signed**, so authorship is
   cryptographic, not a claim.
+- **Hard invariant — every agent chains to a human (see Accountability below).**
 - *My addition:* because identity is a keypair, an agent can be a **code owner** and be notified over
   **nostr** when its code is touched — the requested code-owner feature *requires* this identity
   layer, so build them together.
+
+## Adoption: git-compatible, and mirror GitHub both ways
+
+Two properties make adoption incremental instead of all-or-nothing (the biggest risk for anything
+that competes with git/GitHub):
+
+- **Never reject a git-native client.** A plain `git push` to a hosted keel repo is accepted and
+  **bridges to native keel history** — the fused brief / provenance / status all work, and the user
+  never has to know keel is underneath. (Verified end-to-end at the `keel serve` level; platform
+  routing + auth = Hull M4.)
+- **Two-way GitHub mirroring** (`push to Hull → GitHub`, `push to GitHub → Hull`). A repo lives on
+  both at once, so teams keep GitHub's integrations/CI/network while adopting Hull incrementally. The
+  hard part is already built in keel (byte-identical git codec + `mirror-in`/`mirror-out` both
+  directions + receive-pack/bridge); the remaining work is the remote-sync + GitHub-App layer (loop
+  prevention, conflict policy, webhooks, tokens, accountability mapping). High priority — Linear
+  NEW-1170.
+
+## Accountability — every agent cryptographically chains to a human
+
+**Non-negotiable invariant: no agent is ever an unaccountable actor.** Every agent's authority is a
+cryptographically verifiable **delegation chain that roots at a human** — an ephemeral reviewer, a
+CI-triage bot, a fix agent, all of it. "Nothing is authored anonymously."
+
+This is not new to build — **forge already implements it**, and Hull reuses that scheme rather than
+inventing a parallel one:
+
+- **Attenuation-only delegation** with **Ed25519 / biscuit** tokens. The **accountability chain
+  roots at a natural person**: `human → machine → session / agent-run`. Each hop can only *narrow*
+  scope, TTL, and ref-glob, and is **depth-capped** — a child never holds more authority than its
+  parent.
+- **Tenancy is orthogonal, not an ancestor.** Org / account membership is *scope* (where a principal
+  may act), carried alongside the chain — **never above the human in it**. An org authors nothing on
+  its own; only a human, or an agent that human delegated, authors within an org. (So "human at the
+  root" and the org→account naming hierarchy are two different axes; don't conflate them.)
+- **No service/system escape hatch for authors.** Automation may exist, but an *authoring* agent
+  (one that produces a change, review verdict, comment, or issue transition) **must** root at a
+  human. There is no "service agent" that authors code without a human behind it.
+- The **delegation chain is carried on every authored artifact**, so any action resolves to the
+  human it acts for.
+- Agent work always enters the **human review gate** (`human_required`) — it **never self-merges**
+  (exactly the review system's protected-path rule, §D11).
+- **Standing/scheduled agents** (nightly triage, a cron reviewer) root at the human who *authorized*
+  them, via a **short-TTL delegation auto-renewed** by a machine credential that itself chains to
+  that human — never an eternal token. **Revocation propagates**: revoking a human or machine kills
+  every descendant agent credential (blast-radius = the subtree). Reuse forge's revocation +
+  provenance-bundle work.
+
+In the domain model this is a hard type-level + runtime gate: an `Actor` is accountable iff
+`human_principal()` resolves — a human is its own root; an agent MUST carry a `Delegation` whose root
+hop is a human, or it is rejected at mint and at every authoring boundary (`hull-core`, tested). The
+cryptographic verification (signatures + attenuation-subset + depth-cap + **TTL/revocation** checks)
+is the M1 identity layer, wiring to forge's existing biscuit/Ed25519 delegation issuer.
 
 ### CI/CD
 Requested: custom runners, speed.
