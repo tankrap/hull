@@ -76,9 +76,33 @@ PRs / objects.
   human). **Ephemeral** = minted for one session, attenuated scope + TTL, auto-expiring — exactly
   keel's delegation model. An action (comment, review, commit, close) is **signed**, so authorship is
   cryptographic, not a claim.
+- **Hard invariant — every agent chains to a human (see Accountability below).**
 - *My addition:* because identity is a keypair, an agent can be a **code owner** and be notified over
   **nostr** when its code is touched — the requested code-owner feature *requires* this identity
   layer, so build them together.
+
+## Accountability — every agent cryptographically chains to a human
+
+**Non-negotiable invariant: no agent is ever an unaccountable actor.** Every agent's authority is a
+cryptographically verifiable **delegation chain that roots at a human** — an ephemeral reviewer, a
+CI-triage bot, a fix agent, all of it. "Nothing is authored anonymously."
+
+This is not new to build — **forge already implements it**, and Hull reuses that scheme rather than
+inventing a parallel one:
+
+- **Attenuation-only delegation** with **Ed25519 / biscuit** tokens: `org → account → machine →
+  session/run`, a **human at the root**. Each hop can only *narrow* scope, TTL, and ref-glob, and is
+  **depth-capped** — a child can never hold more authority than its parent.
+- The **delegation chain is carried on every authored artifact** (commit, review verdict, comment,
+  issue transition), so any action resolves to the human it acts for.
+- Agent work always enters the **human review gate** (`human_required`) — it **never self-merges**
+  (which is exactly the review system's protected-path rule, §D11).
+
+In the domain model this is a hard type-level + runtime gate: an `Actor` is accountable iff
+`human_principal()` resolves — a human is its own root; an agent MUST carry a `Delegation` whose root
+hop is a human, or it is rejected at mint and at every authoring boundary (`hull-core`, tested). The
+cryptographic verification (signatures + attenuation-subset checks) is the M1 identity layer, wiring
+to forge's existing biscuit/Ed25519 delegation issuer.
 
 ### CI/CD
 Requested: custom runners, speed.

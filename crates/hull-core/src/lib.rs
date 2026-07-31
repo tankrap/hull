@@ -21,6 +21,17 @@ pub type ActorId = String;
 pub type KeelId = String;
 
 /// A human or an agent. Identity is a keypair, so authorship is signed, not asserted.
+///
+/// **Hard invariant — no unaccountable agents.** Every agent's authority is a cryptographically
+/// verifiable **delegation chain that roots at a human**. A human *is* its own root; an agent MUST
+/// carry a [`Delegation`] whose first hop is a human principal. An agent with no human root cannot
+/// be minted and cannot author anything — "nothing is authored anonymously".
+///
+/// This mirrors the model forge already ships: **attenuation-only, Ed25519/biscuit** delegation
+/// (org → account → machine → session/run, human at the root; each hop only narrows scope, TTL, and
+/// ref-glob, and is depth-capped). Hull reuses that scheme rather than inventing one. The chain is
+/// carried on every authored artifact, and agent work always enters the human review gate — it
+/// never self-merges. See `ARCHITECTURE.md` §"Accountability".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Actor {
     pub id: ActorId,
@@ -28,6 +39,11 @@ pub struct Actor {
     pub lifetime: Lifetime,
     /// Display handle, e.g. `@justin` or `agent:reviewer-3`.
     pub handle: String,
+    /// The attenuation chain rooting this actor's authority at a human. REQUIRED for agents; `None`
+    /// only for a human (a human is the root). Enforced structurally by [`Actor::human_principal`]
+    /// and cryptographically by the delegation verifier (M1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<Delegation>,
     /// secp256k1 nostr pubkey for notification fan-out (code-owner pings), if the actor opted in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nostr_pubkey: Option<String>,
@@ -40,18 +56,64 @@ pub enum ActorKind {
     Agent,
 }
 
-/// Static (registered, long-lived) or ephemeral (session-scoped, attenuated, auto-expiring) — the
-/// froots/buzz distinction, expressed with keel's delegation semantics.
+impl Actor {
+    /// The human this actor ultimately acts for: itself if human, else the root of its delegation
+    /// chain. `None` means **unaccountable** — such an actor must be rejected at mint and at every
+    /// authoring boundary. (Signature/attenuation verification is the crypto layer, M1; this is the
+    /// structural gate that makes the invariant representable and testable.)
+    pub fn human_principal(&self) -> Option<&ActorId> {
+        match self.kind {
+            ActorKind::Human => Some(&self.id),
+            ActorKind::Agent => self.delegation.as_ref().and_then(Delegation::human_root),
+        }
+    }
+
+    /// True iff this actor chains to a human — the gate every mint / write / review must pass.
+    pub fn is_accountable(&self) -> bool {
+        self.human_principal().is_some()
+    }
+}
+
+/// A cryptographically verifiable delegation chain (attenuation-only, Ed25519 — biscuit-style, as
+/// forge implements). Ordered hops from the human root (index 0) down to the actor; each hop only
+/// narrows the parent's scope/TTL/ref-glob and is signed by the parent. Depth-capped. The chain
+/// MUST terminate at a human, or the actor is unaccountable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Delegation {
+    pub chain: Vec<DelegationHop>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DelegationHop {
+    pub principal: ActorId,
+    /// The root hop MUST be `Human`.
+    pub kind: ActorKind,
+    /// Attenuated scope for this hop — a subset of the parent's (scope + TTL + ref-glob).
+    pub scope: String,
+    /// Ed25519 signature by the PARENT principal over this hop (empty until the crypto layer, M1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signature: Vec<u8>,
+}
+
+impl Delegation {
+    /// The human principal at the root, or `None` if the chain doesn't start at a human.
+    pub fn human_root(&self) -> Option<&ActorId> {
+        match self.chain.first() {
+            Some(h) if h.kind == ActorKind::Human => Some(&h.principal),
+            _ => None,
+        }
+    }
+}
+
+/// Static (registered, long-lived) or ephemeral (session-scoped, auto-expiring). The delegation
+/// chain on [`Actor`] carries who delegated it; lifetime carries only how long it lives.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Lifetime {
     Static,
-    /// Minted for one session: expires at `expires_unix`, with an optional parent that delegated it.
-    Ephemeral {
-        expires_unix: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        parent: Option<ActorId>,
-    },
+    /// Minted for one session: expires at `expires_unix` (an ephemeral agent still chains to a
+    /// human via [`Actor::delegation`]).
+    Ephemeral { expires_unix: u64 },
 }
 
 /// A personal or organization account. Repos, issues, and projects belong to an account.
@@ -225,4 +287,38 @@ pub enum ViewKind {
 pub struct OwnerRule {
     pub glob: String,
     pub owners: Vec<ActorId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn human(id: &str) -> Actor {
+        Actor { id: id.into(), kind: ActorKind::Human, lifetime: Lifetime::Static, handle: id.into(), delegation: None, nostr_pubkey: None }
+    }
+    fn agent(id: &str, delegation: Option<Delegation>) -> Actor {
+        Actor { id: id.into(), kind: ActorKind::Agent, lifetime: Lifetime::Ephemeral { expires_unix: 0 }, handle: id.into(), delegation, nostr_pubkey: None }
+    }
+    fn hop(id: &str, kind: ActorKind) -> DelegationHop {
+        DelegationHop { principal: id.into(), kind, scope: "*".into(), signature: vec![] }
+    }
+
+    #[test]
+    fn no_unaccountable_agents() {
+        // a human is its own root
+        assert_eq!(human("h").human_principal(), Some(&"h".to_string()));
+
+        // an agent with NO delegation is unaccountable — rejected
+        assert!(!agent("a", None).is_accountable(), "agent without a human root must be rejected");
+
+        // an agent whose chain roots at a human is accountable, and resolves to that human
+        let d = Delegation { chain: vec![hop("h", ActorKind::Human), hop("machine", ActorKind::Agent), hop("a", ActorKind::Agent)] };
+        let acc = agent("a", Some(d));
+        assert!(acc.is_accountable());
+        assert_eq!(acc.human_principal(), Some(&"h".to_string()));
+
+        // an agent whose chain does NOT start at a human is still unaccountable
+        let bad = Delegation { chain: vec![hop("machine", ActorKind::Agent), hop("a", ActorKind::Agent)] };
+        assert!(!agent("a", Some(bad)).is_accountable(), "a chain with no human root is unaccountable");
+    }
 }
