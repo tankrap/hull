@@ -1,0 +1,17 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / web
+web/node_modules
+web/dist
+web/.vite
+
+# Env / secrets / local db
+.env
+.env.*
+*.db
+*.sqlite
+
+# OS / editor
+.DS_Store

@@ -1,0 +1,10 @@
+[package]
+name = "hull-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hull domain model — accounts, actors (human/agent identities), repos, issues, projects — every object linked to keel provenance by content address."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "hull-scan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Secret scanning for Hull + the keel CLI — the same engine runs client-side (block before a secret leaves the machine) and server-side (backstop on receive-pack)."
+
+[dependencies]
+regex = { workspace = true }
+serde = { workspace = true }

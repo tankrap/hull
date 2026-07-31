@@ -1,0 +1,20 @@
+[package]
+name = "hull-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hull HTTP/JSON API + the reactive activity bridge (keeld QUIC coordination → SSE)."
+
+[[bin]]
+name = "hull-server"
+path = "src/main.rs"
+
+[dependencies]
+hull-core = { path = "../hull-core" }
+hull-scan = { path = "../hull-scan" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
