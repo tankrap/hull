@@ -1668,7 +1668,27 @@ async fn update_issue(
             issue.status = IssueStatus::Closed { reason };
         }
         "reopen" => issue.status = IssueStatus::Open,
-        _ => return (StatusCode::BAD_REQUEST, "action must be 'close' or 'reopen'").into_response(),
+        "assign" | "unassign" => {
+            let who = body.get("assignee").and_then(Value::as_str).unwrap_or("").to_string();
+            if who.is_empty() || app.store.actor(&who).is_none() {
+                return (StatusCode::UNPROCESSABLE_ENTITY, "assignee must be a registered actor").into_response();
+            }
+            issue.assignees.retain(|a| a != &who);
+            if action == "assign" {
+                issue.assignees.push(who);
+            }
+        }
+        "label" | "unlabel" => {
+            let label = body.get("label").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            if label.is_empty() {
+                return (StatusCode::BAD_REQUEST, "label is required").into_response();
+            }
+            issue.labels.retain(|l| l != &label);
+            if action == "label" {
+                issue.labels.push(label);
+            }
+        }
+        _ => return (StatusCode::BAD_REQUEST, "action must be close | reopen | assign | unassign | label | unlabel").into_response(),
     }
     app.store.replace_issue(issue.clone());
     app.hub.publish(

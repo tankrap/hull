@@ -38,6 +38,7 @@ type Issue = {
   assignees: string[];
   status: { state: string; reason?: string };
   code_refs: CodeRef[];
+  labels: string[];
   resolved_by?: string;
   linked_prs?: string[];
 };
@@ -240,15 +241,18 @@ export function App() {
     loadIssues();
   }, [tenant, issueRepo]);
 
-  const transition = async (number: number, action: "close" | "reopen") => {
+  const issueAction = async (number: number, action: string, extra: Record<string, unknown> = {}) => {
     if (!canAct) return alert("Sign in to act.");
-    await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues/${number}`, {
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues/${number}`, {
       method: "PATCH",
       headers: { "content-type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ action, actor: actingAs, ...(action === "close" ? { reason: "completed" } : {}) }),
+      body: JSON.stringify({ action, ...(action === "close" ? { reason: "completed" } : {}), ...extra }),
     });
-    loadIssues();
+    if (res.ok) loadIssues();
+    else alert(await res.text());
   };
+  const transition = (number: number, action: "close" | "reopen") => issueAction(number, action);
+  const [labelDraft, setLabelDraft] = useState<Record<number, string>>({});
 
   // Accounts / orgs (membership + roles).
   type Account = { id: string; handle: string; kind: string; repos: string[]; members: { handle: string; role: string }[] };
@@ -820,7 +824,7 @@ export function App() {
         <ul className="issue-list">
           {issues.length === 0 && <li className="empty">no issues yet — open one above</li>}
           {[...issues]
-            .filter((it) => matchQ(`${it.title} ${it.body} #${it.number}`))
+            .filter((it) => matchQ(`${it.title} ${it.body} #${it.number} ${it.labels.join(" ")}`))
             .sort((a, b) => Number(a.status.state !== "open") - Number(b.status.state !== "open") || b.number - a.number)
             .map((it) => (
             <li key={it.number} className={"issue " + it.status.state}>
@@ -893,6 +897,45 @@ export function App() {
                   {it.code_refs.length > 0 && (
                     <p className="muted">code references (click a ⬡ anchor above for keel provenance)</p>
                   )}
+                  <div className="issue-manage">
+                    <div className="mrow">
+                      <span className="pk-label">assignees</span>
+                      {it.assignees.map((id) => (
+                        <span key={id} className="chip">
+                          {handleOf(id)}
+                          {canAct && <button className="x" title="unassign" onClick={() => issueAction(it.number, "unassign", { assignee: id })}>×</button>}
+                        </span>
+                      ))}
+                      {canAct && me && !it.assignees.includes(me.id) && (
+                        <button className="link" onClick={() => issueAction(it.number, "assign", { assignee: me.id })}>assign me</button>
+                      )}
+                      {it.assignees.length === 0 && !canAct && <span className="muted">none</span>}
+                    </div>
+                    <div className="mrow">
+                      <span className="pk-label">labels</span>
+                      {it.labels.map((l) => (
+                        <span key={l} className="chip label">
+                          {l}
+                          {canAct && <button className="x" title="remove label" onClick={() => issueAction(it.number, "unlabel", { label: l })}>×</button>}
+                        </span>
+                      ))}
+                      {canAct && (
+                        <span className="label-add">
+                          <input
+                            placeholder="add label…"
+                            value={labelDraft[it.number] ?? ""}
+                            onChange={(e) => setLabelDraft((d) => ({ ...d, [it.number]: e.target.value }))}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && (labelDraft[it.number] ?? "").trim()) {
+                                issueAction(it.number, "label", { label: labelDraft[it.number].trim() });
+                                setLabelDraft((d) => ({ ...d, [it.number]: "" }));
+                              }
+                            }}
+                          />
+                        </span>
+                      )}
+                    </div>
+                  </div>
                   <div className="thread-wrap">
                     <h5>Discussion</h5>
                     <Thread target={`issue:${it.number}`} />
@@ -929,7 +972,7 @@ export function App() {
             { k: "cancelled", label: "Cancelled" },
             { k: "duplicate", label: "Duplicate" },
           ].map((col) => {
-            const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k && matchQ(`${i.title} ${i.body} #${i.number}`));
+            const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k && matchQ(`${i.title} ${i.body} #${i.number} ${i.labels.join(" ")}`));
             if (col.k !== "open" && inCol.length === 0) return null;
             return (
               <div className="col" key={col.k}>
