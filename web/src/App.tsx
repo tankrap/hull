@@ -143,6 +143,7 @@ export function App() {
   // Two views: Home (situation room) and a focused Repo view with Issues / PRs tabs.
   const [view, setView] = useState<"home" | "repo">("home");
   const [tab, setTab] = useState<"issues" | "prs">("issues");
+  const [issueView, setIssueView] = useState<"list" | "board">("list");
   const [openIssue, setOpenIssue] = useState<number | null>(null);
   const selectRepo = (repo: string) => {
     setIssueRepo(repo);
@@ -494,6 +495,10 @@ export function App() {
 
         {tab === "issues" && (
         <section className="issues">
+        <div className="view-toggle">
+          <button className={issueView === "list" ? "on" : ""} onClick={() => setIssueView("list")}>List</button>
+          <button className={issueView === "board" ? "on" : ""} onClick={() => setIssueView("board")}>Board</button>
+        </div>
         <form className="issue-form" onSubmit={createIssue}>
           <input
             placeholder="Open an issue…"
@@ -527,6 +532,7 @@ export function App() {
           </select>
           <button type="submit">Open</button>
         </form>
+        {issueView === "list" ? (
         <ul className="issue-list">
           {issues.length === 0 && <li className="empty">no issues yet — open one above</li>}
           {[...issues]
@@ -615,6 +621,43 @@ export function App() {
             </li>
           ))}
         </ul>
+        ) : (
+        <div className="board">
+          {[
+            { k: "open", label: "Open" },
+            { k: "completed", label: "Completed" },
+            { k: "not_planned", label: "Not planned" },
+            { k: "cancelled", label: "Cancelled" },
+            { k: "duplicate", label: "Duplicate" },
+          ].map((col) => {
+            const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k);
+            if (col.k !== "open" && inCol.length === 0) return null;
+            return (
+              <div className="col" key={col.k}>
+                <div className="col-head">
+                  {col.label} <span className="muted">{inCol.length}</span>
+                </div>
+                {inCol.map((it) => (
+                  <div
+                    className="card"
+                    key={it.number}
+                    onClick={() => {
+                      setIssueView("list");
+                      setOpenIssue(it.number);
+                    }}
+                  >
+                    <div className="card-num">#{it.number}</div>
+                    <div className="card-title">{it.title}</div>
+                    {it.assignees.length > 0 && (
+                      <div className="card-assignees">◎ {it.assignees.map((id) => handleOf(id)).join(", ")}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+        )}
         </section>
         )}
 

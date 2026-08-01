@@ -276,3 +276,15 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .sec-banner ul { margin: 8px 0 0; padding-left: 18px; color: #cdd3df; font-size: 13px; }
 .sec-banner code { color: #ffb3b3; }
 .owners-chip { font-size: 12px; color: #d6b98f; background: #201a12; border: 1px solid #3a2f1c; padding: 2px 8px; border-radius: 20px; }
+
+.view-toggle { display: inline-flex; gap: 0; margin-bottom: 12px; border: 1px solid #2a3040; border-radius: 7px; overflow: hidden; }
+.view-toggle button { background: #12151c; border: 0; color: #8b93a7; padding: 5px 14px; cursor: pointer; font: inherit; font-size: 13px; }
+.view-toggle button.on { background: #1c2432; color: #e6e9ef; }
+.board { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; }
+.board .col { flex: 0 0 240px; background: #0e1420; border: 1px solid #1c2432; border-radius: 8px; padding: 8px; }
+.board .col-head { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #8b93a7; padding: 4px 6px 10px; }
+.board .card { background: #12151c; border: 1px solid #20263a; border-radius: 7px; padding: 8px 10px; margin-bottom: 8px; cursor: pointer; }
+.board .card:hover { border-color: #2f8f6b; }
+.board .card-num { font-size: 11px; color: #8b93a7; }
+.board .card-title { font-size: 13px; color: #e6e9ef; margin-top: 2px; }
+.board .card-assignees { font-size: 11px; color: #d6b98f; margin-top: 6px; }
