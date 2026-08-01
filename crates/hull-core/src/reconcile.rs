@@ -66,7 +66,8 @@ pub enum ClaimStatus {
     /// scan. The strongest positive available without running new probes.
     VerifiedMechanically,
     /// The reconciliation engine **read** the diff and found the claimed symbol/file/code. A real
-    /// but weak positive — it confirms presence, not behavior.
+    /// but weak positive — it confirms presence, not behavior. (`supported` is the pre-C4 alias.)
+    #[serde(alias = "supported")]
     VerifiedReadOnly,
     /// Green, but the change **adds its own tests** — the passing tests may only cover this same
     /// change. Flagged, not independently verified.
@@ -74,7 +75,8 @@ pub enum ClaimStatus {
     /// Facts actively contradict it (claimed green tests but verification is red; claimed no
     /// secrets but the scan found one; plan says X, diff does Y).
     Contradicted,
-    /// Nothing in the change speaks to it either way — a human must judge it.
+    /// Nothing in the change speaks to it either way — a human must judge it. (`unsupported` alias.)
+    #[serde(alias = "unsupported", other)]
     NeedsJudgment,
 }
 

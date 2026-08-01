@@ -196,13 +196,28 @@ pub struct FileStore {
 }
 
 impl FileStore {
-    /// Open the store at `path`, loading an existing snapshot or starting empty.
+    /// Open the store at `path`. A **missing** file starts empty (fresh install). A file that
+    /// **exists but won't parse** is NOT silently discarded — that would let the next write overwrite
+    /// recoverable data (e.g. after an incompatible schema change). Instead we preserve a copy and
+    /// refuse to start, so an operator can migrate rather than lose data.
     pub fn open(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let inner = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Snapshot>(&b).ok())
-            .unwrap_or_default();
+        let inner = match std::fs::read(&path) {
+            Err(_) => Snapshot::default(), // no file yet — a fresh store
+            Ok(bytes) => match serde_json::from_slice::<Snapshot>(&bytes) {
+                Ok(snap) => snap,
+                Err(e) => {
+                    let backup = path.with_extension(format!("json.corrupt-{}", std::process::id()));
+                    let _ = std::fs::copy(&path, &backup);
+                    panic!(
+                        "hull: store at {} failed to parse ({e}); preserved a copy at {} and refused \
+                         to start empty (which would overwrite your data). Migrate or restore, then restart.",
+                        path.display(),
+                        backup.display(),
+                    );
+                }
+            },
+        };
         FileStore { path, inner: RwLock::new(inner) }
     }
 
