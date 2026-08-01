@@ -40,6 +40,19 @@ export function App() {
   // Issues for the selected repo under the selected tenant (M2). Click a repo card to switch.
   const [issueRepo, setIssueRepo] = useState<string>("hull");
   const [issues, setIssues] = useState<Issue[]>([]);
+  const [prov, setProv] = useState<Record<string, { change: string; intent: string; author: string }[]>>({});
+
+  // Toggle keel-native provenance ("who/what touched this path") under a code-ref.
+  const showWhy = async (key: string, path: string) => {
+    if (prov[key]) {
+      setProv(({ [key]: _drop, ...rest }) => rest);
+      return;
+    }
+    const d = await fetch(
+      `/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/why?path=${encodeURIComponent(path)}`,
+    ).then((r) => r.json());
+    setProv((p) => ({ ...p, [key]: d.provenance ?? [] }));
+  };
   const [form, setForm] = useState({ title: "", path: "", line: "" });
   const loadIssues = () =>
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`)
@@ -211,34 +224,55 @@ export function App() {
             .sort((a, b) => Number(a.status.state !== "open") - Number(b.status.state !== "open") || b.number - a.number)
             .map((it) => (
             <li key={it.number} className={"issue " + it.status.state}>
-              <span className={"state " + it.status.state} title={it.status.reason ?? ""}>
-                {it.status.state === "open" ? "open" : it.status.reason ?? "closed"}
-              </span>
-              <span className="num">#{it.number}</span>
-              <span className="it-title">{it.title}</span>
-              {it.code_refs.map((c, i) => (
-                <a
-                  key={i}
-                  className="coderef"
-                  title={`content-addressed → keel blob ${c.blob}`}
-                >
-                  <code>
-                    {c.path}:{c.line_start}
-                    {c.line_end ? `-${c.line_end}` : ""}
-                  </code>
-                  <span className="blob">⬡ {c.blob.slice(0, 10)}</span>
-                </a>
-              ))}
-              <span className="by">{it.author}</span>
-              {it.status.state === "open" ? (
-                <button className="act close" onClick={() => transition(it.number, "close")}>
-                  Close
-                </button>
-              ) : (
-                <button className="act reopen" onClick={() => transition(it.number, "reopen")}>
-                  Reopen
-                </button>
-              )}
+              <div className="issue-row">
+                <span className={"state " + it.status.state} title={it.status.reason ?? ""}>
+                  {it.status.state === "open" ? "open" : it.status.reason ?? "closed"}
+                </span>
+                <span className="num">#{it.number}</span>
+                <span className="it-title">{it.title}</span>
+                {it.code_refs.map((c, i) => (
+                  <button
+                    key={i}
+                    className="coderef"
+                    title={`content-addressed → keel blob ${c.blob} · click for provenance`}
+                    onClick={() => showWhy(`${it.number}:${c.path}`, c.path)}
+                  >
+                    <code>
+                      {c.path}:{c.line_start}
+                      {c.line_end ? `-${c.line_end}` : ""}
+                    </code>
+                    <span className="blob">⬡ {c.blob.slice(0, 10)}</span>
+                  </button>
+                ))}
+                <span className="by">{it.author}</span>
+                {it.status.state === "open" ? (
+                  <button className="act close" onClick={() => transition(it.number, "close")}>
+                    Close
+                  </button>
+                ) : (
+                  <button className="act reopen" onClick={() => transition(it.number, "reopen")}>
+                    Reopen
+                  </button>
+                )}
+              </div>
+              {it.code_refs.map((c) => {
+                const key = `${it.number}:${c.path}`;
+                return prov[key] ? (
+                  <ul className="prov" key={key}>
+                    <li className="prov-head">
+                      keel provenance · <code>{c.path}</code>
+                    </li>
+                    {prov[key].length === 0 && <li className="empty">no recorded history</li>}
+                    {prov[key].map((p, j) => (
+                      <li key={j}>
+                        <code className="ch">{p.change.slice(0, 10)}</code>
+                        <span className="intent">{p.intent}</span>
+                        <span className="by">{p.author}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null;
+              })}
             </li>
           ))}
         </ul>

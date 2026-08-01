@@ -107,3 +107,14 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .issues h2 .counts { margin-left: 12px; font-size: 13px; color: #8b93a7; font-weight: 400; }
 .issue.closed { opacity: .62; }
 .issue.closed .it-title { text-decoration: line-through; text-decoration-color: #4a5163; }
+
+/* issue row + inline keel provenance */
+.issue { display: block; }
+.issue-row { display: flex; align-items: center; gap: 10px; }
+.coderef { cursor: pointer; }
+.prov { list-style: none; margin: 8px 0 2px; padding: 8px 10px; border-left: 2px solid #2f8f6b; background: #0e1420; border-radius: 0 6px 6px 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.prov .prov-head { color: #7ee2b8; font-size: 12px; }
+.prov li { display: flex; gap: 8px; align-items: baseline; }
+.prov .ch { color: #6fa8ff; }
+.prov .intent { color: #cdd3df; }
+.prov .by { margin-left: auto; color: #8b93a7; font-size: 12px; }

@@ -112,6 +112,50 @@ impl RepoHost {
     }
 }
 
+/// One change that touched a path — the keel-native provenance behind a code-ref.
+#[derive(serde::Serialize)]
+pub struct Provenance {
+    pub change: String,
+    pub intent: String,
+    pub author: String,
+}
+
+impl RepoHost {
+    /// First-parent history where `path`'s content changed vs its parent — i.e. the changes (and
+    /// authors/agents) that actually touched it. This is `keel why` over a hosted repo, the spine
+    /// that lets a Hull code-ref resolve to who produced it. Newest first, capped at `limit`.
+    pub fn why(&self, tenant: &str, repo: &str, path: &str, limit: usize) -> Vec<Provenance> {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return Vec::new() };
+        let mut out = Vec::new();
+        let mut cur = store.get_ref("main").ok().flatten();
+        while let Some(cid) = cur {
+            let change = match store.get(&cid).ok().flatten() {
+                Some(Object::Change(c)) => c,
+                _ => break,
+            };
+            let here = resolve_path_in_tree(&store, change.tree, path);
+            let parent = change.parents.first().copied();
+            let there = parent
+                .and_then(|p| match store.get(&p).ok().flatten() {
+                    Some(Object::Change(pc)) => resolve_path_in_tree(&store, pc.tree, path),
+                    _ => None,
+                });
+            if here != there {
+                out.push(Provenance {
+                    change: cid.to_hex(),
+                    intent: change.intent,
+                    author: change.author,
+                });
+                if out.len() >= limit {
+                    break;
+                }
+            }
+            cur = parent;
+        }
+        out
+    }
+}
+
 /// Walk `tree` down `path` (`/`-separated) to the blob id at the leaf.
 fn resolve_path_in_tree(store: &Store, tree: ObjectId, path: &str) -> Option<ObjectId> {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();

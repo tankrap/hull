@@ -99,6 +99,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos", get(repos_list))
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
         .route("/api/repos/:tenant/:repo/issues/:number", axum::routing::patch(update_issue))
+        .route("/api/repos/:tenant/:repo/why", get(why))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
         // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
@@ -169,6 +170,19 @@ async fn home(State(app): State<App>, Query(q): Query<HashMap<String, String>>) 
 /// The repos actually hosted on disk (the filesystem registry), plus the seeded domain repos.
 async fn repos_list(State(app): State<App>) -> Json<Value> {
     Json(json!({ "hosted": app.repos.list(), "repos": app.store.repos() }))
+}
+
+/// Keel-native provenance for a path (`GET /api/repos/:tenant/:repo/why?path=…`): the changes and
+/// authors/agents that touched it. This is the spine that makes a code-ref traceable, not just a
+/// pointer — something GitHub has no representation for.
+async fn why(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let path = q.get("path").map(String::as_str).unwrap_or("");
+    let prov = app.repos.why(&tenant, &repo, path, 10);
+    Json(json!({ "path": path, "provenance": prov }))
 }
 
 /// List issues for a hosted repo (`GET /api/repos/:tenant/:repo/issues`).
