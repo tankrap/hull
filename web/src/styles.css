@@ -410,3 +410,6 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 /* Unread notification highlight */
 .notif.unread{background:color-mix(in srgb, var(--accent) 8%, transparent);border-radius:6px}
 .notif.unread .ns{font-weight:600}
+
+/* Comment timestamp */
+.cmt-ts{margin-left:auto;font-size:11px;color:var(--muted);white-space:nowrap;flex:0 0 auto}

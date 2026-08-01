@@ -182,6 +182,15 @@ export function App() {
   // Quick filter across the current repo's issues / PRs (title, body, #number).
   const [q, setQ] = useState("");
   const matchQ = (s: string) => q.trim() === "" || s.toLowerCase().includes(q.trim().toLowerCase());
+  // Compact relative time ("3h ago") from a unix seconds timestamp.
+  const timeAgo = (unix: number) => {
+    if (!unix) return "";
+    const s = Math.max(1, Math.floor(Date.now() / 1000 - unix));
+    const steps: [number, string][] = [[60, "s"], [60, "m"], [24, "h"], [30, "d"], [12, "mo"], [Infinity, "y"]];
+    let v = s, u = "s";
+    for (const [div, unit] of steps) { if (v < div) { u = unit; break; } v = Math.floor(v / div); u = unit; }
+    return `${v}${u} ago`;
+  };
 
   // Notifications inbox, scoped to the acting actor (addressed-to-them + broadcasts). Polled.
   useEffect(() => {
@@ -348,6 +357,7 @@ export function App() {
         <div className="cmt" key={c.id}>
           <b className={actors.find((a) => a.id === c.author)?.kind ?? ""}>{handleOf(c.author)}</b>
           <span className="cmt-body">{c.body}</span>
+          <span className="cmt-ts" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
         </div>
       ))}
       {comments.filter((c) => c.target === target).length === 0 && <div className="muted cmt-empty">no comments yet</div>}
