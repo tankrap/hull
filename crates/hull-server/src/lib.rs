@@ -1448,54 +1448,37 @@ async fn perform_auto_review(
         CiResolution::Pending => "running".into(),
         CiResolution::Failed(_) => "not-run".into(),
     };
-    let verification = app.repos.verification(tenant, repo, &change).unwrap_or_else(|| "unverified".into());
-
-    // 2. Reconcile the change's narrative against its facts.
+    // 2. Produce the review package through the Reviewer capability (Epic D). The OSS default
+    //    reconciles the narrative against the facts (Epic C); a hosted plugin swaps in the sandbox +
+    //    model-backed AI reviewer. Either way the output is a constrained-schema verdict/findings.
     let Some(info) = app.repos.change_info(tenant, repo, &change) else {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "cannot resolve change".into()));
     };
     let lesson = app.store.session_record(&key, &change).map(|s| s.lesson).unwrap_or_default();
     let facts = app.repos.facts(tenant, repo, &change);
-    let ledger = hull_core::reconcile::reconcile(&change, &info.intent, &lesson, &facts);
+    let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
+    let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
+    let pkg = app.registry.review(&hull_plugin::ReviewRequest {
+        repo: key.clone(),
+        change: change.clone(),
+        intent: info.intent.clone(),
+        lesson,
+        author: info.author.clone(),
+        source_url,
+        facts,
+    });
 
-    // 3. Synthesize a blocker finding for every contradicted claim.
-    let anchor = info.files.first().map(|f| f.path.clone()).unwrap_or_else(|| format!("change:{}", &change[..change.len().min(12)]));
-    let mut findings: Vec<ReviewFinding> = Vec::new();
-    for claim in &ledger.claims {
-        use hull_core::reconcile::ClaimStatus;
-        if claim.status == ClaimStatus::Contradicted {
-            let ev = claim.evidence.iter().find(|e| !e.supports).map(|e| e.detail.clone()).unwrap_or_default();
-            findings.push(ReviewFinding {
-                path: anchor.clone(),
-                line: None,
-                severity: "blocker".into(),
-                note: format!("Claim not supported by the change: “{}” — {ev}", claim.text),
-            });
-        }
-    }
-
-    // 4. Verdict.
-    let contradicted = ledger.contradicted();
-    let verdict = if contradicted > 0 {
-        Verdict::RequestChanges
-    } else if verification == "green" && ledger.supported() > 0 {
-        Verdict::Approve
-    } else {
-        Verdict::Comment
+    // 3. Persist the package as a Review under the agent reviewer.
+    let verdict = match pkg.verdict {
+        hull_plugin::ReviewVerdict::Approve => Verdict::Approve,
+        hull_plugin::ReviewVerdict::RequestChanges => Verdict::RequestChanges,
+        hull_plugin::ReviewVerdict::Comment => Verdict::Comment,
     };
-    let summary = format!(
-        "Agent reconciliation review: {} claims — {} supported, {} contradicted; checks {}. {}",
-        ledger.claims.len(),
-        ledger.supported(),
-        contradicted,
-        check_label,
-        match verdict {
-            Verdict::Approve => "Narrative matches the change and checks are green — approving.",
-            Verdict::RequestChanges => "The change contradicts its own stated intent — requesting changes.",
-            _ => "Checks are not green or nothing corroborates the intent — leaving a comment for a human.",
-        }
-    );
-
+    let findings: Vec<ReviewFinding> = pkg
+        .findings
+        .into_iter()
+        .map(|f| ReviewFinding { path: f.path, line: f.line, severity: f.severity, note: f.note })
+        .collect();
     let count = app.store.reviews(&key).len();
     let review = Review {
         id: format!("rv_{}_{}", key.replace('/', "_"), count + 1),
@@ -1503,9 +1486,9 @@ async fn perform_auto_review(
         target: format!("pr:{number}"),
         reviewer: reviewer.id.clone(),
         verdict,
-        summary,
+        summary: format!("{} · checks {check_label}", pkg.summary),
         findings,
-        ledger: Some(ledger),
+        ledger: pkg.ledger,
         created_unix: now(),
     };
     app.store.put_review(review.clone());

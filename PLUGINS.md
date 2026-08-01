@@ -140,6 +140,49 @@ materialized `req.workdir`) and `reg.set_ci_runner(...)`. The built-in [`default
 runs untrusted PR code in-process, this shape is only for local/self-host use; anything hosted uses
 shape A** and runs tests on isolated, sandboxed runners it controls.
 
+## Building an AI reviewer (Epic D)
+
+`Reviewer` is the seam for the review *judgment* (distinct from `CiRunner`, which is the *execution*).
+The OSS core ships the **reconciliation** reviewer as the default (`default_review` — deterministic
+claims-vs-facts, Epic C). A hosted plugin swaps in the **sandbox + model-backed** reviewer (e.g.
+driving [opencode](https://github.com/sst/opencode) or another agent harness to read the change and
+produce a verdict).
+
+```rust
+impl Reviewer for OpencodeReviewer {
+    fn review(&self, req: &ReviewRequest) -> ReviewPackage {
+        // req.source_url → keel-native content-addressed tree tar (CI-SPEC §6); NOT git.
+        // req.intent / req.lesson / req.author → the narrative. req.facts → files/ops/verify/secrets.
+        //
+        // Fetch source into an ISOLATED sandbox, drive the model/agent (opencode) over the change,
+        // and return a CONSTRAINED-SCHEMA verdict — never free-text parsed for approval.
+        let v = self.run_in_sandbox(&req.source_url, &req.intent); // your harness
+        ReviewPackage {
+            verdict: if v.ok { ReviewVerdict::Approve } else { ReviewVerdict::RequestChanges },
+            summary: v.summary,
+            findings: v.findings,   // {path, line?, severity, note}
+            ledger: None,           // or attach your own evidence
+        }
+    }
+}
+// reg.set_reviewer(Arc::new(OpencodeReviewer::new()))
+```
+
+The non-negotiables from the design (Epic D):
+- **Isolation (D2):** the reviewer runs the change's code — untrusted. Fetch/run in a separate
+  process/VM, no core credentials, egress limited to the model API, ephemeral. Never in-process.
+- **Constrained-schema verdict (D7):** the verdict/findings are structured output; repo content is
+  *data, never instructions*. Don't parse free text for an approval — a prompt-injected diff must not
+  be able to talk the reviewer into "approve".
+- **Independence:** review under a model family independent of the author; an agent never reviews its
+  own PR (the core already enforces author≠reviewer).
+- **Advisory only (D11):** a `Reviewer` verdict is input to the merge gate, **not** a merge
+  authorization. Hull's gate still requires keel-verify **green** + an **independent approval**; a
+  reviewer's "approve" never satisfies a protected-path merge by itself.
+
+`source_url` is the keel-native, content-addressed source (a `…/tree/:tree_id/tar` — see CI-SPEC §6),
+so an AI reviewer and a CI runner fetch source the exact same way. No git.
+
 ## Capability roadmap
 
 The SDK starts with the in-process trio `SecretRuleset`, `Notifier`, `AuthProvider`. Planned:

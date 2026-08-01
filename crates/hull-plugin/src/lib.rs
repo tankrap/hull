@@ -181,6 +181,106 @@ pub fn default_local_ci(req: &CiRequest) -> CiOutcome {
     }
 }
 
+// ── Reviewer (Epic D / D1) ──────────────────────────────────────────────────────────────────────
+
+/// Produce a review package for a change (Epic D). The core default [`default_review`] is the
+/// read-only **reconciliation** reviewer (Epic C) — deterministic, claims-vs-facts, no model, no
+/// code execution. The hosted plugin swaps in the **sandbox + model-backed AI reviewer** (runs the
+/// change's code in isolation, writes independent probe tests, model-tiered, and reviews under a
+/// model family independent of the author). A `Reviewer`'s verdict is **advisory** input to the
+/// merge gate — it never satisfies a protected-path merge on its own (that still needs keel-verify
+/// green + an independent human/agent approval).
+pub trait Reviewer: Send + Sync {
+    fn review(&self, req: &ReviewRequest) -> ReviewPackage;
+}
+
+/// What a reviewer judges: the change's narrative (intent + session lesson), its author, the
+/// keel-native content-addressed source (a sandbox reviewer fetches this — see CI-SPEC §6), and the
+/// observed facts (which the reconciliation default reasons over).
+#[derive(Debug, Clone)]
+pub struct ReviewRequest {
+    pub repo: String,
+    pub change: String,
+    pub intent: String,
+    pub lesson: String,
+    pub author: String,
+    /// keel-native content-addressed source (a `…/tree/:tree_id/tar` URL). NOT git.
+    pub source_url: String,
+    pub facts: hull_core::reconcile::ChangeFacts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdict {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReviewFinding {
+    pub path: String,
+    pub line: Option<u32>,
+    /// `info` | `warn` | `blocker`.
+    pub severity: String,
+    pub note: String,
+}
+
+/// A reviewer's structured output. **Constrained-schema verdict (D7):** the verdict and findings are
+/// structured data produced by the reviewer, never free-text parsed for approval — so untrusted repo
+/// content can't talk a reviewer into an approval.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReviewPackage {
+    pub verdict: ReviewVerdict,
+    pub summary: String,
+    pub findings: Vec<ReviewFinding>,
+    /// The reconciliation ledger evidence, when the reviewer produced one (the OSS default does; a
+    /// model-backed reviewer may attach its own or leave this `None`).
+    pub ledger: Option<hull_core::reconcile::ClaimLedger>,
+}
+
+/// The OSS default reviewer (Epic C): reconcile the change's narrative against its facts and
+/// synthesize a verdict + blocker findings for contradicted claims. Deterministic — no model, no
+/// code execution. This is what ships in the free core; hosted swaps in the empirical AI reviewer.
+pub fn default_review(req: &ReviewRequest) -> ReviewPackage {
+    use hull_core::reconcile::{reconcile, ClaimStatus};
+    let ledger = reconcile(&req.change, &req.intent, &req.lesson, &req.facts);
+    let anchor = req.facts.files.first().cloned().unwrap_or_else(|| format!("change:{}", &req.change[..req.change.len().min(12)]));
+    let mut findings = Vec::new();
+    for c in &ledger.claims {
+        if c.status == ClaimStatus::Contradicted {
+            let ev = c.evidence.iter().find(|e| !e.supports).map(|e| e.detail.clone()).unwrap_or_default();
+            findings.push(ReviewFinding {
+                path: anchor.clone(),
+                line: None,
+                severity: "blocker".into(),
+                note: format!("Claim not supported by the change: \u{201c}{}\u{201d} — {ev}", c.text),
+            });
+        }
+    }
+    let contradicted = ledger.contradicted();
+    let verdict = if contradicted > 0 {
+        ReviewVerdict::RequestChanges
+    } else if req.facts.verification == "green" && ledger.supported() > 0 {
+        ReviewVerdict::Approve
+    } else {
+        ReviewVerdict::Comment
+    };
+    let summary = format!(
+        "Reconciliation review: {} claims — {} supported, {} contradicted; checks {}. {}",
+        ledger.claims.len(),
+        ledger.supported(),
+        contradicted,
+        req.facts.verification,
+        match verdict {
+            ReviewVerdict::Approve => "Narrative matches the change and checks are green.",
+            ReviewVerdict::RequestChanges => "The change contradicts its own stated intent.",
+            ReviewVerdict::Comment => "Not green, or nothing corroborates the intent — a human should look.",
+        }
+    );
+    ReviewPackage { verdict, summary, findings, ledger: Some(ledger) }
+}
+
 /// A notification payload (kept generic so plugins map it to their channel).
 #[derive(Debug, Clone)]
 pub struct NotifyEvent {
@@ -206,6 +306,7 @@ pub struct Registry {
     auth_providers: Vec<Arc<dyn AuthProvider>>,
     ci_runner: Option<Arc<dyn CiRunner>>,
     mirror: Option<Arc<dyn Mirror>>,
+    reviewer: Option<Arc<dyn Reviewer>>,
 }
 
 /// What `/api/plugins` reports.
@@ -244,6 +345,10 @@ impl Registry {
     pub fn set_mirror(&mut self, m: Arc<dyn Mirror>) {
         self.mirror = Some(m);
     }
+    /// Install a reviewer (the hosted AI reviewer overrides the OSS reconciliation default).
+    pub fn set_reviewer(&mut self, r: Arc<dyn Reviewer>) {
+        self.reviewer = Some(r);
+    }
 
     /// Installed plugins (for `/api/plugins`).
     pub fn plugins(&self) -> &[PluginInfo] {
@@ -278,6 +383,15 @@ impl Registry {
         match &self.ci_runner {
             Some(r) => r.run(req),
             None => default_local_ci(req),
+        }
+    }
+
+    /// Produce a review package: the installed reviewer (hosted AI) if any, else the OSS
+    /// reconciliation default.
+    pub fn review(&self, req: &ReviewRequest) -> ReviewPackage {
+        match &self.reviewer {
+            Some(r) => r.review(req),
+            None => default_review(req),
         }
     }
 
