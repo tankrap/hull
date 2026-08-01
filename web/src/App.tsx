@@ -4,6 +4,10 @@ import * as ed from "@noble/ed25519";
 const hexToBytes = (h: string) => Uint8Array.from((h.match(/../g) ?? []).map((x) => parseInt(x, 16)));
 const bytesToHex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 
+// The published demo-owner secret (mirrors hull-server's DEMO_OWNER_SECRET). "Sign in as demo" signs
+// the login challenge with this key — real signature auth, just a publicly-known demo credential.
+const DEMO_OWNER_SECRET = "68756c6c2d64656d6f2d6f776e65722d6b65792d64656d6f2d6f6e6c79212121";
+
 // Mirrors hull-server's activity model.
 type RepoActivity = {
   repo: string;
@@ -122,20 +126,18 @@ export function App() {
     setMe(null);
   };
 
-  // Registered actors + who we're acting as (when not signed in, the body actor for demo use).
+  // Registered actors (for display / handle resolution only — you cannot *act* as any of them).
   const [actors, setActors] = useState<Actor[]>([]);
-  const [actingAs, setActingAs] = useState<string>("");
   useEffect(() => {
     fetch("/api/actors")
       .then((r) => r.json())
-      .then((d) => {
-        const list: Actor[] = d.actors ?? [];
-        setActors(list);
-        setActingAs((cur) => cur || list.find((a) => a.kind === "human")?.id || list[0]?.id || "");
-      })
+      .then((d) => setActors(d.actors ?? []))
       .catch(() => {});
   }, []);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
+  // You act only as your signed-in self. No token ⇒ no identity ⇒ writes are blocked (server 401s).
+  const actingAs = me?.id ?? "";
+  const canAct = !!me;
 
   // Notifications inbox, scoped to the acting actor (addressed-to-them + broadcasts). Polled.
   useEffect(() => {
@@ -186,6 +188,7 @@ export function App() {
   }, [tenant, issueRepo]);
 
   const transition = async (number: number, action: "close" | "reopen") => {
+    if (!canAct) return alert("Sign in to act.");
     await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues/${number}`, {
       method: "PATCH",
       headers: { "content-type": "application/json", ...authHeaders() },
@@ -248,6 +251,7 @@ export function App() {
     loadReviews();
   }, [tenant, issueRepo]);
   const submitReview = async (prNumber: number) => {
+    if (!canAct) return alert("Sign in to act.");
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders() },
@@ -272,17 +276,14 @@ export function App() {
 
   const [autoReviewing, setAutoReviewing] = useState<number | null>(null);
   const autoReview = async (prNumber: number) => {
-    const agent = actors.find((a) => a.kind === "agent");
-    if (!agent) {
-      alert("no agent actor registered to run an auto-review");
-      return;
-    }
+    if (!canAct) return alert("Sign in to act.");
     setAutoReviewing(prNumber);
     try {
+      // The server picks an independent agent reviewer — the client never names one (no impersonation).
       const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${prNumber}/auto-review`, {
         method: "POST",
         headers: { "content-type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ reviewer: agent.id }),
+        body: JSON.stringify({}),
       });
       if (res.ok) {
         loadReviews();
@@ -296,6 +297,7 @@ export function App() {
   };
 
   const mergePr = async (number: number) => {
+    if (!canAct) return alert("Sign in to act.");
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${number}/merge`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders() },
@@ -307,6 +309,7 @@ export function App() {
 
   const createPr = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canAct) return alert("Sign in to act.");
     if (!prTitle.trim()) return;
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs`, {
       method: "POST",
@@ -323,6 +326,7 @@ export function App() {
 
   const createIssue = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canAct) return alert("Sign in to act.");
     if (!form.title.trim()) return;
     const code_ref = form.path.trim()
       ? { path: form.path.trim(), line_start: Number(form.line) || 1 }
@@ -383,6 +387,8 @@ export function App() {
         actors={actors}
         tenant={tenant}
         repo={issueRepo}
+        token={token}
+        me={me}
         onBack={() => setOpenReview(null)}
       />
     );
@@ -432,6 +438,7 @@ export function App() {
               />
               <button onClick={signIn}>Sign in</button>
               <button className="link" onClick={registerAndSignIn}>new identity</button>
+              <button className="link" onClick={() => signInWith(DEMO_OWNER_SECRET)} title="log in as the published demo owner (real signature login)">demo</button>
             </>
           )}
         </div>
@@ -566,17 +573,10 @@ export function App() {
           <button className={"tab" + (tab === "prs" ? " active" : "")} onClick={() => setTab("prs")}>
             Pull requests <span className="muted">{prs.length}</span>
           </button>
-          {!me && (
-            <label className="acting">
-              acting as&nbsp;
-              <select value={actingAs} onChange={(e) => setActingAs(e.target.value)}>
-                {actors.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.handle} ({a.kind})
-                  </option>
-                ))}
-              </select>
-            </label>
+          {!canAct && (
+            <span className="acting-note">
+              read-only — <button className="link" onClick={() => signInWith(DEMO_OWNER_SECRET)}>sign in</button> to act
+            </span>
           )}
         </div>
 
@@ -890,6 +890,8 @@ function ReviewPage({
   actors,
   tenant,
   repo,
+  token,
+  me,
   onBack,
 }: {
   review: Review;
@@ -897,8 +899,12 @@ function ReviewPage({
   actors: Actor[];
   tenant: string;
   repo: string;
+  token: string;
+  me: { id: string; handle: string; kind: string } | null;
   onBack: () => void;
 }) {
+  const authHeaders = (): Record<string, string> => (token ? { authorization: `Bearer ${token}` } : {});
+  const canAct = !!me;
   type Session = { task: string; model: string; lesson: string; tool_calls: number; tokens_in: number; tokens_out: number };
   type ChangeInfo = {
     id: string;
@@ -951,10 +957,11 @@ function ReviewPage({
 
   const verify = async (green: boolean) => {
     if (!changeId) return;
+    if (!canAct) return alert("Sign in to act.");
     await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/verify`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ green, actor: review.reviewer }),
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ green }),
     });
     loadChange();
   };
@@ -963,13 +970,14 @@ function ReviewPage({
   const [checkResult, setCheckResult] = useState<{ status: string; summary: string; memoized: boolean } | null>(null);
   const runChecks = async (force: boolean) => {
     if (!changeId) return;
+    if (!canAct) return alert("Sign in to act.");
     setChecking(true);
     setCheckResult(null);
     try {
       const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/check`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ actor: review.reviewer, force }),
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ force }),
       });
       setCheckResult(await res.json());
       loadChange(); // verification was written back by the runner

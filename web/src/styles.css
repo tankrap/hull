@@ -355,3 +355,8 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 /* Issue ↔ PR linkage chips */
 .resolved-chip{font-size:11px;color:#1a7f37;border:1px solid #1a7f3744;background:#1a7f3710;border-radius:999px;padding:2px 9px;font-family:ui-monospace,monospace}
 .linked-chip{font-size:11px;color:#0969da;border:1px solid #0969da44;background:#0969da10;border-radius:999px;padding:2px 9px}
+
+/* Read-only affordance when signed out */
+.acting-note{margin-left:auto;font-size:12px;color:var(--muted)}
+.acting-note .link{font-size:12px}
+.signin .link[title]{opacity:.85}

@@ -157,7 +157,31 @@ fn seed_if_empty(store: &dyn Store) {
     if store.accounts().is_empty() {
         seed(store);
     }
+    ensure_demo_owner(store);
     backfill_members(store);
+}
+
+/// A published demo credential: a fixed Ed25519 secret so a local/demo instance has a **known** human
+/// you can log into (through the real signature flow) and exercise owner-only features. This is not a
+/// backdoor — login still verifies the signature; it's just a demo account whose key is public. The
+/// frontend's "Sign in as demo" uses the same secret. Never ship this key on a real deployment.
+const DEMO_OWNER_SECRET: &str = "68756c6c2d64656d6f2d6f776e65722d6b65792d64656d6f2d6f6e6c79212121";
+
+/// Ensure the demo owner exists and owns every org, so a fresh login lands on a usable account.
+/// Idempotent.
+fn ensure_demo_owner(store: &dyn Store) {
+    use hull_core::{Membership, Role};
+    let Some(minted) = identity::human_from_secret("demo", DEMO_OWNER_SECRET) else { return };
+    let id = minted.actor.id.clone();
+    if store.actor(&id).is_none() {
+        store.put_actor(minted.actor);
+    }
+    for mut acct in store.accounts() {
+        if !acct.members.iter().any(|m| m.actor == id) {
+            acct.members.push(Membership { actor: id.clone(), role: Role::Owner });
+            store.put_account(acct);
+        }
+    }
 }
 
 /// Idempotent migration: an account persisted before memberships existed comes back with an empty
@@ -492,29 +516,16 @@ fn authed_actor(app: &App, headers: &axum::http::HeaderMap) -> Option<Actor> {
 /// The authoring identity: the **authenticated** actor (Bearer token) when signed in, else the
 /// body-supplied `actor_id` (for curl/scripts). Either way it must be accountable.
 #[allow(clippy::result_large_err)]
-fn require_actor(app: &App, headers: &axum::http::HeaderMap, actor_id: &str) -> Result<Actor, Response> {
-    if let Some(a) = authed_actor(app, headers) {
-        return if a.is_accountable() {
-            Ok(a)
-        } else {
-            Err((StatusCode::FORBIDDEN, "authenticated actor is not accountable").into_response())
-        };
-    }
-    require_accountable(app, actor_id)
-}
-
-/// The accountability gate: an authoring action must be by a registered actor that chains to a
-/// human. Returns the actor, or a 403 response to short-circuit the handler.
-#[allow(clippy::result_large_err)] // the Err IS the HTTP response the caller returns
-fn require_accountable(app: &App, actor_id: &str) -> Result<Actor, Response> {
-    match app.store.actor(actor_id) {
+/// The accountable actor for a mutating request. **Identity comes only from a valid session token**
+/// (proven Ed25519 key possession) — never from a client-supplied actor id. No token ⇒ 401. This is
+/// what makes "act as anyone" impossible: you are whoever you signed in as, nobody else. The
+/// `_actor_id` argument (a body field some handlers still pass) is ignored, kept only so call sites
+/// don't churn.
+fn require_actor(app: &App, headers: &axum::http::HeaderMap, _actor_id: &str) -> Result<Actor, Response> {
+    match authed_actor(app, headers) {
         Some(a) if a.is_accountable() => Ok(a),
-        Some(_) => Err((StatusCode::FORBIDDEN, "actor is not accountable (no human root)").into_response()),
-        None => Err((
-            StatusCode::FORBIDDEN,
-            format!("unknown actor '{actor_id}' — register it at POST /api/actors first (nothing is authored anonymously)"),
-        )
-            .into_response()),
+        Some(_) => Err((StatusCode::FORBIDDEN, "authenticated actor is not accountable").into_response()),
+        None => Err((StatusCode::UNAUTHORIZED, "sign in required — no valid session token").into_response()),
     }
 }
 
@@ -1149,13 +1160,21 @@ async fn auto_review(
     State(app): State<App>,
     Path((tenant, repo, number)): Path<(String, String, u64)>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<Value>,
+    Json(_body): Json<Value>,
 ) -> Response {
-    let reviewer = match require_actor(&app, &headers, body.get("reviewer").and_then(Value::as_str).unwrap_or("")) {
-        Ok(a) => a,
-        Err(resp) => return resp,
+    // Any signed-in accountable actor may *ask* for an agent review; the reviewer is never supplied
+    // by the client (no impersonation) — the server picks an agent independent of the PR author.
+    if let Err(resp) = require_actor(&app, &headers, "") {
+        return resp;
+    }
+    let key = format!("{tenant}/{repo}");
+    let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+        return (StatusCode::NOT_FOUND, "no such PR").into_response();
     };
-    match perform_auto_review(&app, &tenant, &repo, number, &reviewer).await {
+    let Some(agent) = independent_agent_reviewer(&app, &pr.author) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "no independent agent reviewer is registered").into_response();
+    };
+    match perform_auto_review(&app, &tenant, &repo, number, &agent).await {
         Ok(review) => (StatusCode::CREATED, Json(json!({ "review": review }))).into_response(),
         Err((code, msg)) => (code, msg).into_response(),
     }

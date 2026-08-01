@@ -55,6 +55,24 @@ pub fn mint_human(handle: &str) -> Minted {
     Minted { actor, secret_key }
 }
 
+/// Mint a human from a **known** 32-byte secret key (hex) rather than a fresh random one — for a
+/// deterministic identity whose key is shared with a client (e.g. a demo account that supports
+/// one-click login through the real signature flow). Returns `None` if the secret isn't 32 bytes.
+pub fn human_from_secret(handle: &str, secret_hex: &str) -> Option<Minted> {
+    let bytes = hex::decode(secret_hex).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    let sk = SigningKey::from_bytes(&arr);
+    let actor = Actor {
+        id: hex::encode(sk.verifying_key().to_bytes()),
+        kind: ActorKind::Human,
+        lifetime: Lifetime::Static,
+        handle: handle.to_string(),
+        delegation: None,
+        nostr_pubkey: None,
+    };
+    Some(Minted { actor, secret_key: secret_hex.to_string() })
+}
+
 /// Mint an agent delegated by `parent`, carrying a chain that roots at a human. `parent` may be a
 /// human (the common case) or an already-accountable agent (multi-hop). Returns `None` if `parent`
 /// is unaccountable — enforcing "no agent without a human root" at mint.
