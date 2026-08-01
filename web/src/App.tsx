@@ -22,6 +22,7 @@ type Issue = {
   title: string;
   body: string;
   author: string;
+  assignees: string[];
   status: { state: string; reason?: string };
   code_refs: CodeRef[];
 };
@@ -69,7 +70,7 @@ export function App() {
     ).then((r) => r.json());
     setProv((p) => ({ ...p, [key]: d.provenance ?? [] }));
   };
-  const [form, setForm] = useState({ title: "", path: "", line: "" });
+  const [form, setForm] = useState({ title: "", path: "", line: "", assignee: "" });
   const loadIssues = () =>
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`)
       .then((r) => r.json())
@@ -97,10 +98,15 @@ export function App() {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ title: form.title.trim(), author: actingAs, code_ref }),
+      body: JSON.stringify({
+        title: form.title.trim(),
+        author: actingAs,
+        code_ref,
+        assignees: form.assignee ? [form.assignee] : [],
+      }),
     });
     if (res.ok) {
-      setForm({ title: "", path: "", line: "" });
+      setForm({ title: "", path: "", line: "", assignee: "" });
       loadIssues();
     } else {
       alert(await res.text());
@@ -242,6 +248,18 @@ export function App() {
             value={form.line}
             onChange={(e) => setForm({ ...form, line: e.target.value })}
           />
+          <select
+            className="assignee-pick"
+            value={form.assignee}
+            onChange={(e) => setForm({ ...form, assignee: e.target.value })}
+          >
+            <option value="">assign…</option>
+            {actors.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.handle}
+              </option>
+            ))}
+          </select>
           <button type="submit">Open</button>
         </form>
         <ul className="issue-list">
@@ -269,6 +287,11 @@ export function App() {
                     </code>
                     <span className="blob">⬡ {c.blob.slice(0, 10)}</span>
                   </button>
+                ))}
+                {it.assignees.map((id) => (
+                  <span key={id} className="assignee-chip" title="assignee">
+                    ◎ {handleOf(id)}
+                  </span>
                 ))}
                 <span className={"by " + (actors.find((a) => a.id === it.author)?.kind ?? "")}>
                   {handleOf(it.author)}

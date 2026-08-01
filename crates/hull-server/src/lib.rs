@@ -291,6 +291,18 @@ async fn create_issue(
             });
         }
     }
+    // Assignees must themselves be registered accountable actors (unknown ids are dropped).
+    let assignees: Vec<String> = body
+        .get("assignees")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .filter(|id| app.store.actor(id).map(|a| a.is_accountable()).unwrap_or(false))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let number = app.store.issues(&key).iter().map(|i| i.number).max().unwrap_or(0) + 1;
     let author = actor.id.clone();
     let issue = Issue {
@@ -300,7 +312,7 @@ async fn create_issue(
         title,
         body: body.get("body").and_then(Value::as_str).unwrap_or("").to_string(),
         author: author.clone(),
-        assignees: vec![],
+        assignees,
         labels: vec![],
         projects: vec![],
         status: IssueStatus::Open,
