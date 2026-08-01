@@ -52,15 +52,8 @@ export function App() {
   const [prov, setProv] = useState<Record<string, { change: string; intent: string; author: string }[]>>({});
 
   // Notifications recorded by the core Notifier plugin capability (poll).
-  const [notifs, setNotifs] = useState<{ kind: string; to: string[]; summary: string; ts: number }[]>([]);
+  const [notifs, setNotifs] = useState<{ kind: string; to: string[]; summary: string; ts: number; broadcast?: boolean }[]>([]);
   const [showNotifs, setShowNotifs] = useState(false);
-  useEffect(() => {
-    const load = () =>
-      fetch("/api/notifications").then((r) => r.json()).then((d) => setNotifs(d.notifications ?? [])).catch(() => {});
-    load();
-    const t = setInterval(load, 4000);
-    return () => clearInterval(t);
-  }, []);
 
   // Auth: sign in by proving possession of an actor's Ed25519 key → session token.
   const [token, setToken] = useState<string>(() => localStorage.getItem("hull_token") ?? "");
@@ -139,6 +132,17 @@ export function App() {
       .catch(() => {});
   }, []);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
+
+  // Notifications inbox, scoped to the acting actor (addressed-to-them + broadcasts). Polled.
+  useEffect(() => {
+    const load = () => {
+      const url = actingAs ? `/api/notifications?actor=${encodeURIComponent(actingAs)}` : "/api/notifications";
+      fetch(url).then((r) => r.json()).then((d) => setNotifs(d.notifications ?? [])).catch(() => {});
+    };
+    load();
+    const t = setInterval(load, 4000);
+    return () => clearInterval(t);
+  }, [actingAs]);
 
   // Two views: Home (situation room) and a focused Repo view with Issues / PRs tabs.
   const [view, setView] = useState<"home" | "repo">("home");
@@ -433,14 +437,26 @@ export function App() {
           </button>
           {showNotifs && (
             <div className="notif-drop">
-              <div className="notif-head">notifications <span className="muted">via Notifier plugin</span></div>
+              <div className="notif-head">
+                inbox for <b>{handleOf(actingAs)}</b> <span className="muted">· via Notifier plugin</span>
+              </div>
               {notifs.length === 0 && <div className="empty">nothing yet</div>}
-              {notifs.slice(0, 12).map((n, i) => (
-                <div className="notif" key={i}>
-                  <span className={"nk " + n.kind}>{n.kind.replace("_", " ")}</span>
-                  <span className="ns">{n.summary}</span>
-                </div>
-              ))}
+              {notifs.slice(0, 15).map((n, i) => {
+                const icon =
+                  n.kind === "review_posted" ? "✍" :
+                  n.kind === "review_requested" ? "👀" :
+                  n.kind === "ci_passed" ? "✓" :
+                  n.kind === "ci_failed" ? "✗" :
+                  n.kind === "code_owner_referenced" ? "⬡" :
+                  n.kind === "mirror_pushed" ? "⇄" : "•";
+                return (
+                  <div className="notif" key={i}>
+                    <span className={"nk " + n.kind}>{icon} {n.kind.replace(/_/g, " ")}</span>
+                    {n.broadcast && <span className="nbcast">team</span>}
+                    <span className="ns">{n.summary}</span>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>

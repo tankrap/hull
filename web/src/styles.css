@@ -344,3 +344,10 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .mirror-badge{font-weight:700;color:#0969da;border:1px solid #0969da55;background:#0969da12;border-radius:999px;padding:2px 10px;font-size:12px}
 .mirror-panel code{font-family:ui-monospace,monospace}
 .mirror-note{width:100%;font-size:11px}
+
+/* Notifications inbox enrichment */
+.notif .nk.ci_passed{color:#1a7f37}
+.notif .nk.ci_failed{color:#cf222e}
+.notif .nk.mirror_pushed{color:#0969da}
+.notif .nk.review_posted{color:#8250df}
+.nbcast{font-size:9px;text-transform:uppercase;letter-spacing:.4px;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:0 5px;color:var(--muted);margin-left:4px}

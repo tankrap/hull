@@ -292,10 +292,26 @@ async fn repos_list(State(app): State<App>) -> Json<Value> {
 /// Recent notifications recorded by the core `Notifier` capability (newest first). Demonstrates the
 /// plugin seam: these were fanned out by `registry.notify`, and a hosted plugin would also deliver
 /// them over a real channel.
-async fn notifications_list(State(app): State<App>) -> Json<Value> {
+async fn notifications_list(
+    State(app): State<App>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
     let mut n = app.notifications.lock().unwrap().clone();
     n.reverse();
-    Json(json!({ "notifications": n }))
+    // Scope to an actor when `?actor=<id>` is given: deliver notifications addressed to them plus
+    // broadcasts (empty `to`, e.g. CI results / mirror pushes). No actor → the full firehose.
+    if let Some(actor) = q.get("actor").filter(|a| !a.is_empty()) {
+        n.retain(|x| x.to.is_empty() || x.to.contains(actor));
+    }
+    // Resolve recipient handles for display.
+    let items: Vec<Value> = n
+        .iter()
+        .map(|x| {
+            let to_handles: Vec<String> = x.to.iter().map(|id| app.store.actor(id).map(|a| a.handle).unwrap_or_else(|| id.chars().take(8).collect())).collect();
+            json!({ "kind": x.kind, "summary": x.summary, "change": x.change, "ts": x.ts, "to": to_handles, "broadcast": x.to.is_empty() })
+        })
+        .collect();
+    Json(json!({ "notifications": items }))
 }
 
 /// Accounts (orgs / personal) with their members (handle + role) and owned repos.
