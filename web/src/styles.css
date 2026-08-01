@@ -399,3 +399,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .cmt-empty{font-size:12px;padding:4px 0}
 .cmt-form{display:flex;gap:6px;margin-top:8px}
 .cmt-form input{flex:1;font-size:13px;padding:5px 9px;border:1px solid var(--line);border-radius:7px;background:var(--surface)}
+
+/* Thread wrapper heading */
+.thread-wrap{margin-top:12px}
+.thread-wrap h5{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}

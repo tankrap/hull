@@ -1174,23 +1174,35 @@ async fn create_comment(
         created_unix: now(),
     };
     app.store.put_comment(comment.clone());
-    // Notify the PR's author + reviewers (not the commenter).
-    if let Some(num) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
-        if let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == num) {
-            let mut to: Vec<String> = pr.reviewers.clone();
-            to.push(pr.author.clone());
-            to.retain(|a| a != &author.id);
-            to.sort();
-            to.dedup();
-            if !to.is_empty() {
-                app.registry.notify(&NotifyEvent {
-                    kind: "comment_posted".into(),
-                    to,
-                    summary: format!("{} commented on PR !{num}", author.handle),
-                    change: pr.changes.first().cloned(),
-                });
+    // Notify the people watching the target (not the commenter): a PR's author + reviewers, or an
+    // issue's author + assignees.
+    let (mut to, summary, change): (Vec<String>, String, Option<String>) =
+        if let Some(num) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
+            match app.store.prs(&key).into_iter().find(|p| p.number == num) {
+                Some(pr) => {
+                    let mut to = pr.reviewers.clone();
+                    to.push(pr.author.clone());
+                    (to, format!("{} commented on PR !{num}", author.handle), pr.changes.first().cloned())
+                }
+                None => (vec![], String::new(), None),
             }
-        }
+        } else if let Some(num) = target.strip_prefix("issue:").and_then(|s| s.parse::<u64>().ok()) {
+            match app.store.issues(&key).into_iter().find(|i| i.number == num) {
+                Some(issue) => {
+                    let mut to = issue.assignees.clone();
+                    to.push(issue.author.clone());
+                    (to, format!("{} commented on issue #{num}", author.handle), None)
+                }
+                None => (vec![], String::new(), None),
+            }
+        } else {
+            (vec![], String::new(), None)
+        };
+    to.retain(|a| a != &author.id);
+    to.sort();
+    to.dedup();
+    if !to.is_empty() {
+        app.registry.notify(&NotifyEvent { kind: "comment_posted".into(), to, summary, change });
     }
     (StatusCode::CREATED, Json(json!({ "comment": comment }))).into_response()
 }
