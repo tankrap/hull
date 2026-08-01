@@ -802,42 +802,57 @@ async fn auto_review(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let key = format!("{tenant}/{repo}");
     let reviewer = match require_actor(&app, &headers, body.get("reviewer").and_then(Value::as_str).unwrap_or("")) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    match perform_auto_review(&app, &tenant, &repo, number, &reviewer).await {
+        Ok(review) => (StatusCode::CREATED, Json(json!({ "review": review }))).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+/// The reviewer runtime: run a PR's checks, reconcile its change, and post an accountable agent
+/// review. Shared by the explicit endpoint and the on-open agent flow. Enforces the gate (agent,
+/// independent of author) itself, so every caller is safe.
+async fn perform_auto_review(
+    app: &App,
+    tenant: &str,
+    repo: &str,
+    number: u64,
+    reviewer: &hull_core::Actor,
+) -> Result<Review, (StatusCode, String)> {
+    let key = format!("{tenant}/{repo}");
     if reviewer.kind != hull_core::ActorKind::Agent {
-        return (StatusCode::FORBIDDEN, "auto-review must be performed by an agent actor").into_response();
+        return Err((StatusCode::FORBIDDEN, "auto-review must be performed by an agent actor".into()));
     }
     let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
-        return (StatusCode::NOT_FOUND, "no such PR").into_response();
+        return Err((StatusCode::NOT_FOUND, "no such PR".into()));
     };
     if pr.author == reviewer.id {
-        return (StatusCode::CONFLICT, "an agent cannot auto-review its own PR — review must be independent").into_response();
+        return Err((StatusCode::CONFLICT, "an agent cannot auto-review its own PR — review must be independent".into()));
     }
     let Some(change) = pr.changes.first().cloned() else {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "PR has no change to review").into_response();
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "PR has no change to review".into()));
     };
 
     // 1. Run the change's checks (refreshes keel verification, memoized by tree).
     let (repos, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
-    let (t, r, c) = (tenant.clone(), repo.clone(), change.clone());
+    let (t, r, c) = (tenant.to_string(), repo.to_string(), change.clone());
     let check = tokio::task::spawn_blocking(move || ci::run_check(&repos, &registry, &ci, &t, &r, &c, false))
         .await
         .ok();
-    let verification = app.repos.verification(&tenant, &repo, &change).unwrap_or_else(|| "unverified".into());
+    let verification = app.repos.verification(tenant, repo, &change).unwrap_or_else(|| "unverified".into());
 
     // 2. Reconcile the change's narrative against its facts.
-    let Some(info) = app.repos.change_info(&tenant, &repo, &change) else {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "cannot resolve change").into_response();
+    let Some(info) = app.repos.change_info(tenant, repo, &change) else {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "cannot resolve change".into()));
     };
     let lesson = app.store.session_record(&key, &change).map(|s| s.lesson).unwrap_or_default();
-    let facts = app.repos.facts(&tenant, &repo, &change);
+    let facts = app.repos.facts(tenant, repo, &change);
     let ledger = hull_core::reconcile::reconcile(&change, &info.intent, &lesson, &facts);
 
-    // 3. Synthesize findings from contradicted claims (blockers) and, when there are contradictions,
-    //    surface unsupported claims as info the human reviewer should confirm.
+    // 3. Synthesize a blocker finding for every contradicted claim.
     let anchor = info.files.first().map(|f| f.path.clone()).unwrap_or_else(|| format!("change:{}", &change[..change.len().min(12)]));
     let mut findings: Vec<ReviewFinding> = Vec::new();
     for claim in &ledger.claims {
@@ -897,7 +912,16 @@ async fn auto_review(
         summary: format!("{} auto-reviewed PR !{number}: {:?}", reviewer.handle, review.verdict),
         change: Some(change),
     });
-    (StatusCode::CREATED, Json(json!({ "review": review }))).into_response()
+    Ok(review)
+}
+
+/// Pick an agent actor that may independently review a PR by `author` — the reviewer for the on-open
+/// agent flow. `None` if no agent other than the author is registered.
+fn independent_agent_reviewer(app: &App, author: &str) -> Option<hull_core::Actor> {
+    app.store
+        .actors()
+        .into_iter()
+        .find(|a| a.kind == hull_core::ActorKind::Agent && a.id != author)
 }
 
 /// List pull requests for a hosted repo (`GET /api/repos/:tenant/:repo/prs`). Each PR's verification
@@ -997,8 +1021,17 @@ async fn create_pr(
     app.store.put_pr(pr.clone());
     app.hub.publish(
         &tenant,
-        ActivityEvent::Push { actor: actor.handle, repo, change: pr.changes[0].clone(), ts: now() },
+        ActivityEvent::Push { actor: actor.handle, repo: repo.clone(), change: pr.changes[0].clone(), ts: now() },
     );
+    // Agent flow (M6): when a PR opens, an independent agent reviewer runs the reconciliation review
+    // automatically — the fully autonomous loop (agent commits → PR → agent reviews → gate enforced).
+    // Fire-and-forget so the response isn't blocked on the test run; the review lands in the feed.
+    if let Some(agent) = independent_agent_reviewer(&app, &pr.author) {
+        let (app2, t2, r2, n2) = (app.clone(), tenant.clone(), repo.clone(), number);
+        tokio::spawn(async move {
+            let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent).await;
+        });
+    }
     (StatusCode::CREATED, Json(json!({ "pr": pr }))).into_response()
 }
 
