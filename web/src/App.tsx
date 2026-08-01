@@ -1241,6 +1241,34 @@ function ReviewPage({
   useEffect(loadLedger, [changeId, tenant, repo, change?.verification]);
   const shownLedger = snapshot ?? ledger;
 
+  // Human resolutions of claims (the needs-judgment action). Fetched from the live ledger (which
+  // overlays them), keyed by claim id, so they show on the snapshot too.
+  type Res = { judgment: string; note: string; by: string };
+  const [resolutions, setResolutions] = useState<Record<string, Res>>({});
+  const loadResolutions = () => {
+    if (!changeId) return;
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/ledger`)
+      .then((r) => r.json())
+      .then((d) => {
+        const m: Record<string, Res> = {};
+        (d.ledger?.claims ?? []).forEach((c: { id: string; resolution?: Res }) => { if (c.resolution) m[c.id] = c.resolution; });
+        setResolutions(m);
+      })
+      .catch(() => {});
+  };
+  useEffect(loadResolutions, [changeId, tenant, repo]);
+  const resolveClaim = async (claimId: string, judgment: "verified" | "concern") => {
+    if (!canAct) return alert("Sign in to act.");
+    const note = prompt(judgment === "verified" ? "What did you check? (optional note)" : "What's the concern?") ?? "";
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/claims/${claimId}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ judgment, note }),
+    });
+    if (res.ok) loadResolutions();
+    else alert(await res.text());
+  };
+
   const verify = async (green: boolean) => {
     if (!changeId) return;
     if (!canAct) return alert("Sign in to act.");
@@ -1392,6 +1420,18 @@ function ReviewPage({
                         ))}
                       </ul>
                     )}
+                    {resolutions[c.id] ? (
+                      <div className={"claim-resolution " + resolutions[c.id].judgment}>
+                        {resolutions[c.id].judgment === "verified" ? "✓ verified by a human" : "⚑ concern raised"} · <b>{resolutions[c.id].by}</b>
+                        {resolutions[c.id].note && <span className="res-note"> — {resolutions[c.id].note}</span>}
+                      </div>
+                    ) : (c.status === "needs_judgment" || c.status === "self_attested") ? (
+                      <div className="claim-actions">
+                        <span className="ca-prompt">a human must judge this:</span>
+                        <button className="ca ok" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}>✓ I checked — verified</button>
+                        <button className="ca bad" disabled={!canAct} onClick={() => resolveClaim(c.id, "concern")}>⚑ raise concern</button>
+                      </div>
+                    ) : null}
                   </li>
                 ))}
               </ul>

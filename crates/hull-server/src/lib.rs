@@ -9,6 +9,7 @@
 
 pub mod activity;
 pub mod ci;
+pub mod claims;
 pub mod ingress;
 pub mod keeld;
 pub mod mirror;
@@ -98,6 +99,7 @@ struct App {
     notifications: Arc<Mutex<Vec<Notification>>>,
     auth: Arc<Mutex<AuthState>>,
     ci: Arc<ci::CiMemo>,
+    claims: Arc<claims::ClaimResolutions>,
     ci_config: Arc<ci::CiConfig>,
     /// Outbound HTTP for dispatching CI jobs to a repo's configured endpoint. Cheap to clone.
     http: reqwest::Client,
@@ -137,6 +139,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         notifications,
         auth: Arc::new(Mutex::new(AuthState::default())),
         ci: Arc::new(ci::CiMemo::from_env()),
+        claims: Arc::new(claims::ClaimResolutions::from_env()),
         ci_config: Arc::new(ci::CiConfig::from_env()),
         http: reqwest::Client::new(),
         public_url: std::env::var("HULL_PUBLIC_URL").unwrap_or_else(|_| "http://127.0.0.1:8930".into()).into(),
@@ -236,6 +239,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
         .route("/api/repos/:tenant/:repo/change/:id/ledger", get(change_ledger))
+        .route("/api/repos/:tenant/:repo/change/:id/claims/:claim/resolve", post(resolve_claim))
         .route("/api/repos/:tenant/:repo/tree/:tree/tar", get(tree_archive))
         .route("/api/repos/:tenant/:repo/change/:id/check", post(run_check_handler))
         .route("/api/repos/:tenant/:repo/change/:id/ci-result", post(ci_result))
@@ -728,7 +732,49 @@ async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(S
         .unwrap_or_default();
     let facts = app.repos.facts(&tenant, &repo, &id);
     let ledger = hull_core::reconcile::reconcile(&id, &info.intent, &lesson, &facts);
-    Json(json!({ "ledger": ledger }))
+    // Overlay human resolutions onto the claims (a resolved needs-judgment claim stops being an open
+    // question). Serialize the ledger, then attach `resolution` per claim by id.
+    let resolutions = app.claims.for_change(&format!("{tenant}/{repo}"), &id);
+    let mut val = serde_json::to_value(&ledger).unwrap_or(json!({}));
+    if let Some(arr) = val.get_mut("claims").and_then(|c| c.as_array_mut()) {
+        for claim in arr {
+            if let Some(cid) = claim.get("id").and_then(Value::as_str) {
+                if let Some(r) = resolutions.get(cid) {
+                    let handle = app.store.actor(&r.by).map(|a| a.handle).unwrap_or_else(|| r.by.chars().take(8).collect());
+                    claim["resolution"] = json!({ "judgment": r.judgment, "note": r.note, "by": handle, "ts": r.ts });
+                }
+            }
+        }
+    }
+    Json(json!({ "ledger": val }))
+}
+
+/// Record a human judgment on a reconciliation claim (`POST …/change/:id/claims/:claim/resolve`) —
+/// the action for a **needs-judgment** item. Body `{judgment: "verified"|"concern", note?}`.
+/// Accountable-only; the resolution is attributed to the signed-in actor and overlaid on the ledger.
+async fn resolve_claim(
+    State(app): State<App>,
+    Path((tenant, repo, id, claim)): Path<(String, String, String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let judgment = match body.get("judgment").and_then(Value::as_str) {
+        Some("verified") => "verified",
+        Some("concern") => "concern",
+        _ => return (StatusCode::BAD_REQUEST, "judgment must be 'verified' or 'concern'").into_response(),
+    };
+    let note = body.get("note").and_then(Value::as_str).unwrap_or("").to_string();
+    app.claims.set(
+        &format!("{tenant}/{repo}"),
+        &id,
+        &claim,
+        claims::ClaimResolution { by: actor.id.clone(), judgment: judgment.into(), note, ts: now() },
+    );
+    Json(json!({ "resolved": claim, "judgment": judgment, "by": actor.handle })).into_response()
 }
 
 /// Expand a keel change (`GET /api/repos/:tenant/:repo/change/:id`): intent, author, and the files

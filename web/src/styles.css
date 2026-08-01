@@ -455,3 +455,15 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .claim.contradicted{border-color:#cf222e66;background:#cf222e0a}
 .claim.self_attested{border-color:#9a670055}
 .rc.self{color:#9a6700;border-color:#9a670055;background:#9a670012}
+
+/* Claim resolution (needs-judgment action) */
+.claim-actions{display:flex;align-items:center;gap:8px;margin-top:8px;padding-left:27px;flex-wrap:wrap}
+.ca-prompt{font-size:11px;color:var(--muted);font-style:italic}
+.ca{font-size:12px;padding:3px 10px;border-radius:6px;border:1px solid var(--line);background:var(--surface);cursor:pointer}
+.ca.ok{color:#1a7f37;border-color:#1a7f3755}
+.ca.bad{color:#cf222e;border-color:#cf222e55}
+.ca:disabled{opacity:.5;cursor:not-allowed}
+.claim-resolution{margin-top:8px;margin-left:27px;font-size:12px;padding:5px 9px;border-radius:6px}
+.claim-resolution.verified{color:#1a7f37;background:#1a7f3712;border:1px solid #1a7f3733}
+.claim-resolution.concern{color:#cf222e;background:#cf222e0a;border:1px solid #cf222e44}
+.res-note{color:var(--muted)}
