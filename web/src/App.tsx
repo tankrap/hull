@@ -252,6 +252,29 @@ export function App() {
       .catch(() => {});
   }, [tenant, issueRepo, view, prs]);
 
+  // CI endpoint config for the selected repo (owners can point it at a CI system per CI-SPEC.md).
+  type CiConfig = { url: string | null; has_secret: boolean; source: string };
+  const [ciConfig, setCiConfig] = useState<CiConfig | null>(null);
+  const [ciUrl, setCiUrl] = useState("");
+  const [ciSecret, setCiSecret] = useState("");
+  const loadCiConfig = () =>
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/ci-config`)
+      .then((r) => r.json())
+      .then((d) => { setCiConfig(d); setCiUrl(d.url ?? ""); })
+      .catch(() => {});
+  useEffect(() => { loadCiConfig(); }, [tenant, issueRepo, view]);
+  const isTenantOwner = !!profile?.memberships.some((m) => m.account === tenant && (m.role === "owner" || m.role === "admin"));
+  const saveCiConfig = async (clear: boolean) => {
+    if (!canAct) return alert("Sign in to act.");
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/ci-config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ url: clear ? "" : ciUrl.trim(), secret: clear ? "" : ciSecret }),
+    });
+    if (res.ok) { setCiSecret(""); loadCiConfig(); }
+    else alert(await res.text());
+  };
+
   // Reviews (first-class), loaded per repo and filtered to a PR target.
   const [reviews, setReviews] = useState<Review[]>([]);
   const [openPr, setOpenPr] = useState<number | null>(null);
@@ -619,6 +642,27 @@ export function App() {
               linked to <code>{mirror.target}</code> · {mirror.outbound.length} change{mirror.outbound.length === 1 ? "" : "s"} pushed outbound
             </span>
             <span className="muted mirror-note">loop-safe: forge-originated changes are never pushed back; webhook redelivery is idempotent</span>
+          </div>
+        )}
+        {ciConfig && (
+          <div className="ci-panel">
+            <span className="ci-badge">⚙ CI</span>
+            <span>
+              {ciConfig.url ? (
+                <>dispatches to <code>{ciConfig.url}</code> <span className="muted">({ciConfig.source}{ciConfig.has_secret ? ", secret set" : ", no secret"})</span></>
+              ) : (
+                <span className="muted">{ciConfig.source} — checks run on the built-in local runner</span>
+              )}
+            </span>
+            {isTenantOwner && (
+              <form className="ci-form" onSubmit={(e) => { e.preventDefault(); saveCiConfig(false); }}>
+                <input className="ci-url" placeholder="https://your-ci/hull" value={ciUrl} onChange={(e) => setCiUrl(e.target.value)} spellCheck={false} />
+                <input className="ci-secret" type="password" placeholder="shared secret (optional)" value={ciSecret} onChange={(e) => setCiSecret(e.target.value)} />
+                <button type="submit">Set</button>
+                {ciConfig.source === "repo" && <button type="button" className="link" onClick={() => saveCiConfig(true)}>clear</button>}
+                <a className="ci-spec-link" href="https://github.com/tankrap/hull/blob/main/CI-SPEC.md" target="_blank" rel="noreferrer">spec ↗</a>
+              </form>
+            )}
           </div>
         )}
         <div className="tabs">
