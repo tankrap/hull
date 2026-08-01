@@ -532,6 +532,22 @@ impl RepoHost {
         let diff = self.diff(tenant, repo, hex);
         let files = diff.iter().map(|f| f.path.clone()).collect();
         let ops = diff.iter().flat_map(|f| f.ops.iter().cloned()).collect();
+        // The literal added lines (lower-cased), so a claim can be corroborated by the code the diff
+        // introduced even when no named op captures it. Bounded so a huge diff can't blow memory.
+        let mut added_text = String::new();
+        'outer: for f in &diff {
+            for h in &f.hunks {
+                for line in &h.lines {
+                    if line.tag == "add" {
+                        added_text.push_str(&line.text.to_lowercase());
+                        added_text.push('\n');
+                        if added_text.len() > 256 * 1024 {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
         let verification = self.verification(tenant, repo, hex).unwrap_or_else(|| "unverified".into());
         let key = format!("{tenant}/{repo}");
         let secrets = self
@@ -540,7 +556,7 @@ impl RepoHost {
             .filter(|s| s.change.is_empty() || s.change == hex)
             .map(|s| s.title)
             .collect();
-        hull_core::reconcile::ChangeFacts { files, ops, verification, secrets }
+        hull_core::reconcile::ChangeFacts { files, ops, verification, secrets, added_text }
     }
 }
 

@@ -1038,7 +1038,7 @@ function ReviewPage({
               <div className="recon-summary">
                 <span className="rc supported">{n("supported")} supported</span>
                 <span className="rc contradicted">{contradicted} contradicted</span>
-                <span className="rc unsupported">{n("unsupported")} unverified</span>
+                <span className="rc unsupported">{n("unsupported")} unconfirmed</span>
               </div>
               {contradicted > 0 && (
                 <p className="recon-warn">⚠ {contradicted} claim{contradicted > 1 ? "s" : ""} the change's own facts contradict — do not merge without resolving.</p>

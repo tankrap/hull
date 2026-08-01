@@ -84,6 +84,10 @@ pub struct ChangeFacts {
     pub verification: String,
     /// Secret-scan findings on the change (rule titles); empty means clean.
     pub secrets: Vec<String>,
+    /// The change's **added** lines, lower-cased and concatenated — the actual code, so a claim can be
+    /// corroborated by what the diff literally introduced (an `onclick`, a css class, a string) even
+    /// when no named function/type op captures it.
+    pub added_text: String,
 }
 
 /// Reconcile a change's narrative against its facts. `intent` and `lesson` are the prose; `facts`
@@ -118,9 +122,12 @@ fn split_claims(prose: &str) -> Vec<String> {
         };
         for clause in line.split(['.', ';', '\n', ',']) {
             let c = clause.trim().trim_start_matches("- ").trim();
-            // Keep clauses that read as an assertion: at least two words and at least one
-            // *content* word (so bare fragments like "the page" or email shards are dropped).
-            if c.split_whitespace().count() >= 2 && !significant_words(&c.to_lowercase()).is_empty() {
+            // Keep clauses that read as an assertion. A real claim carries substance: either two
+            // content words, or one long one (≥5 chars). This drops bare fragments like "the page"
+            // (one short noun) and email shards while keeping "wrote tests" / "make it clickable".
+            let sig = significant_words(&c.to_lowercase());
+            let substantive = sig.len() >= 2 || sig.iter().any(|w| w.len() >= 5);
+            if c.split_whitespace().count() >= 2 && substantive {
                 out.push(c.to_string());
             }
         }
@@ -214,6 +221,20 @@ fn judge(text: &str, source: ClaimSource, facts: &ChangeFacts) -> Claim {
                 detail: format!("touches {p}"),
                 supports: true,
             });
+        } else if !facts.added_text.is_empty() {
+            // Last resort: corroborate against the literal added code. A claim is supported if a
+            // majority of its content words (min two) actually appear in what the diff introduced —
+            // catches claims whose evidence is a call/attribute/string, not a named definition.
+            let content: Vec<&String> = words.iter().filter(|w| w.len() >= 4).collect();
+            let hits: Vec<&String> = content.iter().filter(|w| facts.added_text.contains(w.as_str())).copied().collect();
+            if content.len() >= 2 && hits.len() * 2 >= content.len() {
+                let sample: Vec<String> = hits.iter().take(3).map(|s| (*s).clone()).collect();
+                evidence.push(Evidence {
+                    kind: "diff".into(),
+                    detail: format!("added code references {}", sample.join(", ")),
+                    supports: true,
+                });
+            }
         }
     }
 
@@ -268,6 +289,7 @@ mod tests {
             ops: vec!["added fn add_member".into(), "added fn accounts_list".into()],
             verification: "green".into(),
             secrets: vec![],
+            added_text: String::new(),
         }
     }
 
@@ -309,6 +331,25 @@ mod tests {
     fn unrelated_claim_is_unsupported() {
         let l = reconcile("c1", "refactored the pagination cursor", "", &facts());
         assert!(l.claims.iter().all(|c| c.status == ClaimStatus::Unsupported));
+    }
+
+    #[test]
+    fn added_code_corroborates_a_claim_with_no_named_op() {
+        // "make it clickable" maps to no fn/type op, but the added code has an onClick.
+        let mut f = facts();
+        f.ops.clear();
+        f.added_text = "const selectrepo = () => { onclick handler makes the repo clickable }".into();
+        let l = reconcile("c1", "make the repo clickable", "", &f);
+        let claim = l.claims.iter().find(|c| c.text.contains("clickable")).unwrap();
+        assert_eq!(claim.status, ClaimStatus::Supported);
+        assert!(claim.evidence.iter().any(|e| e.detail.contains("added code references")));
+    }
+
+    #[test]
+    fn bare_fragment_is_not_a_claim() {
+        // "the page" is a sentence shard, not an assertion — it should not appear at all.
+        let l = reconcile("c1", "reworked navigation. the page. added fn foo", "", &facts());
+        assert!(!l.claims.iter().any(|c| c.text.eq_ignore_ascii_case("the page")));
     }
 
     #[test]
