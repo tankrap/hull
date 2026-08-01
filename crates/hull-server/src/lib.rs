@@ -146,6 +146,29 @@ fn seed_if_empty(store: &dyn Store) {
     if store.accounts().is_empty() {
         seed(store);
     }
+    backfill_members(store);
+}
+
+/// Idempotent migration: an account persisted before memberships existed comes back with an empty
+/// `members` list. Backfill the canonical org members (the human `justin` as Owner, `agent:reviewer`
+/// as Write) by handle, without wiping the durable demo store or sweeping in every actor ever
+/// registered. Skips a handle that isn't present.
+fn backfill_members(store: &dyn Store) {
+    use hull_core::{Membership, Role};
+    const CANONICAL: &[(&str, Role)] = &[("justin", Role::Owner), ("agent:reviewer", Role::Write)];
+    for mut acct in store.accounts() {
+        if !acct.members.is_empty() {
+            continue;
+        }
+        for (handle, role) in CANONICAL {
+            if let Some(actor) = store.actors().into_iter().find(|a| &a.handle == handle) {
+                acct.members.push(Membership { actor: actor.id, role: *role });
+            }
+        }
+        if !acct.members.is_empty() {
+            store.put_account(acct);
+        }
+    }
 }
 
 fn make_router(app: App) -> Router {
