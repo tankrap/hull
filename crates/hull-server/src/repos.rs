@@ -13,7 +13,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use keel_store::{Object, ObjectId, Store};
+use keel_store::{Object, ObjectId, Store, Verification};
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
@@ -134,13 +134,39 @@ pub struct ChangedFile {
     pub status: String, // added | modified | deleted
 }
 
-/// The keel change a PR proposes, expanded for the review page.
+/// The keel session behind a change (task/reasoning/operations) — populated when the change was
+/// committed with `--session` / `keel capture`. Absent for a plain `git push`.
+#[derive(serde::Serialize)]
+pub struct SessionSummary {
+    pub task: String,
+    pub model: String,
+    pub lesson: String,
+    pub tool_calls: usize,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+/// The keel change a PR proposes, expanded for the review page — with real keel verification and,
+/// when present, the session behind it.
 #[derive(serde::Serialize)]
 pub struct ChangeInfo {
     pub id: String,
     pub intent: String,
     pub author: String,
+    /// keel verification state: `green` | `red` | `unverified` (the "tests & CI" signal).
+    pub verification: String,
     pub files: Vec<ChangedFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionSummary>,
+}
+
+fn verification_str(v: Verification) -> String {
+    match v {
+        Verification::Green => "green",
+        Verification::Red => "red",
+        Verification::Unverified => "unverified",
+    }
+    .to_string()
 }
 
 const MODE_DIR: u32 = 0o040000;
@@ -196,7 +222,35 @@ impl RepoHost {
             }
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        Some(ChangeInfo { id: hex.to_string(), intent: change.intent, author: change.author, files })
+        // Real keel verification (tests & CI signal), and the session behind the change if it links one.
+        let verification = verification_str(store.verification(&cid).unwrap_or(Verification::Unverified));
+        let session = change.session.and_then(|sid| match store.get(&sid).ok().flatten() {
+            Some(Object::Session(s)) => Some(SessionSummary {
+                task: s.task,
+                model: s.model,
+                lesson: s.lesson,
+                tool_calls: s.tool_calls.len(),
+                tokens_in: s.tokens_in,
+                tokens_out: s.tokens_out,
+            }),
+            _ => None,
+        });
+        Some(ChangeInfo { id: hex.to_string(), intent: change.intent, author: change.author, verification, files, session })
+    }
+
+    /// The keel verification state of a change (`green`/`red`/`unverified`), or `None` if missing.
+    pub fn verification(&self, tenant: &str, repo: &str, hex: &str) -> Option<String> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let cid = ObjectId::from_hex(hex)?;
+        Some(verification_str(store.verification(&cid).ok()?))
+    }
+
+    /// Set a change's keel verification (`green` or `red`) — the same side table `keel verify` writes.
+    pub fn set_verification(&self, tenant: &str, repo: &str, hex: &str, green: bool) -> bool {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return false };
+        let Some(cid) = ObjectId::from_hex(hex) else { return false };
+        let v = if green { Verification::Green } else { Verification::Red };
+        store.set_verification(&cid, v).is_ok()
     }
 }
 

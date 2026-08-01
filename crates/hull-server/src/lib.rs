@@ -144,6 +144,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
+        .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
         // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
@@ -376,9 +377,42 @@ async fn create_review(
     (StatusCode::CREATED, Json(json!({ "review": review }))).into_response()
 }
 
-/// List pull requests for a hosted repo (`GET /api/repos/:tenant/:repo/prs`).
+/// List pull requests for a hosted repo (`GET /api/repos/:tenant/:repo/prs`). Each PR's verification
+/// is refreshed live from keel (the change's verify state), so an approving review + green keel
+/// verify shows on the badge.
 async fn prs(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "prs": app.store.prs(&format!("{tenant}/{repo}")) }))
+    let mut list = app.store.prs(&format!("{tenant}/{repo}"));
+    for pr in &mut list {
+        if let Some(c) = pr.changes.first() {
+            if let Some(v) = app.repos.verification(&tenant, &repo, c) {
+                pr.verification = match v.as_str() {
+                    "green" => Verification::Green,
+                    "red" => Verification::Red,
+                    _ => Verification::Unverified,
+                };
+            }
+        }
+    }
+    Json(json!({ "prs": list }))
+}
+
+/// Set a change's keel verification (`POST /api/repos/:tenant/:repo/change/:id/verify` with
+/// `{"green": true|false}`) — the same side table `keel verify` writes. Gated to an accountable
+/// actor. PR badges refresh from this on the next list.
+async fn verify_change(
+    State(app): State<App>,
+    Path((tenant, repo, id)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = require_accountable(&app, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        return resp;
+    }
+    let green = body.get("green").and_then(Value::as_bool).unwrap_or(true);
+    if app.repos.set_verification(&tenant, &repo, &id, green) {
+        Json(json!({ "verification": if green { "green" } else { "red" } })).into_response()
+    } else {
+        (StatusCode::UNPROCESSABLE_ENTITY, "unknown change").into_response()
+    }
 }
 
 /// Open a PR (`POST /api/repos/:tenant/:repo/prs`). It proposes real keel changes: `changes` may be

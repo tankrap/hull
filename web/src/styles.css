@@ -188,3 +188,8 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .notif .nk { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 2px 6px; border-radius: 20px; background: #1c2432; color: #9fb2d6; white-space: nowrap; }
 .notif .nk.review_posted { background: #14231d; color: #7ee2b8; }
 .notif .ns { font-size: 13px; color: #cdd3df; }
+
+.rp-card .verif { font-size: 12px; text-transform: uppercase; padding: 2px 8px; border-radius: 20px; background: #1c2432; color: #9fb2d6; }
+.rp-card .verif.green { background: #14231d; color: #7ee2b8; } .rp-card .verif.red { background: #2a1618; color: #ff9b9b; }
+.verify-actions { display: flex; gap: 8px; margin-top: 10px; }
+.verify-actions .act { padding: 5px 12px; border-radius: 6px; font: inherit; font-size: 12px; cursor: pointer; }

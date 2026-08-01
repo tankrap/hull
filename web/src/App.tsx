@@ -556,26 +556,48 @@ function ReviewPage({
   repo: string;
   onBack: () => void;
 }) {
-  type ChangeInfo = { id: string; intent: string; author: string; files: { path: string; status: string }[] };
+  type Session = { task: string; model: string; lesson: string; tool_calls: number; tokens_in: number; tokens_out: number };
+  type ChangeInfo = {
+    id: string;
+    intent: string;
+    author: string;
+    verification: string;
+    files: { path: string; status: string }[];
+    session?: Session;
+  };
   const [change, setChange] = useState<ChangeInfo | null>(null);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
   const reviewerActor = actors.find((a) => a.id === review.reviewer);
   const changeId = pr?.changes[0];
-  useEffect(() => {
+  const loadChange = () => {
     if (!changeId) return;
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}`)
       .then((r) => r.json())
       .then((d) => setChange(d.change))
       .catch(() => {});
-  }, [changeId, tenant, repo]);
+  };
+  useEffect(loadChange, [changeId, tenant, repo]);
+
+  const verify = async (green: boolean) => {
+    if (!changeId) return;
+    await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/verify`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ green, actor: review.reviewer }),
+    });
+    loadChange();
+  };
 
   const independent = pr ? pr.author !== review.reviewer : true;
+  const verification = change?.verification ?? "unverified";
   const risk =
-    pr?.verification === "green"
+    verification === "green"
       ? "low — keel verify is green"
-      : change && change.files.length > 8
-        ? "elevated — unverified and a broad change"
-        : "moderate — unverified";
+      : verification === "red"
+        ? "high — keel verify is red"
+        : change && change.files.length > 8
+          ? "elevated — unverified and a broad change"
+          : "moderate — unverified";
 
   return (
     <div className="app review-page">
@@ -634,22 +656,38 @@ function ReviewPage({
         </section>
 
         <section className="rp-card">
-          <h3>Risk read</h3>
+          <h3>Tests &amp; CI · risk</h3>
           <p>
-            verification: <b>{pr?.verification ?? "—"}</b> · risk: <b>{risk}</b>
+            keel verification: <span className={"verif " + verification}>{verification}</span> · risk: <b>{risk}</b>
           </p>
+          <div className="verify-actions">
+            <button className="act close" onClick={() => verify(true)}>Mark keel-verify green</button>
+            <button className="act reopen" onClick={() => verify(false)}>Mark red</button>
+          </div>
         </section>
 
-        <section className="rp-card muted-card">
-          <h3>
-            Session context <span className="muted">(from the keel session that produced this change)</span>
-          </h3>
-          <p className="muted">
-            task · reasoning · semantic operations · tests &amp; CI — these come from the keel session behind the
-            change. Not yet populated for a change pushed over plain git; wiring the session-linked review package
-            is the next slice.
-          </p>
-        </section>
+        {change?.session ? (
+          <section className="rp-card">
+            <h3>
+              Session <span className="muted">the keel session that produced this change</span>
+            </h3>
+            <p><b>task:</b> {change.session.task}</p>
+            <p>
+              <b>model:</b> {change.session.model || "—"} · <b>tool calls:</b> {change.session.tool_calls} ·{" "}
+              <b>tokens:</b> {change.session.tokens_in}/{change.session.tokens_out}
+            </p>
+            {change.session.lesson && <p><b>lesson learned:</b> <i>{change.session.lesson}</i></p>}
+          </section>
+        ) : (
+          <section className="rp-card muted-card">
+            <h3>Session <span className="muted">reasoning · operations · tokens</span></h3>
+            <p className="muted">
+              No keel session is linked to this change — it was pushed as a plain git commit. Commit with{" "}
+              <code>keel commit --session</code> or <code>keel capture</code> and the task, reasoning, tool calls,
+              and lesson show up here automatically.
+            </p>
+          </section>
+        )}
       </main>
     </div>
   );
