@@ -433,24 +433,27 @@ async fn actors_list(State(app): State<App>) -> Json<Value> {
 /// root; an `agent` must name `delegated_by` (an existing accountable actor) and gets a delegation
 /// chain rooting at that human — enforcing "no unaccountable agents" at mint. The secret key is
 /// returned ONCE and never stored.
-async fn register_actor(State(app): State<App>, Json(body): Json<Value>) -> Response {
+async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
     let handle = body.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if handle.is_empty() {
         return (StatusCode::BAD_REQUEST, "handle is required").into_response();
     }
     let minted = match body.get("kind").and_then(Value::as_str).unwrap_or("human") {
+        // Creating a *new* human identity is open self-serve onboarding — you're a new person, not
+        // claiming to be an existing one.
         "human" => identity::mint_human(&handle),
+        // An agent is delegated by its parent — and the parent is the **authenticated caller**, never
+        // a body field. You can only mint an agent that chains to *you*, so a delegation can't be
+        // forged in someone else's name.
         "agent" => {
-            let Some(parent_id) = body.get("delegated_by").and_then(Value::as_str) else {
-                return (StatusCode::UNPROCESSABLE_ENTITY, "an agent must be 'delegated_by' a human actor").into_response();
-            };
-            let Some(parent) = app.store.actor(parent_id) else {
-                return (StatusCode::UNPROCESSABLE_ENTITY, format!("delegated_by: unknown actor '{parent_id}'")).into_response();
+            let parent = match require_actor(&app, &headers, "") {
+                Ok(a) => a,
+                Err(resp) => return resp,
             };
             let scope = body.get("scope").and_then(Value::as_str).unwrap_or("*");
             match identity::mint_agent(&handle, &parent, scope, Lifetime::Ephemeral { expires_unix: 0 }) {
                 Some(m) => m,
-                None => return (StatusCode::UNPROCESSABLE_ENTITY, "the delegating actor is not accountable (must chain to a human)").into_response(),
+                None => return (StatusCode::UNPROCESSABLE_ENTITY, "you are not accountable — an agent must chain to a human").into_response(),
             }
         }
         _ => return (StatusCode::BAD_REQUEST, "kind must be 'human' or 'agent'").into_response(),

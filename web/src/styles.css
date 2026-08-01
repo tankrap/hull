@@ -385,3 +385,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .ci-form .ci-url{min-width:200px}
 .ci-form input{font-size:12px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg)}
 .ci-spec-link{font-size:11px;color:var(--muted)}
+
+/* Mint-agent action in profile */
+.profile-actions{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.mint-agent{background:#8250df;color:#fff;border:none;border-radius:7px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer}

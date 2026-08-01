@@ -140,6 +140,20 @@ export function App() {
     setToken("");
     setMe(null);
   };
+  // Mint an agent that cryptographically chains to you (the authenticated caller is the parent).
+  const createAgent = async () => {
+    const handle = prompt("handle for your agent (it will chain to you)", "agent:mine") ?? "";
+    if (!handle.trim()) return;
+    const res = await fetch("/api/actors", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ handle: handle.trim(), kind: "agent" }),
+    });
+    if (!res.ok) return alert(await res.text());
+    const { secret_key } = await res.json();
+    fetch("/api/actors").then((r) => r.json()).then((d) => setActors(d.actors ?? []));
+    alert(`Agent created, delegated by you.\n\nIts secret key (save it — the agent signs in with this):\n\n${secret_key}`);
+  };
 
   // Registered actors (for display / handle resolution only — you cannot *act* as any of them).
   const [actors, setActors] = useState<Actor[]>([]);
@@ -502,6 +516,11 @@ export function App() {
                       <span className="muted">none</span>
                     )}
                   </div>
+                  {profile.kind === "human" && (
+                    <div className="profile-actions">
+                      <button className="mint-agent" onClick={createAgent}>+ create an agent (chains to you)</button>
+                    </div>
+                  )}
                 </div>
               )}
             </span>
