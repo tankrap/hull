@@ -429,3 +429,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 
 /* Request-reviewer picker */
 .req-reviewer{font-size:12px;padding:4px 8px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--ink)}
+
+/* Closed PR state */
+.verif.closed{color:var(--muted);border-color:var(--line)}
+.closed-note{color:var(--muted);font-weight:600}

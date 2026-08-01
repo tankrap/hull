@@ -433,6 +433,16 @@ export function App() {
     }
   };
 
+  const closePr = async (number: number, reopen: boolean) => {
+    if (!canAct) return alert("Sign in to act.");
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${number}/close`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ reopen }),
+    });
+    if (res.ok) loadPrs();
+    else alert(await res.text());
+  };
   const mergePr = async (number: number) => {
     if (!canAct) return alert("Sign in to act.");
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${number}/merge`, {
@@ -1033,8 +1043,8 @@ export function App() {
             return (
             <li key={p.number} className="issue">
               <div className="issue-row">
-                <span className={"verif " + (p.state === "merged" ? "merged" : p.verification)}>
-                  {p.state === "merged" ? "merged" : p.verification}
+                <span className={"verif " + (p.state === "merged" ? "merged" : p.state === "closed" ? "closed" : p.verification)}>
+                  {p.state === "merged" ? "merged" : p.state === "closed" ? "closed" : p.verification}
                 </span>
                 <span className="num">!{p.number}</span>
                 <button
@@ -1063,9 +1073,15 @@ export function App() {
                   <div className="merge-bar">
                     {p.state === "merged" ? (
                       <span className="merged-note">✓ merged</span>
+                    ) : p.state === "closed" ? (
+                      <>
+                        <span className="closed-note">✕ closed without merging</span>
+                        {canAct && <button className="link" onClick={() => closePr(p.number, true)}>reopen</button>}
+                      </>
                     ) : (
                       <>
                         <button className="merge-btn" onClick={() => mergePr(p.number)}>Merge</button>
+                        {canAct && <button className="link" onClick={() => closePr(p.number, false)}>close</button>}
                         <span className="muted">
                           gate: keel-verify green + an approving review from someone other than the author
                         </span>

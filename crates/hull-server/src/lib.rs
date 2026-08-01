@@ -226,6 +226,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/why", get(why))
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/merge", post(merge_pr))
+        .route("/api/repos/:tenant/:repo/prs/:number/close", post(close_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/auto-review", post(auto_review))
         .route("/api/repos/:tenant/:repo/prs/:number/reviewers", post(request_reviewer))
         .route("/api/repos/:tenant/:repo/mirror", get(mirror_status))
@@ -953,6 +954,34 @@ async fn ingest_session(
 
 /// Merge a PR (`POST /api/repos/:tenant/:repo/prs/:number/merge`). The review gate: the acting actor
 /// must be accountable, the change must be keel-verify **green**, and there must be an **approve**
+/// Close a PR without merging, or reopen a closed one (`POST …/prs/:number/close` with
+/// `{"reopen": bool}`). A merged PR can't be closed/reopened. Only the author or an org owner/admin.
+async fn close_pr(
+    State(app): State<App>,
+    Path((tenant, repo, number)): Path<(String, String, u64)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(mut pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+        return (StatusCode::NOT_FOUND, "no such PR").into_response();
+    };
+    if pr.state == PrState::Merged {
+        return (StatusCode::CONFLICT, "a merged PR can't be closed or reopened").into_response();
+    }
+    if pr.author != actor.id && !is_repo_admin(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only the PR author or a repo owner/admin can close it").into_response();
+    }
+    let reopen = body.get("reopen").and_then(Value::as_bool).unwrap_or(false);
+    pr.state = if reopen { PrState::Open } else { PrState::Closed };
+    app.store.replace_pr(pr.clone());
+    Json(json!({ "pr": pr })).into_response()
+}
+
 /// Request a review from an actor (`POST …/prs/:number/reviewers` with `{reviewer}`). Adds them to
 /// the PR's reviewers and notifies them (`review_requested`). Any signed-in actor may request.
 async fn request_reviewer(
