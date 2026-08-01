@@ -46,6 +46,55 @@ pub trait AuthProvider: Send + Sync {
     fn authenticate(&self, credential: &str) -> Option<String>;
 }
 
+/// Mirror a landed change to an external forge (GitHub is the first target — the top adoption lever:
+/// a team keeps its GitHub while Hull hosts the agent-native layer). The core default
+/// [`LogMirror`] is a dry-run that records what it *would* push (so the loop-prevention and
+/// idempotency plumbing is testable without credentials); the hosted plugin pushes for real via a
+/// GitHub App installation. Direction and origin tracking live in the core plumbing, not here — a
+/// [`Mirror`] only has to know how to push one change outbound.
+pub trait Mirror: Send + Sync {
+    /// The external target for `repo`, e.g. `github:tankrap/hull`, or `None` if this repo isn't
+    /// linked. Used for the idempotency key and the UI's mirror status.
+    fn target(&self, repo: &str) -> Option<String>;
+    /// Push one landed change outbound. Returns an external ref (a sha / PR url) on success.
+    fn push(&self, req: &MirrorPush) -> MirrorResult;
+}
+
+#[derive(Debug, Clone)]
+pub struct MirrorPush {
+    pub repo: String,
+    pub change: String,
+    pub intent: String,
+    pub author: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MirrorResult {
+    pub ok: bool,
+    /// The external reference created (e.g. a GitHub commit sha or PR url), when known.
+    pub external_ref: Option<String>,
+    pub detail: String,
+}
+
+/// The core default mirror: a dry-run that logs the push and returns a synthetic ref, so the
+/// change-land → outbound-push path (and its loop prevention) works end-to-end without a real
+/// forge. Enabled by setting `HULL_MIRROR_TARGET` (e.g. `github:tankrap/hull`); unset means no repo
+/// is linked and nothing is mirrored.
+pub struct LogMirror;
+
+impl Mirror for LogMirror {
+    fn target(&self, _repo: &str) -> Option<String> {
+        std::env::var("HULL_MIRROR_TARGET").ok().filter(|s| !s.is_empty())
+    }
+    fn push(&self, req: &MirrorPush) -> MirrorResult {
+        let target = std::env::var("HULL_MIRROR_TARGET").unwrap_or_default();
+        eprintln!("hull-mirror(dry-run): would push {} @ {} → {target}", req.repo, &req.change[..req.change.len().min(12)]);
+        // A deterministic synthetic external ref (no RNG in this runtime): the change id is already
+        // the content address, so echo a short form as the stand-in for a forge sha.
+        MirrorResult { ok: true, external_ref: Some(format!("dry:{}", &req.change[..req.change.len().min(12)])), detail: format!("dry-run push to {target}") }
+    }
+}
+
 /// Run a change's checks and return a verdict (the reviewer/CI runtime, D1/D2). The core default
 /// [`default_local_ci`] checks out the change and runs its detected test command locally; the hosted
 /// plugin runs it on autoscaled, content-addressed runners. Either way it produces the green/red
@@ -156,6 +205,7 @@ pub struct Registry {
     notifiers: Vec<Arc<dyn Notifier>>,
     auth_providers: Vec<Arc<dyn AuthProvider>>,
     ci_runner: Option<Arc<dyn CiRunner>>,
+    mirror: Option<Arc<dyn Mirror>>,
 }
 
 /// What `/api/plugins` reports.
@@ -189,6 +239,10 @@ impl Registry {
     /// Install a CI runner (last one installed wins — a hosted plugin overrides the local default).
     pub fn set_ci_runner(&mut self, r: Arc<dyn CiRunner>) {
         self.ci_runner = Some(r);
+    }
+    /// Install a mirror (a hosted GitHub-App plugin overrides the local dry-run default).
+    pub fn set_mirror(&mut self, m: Arc<dyn Mirror>) {
+        self.mirror = Some(m);
     }
 
     /// Installed plugins (for `/api/plugins`).
@@ -224,6 +278,23 @@ impl Registry {
         match &self.ci_runner {
             Some(r) => r.run(req),
             None => default_local_ci(req),
+        }
+    }
+
+    /// The external target this repo mirrors to, if any (installed mirror, else the dry-run default).
+    pub fn mirror_target(&self, repo: &str) -> Option<String> {
+        match &self.mirror {
+            Some(m) => m.target(repo),
+            None => LogMirror.target(repo),
+        }
+    }
+
+    /// Push a landed change outbound through the installed mirror (or the dry-run default). The
+    /// caller is responsible for loop prevention and idempotency — this only performs the push.
+    pub fn mirror_push(&self, req: &MirrorPush) -> MirrorResult {
+        match &self.mirror {
+            Some(m) => m.push(req),
+            None => LogMirror.push(req),
         }
     }
 }

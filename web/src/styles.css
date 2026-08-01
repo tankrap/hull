@@ -338,3 +338,9 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .auto-review-btn{background:linear-gradient(90deg,#6639ba,#8250df);color:#fff;border:none;border-radius:7px;padding:6px 13px;font-weight:600;cursor:pointer}
 .auto-review-btn:disabled{opacity:.6;cursor:progress}
 .auto-review-bar .muted{font-size:12px}
+
+/* Mirror panel (repo view) */
+.mirror-panel{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;margin:0 0 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel);font-size:13px}
+.mirror-badge{font-weight:700;color:#0969da;border:1px solid #0969da55;background:#0969da12;border-radius:999px;padding:2px 10px;font-size:12px}
+.mirror-panel code{font-family:ui-monospace,monospace}
+.mirror-note{width:100%;font-size:11px}

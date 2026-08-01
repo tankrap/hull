@@ -11,6 +11,7 @@ pub mod activity;
 pub mod ci;
 pub mod ingress;
 pub mod keeld;
+pub mod mirror;
 pub mod plugins;
 pub mod quic;
 pub mod repos;
@@ -97,6 +98,7 @@ struct App {
     notifications: Arc<Mutex<Vec<Notification>>>,
     auth: Arc<Mutex<AuthState>>,
     ci: Arc<ci::CiMemo>,
+    mirror: Arc<mirror::MirrorLedger>,
 }
 
 impl repos::HasRepoHost for App {
@@ -130,6 +132,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         notifications,
         auth: Arc::new(Mutex::new(AuthState::default())),
         ci: Arc::new(ci::CiMemo::from_env()),
+        mirror: Arc::new(mirror::MirrorLedger::from_env()),
     }
 }
 
@@ -191,6 +194,8 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/merge", post(merge_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/auto-review", post(auto_review))
+        .route("/api/repos/:tenant/:repo/mirror", get(mirror_status))
+        .route("/api/repos/:tenant/:repo/mirror/inbound", post(mirror_inbound))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
@@ -724,9 +729,95 @@ async fn merge_pr(
     app.store.replace_pr(pr.clone());
     app.hub.publish(
         &tenant,
-        ActivityEvent::Push { actor: actor.handle, repo, change: pr.changes.first().cloned().unwrap_or_default(), ts: now() },
+        ActivityEvent::Push { actor: actor.handle, repo: repo.clone(), change: pr.changes.first().cloned().unwrap_or_default(), ts: now() },
     );
+    // Outbound mirror on change-land — guarded by loop prevention + idempotency.
+    if let Some(change) = pr.changes.first() {
+        mirror_out(&app, &tenant, &repo, change);
+    }
     Json(json!({ "pr": pr })).into_response()
+}
+
+/// Push a landed change out to the external forge, if the repo is mirrored — but only if the change
+/// didn't originate on the other side (loop prevention) and hasn't already been pushed (idempotency).
+/// A no-op when no mirror is configured. Returns whether a push happened (for the inbound test path).
+fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
+    let key = format!("{tenant}/{repo}");
+    let Some(target) = app.registry.mirror_target(&key) else { return false };
+    if !app.mirror.should_push_out(change) {
+        return false; // originated on the forge — pushing it back would loop
+    }
+    if !app.mirror.mark_processed(&format!("out:{change}")) {
+        return false; // already pushed this change
+    }
+    let info = app.repos.change_info(tenant, repo, change);
+    let (intent, author) = info.map(|i| (i.intent, i.author)).unwrap_or_default();
+    let result = app.registry.mirror_push(&hull_plugin::MirrorPush {
+        repo: key.clone(),
+        change: change.to_string(),
+        intent,
+        author,
+    });
+    if result.ok {
+        app.mirror.set_origin(change, "hull");
+        app.mirror.record_outbound(mirror::Outbound {
+            repo: key,
+            change: change.to_string(),
+            target: target.clone(),
+            external_ref: result.external_ref.unwrap_or_default(),
+            ts: now(),
+        });
+        app.registry.notify(&NotifyEvent {
+            kind: "mirror_pushed".into(),
+            to: vec![],
+            summary: format!("mirrored {}/{} @ {} → {target}", tenant, repo, &change[..change.len().min(12)]),
+            change: Some(change.to_string()),
+        });
+    }
+    result.ok
+}
+
+/// The repo's mirror status (`GET /api/repos/:tenant/:repo/mirror`): the external target it's linked
+/// to (if any) and the outbound pushes recorded, for the UI's mirror panel.
+async fn mirror_status(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+    let key = format!("{tenant}/{repo}");
+    Json(json!({
+        "target": app.registry.mirror_target(&key),
+        "outbound": app.mirror.outbound_for(&key),
+    }))
+}
+
+/// Inbound mirror (`POST /api/repos/:tenant/:repo/mirror/inbound`) — a forge → Hull delivery
+/// (GitHub webhook, in production). Body: `{external_id, change, intent?, author?}`. Idempotent on
+/// `external_id` (redelivery is a no-op) and it stamps the change's origin as `github`, so the
+/// change-land trigger will **not** push it back out (loop prevention). Accountable-only (the mirror
+/// service's actor stands in for the webhook secret in this scaffold).
+async fn mirror_inbound(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        return resp;
+    }
+    let external_id = body.get("external_id").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let change = body.get("change").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if external_id.is_empty() || change.is_empty() {
+        return (StatusCode::BAD_REQUEST, "external_id and change are required").into_response();
+    }
+    // Idempotency: a redelivered webhook is a no-op.
+    if !app.mirror.mark_processed(&format!("in:{external_id}")) {
+        return Json(json!({ "processed": false, "duplicate": true, "change": change })).into_response();
+    }
+    // Loop prevention: mark this change as forge-originated so it is never pushed back out.
+    app.mirror.set_origin(&change, "github");
+    let author = body.get("author").and_then(Value::as_str).unwrap_or("mirror").to_string();
+    app.hub.publish(
+        &tenant,
+        ActivityEvent::Push { actor: author, repo: repo.clone(), change: change.clone(), ts: now() },
+    );
+    (StatusCode::CREATED, Json(json!({ "processed": true, "duplicate": false, "change": change, "origin": "github" }))).into_response()
 }
 
 /// List reviews for a hosted repo (`GET /api/repos/:tenant/:repo/reviews`); the client filters by

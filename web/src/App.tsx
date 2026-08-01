@@ -214,6 +214,18 @@ export function App() {
   useEffect(() => {
     loadPrs();
   }, [tenant, issueRepo]);
+
+  // Mirror status for the selected repo (external target + outbound pushes). Refreshes with prs so a
+  // merge that mirrors out shows up.
+  type Mirror = { target: string | null; outbound: { change: string; target: string; external_ref: string; ts: number }[] };
+  const [mirror, setMirror] = useState<Mirror | null>(null);
+  useEffect(() => {
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/mirror`)
+      .then((r) => r.json())
+      .then((d) => setMirror(d))
+      .catch(() => {});
+  }, [tenant, issueRepo, view, prs]);
+
   // Reviews (first-class), loaded per repo and filtered to a PR target.
   const [reviews, setReviews] = useState<Review[]>([]);
   const [openPr, setOpenPr] = useState<number | null>(null);
@@ -516,6 +528,15 @@ export function App() {
                 </li>
               ))}
             </ul>
+          </div>
+        )}
+        {mirror?.target && (
+          <div className="mirror-panel">
+            <span className="mirror-badge">⇄ mirrored</span>
+            <span>
+              linked to <code>{mirror.target}</code> · {mirror.outbound.length} change{mirror.outbound.length === 1 ? "" : "s"} pushed outbound
+            </span>
+            <span className="muted mirror-note">loop-safe: forge-originated changes are never pushed back; webhook redelivery is idempotent</span>
           </div>
         )}
         <div className="tabs">
