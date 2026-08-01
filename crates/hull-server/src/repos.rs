@@ -502,6 +502,24 @@ impl RepoHost {
         let v = if green { Verification::Green } else { Verification::Red };
         store.set_verification(&cid, v).is_ok()
     }
+
+    /// The observable facts of a change — touched files, semantic operations, verification, and
+    /// secret findings — the ground truth a [`reconcile`](hull_core::reconcile) run judges claims
+    /// against.
+    pub fn facts(&self, tenant: &str, repo: &str, hex: &str) -> hull_core::reconcile::ChangeFacts {
+        let diff = self.diff(tenant, repo, hex);
+        let files = diff.iter().map(|f| f.path.clone()).collect();
+        let ops = diff.iter().flat_map(|f| f.ops.iter().cloned()).collect();
+        let verification = self.verification(tenant, repo, hex).unwrap_or_else(|| "unverified".into());
+        let key = format!("{tenant}/{repo}");
+        let secrets = self
+            .secrets(&key)
+            .into_iter()
+            .filter(|s| s.change.is_empty() || s.change == hex)
+            .map(|s| s.title)
+            .collect();
+        hull_core::reconcile::ChangeFacts { files, ops, verification, secrets }
+    }
 }
 
 impl RepoHost {

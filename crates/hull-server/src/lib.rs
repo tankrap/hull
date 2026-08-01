@@ -167,6 +167,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
+        .route("/api/repos/:tenant/:repo/change/:id/ledger", get(change_ledger))
         .route("/api/repos/:tenant/:repo/security", get(repo_security))
         .route("/api/repos/:tenant/:repo/owners", get(owners_list).post(set_owners))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
@@ -533,6 +534,27 @@ async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(Strin
 /// semantic-operations summary — the review's diff viewer.
 async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
     Json(json!({ "files": app.repos.diff(&tenant, &repo, &id) }))
+}
+
+/// The **reconciliation ledger** for a change (`GET …/change/:id/ledger`): the claims extracted from
+/// the change's narrative (intent + session lesson), each judged **supported / contradicted /
+/// unsupported** against the real facts of the change (touched files, semantic ops, keel
+/// verification, secret scan). This is the substance of a Hull review — does the code do what its
+/// author said it does — computed the same way every time (pure, content-addressable).
+async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
+    let Some(info) = app.repos.change_info(&tenant, &repo, &id) else {
+        return Json(json!({ "ledger": null }));
+    };
+    // Narrative: the change intent, plus the lesson from a native or ingested session.
+    let lesson = info
+        .session
+        .as_ref()
+        .map(|s| s.lesson.clone())
+        .or_else(|| app.store.session_record(&format!("{tenant}/{repo}"), &id).map(|s| s.lesson))
+        .unwrap_or_default();
+    let facts = app.repos.facts(&tenant, &repo, &id);
+    let ledger = hull_core::reconcile::reconcile(&id, &info.intent, &lesson, &facts);
+    Json(json!({ "ledger": ledger }))
 }
 
 /// Expand a keel change (`GET /api/repos/:tenant/:repo/change/:id`): intent, author, and the files

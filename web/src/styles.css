@@ -295,3 +295,28 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .org-card .org-members{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
 .org-card .mem{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;background:var(--bg)}
 .org-card .mem .role{font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);border-left:1px solid var(--line);padding-left:6px}
+
+/* Reconciliation ledger (review page) */
+.rp-card.reconcile .recon-summary{display:flex;gap:8px;margin:2px 0 12px;flex-wrap:wrap}
+.rc{font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid var(--line);font-weight:600}
+.rc.supported{color:#1a7f37;border-color:#1a7f3755;background:#1a7f3712}
+.rc.contradicted{color:#cf222e;border-color:#cf222e55;background:#cf222e12}
+.rc.unsupported{color:var(--muted)}
+.recon-warn{color:#cf222e;font-size:13px;margin:0 0 12px;font-weight:600}
+.recon-claims{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}
+.recon-claims .claim{border:1px solid var(--line);border-radius:9px;padding:9px 12px;background:var(--bg)}
+.recon-claims .claim.contradicted{border-color:#cf222e66;background:#cf222e0a}
+.recon-claims .claim.supported{border-color:#1a7f3733}
+.claim-head{display:flex;align-items:center;gap:9px}
+.cstat{width:18px;height:18px;flex:0 0 18px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:#fff}
+.cstat.supported{background:#1a7f37}
+.cstat.contradicted{background:#cf222e}
+.cstat.unsupported{background:#8b949e}
+.claim-text{flex:1;font-size:13px}
+.claim-src{font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:1px 6px}
+.claim-ev{list-style:none;margin:7px 0 0;padding:0 0 0 27px;display:flex;flex-direction:column;gap:3px}
+.claim-ev li{font-size:12px;color:var(--muted)}
+.claim-ev li.bad{color:#cf222e}
+.claim-ev li.ok::before{content:"✓ ";color:#1a7f37}
+.claim-ev li.bad::before{content:"✗ "}
+.ev-kind{font-family:ui-monospace,monospace;font-size:11px;opacity:.75;border:1px solid var(--line);border-radius:4px;padding:0 5px;margin-right:4px}

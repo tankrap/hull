@@ -12,6 +12,7 @@
 //! the scaffold. M1+ swaps in a SQL-backed store (accounts/issues) that references keel by id.
 
 pub mod identity;
+pub mod reconcile;
 pub mod store;
 
 use serde::{Deserialize, Serialize};

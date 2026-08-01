@@ -828,8 +828,12 @@ function ReviewPage({
   };
   type DiffLine = { tag: string; text: string };
   type FileDiff = { path: string; status: string; ops: string[]; hunks: { old_start: number; new_start: number; lines: DiffLine[] }[] };
+  type Evidence = { kind: string; detail: string; supports: boolean };
+  type Claim = { id: string; text: string; source: string; status: string; evidence: Evidence[] };
+  type Ledger = { change: string; claims: Claim[] };
   const [change, setChange] = useState<ChangeInfo | null>(null);
   const [diff, setDiff] = useState<FileDiff[]>([]);
+  const [ledger, setLedger] = useState<Ledger | null>(null);
   const [openFile, setOpenFile] = useState<string | null>(null);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
   const reviewerActor = actors.find((a) => a.id === review.reviewer);
@@ -849,6 +853,15 @@ function ReviewPage({
       .then((d) => setDiff(d.files ?? []))
       .catch(() => {});
   }, [changeId, tenant, repo]);
+  const loadLedger = () => {
+    if (!changeId) return;
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/ledger`)
+      .then((r) => r.json())
+      .then((d) => setLedger(d.ledger))
+      .catch(() => {});
+  };
+  // Reconcile after verification is known, so a green/red signal is reflected in the claim statuses.
+  useEffect(loadLedger, [changeId, tenant, repo, change?.verification]);
 
   const verify = async (green: boolean) => {
     if (!changeId) return;
@@ -902,6 +915,47 @@ function ReviewPage({
           </p>
           {review.summary && <p className="summary">{review.summary}</p>}
         </section>
+
+        {ledger && ledger.claims.length > 0 && (() => {
+          const n = (s: string) => ledger.claims.filter((c) => c.status === s).length;
+          const contradicted = n("contradicted");
+          return (
+            <section className="rp-card reconcile">
+              <h3>
+                Reconciliation{" "}
+                <span className="muted">· does the change do what its author said?</span>
+              </h3>
+              <div className="recon-summary">
+                <span className="rc supported">{n("supported")} supported</span>
+                <span className="rc contradicted">{contradicted} contradicted</span>
+                <span className="rc unsupported">{n("unsupported")} unverified</span>
+              </div>
+              {contradicted > 0 && (
+                <p className="recon-warn">⚠ {contradicted} claim{contradicted > 1 ? "s" : ""} the change's own facts contradict — do not merge without resolving.</p>
+              )}
+              <ul className="recon-claims">
+                {ledger.claims.map((c) => (
+                  <li key={c.id} className={"claim " + c.status}>
+                    <div className="claim-head">
+                      <span className={"cstat " + c.status}>{c.status === "supported" ? "✓" : c.status === "contradicted" ? "✗" : "?"}</span>
+                      <span className="claim-text">{c.text}</span>
+                      <span className="claim-src">{c.source}</span>
+                    </div>
+                    {c.evidence.length > 0 && (
+                      <ul className="claim-ev">
+                        {c.evidence.map((e, i) => (
+                          <li key={i} className={e.supports ? "ok" : "bad"}>
+                            <span className="ev-kind">{e.kind}</span> {e.detail}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          );
+        })()}
 
         {review.findings?.length > 0 && (
           <section className="rp-card">
