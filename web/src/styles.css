@@ -433,3 +433,14 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 /* Closed PR state */
 .verif.closed{color:var(--muted);border-color:var(--line)}
 .closed-note{color:var(--muted);font-weight:600}
+
+/* Risk-ranked findings (F2) */
+.find-tally{margin-left:10px;display:inline-flex;gap:6px}
+.rp-findings .sev-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)}
+.rp-findings .sev-row.blocker{background:color-mix(in srgb,#cf222e 7%,transparent);border-radius:6px;padding:6px 8px}
+.rp-findings .sev-row.warn{background:color-mix(in srgb,#9a6700 8%,transparent);border-radius:6px;padding:6px 8px}
+.sev{font-size:10px;text-transform:uppercase;letter-spacing:.4px;font-weight:700;padding:1px 7px;border-radius:999px;border:1px solid var(--line)}
+.sev.blocker{color:#fff;background:#cf222e;border-color:#cf222e}
+.sev.warn{color:#9a6700;border-color:#9a670055;background:#9a670012}
+.sev.info{color:var(--muted)}
+.rp-findings .fnote{flex:1}

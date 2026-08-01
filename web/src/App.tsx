@@ -1382,20 +1382,32 @@ function ReviewPage({
           );
         })()}
 
-        {review.findings?.length > 0 && (
-          <section className="rp-card">
-            <h3>Findings <span className="muted">({review.findings.length})</span></h3>
-            <ul className="rp-findings">
-              {review.findings.map((f, i) => (
-                <li key={i}>
-                  <span className={"sev " + f.severity}>{f.severity}</span>
-                  <code>{f.path}{f.line ? `:${f.line}` : ""}</code>
-                  <span className="fnote">{f.note}</span>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
+        {review.findings?.length > 0 && (() => {
+          const rank: Record<string, number> = { blocker: 0, warn: 1, info: 2 };
+          const ranked = [...review.findings].sort((a, b) => (rank[a.severity] ?? 3) - (rank[b.severity] ?? 3));
+          const counts = ranked.reduce((m: Record<string, number>, f) => ({ ...m, [f.severity]: (m[f.severity] ?? 0) + 1 }), {});
+          return (
+            <section className="rp-card">
+              <h3>
+                Findings <span className="muted">· risk-ranked</span>
+                <span className="find-tally">
+                  {counts.blocker ? <span className="sev blocker">{counts.blocker} blocker</span> : null}
+                  {counts.warn ? <span className="sev warn">{counts.warn} warn</span> : null}
+                  {counts.info ? <span className="sev info">{counts.info} info</span> : null}
+                </span>
+              </h3>
+              <ul className="rp-findings">
+                {ranked.map((f, i) => (
+                  <li key={i} className={"sev-row " + f.severity}>
+                    <span className={"sev " + f.severity}>{f.severity}</span>
+                    {f.path && <code>{f.path}{f.line ? `:${f.line}` : ""}</code>}
+                    <span className="fnote">{f.note}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          );
+        })()}
 
         <section className="rp-card">
           <h3>Proposed change</h3>
