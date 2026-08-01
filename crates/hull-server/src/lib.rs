@@ -12,6 +12,7 @@ pub mod artifacts;
 pub mod autonomy;
 pub mod ci;
 pub mod claims;
+pub mod reviewcache;
 pub mod ingress;
 pub mod keeld;
 pub mod mirror;
@@ -103,6 +104,7 @@ struct App {
     ci: Arc<ci::CiMemo>,
     claims: Arc<claims::ClaimResolutions>,
     artifacts: Arc<artifacts::ArtifactStore>,
+    review_cache: Arc<reviewcache::ReviewCache>,
     autonomy: Arc<autonomy::AutonomyStore>,
     ci_config: Arc<ci::CiConfig>,
     /// Outbound HTTP for dispatching CI jobs to a repo's configured endpoint. Cheap to clone.
@@ -145,6 +147,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         ci: Arc::new(ci::CiMemo::from_env()),
         claims: Arc::new(claims::ClaimResolutions::from_env()),
         artifacts: Arc::new(artifacts::ArtifactStore::from_env()),
+        review_cache: Arc::new(reviewcache::ReviewCache::from_env()),
         autonomy: Arc::new(autonomy::AutonomyStore::from_env()),
         ci_config: Arc::new(ci::CiConfig::from_env()),
         http: reqwest::Client::new(),
@@ -1687,23 +1690,44 @@ async fn perform_auto_review(
         source_url,
         facts,
     };
-    // The reviewer may make a blocking model call (the OpenRouter reviewer); keep the runtime free.
-    let registry = app.registry.clone();
-    let pkg = tokio::task::spawn_blocking(move || registry.review(&review_req))
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "reviewer panicked".to_string()))?;
-
-    // 3. Persist the package as a Review under the agent reviewer.
-    let verdict = match pkg.verdict {
-        hull_plugin::ReviewVerdict::Approve => Verdict::Approve,
-        hull_plugin::ReviewVerdict::RequestChanges => Verdict::RequestChanges,
-        hull_plugin::ReviewVerdict::Comment => Verdict::Comment,
+    // D9 — incremental re-review: an unchanged tree reuses its cached verdict (skip the model call);
+    // a changed tree (different diff) has a different key, so it re-reviews. `force` bypasses.
+    let (verdict, findings, ledger, base_summary, from_cache) = match app.review_cache.get(&tree) {
+        Some(cr) => {
+            let v = match cr.verdict.as_str() {
+                "approve" => Verdict::Approve,
+                "request_changes" => Verdict::RequestChanges,
+                _ => Verdict::Comment,
+            };
+            let f: Vec<ReviewFinding> = cr.findings.into_iter().map(|f| ReviewFinding { path: f.path, line: f.line, severity: f.severity, note: f.note }).collect();
+            (v, f, cr.ledger, cr.summary, true)
+        }
+        None => {
+            // The reviewer may make a blocking model call (the OpenRouter reviewer); keep the runtime free.
+            let registry = app.registry.clone();
+            let pkg = tokio::task::spawn_blocking(move || registry.review(&review_req))
+                .await
+                .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "reviewer panicked".to_string()))?;
+            let v = match pkg.verdict {
+                hull_plugin::ReviewVerdict::Approve => Verdict::Approve,
+                hull_plugin::ReviewVerdict::RequestChanges => Verdict::RequestChanges,
+                hull_plugin::ReviewVerdict::Comment => Verdict::Comment,
+            };
+            let f: Vec<ReviewFinding> = pkg.findings.into_iter().map(|f| ReviewFinding { path: f.path, line: f.line, severity: f.severity, note: f.note }).collect();
+            let verdict_str = match v {
+                Verdict::Approve => "approve",
+                Verdict::RequestChanges => "request_changes",
+                _ => "comment",
+            };
+            app.review_cache.put(&tree, reviewcache::CachedReview {
+                verdict: verdict_str.into(),
+                summary: pkg.summary.clone(),
+                findings: f.iter().map(|x| reviewcache::CachedFinding { path: x.path.clone(), line: x.line, severity: x.severity.clone(), note: x.note.clone() }).collect(),
+                ledger: pkg.ledger.clone(),
+            });
+            (v, f, pkg.ledger, pkg.summary, false)
+        }
     };
-    let findings: Vec<ReviewFinding> = pkg
-        .findings
-        .into_iter()
-        .map(|f| ReviewFinding { path: f.path, line: f.line, severity: f.severity, note: f.note })
-        .collect();
     let count = app.store.reviews(&key).len();
     let rid = format!("rv_{}_{}", key.replace('/', "_"), count + 1);
     // D8 — content-addressed audit artifact: the full record of why this verdict was reached.
@@ -1712,10 +1736,11 @@ async fn perform_auto_review(
         "repo": key, "change": change, "tree_id": tree,
         "reviewer": reviewer.id, "reviewer_handle": reviewer.handle,
         "verdict": format!("{verdict:?}"),
-        "summary": pkg.summary,
+        "summary": base_summary.clone(),
         "checks": check_label,
+        "cached": from_cache,
         "findings": findings.clone(),
-        "ledger": pkg.ledger.clone(),
+        "ledger": ledger.clone(),
         "inputs": artifact_inputs,
         "models": {
             "screen": app.registry.config("HULL_REVIEW_MODEL"),
@@ -1730,9 +1755,9 @@ async fn perform_auto_review(
         target: format!("pr:{number}"),
         reviewer: reviewer.id.clone(),
         verdict,
-        summary: format!("{} · checks {check_label}", pkg.summary),
+        summary: format!("{base_summary} · checks {check_label}{}", if from_cache { " · reused (unchanged tree)" } else { "" }),
         findings,
-        ledger: pkg.ledger,
+        ledger,
         artifact_id: Some(artifact_id),
         created_unix: now(),
     };
