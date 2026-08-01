@@ -351,3 +351,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .notif .nk.mirror_pushed{color:#0969da}
 .notif .nk.review_posted{color:#8250df}
 .nbcast{font-size:9px;text-transform:uppercase;letter-spacing:.4px;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:0 5px;color:var(--muted);margin-left:4px}
+
+/* Issue ↔ PR linkage chips */
+.resolved-chip{font-size:11px;color:#1a7f37;border:1px solid #1a7f3744;background:#1a7f3710;border-radius:999px;padding:2px 9px;font-family:ui-monospace,monospace}
+.linked-chip{font-size:11px;color:#0969da;border:1px solid #0969da44;background:#0969da10;border-radius:999px;padding:2px 9px}

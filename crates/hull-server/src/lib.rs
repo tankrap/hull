@@ -751,7 +751,54 @@ async fn merge_pr(
     if let Some(change) = pr.changes.first() {
         mirror_out(&app, &tenant, &repo, change);
     }
-    Json(json!({ "pr": pr })).into_response()
+    // Auto-close the issues this PR fixes, stamping the resolving keel change as provenance.
+    let resolving = pr.changes.first().cloned();
+    let mut closed: Vec<u64> = Vec::new();
+    for num in closing_issue_numbers(&pr.title, &[]) {
+        if let Some(mut issue) = app.store.issues(&pr.repo).into_iter().find(|i| i.number == num) {
+            if matches!(issue.status, hull_core::IssueStatus::Open) {
+                issue.status = hull_core::IssueStatus::Closed { reason: hull_core::CloseReason::Completed };
+                issue.resolved_by = resolving.clone();
+                if !issue.linked_prs.contains(&pr.id) {
+                    issue.linked_prs.push(pr.id.clone());
+                }
+                let assignees = issue.assignees.clone();
+                let author = issue.author.clone();
+                app.store.replace_issue(issue);
+                closed.push(num);
+                let mut to = assignees;
+                if !to.contains(&author) {
+                    to.push(author);
+                }
+                app.registry.notify(&NotifyEvent {
+                    kind: "issue_closed".into(),
+                    to,
+                    summary: format!("issue #{num} closed by merging PR !{number}"),
+                    change: resolving.clone(),
+                });
+            }
+        }
+    }
+    Json(json!({ "pr": pr, "closed_issues": closed })).into_response()
+}
+
+/// Issue numbers a PR closes: from closing keywords in the title (`fixes #12`, `closes #3`,
+/// `resolves #7`) plus any explicit `closes` list. Deduped.
+fn closing_issue_numbers(title: &str, explicit: &[u64]) -> Vec<u64> {
+    let mut out: Vec<u64> = explicit.to_vec();
+    let lower = title.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| c.is_whitespace() || c == ':' || c == ',' || c == '(').collect();
+    const KW: &[&str] = &["fix", "fixes", "fixed", "close", "closes", "closed", "resolve", "resolves", "resolved"];
+    for pair in words.windows(2) {
+        if KW.contains(&pair[0]) {
+            if let Some(n) = pair[1].strip_prefix('#').and_then(|s| s.parse::<u64>().ok()) {
+                out.push(n);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Push a landed change out to the external forge, if the repo is mirrored — but only if the change
@@ -1149,6 +1196,17 @@ async fn create_pr(
         });
     }
     app.store.put_pr(pr.clone());
+    // Link the issues this PR closes (from `fixes #N` in the title, or an explicit `closes` list) so
+    // they show the incoming PR now and auto-close when it merges.
+    let explicit: Vec<u64> = body.get("closes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
+    for num in closing_issue_numbers(&pr.title, &explicit) {
+        if let Some(mut issue) = app.store.issues(&pr.repo).into_iter().find(|i| i.number == num) {
+            if !issue.linked_prs.contains(&pr.id) {
+                issue.linked_prs.push(pr.id.clone());
+                app.store.replace_issue(issue);
+            }
+        }
+    }
     app.hub.publish(
         &tenant,
         ActivityEvent::Push { actor: actor.handle, repo: repo.clone(), change: pr.changes[0].clone(), ts: now() },

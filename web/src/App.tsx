@@ -32,6 +32,8 @@ type Issue = {
   assignees: string[];
   status: { state: string; reason?: string };
   code_refs: CodeRef[];
+  resolved_by?: string;
+  linked_prs?: string[];
 };
 
 /**
@@ -654,6 +656,16 @@ export function App() {
                     ◎ {handleOf(id)}
                   </span>
                 ))}
+                {it.resolved_by && (
+                  <span className="resolved-chip" title="closed by a merged PR — resolving keel change">
+                    ⬡ resolved by {it.resolved_by.slice(0, 10)}
+                  </span>
+                )}
+                {!it.resolved_by && (it.linked_prs?.length ?? 0) > 0 && (
+                  <span className="linked-chip" title="a PR references this issue">
+                    ⇄ {it.linked_prs!.length} linked PR{it.linked_prs!.length > 1 ? "s" : ""}
+                  </span>
+                )}
                 <span className={"by " + (actors.find((a) => a.id === it.author)?.kind ?? "")}>
                   {handleOf(it.author)}
                 </span>
