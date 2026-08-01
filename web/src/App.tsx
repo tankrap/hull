@@ -179,6 +179,10 @@ export function App() {
       <section className="issues">
         <h2>
           Issues <span className="muted">{tenant}/{issueRepo}</span>
+          <span className="counts">
+            {issues.filter((i) => i.status.state === "open").length} open ·{" "}
+            {issues.filter((i) => i.status.state !== "open").length} closed
+          </span>
         </h2>
         <form className="issue-form" onSubmit={createIssue}>
           <input
@@ -203,9 +207,13 @@ export function App() {
         </form>
         <ul className="issue-list">
           {issues.length === 0 && <li className="empty">no issues yet — open one above</li>}
-          {issues.map((it) => (
-            <li key={it.number} className="issue">
-              <span className={"state " + it.status.state}>{it.status.state}</span>
+          {[...issues]
+            .sort((a, b) => Number(a.status.state !== "open") - Number(b.status.state !== "open") || b.number - a.number)
+            .map((it) => (
+            <li key={it.number} className={"issue " + it.status.state}>
+              <span className={"state " + it.status.state} title={it.status.reason ?? ""}>
+                {it.status.state === "open" ? "open" : it.status.reason ?? "closed"}
+              </span>
               <span className="num">#{it.number}</span>
               <span className="it-title">{it.title}</span>
               {it.code_refs.map((c, i) => (

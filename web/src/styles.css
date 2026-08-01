@@ -103,3 +103,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .issue .act { padding: 3px 12px; border-radius: 6px; font: inherit; font-size: 12px; cursor: pointer; border: 1px solid #2a3040; background: #12151c; color: #cdd3df; }
 .issue .act.close { border-color: #2f8f6b; color: #7ee2b8; }
 .issue .act.reopen { border-color: #3a5a8f; color: #8fb4ff; }
+
+.issues h2 .counts { margin-left: 12px; font-size: 13px; color: #8b93a7; font-weight: 400; }
+.issue.closed { opacity: .62; }
+.issue.closed .it-title { text-decoration: line-through; text-decoration-color: #4a5163; }
