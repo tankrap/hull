@@ -165,6 +165,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
+        .route("/api/repos/:tenant/:repo/security", get(repo_security))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
@@ -404,6 +405,11 @@ async fn why(
     let path = q.get("path").map(String::as_str).unwrap_or("");
     let prov = app.repos.why(&tenant, &repo, path, 10);
     Json(json!({ "path": path, "provenance": prov }))
+}
+
+/// Secret findings from the server-side push scan (`GET /api/repos/:tenant/:repo/security`).
+async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+    Json(json!({ "secrets": app.repos.secrets(&format!("{tenant}/{repo}")) }))
 }
 
 /// The diff of a change (`GET /api/repos/:tenant/:repo/change/:id/diff`): per-file line hunks plus a

@@ -185,6 +185,15 @@ export function App() {
     loadIssues();
   };
 
+  // Server-side secret-scan findings for the selected repo.
+  const [secrets, setSecrets] = useState<{ path: string; line: number; title: string; redacted: string }[]>([]);
+  useEffect(() => {
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/security`)
+      .then((r) => r.json())
+      .then((d) => setSecrets(d.secrets ?? []))
+      .catch(() => {});
+  }, [tenant, issueRepo, view]);
+
   // Pull requests for the selected repo.
   const [prs, setPrs] = useState<PR[]>([]);
   const [prTitle, setPrTitle] = useState("");
@@ -450,6 +459,18 @@ export function App() {
 
       {view === "repo" && (
       <main className="repo-view">
+        {secrets.length > 0 && (
+          <div className="sec-banner">
+            <b>⚠ {secrets.length} secret{secrets.length > 1 ? "s" : ""} detected on push</b>
+            <ul>
+              {secrets.slice(0, 5).map((s, i) => (
+                <li key={i}>
+                  {s.title} — <code>{s.path}:{s.line}</code> <span className="muted">{s.redacted}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <div className="tabs">
           <button className={"tab" + (tab === "issues" ? " active" : "")} onClick={() => setTab("issues")}>
             Issues <span className="muted">{issues.filter((i) => i.status.state === "open").length}</span>

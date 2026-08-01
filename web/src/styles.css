@@ -270,3 +270,8 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .ops-summary .op { font-size: 12.5px; padding: 3px 9px; border-radius: 6px; background: #14231d; color: #a8e6c8; border: 1px solid #1f4030; }
 .ops-summary .op.del { background: #201113; color: #f0a8ab; border-color: #3a1c1f; }
 .ops-summary .ops-title .shape { color: #8b93a7; font-weight: 400; text-transform: none; letter-spacing: 0; }
+
+.sec-banner { background: #2a1416; border: 1px solid #5a2a2e; border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; }
+.sec-banner b { color: #ff9b9b; }
+.sec-banner ul { margin: 8px 0 0; padding-left: 18px; color: #cdd3df; font-size: 13px; }
+.sec-banner code { color: #ffb3b3; }

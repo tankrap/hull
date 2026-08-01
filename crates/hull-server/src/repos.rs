@@ -21,15 +21,87 @@ use std::sync::{Arc, Mutex};
 
 /// Hosts keel repos under a root dir at `<root>/{tenant}/{repo}/.keel/store`. Opened stores are
 /// cached — an LMDB env is cheap to clone (shared handle) but expensive to open per request.
+/// A secret detected by the server-side scan of a push (the backstop layer).
+#[derive(Clone, serde::Serialize)]
+pub struct SecretHit {
+    pub repo: String,
+    pub change: String,
+    pub path: String,
+    pub rule: String,
+    pub title: String,
+    pub line: usize,
+    pub redacted: String,
+}
+
 #[derive(Clone)]
 pub struct RepoHost {
     root: PathBuf,
     open: Arc<Mutex<HashMap<String, Store>>>,
+    secrets: Arc<Mutex<Vec<SecretHit>>>,
 }
 
 impl RepoHost {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        RepoHost { root: root.into(), open: Arc::new(Mutex::new(HashMap::new())) }
+        RepoHost {
+            root: root.into(),
+            open: Arc::new(Mutex::new(HashMap::new())),
+            secrets: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Scan the changed blobs of a repo's HEAD change for secrets (the server-side backstop; the
+    /// same `hull-scan` engine runs client-side too). Records hits and returns how many were found.
+    /// Called after a push bridges git → keel.
+    pub fn scan_head(&self, tenant: &str, repo: &str) -> usize {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return 0 };
+        let Some(head) = store.get_ref("main").ok().flatten() else { return 0 };
+        let change = match store.get(&head).ok().flatten() {
+            Some(Object::Change(c)) => c,
+            _ => return 0,
+        };
+        let mut head_files = HashMap::new();
+        flatten_tree(&store, change.tree, "", &mut head_files, 0);
+        let mut parent_files = HashMap::new();
+        if let Some(p) = change.parents.first() {
+            if let Some(Object::Change(pc)) = store.get(p).ok().flatten() {
+                flatten_tree(&store, pc.tree, "", &mut parent_files, 0);
+            }
+        }
+        let key = format!("{tenant}/{repo}");
+        let change_hex = head.to_hex();
+        let mut hits = Vec::new();
+        for (path, blob) in &head_files {
+            if parent_files.get(path) == Some(blob) {
+                continue; // unchanged
+            }
+            if let Some(Object::Blob(b)) = store.get(blob).ok().flatten() {
+                if b.len() > MAX_BLOB_FOR_DIFF {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&b);
+                for f in hull_scan::scan(&text) {
+                    hits.push(SecretHit {
+                        repo: key.clone(),
+                        change: change_hex.clone(),
+                        path: path.clone(),
+                        rule: f.rule,
+                        title: f.title,
+                        line: f.line,
+                        redacted: f.redacted,
+                    });
+                }
+            }
+        }
+        let n = hits.len();
+        if n > 0 {
+            self.secrets.lock().unwrap().extend(hits);
+        }
+        n
+    }
+
+    /// Secret hits recorded for a repo (server-side scan backstop).
+    pub fn secrets(&self, repo: &str) -> Vec<SecretHit> {
+        self.secrets.lock().unwrap().iter().filter(|s| s.repo == repo).cloned().collect()
     }
 
     /// Root from `HULL_REPOS_ROOT`, defaulting to `~/.hull/repos`.
@@ -571,6 +643,11 @@ pub async fn receive_pack<S: HasRepoHost + Clone + Send + Sync + 'static>(
     match keel_git::smart_http::receive_pack(&store, &body) {
         Ok(resp) => {
             let _ = keel_git::bridge::bridge(&store); // git → native keel history
+            // Server-side secret-scan backstop: flag any secret in the pushed change.
+            let n = app.repo_host().scan_head(&tenant, &repo);
+            if n > 0 {
+                eprintln!("hull: ⚠ {n} secret finding(s) in push to {tenant}/{repo} (see /api/repos/…/security)");
+            }
             with_type("application/x-git-receive-pack-result", resp)
         }
         Err(e) => server_error(e),
