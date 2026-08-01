@@ -46,6 +46,17 @@ export function App() {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [prov, setProv] = useState<Record<string, { change: string; intent: string; author: string }[]>>({});
 
+  // Notifications recorded by the core Notifier plugin capability (poll).
+  const [notifs, setNotifs] = useState<{ kind: string; to: string[]; summary: string; ts: number }[]>([]);
+  const [showNotifs, setShowNotifs] = useState(false);
+  useEffect(() => {
+    const load = () =>
+      fetch("/api/notifications").then((r) => r.json()).then((d) => setNotifs(d.notifications ?? [])).catch(() => {});
+    load();
+    const t = setInterval(load, 4000);
+    return () => clearInterval(t);
+  }, []);
+
   // Registered actors + who we're acting as (every authoring action must be an accountable actor).
   const [actors, setActors] = useState<Actor[]>([]);
   const [actingAs, setActingAs] = useState<string>("");
@@ -242,6 +253,23 @@ export function App() {
             aria-label="tenant"
           />
         </label>
+        <div className="bell-wrap">
+          <button className="bell" onClick={() => setShowNotifs((s) => !s)} title="notifications">
+            🔔{notifs.length > 0 && <span className="bell-count">{notifs.length}</span>}
+          </button>
+          {showNotifs && (
+            <div className="notif-drop">
+              <div className="notif-head">notifications <span className="muted">via Notifier plugin</span></div>
+              {notifs.length === 0 && <div className="empty">nothing yet</div>}
+              {notifs.slice(0, 12).map((n, i) => (
+                <div className="notif" key={i}>
+                  <span className={"nk " + n.kind}>{n.kind.replace("_", " ")}</span>
+                  <span className="ns">{n.summary}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </header>
 
       <main className="grid">

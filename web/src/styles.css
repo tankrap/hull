@@ -176,3 +176,15 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .rp-files .fst { display: inline-block; width: 16px; text-align: center; border-radius: 4px; font-size: 11px; }
 .rp-files .fst.added { background: #14231d; color: #7ee2b8; } .rp-files .fst.modified { background: #1c2432; color: #8fb4ff; } .rp-files .fst.deleted { background: #2a1618; color: #ff9b9b; }
 .muted-card { opacity: .8; border-style: dashed; }
+
+/* notifications bell */
+.bell-wrap { position: relative; margin-left: 12px; }
+.bell { background: none; border: 0; cursor: pointer; font-size: 18px; position: relative; }
+.bell-count { position: absolute; top: -6px; right: -10px; background: #d84a4a; color: #fff; font-size: 10px; border-radius: 10px; padding: 0 5px; }
+.notif-drop { position: absolute; right: 0; top: 32px; width: 360px; max-height: 60vh; overflow: auto; background: #12151c; border: 1px solid #2a3040; border-radius: 10px; padding: 8px; z-index: 20; box-shadow: 0 10px 30px #0008; }
+.notif-head { font-size: 12px; color: #8b93a7; padding: 4px 6px 8px; }
+.notif { display: flex; gap: 8px; align-items: baseline; padding: 6px; border-radius: 6px; }
+.notif:hover { background: #0e1420; }
+.notif .nk { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 2px 6px; border-radius: 20px; background: #1c2432; color: #9fb2d6; white-space: nowrap; }
+.notif .nk.review_posted { background: #14231d; color: #7ee2b8; }
+.notif .ns { font-size: 13px; color: #cdd3df; }

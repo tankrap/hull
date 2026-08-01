@@ -23,7 +23,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use hull_plugin::{NotifyEvent, Notifier};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use futures::stream::Stream;
 use hull_core::store::{FileStore, InMemory, Store};
 use hull_core::*;
@@ -45,12 +47,45 @@ impl Default for Options {
     }
 }
 
+/// A delivered notification, captured for `/api/notifications`. In a hosted deployment a `Notifier`
+/// plugin would ALSO fan this out over email/Slack/nostr; the core records + logs it.
+#[derive(Clone, serde::Serialize)]
+struct Notification {
+    kind: String,
+    to: Vec<String>,
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    change: Option<String>,
+    ts: u64,
+}
+
+/// A core [`Notifier`] capability that records recent notifications in memory so the UI can show
+/// them — demonstrating the plugin seam end-to-end (the registry fans out to every notifier).
+struct RecordingNotifier(Arc<Mutex<Vec<Notification>>>);
+impl Notifier for RecordingNotifier {
+    fn notify(&self, e: &NotifyEvent) {
+        let mut buf = self.0.lock().unwrap();
+        buf.push(Notification {
+            kind: e.kind.clone(),
+            to: e.to.clone(),
+            summary: e.summary.clone(),
+            change: e.change.clone(),
+            ts: now(),
+        });
+        let n = buf.len();
+        if n > 100 {
+            buf.drain(0..n - 100);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct App {
     store: Arc<dyn Store>,
     hub: Arc<ActivityHub>,
     registry: Arc<Registry>,
     repos: repos::RepoHost,
+    notifications: Arc<Mutex<Vec<Notification>>>,
 }
 
 impl repos::HasRepoHost for App {
@@ -71,8 +106,12 @@ pub fn router(registry: Registry) -> Router {
     make_router(build_app(registry, hub, store))
 }
 
-fn build_app(registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store>) -> App {
-    App { store, hub, registry: Arc::new(registry), repos: repos::RepoHost::from_env() }
+fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store>) -> App {
+    // Register a core recording notifier so notifications are observable; the registry fans out to
+    // this plus the log notifier plus any hosted plugin notifier.
+    let notifications: Arc<Mutex<Vec<Notification>>> = Arc::new(Mutex::new(Vec::new()));
+    registry.add_notifier(Arc::new(RecordingNotifier(notifications.clone())));
+    App { store, hub, registry: Arc::new(registry), repos: repos::RepoHost::from_env(), notifications }
 }
 
 /// Path to the durable domain snapshot (`HULL_DATA_DIR`/store.json, default `~/.hull/data`).
@@ -97,6 +136,7 @@ fn make_router(app: App) -> Router {
         .route("/api/home", get(home))
         .route("/api/feed", get(feed))
         .route("/api/actors", get(actors_list).post(register_actor))
+        .route("/api/notifications", get(notifications_list))
         .route("/api/repos", get(repos_list))
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
         .route("/api/repos/:tenant/:repo/issues/:number", axum::routing::patch(update_issue))
@@ -174,6 +214,15 @@ async fn home(State(app): State<App>, Query(q): Query<HashMap<String, String>>) 
 /// The repos actually hosted on disk (the filesystem registry), plus the seeded domain repos.
 async fn repos_list(State(app): State<App>) -> Json<Value> {
     Json(json!({ "hosted": app.repos.list(), "repos": app.store.repos() }))
+}
+
+/// Recent notifications recorded by the core `Notifier` capability (newest first). Demonstrates the
+/// plugin seam: these were fanned out by `registry.notify`, and a hosted plugin would also deliver
+/// them over a real channel.
+async fn notifications_list(State(app): State<App>) -> Json<Value> {
+    let mut n = app.notifications.lock().unwrap().clone();
+    n.reverse();
+    Json(json!({ "notifications": n }))
 }
 
 /// Registered actors (public — no secret keys), each with its accountability root.
@@ -306,12 +355,24 @@ async fn create_review(
         id: format!("rv_{}_{}", key.replace('/', "_"), count + 1),
         repo: key,
         target,
-        reviewer: reviewer.id,
+        reviewer: reviewer.id.clone(),
         verdict,
         summary: body.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
         created_unix: now(),
     };
     app.store.put_review(review.clone());
+    // Notify the PR's author via the Notifier plugin capability (core records + logs it; a hosted
+    // plugin would also deliver over Slack/email/nostr).
+    if let Some(num) = review.target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
+        if let Some(pr) = app.store.prs(&review.repo).into_iter().find(|p| p.number == num) {
+            app.registry.notify(&NotifyEvent {
+                kind: "review_posted".into(),
+                to: vec![pr.author.clone()],
+                summary: format!("{} posted a {:?} review on PR !{num}", reviewer.handle, review.verdict),
+                change: pr.changes.first().cloned(),
+            });
+        }
+    }
     (StatusCode::CREATED, Json(json!({ "review": review }))).into_response()
 }
 
@@ -437,6 +498,14 @@ async fn create_issue(
         created_unix: now(),
     };
     app.store.put_issue(issue.clone());
+    if !issue.assignees.is_empty() {
+        app.registry.notify(&NotifyEvent {
+            kind: "issue_assigned".into(),
+            to: issue.assignees.clone(),
+            summary: format!("{} assigned issue #{number}: {}", actor.handle, issue.title),
+            change: None,
+        });
+    }
     app.hub.publish(
         &tenant,
         ActivityEvent::Issue { repo, number, action: "opened".into(), actor: author, ts: now() },
