@@ -1161,6 +1161,27 @@ function ReviewPage({
           ? "elevated — unverified and a broad change"
           : "moderate — unverified";
 
+  // Discussion thread — the same PR thread as the compact view, followed into the deep review page.
+  type Cmt = { id: string; target: string; author: string; body: string; created_unix: number };
+  const [thread, setThread] = useState<Cmt[]>([]);
+  const [draft, setDraft] = useState("");
+  const loadThread = () =>
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/comments`)
+      .then((r) => r.json())
+      .then((d) => setThread((d.comments ?? []).filter((c: Cmt) => pr && c.target === `pr:${pr.number}`)))
+      .catch(() => {});
+  useEffect(() => { loadThread(); }, [tenant, repo, pr?.number]);
+  const postThreadComment = async () => {
+    if (!canAct || !pr || !draft.trim()) return;
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/comments`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ target: `pr:${pr.number}`, body: draft.trim() }),
+    });
+    if (res.ok) { setDraft(""); loadThread(); }
+    else alert(await res.text());
+  };
+
   return (
     <div className="app review-page">
       <header className="top">
@@ -1393,6 +1414,31 @@ function ReviewPage({
               <code>keel commit --session</code> or <code>keel capture</code> and the task, reasoning, tool calls,
               and lesson show up here automatically.
             </p>
+          </section>
+        )}
+
+        {pr && (
+          <section className="rp-card">
+            <h3>Discussion <span className="muted">humans and agents, one accountable thread</span></h3>
+            <div className="pr-thread">
+              {thread.sort((a, b) => a.created_unix - b.created_unix).map((c) => (
+                <div className="cmt" key={c.id}>
+                  <b className={actors.find((a) => a.id === c.author)?.kind ?? ""}>{handleOf(c.author)}</b>
+                  <span className="cmt-body">{c.body}</span>
+                </div>
+              ))}
+              {thread.length === 0 && <div className="muted cmt-empty">no comments yet</div>}
+              <div className="cmt-form">
+                <input
+                  placeholder={canAct ? "comment…" : "sign in to comment"}
+                  disabled={!canAct}
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && postThreadComment()}
+                />
+                <button disabled={!canAct} onClick={postThreadComment}>Comment</button>
+              </div>
+            </div>
           </section>
         )}
       </main>
