@@ -8,6 +8,7 @@
 //! `/api/repos/:repo/issues` · `/api/scan` · `/api/plugins`.
 
 pub mod activity;
+pub mod autonomy;
 pub mod ci;
 pub mod claims;
 pub mod ingress;
@@ -23,7 +24,7 @@ use axum::{
     http::StatusCode,
     response::sse::{Event, Sse},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use hull_plugin::{NotifyEvent, Notifier};
@@ -100,6 +101,7 @@ struct App {
     auth: Arc<Mutex<AuthState>>,
     ci: Arc<ci::CiMemo>,
     claims: Arc<claims::ClaimResolutions>,
+    autonomy: Arc<autonomy::AutonomyStore>,
     ci_config: Arc<ci::CiConfig>,
     /// Outbound HTTP for dispatching CI jobs to a repo's configured endpoint. Cheap to clone.
     http: reqwest::Client,
@@ -140,6 +142,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         auth: Arc::new(Mutex::new(AuthState::default())),
         ci: Arc::new(ci::CiMemo::from_env()),
         claims: Arc::new(claims::ClaimResolutions::from_env()),
+        autonomy: Arc::new(autonomy::AutonomyStore::from_env()),
         ci_config: Arc::new(ci::CiConfig::from_env()),
         http: reqwest::Client::new(),
         public_url: std::env::var("HULL_PUBLIC_URL").unwrap_or_else(|_| "http://127.0.0.1:8930".into()).into(),
@@ -244,6 +247,8 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/change/:id/check", post(run_check_handler))
         .route("/api/repos/:tenant/:repo/change/:id/ci-result", post(ci_result))
         .route("/api/repos/:tenant/:repo/ci-config", get(get_ci_config).put(set_ci_config))
+        .route("/api/repos/:tenant/:repo/autonomy", get(get_repo_autonomy).put(set_repo_autonomy))
+        .route("/api/accounts/:id/autonomy", put(set_account_autonomy))
         .route("/api/repos/:tenant/:repo/security", get(repo_security))
         .route("/api/repos/:tenant/:repo/owners", get(owners_list).post(set_owners))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
@@ -1004,6 +1009,98 @@ fn is_repo_admin(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The id of the account that owns `tenant/repo` (for the account-level policy fallback).
+fn repo_account_id(app: &App, tenant: &str, repo: &str) -> Option<String> {
+    let name = format!("{tenant}/{repo}");
+    app.store
+        .repos()
+        .into_iter()
+        .find(|r| r.name == name || r.name == repo)
+        .map(|r| r.owner)
+        .or_else(|| app.store.accounts().into_iter().find(|a| a.handle == tenant).map(|a| a.id))
+}
+
+fn tier_from_str(s: &str) -> Option<hull_core::AutonomyTier> {
+    match s.to_lowercase().as_str() {
+        "t0" => Some(hull_core::AutonomyTier::T0),
+        "t1" => Some(hull_core::AutonomyTier::T1),
+        "t2" => Some(hull_core::AutonomyTier::T2),
+        "t3" => Some(hull_core::AutonomyTier::T3),
+        _ => None,
+    }
+}
+
+/// The effective autonomy policy for a repo (`GET …/autonomy`) — the resolved tier, where it comes
+/// from, and the protected paths that always require a human.
+async fn get_repo_autonomy(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+    let acct = repo_account_id(&app, &tenant, &repo);
+    let e = app.autonomy.effective(&tenant, &repo, acct.as_deref());
+    Json(json!({
+        "tier": e.tier, "source": e.source, "protected_paths": e.protected_paths,
+        "repo_override": app.autonomy.get_repo(&tenant, &repo).map(|p| p.tier),
+        "account_tier": acct.as_deref().and_then(|a| app.autonomy.get_account(a)).map(|p| p.tier),
+    }))
+}
+
+/// Set the repo's autonomy tier (`PUT …/autonomy` `{tier, protected_paths?}`) — owner/admin only.
+async fn set_repo_autonomy(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_repo_admin(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin can set autonomy").into_response();
+    }
+    let Some(tier) = body.get("tier").and_then(Value::as_str).and_then(tier_from_str) else {
+        return (StatusCode::BAD_REQUEST, "tier must be t0 | t1 | t2 | t3").into_response();
+    };
+    let protected_paths = body
+        .get("protected_paths")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    app.autonomy.set_repo(&tenant, &repo, hull_core::AutonomyPolicy { tier, protected_paths });
+    Json(json!({ "tier": tier })).into_response()
+}
+
+/// Set an account's autonomy tier (`PUT /api/accounts/:id/autonomy`) — account owner/admin only.
+async fn set_account_autonomy(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let is_admin = app
+        .store
+        .accounts()
+        .into_iter()
+        .find(|a| a.id == id)
+        .map(|a| a.members.iter().any(|m| m.actor == actor.id && matches!(m.role, Role::Owner | Role::Admin)))
+        .unwrap_or(false);
+    if !is_admin {
+        return (StatusCode::FORBIDDEN, "only an account owner/admin can set autonomy").into_response();
+    }
+    let Some(tier) = body.get("tier").and_then(Value::as_str).and_then(tier_from_str) else {
+        return (StatusCode::BAD_REQUEST, "tier must be t0 | t1 | t2 | t3").into_response();
+    };
+    let protected_paths = body
+        .get("protected_paths")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    app.autonomy.set_account(&id, hull_core::AutonomyPolicy { tier, protected_paths });
+    Json(json!({ "tier": tier })).into_response()
+}
+
 /// Ingest a keel session for a change (`POST …/change/:id/session`) — the output of `keel capture`,
 /// associated by change id. Gated to an accountable actor. Fills the review package for a change
 /// that crossed the git boundary (where the native `Change.session` was lost).
@@ -1126,12 +1223,44 @@ async fn merge_pr(
     if !green {
         return (StatusCode::CONFLICT, "cannot merge: change is not keel-verify green").into_response();
     }
-    // an independent approving review (approver != PR author)
-    let has_independent_approval = app.store.reviews(&key).iter().any(|r| {
-        r.target == format!("pr:{number}") && r.verdict == Verdict::Approve && r.reviewer != pr.author
-    });
-    if !has_independent_approval {
-        return (StatusCode::CONFLICT, "cannot merge: needs an approving review from someone other than the author").into_response();
+    // Independent approving reviews (approver != PR author), split by actor kind.
+    let approvals: Vec<ActorId> = app
+        .store
+        .reviews(&key)
+        .into_iter()
+        .filter(|r| r.target == format!("pr:{number}") && r.verdict == Verdict::Approve && r.reviewer != pr.author)
+        .map(|r| r.reviewer)
+        .collect();
+    let human_approval = approvals.iter().any(|a| app.store.actor(a).map(|x| x.kind == hull_core::ActorKind::Human).unwrap_or(false));
+    let agent_approval = approvals.iter().any(|a| app.store.actor(a).map(|x| x.kind == hull_core::ActorKind::Agent).unwrap_or(false));
+
+    // Autonomy policy: when may an AGENT's approve stand in for a human's?
+    let acct = repo_account_id(&app, &tenant, &repo);
+    let eff = app.autonomy.effective(&tenant, &repo, acct.as_deref());
+    let change = pr.changes.first().cloned().unwrap_or_default();
+    let files: Vec<String> = app.repos.change_info(&tenant, &repo, &change).map(|i| i.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
+    let protected = autonomy::touches_protected(&files, &eff.protected_paths);
+    let contradicted = {
+        let lesson = app.store.session_record(&key, &change).map(|s| s.lesson).unwrap_or_default();
+        let intent = app.repos.change_info(&tenant, &repo, &change).map(|i| i.intent).unwrap_or_default();
+        hull_core::reconcile::reconcile(&change, &intent, &lesson, &app.repos.facts(&tenant, &repo, &change)).contradicted() > 0
+    };
+    let low_risk = !protected && !contradicted; // green is already required above
+    let agent_approve_counts = match eff.tier {
+        hull_core::AutonomyTier::T0 | hull_core::AutonomyTier::T1 => false,
+        hull_core::AutonomyTier::T2 => low_risk,
+        hull_core::AutonomyTier::T3 => !protected, // protected paths ALWAYS need a human (D11)
+    };
+    let approved = human_approval || (agent_approval && agent_approve_counts);
+    if !approved {
+        let why = if agent_approval && protected {
+            "an agent approved, but this change touches a protected path — a human approval is required (D11)"
+        } else if agent_approval {
+            "an agent approved, but the repo's autonomy tier doesn't let an agent approve this — needs a human approval"
+        } else {
+            "needs an approving review from someone other than the author"
+        };
+        return (StatusCode::CONFLICT, format!("cannot merge: {why}")).into_response();
     }
     pr.state = PrState::Merged;
     pr.merged_by = Some(actor.id.clone());
@@ -1674,14 +1803,17 @@ async fn create_pr(
         &tenant,
         ActivityEvent::Push { actor: actor.handle, repo: repo.clone(), change: pr.changes[0].clone(), ts: now() },
     );
-    // Agent flow (M6): when a PR opens, an independent agent reviewer runs the reconciliation review
-    // automatically — the fully autonomous loop (agent commits → PR → agent reviews → gate enforced).
-    // Fire-and-forget so the response isn't blocked on the test run; the review lands in the feed.
-    if let Some(agent) = independent_agent_reviewer(&app, &pr.author) {
-        let (app2, t2, r2, n2) = (app.clone(), tenant.clone(), repo.clone(), number);
-        tokio::spawn(async move {
-            let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent).await;
-        });
+    // Agent flow (M6): when a PR opens, an independent agent reviewer auto-reviews it — but only if
+    // the repo's autonomy tier permits autonomous action (T1+). At T0 (observe-only), nothing fires.
+    let acct = repo_account_id(&app, &tenant, &repo);
+    let tier = app.autonomy.effective(&tenant, &repo, acct.as_deref()).tier;
+    if tier >= hull_core::AutonomyTier::T1 {
+        if let Some(agent) = independent_agent_reviewer(&app, &pr.author) {
+            let (app2, t2, r2, n2) = (app.clone(), tenant.clone(), repo.clone(), number);
+            tokio::spawn(async move {
+                let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent).await;
+            });
+        }
     }
     (StatusCode::CREATED, Json(json!({ "pr": pr }))).into_response()
 }

@@ -343,6 +343,36 @@ pub struct ReviewFinding {
     pub note: String,
 }
 
+/// How much an agent may do **autonomously** in a scope (org account or repo). Tiers T0–T3 (§8.6):
+/// the default cap is **T1** until a human raises it — "the token says *may*, the policy decides
+/// *do*." Ordered so `tier >= AutonomyTier::T2` is a meaningful gate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomyTier {
+    /// Observe-only. No autonomous action — no auto-review, no agent approvals.
+    T0,
+    /// Review-required (default). Agents auto-review PRs, but the verdict is **advisory**: a merge
+    /// needs a human approval.
+    #[default]
+    T1,
+    /// Auto-approve **low-risk** changes: an agent's approve satisfies the merge gate when the change
+    /// is green, uncontradicted, and touches no protected path.
+    T2,
+    /// Autonomous: an agent's approve counts broadly. Still never auto-approves a **protected path**
+    /// and stays within grant scope (D11 — a verdict never merges a protected path alone).
+    T3,
+}
+
+/// The autonomy policy for a scope: the tier plus the protected-path globs that always require a
+/// human, regardless of tier. Resolved repo → account → instance default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutonomyPolicy {
+    pub tier: AutonomyTier,
+    /// Path globs that always require human review (auth, migrations, the .hull policy dir …).
+    #[serde(default)]
+    pub protected_paths: Vec<String>,
+}
+
 /// Mirror of keel's verification (from `keel verify`) — first-class in Hull.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

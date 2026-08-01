@@ -317,6 +317,32 @@ export function App() {
     else alert(await res.text());
   };
 
+  // Autonomy policy for the selected repo (tier T0–T3, resolved repo → account → instance).
+  type Autonomy = { tier: string; source: string; protected_paths: string[] };
+  const [autonomy, setAutonomy] = useState<Autonomy | null>(null);
+  const loadAutonomy = () =>
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/autonomy`)
+      .then((r) => r.json())
+      .then((d) => setAutonomy(d))
+      .catch(() => {});
+  useEffect(() => { loadAutonomy(); }, [tenant, issueRepo, view]);
+  const setTier = async (tier: string) => {
+    if (!canAct) return alert("Sign in to act.");
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/autonomy`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ tier }),
+    });
+    if (res.ok) loadAutonomy();
+    else alert(await res.text());
+  };
+  const TIERS: Record<string, string> = {
+    t0: "Observe — no autonomous action",
+    t1: "Review-required — agents auto-review; a human approves",
+    t2: "Auto-approve low-risk — agent approve merges green, uncontradicted, non-protected changes",
+    t3: "Autonomous — agent approve counts broadly (never protected paths)",
+  };
+
   // Reviews (first-class), loaded per repo and filtered to a PR target.
   const [reviews, setReviews] = useState<Review[]>([]);
   const [openPr, setOpenPr] = useState<number | null>(null);
@@ -756,6 +782,21 @@ export function App() {
               linked to <code>{mirror.target}</code> · {mirror.outbound.length} change{mirror.outbound.length === 1 ? "" : "s"} pushed outbound
             </span>
             <span className="muted mirror-note">loop-safe: forge-originated changes are never pushed back; webhook redelivery is idempotent</span>
+          </div>
+        )}
+        {autonomy && (
+          <div className={"autonomy-panel tier-" + autonomy.tier}>
+            <span className="auto-badge">⚙ autonomy</span>
+            <span className="auto-tier">{autonomy.tier.toUpperCase()}</span>
+            <span className="muted">{TIERS[autonomy.tier]}</span>
+            <span className="muted auto-src">· from {autonomy.source}</span>
+            {isTenantOwner && (
+              <select className="auto-select" value={autonomy.tier} onChange={(e) => setTier(e.target.value)} title="set the repo's autonomy tier">
+                {["t0", "t1", "t2", "t3"].map((t) => (
+                  <option key={t} value={t}>{t.toUpperCase()}</option>
+                ))}
+              </select>
+            )}
           </div>
         )}
         {ciConfig && (

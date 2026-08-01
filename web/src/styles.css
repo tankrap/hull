@@ -467,3 +467,14 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .claim-resolution.verified{color:#1a7f37;background:#1a7f3712;border:1px solid #1a7f3733}
 .claim-resolution.concern{color:#cf222e;background:#cf222e0a;border:1px solid #cf222e44}
 .res-note{color:var(--muted)}
+
+/* Autonomy policy panel (repo view) */
+.autonomy-panel{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;margin:0 0 12px;border:1px solid var(--line);border-radius:9px;background:var(--surface);font-size:13px}
+.auto-badge{font-weight:700;border-radius:999px;padding:2px 10px;font-size:12px;color:#6639ba;border:1px solid #6639ba55;background:#6639ba12}
+.auto-tier{font-weight:800;letter-spacing:.5px}
+.autonomy-panel.tier-t0 .auto-tier{color:var(--muted)}
+.autonomy-panel.tier-t1 .auto-tier{color:#1a7f37}
+.autonomy-panel.tier-t2 .auto-tier{color:#9a6700}
+.autonomy-panel.tier-t3 .auto-tier{color:#cf222e}
+.auto-src{font-size:11px}
+.auto-select{margin-left:auto;font-size:12px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)}
