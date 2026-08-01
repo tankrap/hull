@@ -49,3 +49,4 @@ cd web && npm install && npm run dev # the home page (proxies the API)
 
 M0 scaffold: domain model, server skeleton with the reactive feed seam, a real+tested secret-scan
 engine, and the web shell. Builds and runs. Milestones M1–M6 are in ARCHITECTURE.md.
+
