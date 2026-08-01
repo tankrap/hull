@@ -1388,6 +1388,23 @@ function ReviewPage({
           <span className={"verdict " + review.verdict}>{review.verdict.replace("_", " ")}</span>
           <h1>{pr ? `PR !${pr.number} · ${pr.title}` : review.target}</h1>
         </div>
+        {(() => {
+          // F5: degraded-state badges — surface where the review is thinner than ideal.
+          const needs = shownLedger?.claims.filter((c) => c.status === "needs_judgment").length ?? 0;
+          const selfAtt = shownLedger?.claims.filter((c) => c.status === "self_attested").length ?? 0;
+          const badges: { cls: string; label: string; title: string }[] = [];
+          if (change && !change.session) badges.push({ cls: "no-plan", label: "no plan captured", title: "pushed as plain git — no session/plan; provenance is reconstructed, not native (commit with keel --session)" });
+          if (change && change.verification !== "green") badges.push({ cls: "unverified", label: `checks ${change.verification}`, title: "checks are not green — the mechanical evidence is incomplete" });
+          if (needs > 0) badges.push({ cls: "partial", label: `${needs} unresolved claim${needs > 1 ? "s" : ""}`, title: "claims the engine couldn't verify — a human must judge them (partial review)" });
+          if (selfAtt > 0) badges.push({ cls: "self", label: "self-attested tests", title: "green, but the change tests itself — not independently verified" });
+          return badges.length > 0 ? (
+            <div className="degraded-badges">
+              {badges.map((b, i) => (
+                <span key={i} className={"degraded " + b.cls} title={b.title}>⚠ {b.label}</span>
+              ))}
+            </div>
+          ) : null;
+        })()}
 
         <section className="rp-card">
           <h3>Reviewer</h3>

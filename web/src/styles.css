@@ -491,3 +491,9 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 /* D8 audit artifact link */
 .audit-artifact{font-size:12px;margin-top:6px}
 .audit-artifact a{font-family:ui-monospace,monospace;color:var(--accent)}
+
+/* F5 degraded-state badges */
+.degraded-badges{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 14px}
+.degraded{font-size:11px;font-weight:600;padding:3px 10px;border-radius:999px;border:1px solid #9a670055;background:#9a670012;color:#9a6700;cursor:help}
+.degraded.unverified{color:#cf222e;border-color:#cf222e44;background:#cf222e0a}
+.degraded.no-plan{color:var(--muted);border-color:var(--line);background:var(--surface)}
