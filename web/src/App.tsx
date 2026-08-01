@@ -1443,8 +1443,13 @@ function ReviewPage({
               {contradicted > 0 && (
                 <p className="recon-warn">⚠ {contradicted} claim{contradicted > 1 ? "s" : ""} the change's own facts contradict — do not merge without resolving.</p>
               )}
-              <ul className="recon-claims">
-                {claims.map((c) => (
+              {(() => {
+                // F1: unverified/contradicted are primary; verified rows collapse by default.
+                const isVerified = (s: string) => s === "verified_mechanically" || s === "verified_read_only";
+                const primary = claims.filter((c) => !isVerified(c.status));
+                const verified = claims.filter((c) => isVerified(c.status));
+                // One traceable row: status → claim → evidence → (resolution / action).
+                const row = (c: (typeof claims)[number]) => (
                   <li key={c.id} className={"claim " + c.status}>
                     <div className="claim-head">
                       <span className={"cstat " + c.status} title={(meta[c.status] ?? ["?", c.status])[1]}>{(meta[c.status] ?? ["?"])[0]}</span>
@@ -1474,8 +1479,22 @@ function ReviewPage({
                       </div>
                     ) : null}
                   </li>
-                ))}
-              </ul>
+                );
+                return (
+                  <>
+                    <ul className="recon-claims">
+                      {primary.length === 0 && <li className="claim-none muted">nothing needs attention — all claims verified</li>}
+                      {primary.map(row)}
+                    </ul>
+                    {verified.length > 0 && (
+                      <details className="verified-fold">
+                        <summary>✓ {verified.length} verified claim{verified.length > 1 ? "s" : ""} <span className="muted">— show</span></summary>
+                        <ul className="recon-claims">{verified.map(row)}</ul>
+                      </details>
+                    )}
+                  </>
+                );
+              })()}
             </section>
           );
         })()}

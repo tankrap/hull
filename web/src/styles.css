@@ -478,3 +478,12 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .autonomy-panel.tier-t3 .auto-tier{color:#cf222e}
 .auto-src{font-size:11px}
 .auto-select{margin-left:auto;font-size:12px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)}
+
+/* F1: verified claims collapse; primary claims lead */
+.verified-fold{margin-top:10px}
+.verified-fold summary{cursor:pointer;font-size:12px;color:#1a7f37;list-style:none;padding:4px 0}
+.verified-fold summary::-webkit-details-marker{display:none}
+.verified-fold summary::before{content:"▸ ";color:var(--muted)}
+.verified-fold[open] summary::before{content:"▾ "}
+.verified-fold .recon-claims{margin-top:6px;opacity:.85}
+.claim-none{padding:8px 0}
