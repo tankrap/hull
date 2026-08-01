@@ -299,6 +299,11 @@ pub struct Review {
     pub summary: String,
     #[serde(default)]
     pub findings: Vec<ReviewFinding>,
+    /// For an agent reconciliation review: the claim ledger **as evaluated when the verdict was
+    /// posted**. Immutable point-in-time evidence — verification can change later, but this records
+    /// what the review actually decided on. `None` for a manual human review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<reconcile::ClaimLedger>,
     pub created_unix: u64,
 }
 

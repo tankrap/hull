@@ -22,7 +22,9 @@ type ActivityEvent =
 type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable: boolean; human_root: string | null };
 type PR = { number: number; title: string; author: string; changes: string[]; verification: string; state: string; reviewers: string[] };
 type Finding = { path: string; line?: number; severity: string; note: string };
-type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string; findings: Finding[] };
+type ClaimEv = { kind: string; detail: string; supports: boolean };
+type LedgerSnap = { change: string; claims: { id: string; text: string; source: string; status: string; evidence: ClaimEv[] }[] };
+type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string; findings: Finding[]; ledger?: LedgerSnap };
 type CodeRef = { repo: string; blob: string; path: string; line_start: number; line_end?: number };
 type Issue = {
   number: number;
@@ -933,8 +935,11 @@ function ReviewPage({
       .then((d) => setDiff(d.files ?? []))
       .catch(() => {});
   }, [changeId, tenant, repo]);
+  // If this review carries an immutable ledger snapshot (an agent reconciliation review), show that
+  // — it's the evidence the verdict was actually based on. Otherwise reconcile live.
+  const snapshot = review.ledger ?? null;
   const loadLedger = () => {
-    if (!changeId) return;
+    if (snapshot || !changeId) return;
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/ledger`)
       .then((r) => r.json())
       .then((d) => setLedger(d.ledger))
@@ -942,6 +947,7 @@ function ReviewPage({
   };
   // Reconcile after verification is known, so a green/red signal is reflected in the claim statuses.
   useEffect(loadLedger, [changeId, tenant, repo, change?.verification]);
+  const shownLedger = snapshot ?? ledger;
 
   const verify = async (green: boolean) => {
     if (!changeId) return;
@@ -1017,14 +1023,17 @@ function ReviewPage({
           {review.summary && <p className="summary">{review.summary}</p>}
         </section>
 
-        {ledger && ledger.claims.length > 0 && (() => {
+        {shownLedger && shownLedger.claims.length > 0 && (() => {
+          const ledger = shownLedger;
           const n = (s: string) => ledger.claims.filter((c) => c.status === s).length;
           const contradicted = n("contradicted");
           return (
             <section className="rp-card reconcile">
               <h3>
                 Reconciliation{" "}
-                <span className="muted">· does the change do what its author said?</span>
+                <span className="muted">
+                  · {snapshot ? `evidence ${handleOf(review.reviewer)}'s verdict was based on` : "does the change do what its author said?"}
+                </span>
               </h3>
               <div className="recon-summary">
                 <span className="rc supported">{n("supported")} supported</span>

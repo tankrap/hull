@@ -949,6 +949,7 @@ async fn create_review(
         verdict,
         summary: body.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
         findings,
+        ledger: None,
         created_unix: now(),
     };
     app.store.put_review(review.clone());
@@ -1080,6 +1081,7 @@ async fn perform_auto_review(
         verdict,
         summary,
         findings,
+        ledger: Some(ledger),
         created_unix: now(),
     };
     app.store.put_review(review.clone());
