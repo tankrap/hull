@@ -161,6 +161,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/issues/:number", axum::routing::patch(update_issue))
         .route("/api/repos/:tenant/:repo/why", get(why))
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
+        .route("/api/repos/:tenant/:repo/prs/:number/merge", post(merge_pr))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
@@ -461,6 +462,53 @@ async fn ingest_session(
     (StatusCode::CREATED, Json(json!({ "session": record }))).into_response()
 }
 
+/// Merge a PR (`POST /api/repos/:tenant/:repo/prs/:number/merge`). The review gate: the acting actor
+/// must be accountable, the change must be keel-verify **green**, and there must be an **approve**
+/// review by someone **other than the author** (independent — no self-merge). Records who merged.
+async fn merge_pr(
+    State(app): State<App>,
+    Path((tenant, repo, number)): Path<(String, String, u64)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(mut pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+        return (StatusCode::NOT_FOUND, "no such PR").into_response();
+    };
+    if pr.state == PrState::Merged {
+        return (StatusCode::CONFLICT, "already merged").into_response();
+    }
+    // green keel verification of the proposed change
+    let green = pr
+        .changes
+        .first()
+        .and_then(|c| app.repos.verification(&tenant, &repo, c))
+        .map(|v| v == "green")
+        .unwrap_or(false);
+    if !green {
+        return (StatusCode::CONFLICT, "cannot merge: change is not keel-verify green").into_response();
+    }
+    // an independent approving review (approver != PR author)
+    let has_independent_approval = app.store.reviews(&key).iter().any(|r| {
+        r.target == format!("pr:{number}") && r.verdict == Verdict::Approve && r.reviewer != pr.author
+    });
+    if !has_independent_approval {
+        return (StatusCode::CONFLICT, "cannot merge: needs an approving review from someone other than the author").into_response();
+    }
+    pr.state = PrState::Merged;
+    pr.merged_by = Some(actor.id.clone());
+    app.store.replace_pr(pr.clone());
+    app.hub.publish(
+        &tenant,
+        ActivityEvent::Push { actor: actor.handle, repo, change: pr.changes.first().cloned().unwrap_or_default(), ts: now() },
+    );
+    Json(json!({ "pr": pr })).into_response()
+}
+
 /// List reviews for a hosted repo (`GET /api/repos/:tenant/:repo/reviews`); the client filters by
 /// target (e.g. `pr:1`).
 async fn reviews(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
@@ -619,6 +667,8 @@ async fn create_pr(
         changes,
         verification: Verification::Unverified,
         reviewers: vec![],
+        state: PrState::Open,
+        merged_by: None,
         created_unix: now(),
     };
     app.store.put_pr(pr.clone());

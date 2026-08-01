@@ -231,6 +231,16 @@ pub struct Issue {
     pub created_unix: u64,
 }
 
+/// Where a PR is in its lifecycle.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PrState {
+    #[default]
+    Open,
+    Merged,
+    Closed,
+}
+
 /// A pull request — a keel change (or range) proposed for merge, carrying its verification status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PullRequest {
@@ -245,6 +255,11 @@ pub struct PullRequest {
     pub verification: Verification,
     #[serde(default)]
     pub reviewers: Vec<ActorId>,
+    #[serde(default)]
+    pub state: PrState,
+    /// The accountable actor who merged it, once merged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_by: Option<ActorId>,
     pub created_unix: u64,
 }
 

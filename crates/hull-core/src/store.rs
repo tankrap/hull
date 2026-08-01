@@ -24,6 +24,8 @@ pub trait Store: Send + Sync {
     fn replace_issue(&self, issue: Issue) -> bool;
     fn put_pr(&self, pr: PullRequest);
     fn prs(&self, repo: &str) -> Vec<PullRequest>;
+    /// Replace an existing PR, matched by `repo` + `number`. Returns true if one was replaced.
+    fn replace_pr(&self, pr: PullRequest) -> bool;
     fn put_review(&self, review: Review);
     fn reviews(&self, repo: &str) -> Vec<Review>;
     /// Associate an ingested keel session with a change (latest write wins per change).
@@ -95,6 +97,16 @@ impl Store for InMemory {
     }
     fn prs(&self, repo: &str) -> Vec<PullRequest> {
         self.prs.read().unwrap().iter().filter(|p| p.repo == repo).cloned().collect()
+    }
+    fn replace_pr(&self, pr: PullRequest) -> bool {
+        let mut g = self.prs.write().unwrap();
+        match g.iter_mut().find(|p| p.repo == pr.repo && p.number == pr.number) {
+            Some(slot) => {
+                *slot = pr;
+                true
+            }
+            None => false,
+        }
     }
     fn put_review(&self, review: Review) {
         self.reviews.write().unwrap().push(review);
@@ -236,6 +248,20 @@ impl Store for FileStore {
     }
     fn prs(&self, repo: &str) -> Vec<PullRequest> {
         self.inner.read().unwrap().prs.iter().filter(|p| p.repo == repo).cloned().collect()
+    }
+    fn replace_pr(&self, pr: PullRequest) -> bool {
+        let mut g = self.inner.write().unwrap();
+        let replaced = match g.prs.iter_mut().find(|p| p.repo == pr.repo && p.number == pr.number) {
+            Some(slot) => {
+                *slot = pr;
+                true
+            }
+            None => false,
+        };
+        if replaced {
+            self.save(&g);
+        }
+        replaced
     }
     fn put_review(&self, review: Review) {
         self.mutate(|s| s.reviews.push(review));

@@ -239,3 +239,9 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 /* home grid a touch calmer */
 .grid { padding: 20px 24px; }
 .grid h2 { font-size: 15px; }
+
+.verif.merged { background: #201a24; color: #c98bd6; }
+.merge-bar { display: flex; align-items: center; gap: 10px; padding-bottom: 8px; border-bottom: 1px solid #1c2432; margin-bottom: 4px; }
+.merge-btn { padding: 5px 16px; border-radius: 6px; border: 1px solid #7c4fbf; background: #1c1526; color: #c98bd6; font: inherit; font-size: 13px; cursor: pointer; }
+.merge-btn:hover { background: #241a30; }
+.merged-note { color: #c98bd6; font-weight: 500; }

@@ -20,7 +20,7 @@ type ActivityEvent =
   | { kind: "issue"; repo: string; number: number; action: string; actor: string; ts: number };
 
 type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable: boolean; human_root: string | null };
-type PR = { number: number; title: string; author: string; changes: string[]; verification: string };
+type PR = { number: number; title: string; author: string; changes: string[]; verification: string; state: string };
 type Finding = { path: string; line?: number; severity: string; note: string };
 type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string; findings: Finding[] };
 type CodeRef = { repo: string; blob: string; path: string; line_start: number; line_end?: number };
@@ -230,6 +230,16 @@ export function App() {
     } else {
       alert(await res.text());
     }
+  };
+
+  const mergePr = async (number: number) => {
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${number}/merge`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ actor: actingAs }),
+    });
+    if (res.ok) loadPrs();
+    else alert(await res.text());
   };
 
   const createPr = async (e: React.FormEvent) => {
@@ -604,7 +614,9 @@ export function App() {
             return (
             <li key={p.number} className="issue">
               <div className="issue-row">
-                <span className={"verif " + p.verification}>{p.verification}</span>
+                <span className={"verif " + (p.state === "merged" ? "merged" : p.verification)}>
+                  {p.state === "merged" ? "merged" : p.verification}
+                </span>
                 <span className="num">!{p.number}</span>
                 <button
                   className="it-title"
@@ -626,6 +638,18 @@ export function App() {
               </div>
               {openPr === p.number && (
                 <div className="reviews">
+                  <div className="merge-bar">
+                    {p.state === "merged" ? (
+                      <span className="merged-note">✓ merged</span>
+                    ) : (
+                      <>
+                        <button className="merge-btn" onClick={() => mergePr(p.number)}>Merge</button>
+                        <span className="muted">
+                          gate: keel-verify green + an approving review from someone other than the author
+                        </span>
+                      </>
+                    )}
+                  </div>
                   {prReviews.length === 0 && <p className="muted">no reviews yet</p>}
                   {prReviews.map((r) => (
                     <button className="review clickable" key={r.id} onClick={() => setOpenReview(r)} title="open review">
