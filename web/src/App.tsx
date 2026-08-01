@@ -678,14 +678,19 @@ function ReviewPage({
         {change?.session ? (
           <section className="rp-card">
             <h3>
-              Session <span className="muted">the keel session that produced this change</span>
+              Session <span className="muted">the agent session behind this change</span>
             </h3>
             <p><b>task:</b> {change.session.task}</p>
             <p>
-              <b>model:</b> {change.session.model || "—"} · <b>tool calls:</b> {change.session.tool_calls} ·{" "}
-              <b>tokens:</b> {change.session.tokens_in}/{change.session.tokens_out}
+              <b>model:</b> {change.session.model || "—"}
+              {change.session.lesson && <> · <b>lesson:</b> <i>{change.session.lesson}</i></>}
             </p>
-            {change.session.lesson && <p><b>lesson learned:</b> <i>{change.session.lesson}</i></p>}
+            {(change.session.tool_calls > 0 || change.session.tokens_out > 0) && (
+              <p className="muted">
+                agent-session totals: {change.session.tool_calls} tool calls · {change.session.tokens_in}/
+                {change.session.tokens_out} tokens (spans the whole run, not just this change)
+              </p>
+            )}
           </section>
         ) : (
           <section className="rp-card muted-card">

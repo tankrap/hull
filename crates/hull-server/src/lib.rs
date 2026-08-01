@@ -353,14 +353,15 @@ async fn ingest_session(
     if let Err(resp) = require_accountable(&app, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
         return resp;
     }
-    let task = body.get("task").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    if task.is_empty() {
-        return (StatusCode::BAD_REQUEST, "task is required").into_response();
-    }
+    // The task is authoritative from the CHANGE's own intent, never the caller — so a session
+    // captured from a long multi-task agent run can't mislabel what a specific change did.
+    let Some(info) = app.repos.change_info(&tenant, &repo, &id) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "unknown change").into_response();
+    };
     let record = SessionRecord {
         repo: format!("{tenant}/{repo}"),
         change: id,
-        task,
+        task: info.intent,
         model: body.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
         lesson: body.get("lesson").and_then(Value::as_str).unwrap_or("").to_string(),
         tool_calls: body.get("tool_calls").and_then(Value::as_u64).unwrap_or(0) as usize,
