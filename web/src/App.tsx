@@ -186,6 +186,14 @@ export function App() {
     loadIssues();
   };
 
+  // Accounts / orgs (membership + roles).
+  type Account = { id: string; handle: string; kind: string; repos: string[]; members: { handle: string; role: string }[] };
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  useEffect(() => {
+    fetch("/api/accounts").then((r) => r.json()).then((d) => setAccounts(d.accounts ?? [])).catch(() => {});
+  }, []);
+  const org = accounts.find((a) => a.handle === tenant);
+
   // Server-side secret-scan findings for the selected repo.
   const [secrets, setSecrets] = useState<{ path: string; line: number; title: string; redacted: string }[]>([]);
   useEffect(() => {
@@ -401,6 +409,19 @@ export function App() {
         </div>
       </header>
 
+      {view === "home" && org && (
+        <div className="org-card">
+          <span className="org-name">{org.handle}</span>
+          <span className="muted">{org.kind}</span>
+          <span className="org-members">
+            {org.members.map((m, i) => (
+              <span className="mem" key={i}>
+                {m.handle}<span className="role">{m.role}</span>
+              </span>
+            ))}
+          </span>
+        </div>
+      )}
       {view === "home" && (
       <main className="grid">
         <section>

@@ -152,6 +152,8 @@ fn make_router(app: App) -> Router {
         .route("/api/home", get(home))
         .route("/api/feed", get(feed))
         .route("/api/actors", get(actors_list).post(register_actor))
+        .route("/api/accounts", get(accounts_list))
+        .route("/api/accounts/:id/members", post(add_member))
         .route("/api/auth/challenge", get(auth_challenge))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/me", get(auth_me))
@@ -260,6 +262,67 @@ async fn notifications_list(State(app): State<App>) -> Json<Value> {
     let mut n = app.notifications.lock().unwrap().clone();
     n.reverse();
     Json(json!({ "notifications": n }))
+}
+
+/// Accounts (orgs / personal) with their members (handle + role) and owned repos.
+async fn accounts_list(State(app): State<App>) -> Json<Value> {
+    let repos = app.store.repos();
+    let accounts: Vec<Value> = app
+        .store
+        .accounts()
+        .into_iter()
+        .map(|a| {
+            let members: Vec<Value> = a
+                .members
+                .iter()
+                .map(|m| {
+                    json!({
+                        "actor": m.actor,
+                        "handle": app.store.actor(&m.actor).map(|x| x.handle).unwrap_or_default(),
+                        "role": m.role,
+                    })
+                })
+                .collect();
+            let owned: Vec<String> = repos.iter().filter(|r| r.owner == a.id).map(|r| r.name.clone()).collect();
+            json!({ "id": a.id, "handle": a.handle, "kind": a.kind, "members": members, "repos": owned })
+        })
+        .collect();
+    Json(json!({ "accounts": accounts }))
+}
+
+/// Add/update an org member (`POST /api/accounts/:id/members` with `{actor, role}`). Authz uses
+/// membership: only an **Owner or Admin** of the org may do it.
+async fn add_member(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let acting = match require_actor(&app, &headers, body.get("by").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(mut acct) = app.store.accounts().into_iter().find(|a| a.id == id) else {
+        return (StatusCode::NOT_FOUND, "no such account").into_response();
+    };
+    let is_admin = acct.members.iter().any(|m| m.actor == acting.id && matches!(m.role, Role::Owner | Role::Admin));
+    if !is_admin {
+        return (StatusCode::FORBIDDEN, "only an org owner/admin can manage members").into_response();
+    }
+    let actor = body.get("actor").and_then(Value::as_str).unwrap_or("").to_string();
+    if app.store.actor(&actor).is_none() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "unknown actor").into_response();
+    }
+    let role = match body.get("role").and_then(Value::as_str) {
+        Some("owner") => Role::Owner,
+        Some("admin") => Role::Admin,
+        Some("read") => Role::Read,
+        _ => Role::Write,
+    };
+    acct.members.retain(|m| m.actor != actor);
+    acct.members.push(Membership { actor, role });
+    app.store.put_account(acct.clone());
+    (StatusCode::CREATED, Json(json!({ "account": acct }))).into_response()
 }
 
 /// Registered actors (public — no secret keys), each with its accountability root.
@@ -923,12 +986,6 @@ async fn feed(
 /// Seed a little sample data so the scaffold is explorable — including real accountable actors: a
 /// human, and an agent delegated by that human (so there's an accountable author to open issues).
 fn seed(store: &dyn Store) {
-    store.put_account(Account {
-        id: "acct_tankrap".into(),
-        kind: AccountKind::Organization,
-        handle: "tankrap".into(),
-        members: vec![],
-    });
     for name in ["keel", "hull"] {
         store.put_repo(Repo {
             id: format!("repo_{name}"),
@@ -937,12 +994,14 @@ fn seed(store: &dyn Store) {
             default_branch: "main".into(),
         });
     }
-    // A human root + an agent it delegated — both real Ed25519 identities.
+    // A human root + an agent it delegated — both real Ed25519 identities, both org members.
     let human = identity::mint_human("justin").actor;
     store.put_actor(human.clone());
+    let mut members = vec![Membership { actor: human.id.clone(), role: Role::Owner }];
     if let Some(agent) =
         identity::mint_agent("agent:reviewer", &human, "issues:*", Lifetime::Static)
     {
+        members.push(Membership { actor: agent.actor.id.clone(), role: Role::Write });
         // agent:reviewer owns the server crate — it'll be auto-requested on PRs touching it.
         store.set_owners(
             "tankrap/hull",
@@ -950,6 +1009,12 @@ fn seed(store: &dyn Store) {
         );
         store.put_actor(agent.actor);
     }
+    store.put_account(Account {
+        id: "acct_tankrap".into(),
+        kind: AccountKind::Organization,
+        handle: "tankrap".into(),
+        members,
+    });
     store.put_issue(Issue {
         id: "iss_1".into(),
         repo: "repo_keel".into(),
