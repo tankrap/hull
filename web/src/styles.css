@@ -275,3 +275,4 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .sec-banner b { color: #ff9b9b; }
 .sec-banner ul { margin: 8px 0 0; padding-left: 18px; color: #cdd3df; font-size: 13px; }
 .sec-banner code { color: #ffb3b3; }
+.owners-chip { font-size: 12px; color: #d6b98f; background: #201a12; border: 1px solid #3a2f1c; padding: 2px 8px; border-radius: 20px; }

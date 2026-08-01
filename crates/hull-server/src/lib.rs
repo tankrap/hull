@@ -166,6 +166,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
         .route("/api/repos/:tenant/:repo/security", get(repo_security))
+        .route("/api/repos/:tenant/:repo/owners", get(owners_list).post(set_owners))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
@@ -405,6 +406,59 @@ async fn why(
     let path = q.get("path").map(String::as_str).unwrap_or("");
     let prov = app.repos.why(&tenant, &repo, path, 10);
     Json(json!({ "path": path, "provenance": prov }))
+}
+
+/// A repo's code-owner rules (`GET /api/repos/:tenant/:repo/owners`).
+async fn owners_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+    Json(json!({ "owners": app.store.owners(&format!("{tenant}/{repo}")) }))
+}
+
+/// Set a repo's code-owner rules (`POST …/owners` with `{rules: [{glob, owners:[actorId]}]}`),
+/// gated to an accountable actor.
+async fn set_owners(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        return resp;
+    }
+    let rules: Vec<OwnerRule> = body
+        .get("rules")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    Some(OwnerRule {
+                        glob: r.get("glob").and_then(Value::as_str)?.to_string(),
+                        owners: r
+                            .get("owners")
+                            .and_then(Value::as_array)
+                            .map(|o| o.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    app.store.set_owners(&format!("{tenant}/{repo}"), rules.clone());
+    (StatusCode::CREATED, Json(json!({ "owners": rules }))).into_response()
+}
+
+/// Resolve the code owners whose globs match any of `files`, deduped.
+fn owners_for(app: &App, repo_key: &str, files: &[String]) -> Vec<String> {
+    let mut set: Vec<String> = Vec::new();
+    for rule in app.store.owners(repo_key) {
+        if files.iter().any(|f| hull_core::store::glob_match(&rule.glob, f)) {
+            for o in rule.owners {
+                if !set.contains(&o) {
+                    set.push(o);
+                }
+            }
+        }
+    }
+    set
 }
 
 /// Secret findings from the server-side push scan (`GET /api/repos/:tenant/:repo/security`).
@@ -671,6 +725,14 @@ async fn create_pr(
         return (StatusCode::UNPROCESSABLE_ENTITY, "no changes to propose (empty repo?)").into_response();
     }
     let number = app.store.prs(&key).iter().map(|p| p.number).max().unwrap_or(0) + 1;
+    // Code owners: resolve the owners of any file this change touches — they become requested
+    // reviewers and get notified.
+    let files: Vec<String> = changes
+        .first()
+        .and_then(|c| app.repos.change_info(&tenant, &repo, c))
+        .map(|ci| ci.files.into_iter().map(|f| f.path).collect())
+        .unwrap_or_default();
+    let owners = owners_for(&app, &key, &files);
     let pr = PullRequest {
         id: format!("pr_{}_{number}", key.replace('/', "_")),
         repo: key,
@@ -679,11 +741,19 @@ async fn create_pr(
         author: actor.id,
         changes,
         verification: Verification::Unverified,
-        reviewers: vec![],
+        reviewers: owners.clone(),
         state: PrState::Open,
         merged_by: None,
         created_unix: now(),
     };
+    if !owners.is_empty() {
+        app.registry.notify(&NotifyEvent {
+            kind: "code_owner_referenced".into(),
+            to: owners,
+            summary: format!("your code is in PR !{number}: {}", pr.title),
+            change: pr.changes.first().cloned(),
+        });
+    }
     app.store.put_pr(pr.clone());
     app.hub.publish(
         &tenant,
@@ -873,6 +943,11 @@ fn seed(store: &dyn Store) {
     if let Some(agent) =
         identity::mint_agent("agent:reviewer", &human, "issues:*", Lifetime::Static)
     {
+        // agent:reviewer owns the server crate — it'll be auto-requested on PRs touching it.
+        store.set_owners(
+            "tankrap/hull",
+            vec![OwnerRule { glob: "crates/hull-server/**".into(), owners: vec![agent.actor.id.clone()] }],
+        );
         store.put_actor(agent.actor);
     }
     store.put_issue(Issue {

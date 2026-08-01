@@ -2,7 +2,7 @@
 //! (accounts/issues/projects as relational rows) that references keel objects by content address.
 //! Keeping this a trait means the server, tests, and the eventual SQL store all share one shape.
 
-use crate::{Account, Actor, Issue, Project, PullRequest, Repo, Review, SessionRecord};
+use crate::{Account, Actor, Issue, OwnerRule, Project, PullRequest, Repo, Review, SessionRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,6 +33,21 @@ pub trait Store: Send + Sync {
     fn session_record(&self, repo: &str, change: &str) -> Option<SessionRecord>;
     fn put_project(&self, project: Project);
     fn projects(&self, owner: &str) -> Vec<Project>;
+    /// Set a repo's code-owner rules (replaces the existing set).
+    fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>);
+    fn owners(&self, repo: &str) -> Vec<OwnerRule>;
+}
+
+/// Match a code-owner glob against a repo-relative path. Supports `dir/**` (prefix), `*.ext`
+/// (extension), and exact paths — enough for `.hull/owners`-style rules.
+pub fn glob_match(glob: &str, path: &str) -> bool {
+    if let Some(dir) = glob.strip_suffix("/**") {
+        return path == dir || path.starts_with(&format!("{dir}/"));
+    }
+    if let Some(ext) = glob.strip_prefix("*.") {
+        return path.ends_with(&format!(".{ext}"));
+    }
+    path == glob || path.starts_with(&format!("{glob}/"))
 }
 
 /// A thread-safe in-memory [`Store`] for the scaffold and tests.
@@ -45,6 +60,7 @@ pub struct InMemory {
     prs: RwLock<Vec<PullRequest>>,
     reviews: RwLock<Vec<Review>>,
     sessions: RwLock<Vec<SessionRecord>>,
+    owners: RwLock<HashMap<String, Vec<OwnerRule>>>,
     projects: RwLock<Vec<Project>>,
 }
 
@@ -128,6 +144,12 @@ impl Store for InMemory {
     fn projects(&self, owner: &str) -> Vec<Project> {
         self.projects.read().unwrap().iter().filter(|p| p.owner == owner).cloned().collect()
     }
+    fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>) {
+        self.owners.write().unwrap().insert(repo.to_string(), rules);
+    }
+    fn owners(&self, repo: &str) -> Vec<OwnerRule> {
+        self.owners.read().unwrap().get(repo).cloned().unwrap_or_default()
+    }
 }
 
 /// The full domain state, serialized as one JSON snapshot — the on-disk form of [`FileStore`].
@@ -147,6 +169,8 @@ struct Snapshot {
     reviews: Vec<Review>,
     #[serde(default)]
     sessions: Vec<SessionRecord>,
+    #[serde(default)]
+    owners: HashMap<String, Vec<OwnerRule>>,
     #[serde(default)]
     projects: Vec<Project>,
 }
@@ -283,6 +307,14 @@ impl Store for FileStore {
     }
     fn projects(&self, owner: &str) -> Vec<Project> {
         self.inner.read().unwrap().projects.iter().filter(|p| p.owner == owner).cloned().collect()
+    }
+    fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>) {
+        self.mutate(|s| {
+            s.owners.insert(repo.to_string(), rules);
+        });
+    }
+    fn owners(&self, repo: &str) -> Vec<OwnerRule> {
+        self.inner.read().unwrap().owners.get(repo).cloned().unwrap_or_default()
     }
 }
 

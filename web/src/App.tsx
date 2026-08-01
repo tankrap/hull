@@ -20,7 +20,7 @@ type ActivityEvent =
   | { kind: "issue"; repo: string; number: number; action: string; actor: string; ts: number };
 
 type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable: boolean; human_root: string | null };
-type PR = { number: number; title: string; author: string; changes: string[]; verification: string; state: string };
+type PR = { number: number; title: string; author: string; changes: string[]; verification: string; state: string; reviewers: string[] };
 type Finding = { path: string; line?: number; severity: string; note: string };
 type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string; findings: Finding[] };
 type CodeRef = { repo: string; blob: string; path: string; line_start: number; line_end?: number };
@@ -652,6 +652,9 @@ export function App() {
                 </span>
                 {prReviews.length > 0 && (
                   <span className="review-count" title="reviews">{prReviews.length} review{prReviews.length > 1 ? "s" : ""}</span>
+                )}
+                {p.reviewers?.length > 0 && (
+                  <span className="owners-chip" title="code owners auto-requested">◎ {p.reviewers.map((id) => handleOf(id)).join(", ")}</span>
                 )}
                 <span className={"by " + (actors.find((a) => a.id === p.author)?.kind ?? "")}>
                   {handleOf(p.author)}
