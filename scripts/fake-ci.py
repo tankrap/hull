@@ -12,8 +12,10 @@ Then point a repo (or the instance) at it:
     HULL_CI_URL=http://127.0.0.1:<port> HULL_CI_SECRET=<secret> hull-server
     # or: PUT /api/repos/:tenant/:repo/ci-config { by, url, secret }
 """
+import io
 import json
 import sys
+import tarfile
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -22,9 +24,21 @@ VERDICT = sys.argv[2] if len(sys.argv) > 2 else "green"   # what this stand-in r
 SECRET = sys.argv[3] if len(sys.argv) > 3 else ""
 
 
+def fetch_source(job):
+    """keel-native, content-addressed: GET job['source_url'] to obtain the change's tree (by tree_id)
+    as a tar archive. NOT git. A real runner extracts this into a sandbox and runs there."""
+    with urllib.request.urlopen(job["source_url"]) as r:
+        data = r.read()
+    tf = tarfile.open(fileobj=io.BytesIO(data))
+    names = tf.getnames()
+    print(f"  [fake-ci] fetched keel tree {job['tree_id'][:12]} → {len(names)} entries, {len(data)} bytes", flush=True)
+    return names
+
+
 def run_checks(job):
-    """Where a real CI clones job['git_url'] @ job['ref'] and runs tests on a sandboxed runner.
-    Returns (status, summary). This stand-in just reports a fixed verdict."""
+    """Where a real CI extracts the source into a sandbox and runs tests. Returns (status, summary).
+    This stand-in fetches the tree (proving the keel-native fetch works) and reports a fixed verdict."""
+    fetch_source(job)
     return VERDICT, f"fake-ci reporting {VERDICT} for {job['change'][:12]}"
 
 
@@ -42,7 +56,7 @@ class Handler(BaseHTTPRequestHandler):
         job = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         version = self.headers.get("X-Hull-CI-Version", "?")
         print(f"[fake-ci] dispatch v{version}: {job['repo']} change={job['change'][:12]} "
-              f"tree={job['tree_id'][:12]} clone={job['git_url']}@{job['ref'][:12]}", flush=True)
+              f"tree={job['tree_id'][:12]} source={job['source_url']}", flush=True)
 
         # §5 — acknowledge receipt immediately; the verdict comes later via the callback.
         self.send_response(202)

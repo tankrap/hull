@@ -236,6 +236,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
         .route("/api/repos/:tenant/:repo/change/:id/ledger", get(change_ledger))
+        .route("/api/repos/:tenant/:repo/tree/:tree/tar", get(tree_archive))
         .route("/api/repos/:tenant/:repo/change/:id/check", post(run_check_handler))
         .route("/api/repos/:tenant/:repo/change/:id/ci-result", post(ci_result))
         .route("/api/repos/:tenant/:repo/ci-config", get(get_ci_config).put(set_ci_config))
@@ -671,6 +672,42 @@ async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(Strin
 /// semantic-operations summary — the review's diff viewer.
 async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
     Json(json!({ "files": app.repos.diff(&tenant, &repo, &id) }))
+}
+
+/// **keel-native content-addressed source fetch** (`GET …/tree/:tree/tar`): the change's keel tree,
+/// addressed by its `tree_id`, materialized and streamed as a tar archive. This is how a CI or
+/// reviewer runner obtains source — by content address, over keel, **not** `git clone`. (Hull's git
+/// smart-HTTP endpoints exist only for interop/mirroring, never as the runner fetch path.) The
+/// archive is verifiable: re-hashing the tree reproduces `tree`.
+async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(String, String, String)>) -> Response {
+    let dir = std::env::temp_dir().join(format!("hull-tree-{}-{}", &tree[..tree.len().min(16)], std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if !app.repos.checkout_tree(&tenant, &repo, &tree, &dir) {
+        return (StatusCode::NOT_FOUND, "no such tree").into_response();
+    }
+    let result = tokio::task::spawn_blocking({
+        let dir = dir.clone();
+        move || {
+            let mut buf = Vec::new();
+            {
+                let mut ar = tar::Builder::new(&mut buf);
+                ar.mode(tar::HeaderMode::Deterministic);
+                ar.append_dir_all(".", &dir)?;
+                ar.finish()?;
+            }
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        }
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    match result {
+        Ok(Ok(bytes)) => (
+            [(axum::http::header::CONTENT_TYPE, "application/x-tar"), (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"tree.tar\"")],
+            bytes,
+        )
+            .into_response(),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "could not archive tree").into_response(),
+    }
 }
 
 /// The **reconciliation ledger** for a change (`GET …/change/:id/ledger`): the claims extracted from

@@ -42,3 +42,6 @@ rcgen = "0.13"
 # Outbound HTTP: Hull dispatches a standard CI job payload to the repo's configured CI endpoint
 # (Hull owns no queue — the CI system does whatever it wants and posts the verdict back).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Content-addressed source fetch: a CI/reviewer runner pulls the change's keel TREE (by tree_id) as
+# a tar archive — keel-native, NOT git. git smart-HTTP stays strictly for interop/mirroring.
+tar = "0.4"

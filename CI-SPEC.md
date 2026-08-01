@@ -49,7 +49,7 @@ sequenceDiagram
     H->>C: POST <ci endpoint>  (dispatch payload, §5)
     C-->>H: 2xx (accepted)
     H-->>U: { status: "dispatched" }
-    C->>H: GET/clone git_url @ ref
+    C->>H: GET source_url  (keel tree tar, by tree_id)
     H-->>C: repository objects
     C->>R: schedule + run tests (your concern)
     R-->>C: pass / fail
@@ -102,8 +102,7 @@ X-Hull-CI-Secret: <shared secret>          # present iff a secret is configured
   "tree_id":      "f7a2d47020c63c8e…",
   "intent":       "fixes #6 pagination off-by-one",
   "author":       "justin",
-  "git_url":      "https://hull.example/tankrap/hull",
-  "ref":          "21ea2242186c99ff…",
+  "source_url":   "https://hull.example/api/repos/tankrap/hull/tree/f7a2d47020c63c8e…/tar",
   "callback_url": "https://hull.example/api/repos/tankrap/hull/change/21ea…/ci-result"
 }
 ```
@@ -114,12 +113,11 @@ X-Hull-CI-Secret: <shared secret>          # present iff a secret is configured
 |-------|------|-------|
 | `repo` | string | `tenant/repo`. Routing/logging only. |
 | `change` | string | keel change id. Include it in your callback path (Hull derives it from `callback_url`; you MUST use `callback_url` verbatim). |
-| `tree_id` | string | Content-address of the source. You **MAY** use it as your own cache key; you **MUST NOT** need it to run. |
+| `tree_id` | string | The keel **content-address** of the source. `source_url` resolves to exactly this tree; you **MAY** use it as your own cache key, and you **MAY** verify the fetched archive re-hashes to it. |
 | `intent` | string | Human summary of the change. Display only. |
 | `author` | string | Actor handle. Display only. |
-| `git_url` | string | Clone URL. Hull serves git smart-HTTP at this path. |
-| `ref` | string | The revision to check out after cloning (equal to `change`). |
-| `callback_url` | string | Where to POST the verdict (§6). Treat as **opaque**; do not construct it yourself. |
+| `source_url` | string | keel-native, content-addressed source: **GET** it to receive the change's tree (identified by `tree_id`) as a `tar` archive. This is the *only* fetch path — see §6. Treat as **opaque**. |
+| `callback_url` | string | Where to POST the verdict (§6/§7). Treat as **opaque**; do not construct it yourself. |
 
 **Your CI MUST:**
 - Respond `2xx` promptly to acknowledge receipt (this is *accepted*, not *done*). A non-2xx response
@@ -134,19 +132,28 @@ X-Hull-CI-Secret: <shared secret>          # present iff a secret is configured
 
 ## 6. Fetching the source
 
-Clone `git_url` and check out `ref`:
+Source is fetched **by content address, over keel — never with git.** keel is the substrate; git in
+Hull exists only for interop/mirroring and is not part of this contract.
+
+`GET source_url` returns the change's keel **tree** (the one named by `tree_id`) as a `tar` archive.
+Extract it into your sandbox and run there:
 
 ```
-git clone <git_url> work && cd work && git checkout <ref>
+curl -sL "$source_url" | tar -x -C work && cd work
 ```
 
-Hull serves standard git smart-HTTP (`info/refs?service=git-upload-pack`, `git-upload-pack`) at
-`git_url`. Your runners **SHOULD** perform the clone inside the isolated sandbox, not on the
-control-plane host.
+Because the source is addressed by `tree_id`, the fetch is:
+- **Content-addressed** — the same `tree_id` always yields the same bytes; cache on it freely.
+- **Verifiable** — a conforming runner **MAY** re-hash the extracted tree and confirm it reproduces
+  `tree_id`, rejecting a mismatch.
+- **git-free** — do **not** `git clone`. A runner that shells out to git for source is not
+  conforming; there is no ref to check out and no `.git` in the archive.
 
-> **Private repositories:** clone auth is out of scope for contract v1 (repos are assumed fetchable
-> by the CI system's network identity). A scoped, short-lived fetch token in the dispatch payload is
-> reserved for a future version; ignore its absence today.
+Your runners **SHOULD** fetch and extract inside the isolated sandbox, not on the control-plane host.
+
+> **Private repositories:** `source_url` auth is out of scope for contract v1 (the archive is
+> fetchable by the CI system's network identity). A scoped, short-lived fetch token in the dispatch
+> payload is reserved for a future version; ignore its absence today.
 
 ---
 
@@ -229,7 +236,7 @@ A conforming CI integration:
 
 - [ ] Accepts `POST` at its configured endpoint and returns `2xx` on receipt.
 - [ ] Verifies `X-Hull-CI-Secret` on dispatch when a secret is configured.
-- [ ] Clones `git_url`, checks out `ref`, runs its checks in isolation.
+- [ ] Fetches `source_url` (keel tree tar), extracts, runs its checks in isolation — no git.
 - [ ] POSTs `{status, summary}` to the exact `callback_url`, echoing `X-Hull-CI-Secret`.
 - [ ] Uses `errored` (not `red`) for infrastructure failures.
 - [ ] Ignores unknown dispatch fields (forward-compatible).
@@ -248,7 +255,7 @@ def on_dispatch(req):
     job = req.json()
     ack(202)                                                # §5: acknowledge, don't block
 
-    workdir = clone(job["git_url"], ref=job["ref"])         # §6
+    workdir = fetch_tar(job["source_url"])                  # §6 — content-addressed, not git
     result  = run_tests_in_sandbox(workdir)                 # your concern
 
     status  = "green" if result.ok else "red"               # §7

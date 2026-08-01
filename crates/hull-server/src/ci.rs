@@ -229,9 +229,9 @@ pub fn dispatch_body(tenant: &str, repo: &str, change: &str, tree: &str, intent:
         "tree_id": tree,
         "intent": intent,
         "author": author,
-        // The runner clones this and checks out `ref` (the change id) — Hull serves git at /:t/:r.
-        "git_url": format!("{base}/{tenant}/{repo}"),
-        "ref": change,
+        // keel-native, content-addressed source: GET this to obtain the change's tree (by tree_id) as
+        // a tar archive. NOT git — git smart-HTTP is interop/mirroring only.
+        "source_url": format!("{base}/api/repos/{tenant}/{repo}/tree/{tree}/tar"),
         // Where the CI system POSTs its verdict when done.
         "callback_url": format!("{base}/api/repos/{tenant}/{repo}/change/{change}/ci-result"),
     })

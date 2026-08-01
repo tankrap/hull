@@ -525,6 +525,14 @@ impl RepoHost {
         keel_store::snapshot::checkout(&store, tree, dir).is_ok()
     }
 
+    /// Materialize a **tree** (by its content-address `tree_id`) onto `dir` — the keel-native way a
+    /// runner obtains source: addressed by content, not a git ref.
+    pub fn checkout_tree(&self, tenant: &str, repo: &str, tree_hex: &str, dir: &std::path::Path) -> bool {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return false };
+        let Some(tid) = ObjectId::from_hex(tree_hex) else { return false };
+        keel_store::snapshot::checkout(&store, tid, dir).is_ok()
+    }
+
     /// The observable facts of a change — touched files, semantic operations, verification, and
     /// secret findings — the ground truth a [`reconcile`](hull_core::reconcile) run judges claims
     /// against.
