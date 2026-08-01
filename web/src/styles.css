@@ -403,3 +403,6 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 /* Thread wrapper heading */
 .thread-wrap{margin-top:12px}
 .thread-wrap h5{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}
+
+/* Repo search/filter box */
+.repo-search{margin-left:12px;min-width:180px;font-size:13px;padding:5px 10px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--ink)}

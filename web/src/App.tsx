@@ -167,6 +167,9 @@ export function App() {
   // You act only as your signed-in self. No token ⇒ no identity ⇒ writes are blocked (server 401s).
   const actingAs = me?.id ?? "";
   const canAct = !!me;
+  // Quick filter across the current repo's issues / PRs (title, body, #number).
+  const [q, setQ] = useState("");
+  const matchQ = (s: string) => q.trim() === "" || s.toLowerCase().includes(q.trim().toLowerCase());
 
   // Notifications inbox, scoped to the acting actor (addressed-to-them + broadcasts). Polled.
   useEffect(() => {
@@ -738,6 +741,13 @@ export function App() {
           <button className={"tab" + (tab === "prs" ? " active" : "")} onClick={() => setTab("prs")}>
             Pull requests <span className="muted">{prs.length}</span>
           </button>
+          <input
+            className="repo-search"
+            placeholder={`filter ${tab === "issues" ? "issues" : "pull requests"}…`}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            spellCheck={false}
+          />
           {!canAct && (
             <span className="acting-note">
               read-only — <button className="link" onClick={() => signInWith(DEMO_OWNER_SECRET)}>sign in</button> to act
@@ -788,6 +798,7 @@ export function App() {
         <ul className="issue-list">
           {issues.length === 0 && <li className="empty">no issues yet — open one above</li>}
           {[...issues]
+            .filter((it) => matchQ(`${it.title} ${it.body} #${it.number}`))
             .sort((a, b) => Number(a.status.state !== "open") - Number(b.status.state !== "open") || b.number - a.number)
             .map((it) => (
             <li key={it.number} className={"issue " + it.status.state}>
@@ -896,7 +907,7 @@ export function App() {
             { k: "cancelled", label: "Cancelled" },
             { k: "duplicate", label: "Duplicate" },
           ].map((col) => {
-            const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k);
+            const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k && matchQ(`${i.title} ${i.body} #${i.number}`));
             if (col.k !== "open" && inCol.length === 0) return null;
             return (
               <div className="col" key={col.k}>
@@ -939,7 +950,7 @@ export function App() {
         </form>
         <ul className="issue-list">
           {prs.length === 0 && <li className="empty">no pull requests yet</li>}
-          {[...prs].sort((a, b) => b.number - a.number).map((p) => {
+          {[...prs].filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
             const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
             return (
             <li key={p.number} className="issue">
