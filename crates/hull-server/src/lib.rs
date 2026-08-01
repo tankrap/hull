@@ -79,6 +79,14 @@ impl Notifier for RecordingNotifier {
     }
 }
 
+/// Login challenges (nonce → issue time) and issued session tokens (token → actor id). In-memory
+/// (crash-only); a hosted deployment would back this with the domain store / a cache.
+#[derive(Default)]
+struct AuthState {
+    challenges: HashMap<String, u64>,
+    tokens: HashMap<String, String>,
+}
+
 #[derive(Clone)]
 struct App {
     store: Arc<dyn Store>,
@@ -86,6 +94,7 @@ struct App {
     registry: Arc<Registry>,
     repos: repos::RepoHost,
     notifications: Arc<Mutex<Vec<Notification>>>,
+    auth: Arc<Mutex<AuthState>>,
 }
 
 impl repos::HasRepoHost for App {
@@ -111,7 +120,14 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
     // this plus the log notifier plus any hosted plugin notifier.
     let notifications: Arc<Mutex<Vec<Notification>>> = Arc::new(Mutex::new(Vec::new()));
     registry.add_notifier(Arc::new(RecordingNotifier(notifications.clone())));
-    App { store, hub, registry: Arc::new(registry), repos: repos::RepoHost::from_env(), notifications }
+    App {
+        store,
+        hub,
+        registry: Arc::new(registry),
+        repos: repos::RepoHost::from_env(),
+        notifications,
+        auth: Arc::new(Mutex::new(AuthState::default())),
+    }
 }
 
 /// Path to the durable domain snapshot (`HULL_DATA_DIR`/store.json, default `~/.hull/data`).
@@ -136,6 +152,9 @@ fn make_router(app: App) -> Router {
         .route("/api/home", get(home))
         .route("/api/feed", get(feed))
         .route("/api/actors", get(actors_list).post(register_actor))
+        .route("/api/auth/challenge", get(auth_challenge))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/me", get(auth_me))
         .route("/api/notifications", get(notifications_list))
         .route("/api/repos", get(repos_list))
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
@@ -288,6 +307,75 @@ async fn register_actor(State(app): State<App>, Json(body): Json<Value>) -> Resp
     (StatusCode::CREATED, Json(json!({ "actor": minted.actor, "secret_key": minted.secret_key }))).into_response()
 }
 
+// ── auth: prove you hold an actor's Ed25519 key, get a session token ────────────────────────────
+
+/// `GET /api/auth/challenge` — a one-time nonce to sign. Old nonces are pruned.
+async fn auth_challenge(State(app): State<App>) -> Json<Value> {
+    let nonce = identity::random_hex(16);
+    let now = now();
+    let mut a = app.auth.lock().unwrap();
+    a.challenges.retain(|_, ts| now.saturating_sub(*ts) < 300); // 5-minute TTL
+    a.challenges.insert(nonce.clone(), now);
+    Json(json!({ "nonce": nonce }))
+}
+
+/// `POST /api/auth/login` — `{actor, nonce, signature}`. Verifies the Ed25519 signature over
+/// `hull-login:<nonce>` against the actor's id (public key). On success, mints a session token.
+async fn auth_login(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let actor = body.get("actor").and_then(Value::as_str).unwrap_or("").to_string();
+    let nonce = body.get("nonce").and_then(Value::as_str).unwrap_or("").to_string();
+    let signature = body.get("signature").and_then(Value::as_str).unwrap_or("");
+    if app.store.actor(&actor).is_none() {
+        return (StatusCode::UNAUTHORIZED, "unknown actor").into_response();
+    }
+    {
+        // consume the nonce (one-time)
+        let mut a = app.auth.lock().unwrap();
+        if a.challenges.remove(&nonce).is_none() {
+            return (StatusCode::UNAUTHORIZED, "invalid or expired challenge").into_response();
+        }
+    }
+    let message = format!("hull-login:{nonce}");
+    if !identity::verify(&actor, message.as_bytes(), signature) {
+        return (StatusCode::UNAUTHORIZED, "signature verification failed").into_response();
+    }
+    let token = identity::random_hex(24);
+    app.auth.lock().unwrap().tokens.insert(token.clone(), actor.clone());
+    (StatusCode::CREATED, Json(json!({ "token": token, "actor": actor }))).into_response()
+}
+
+/// `GET /api/auth/me` (Bearer token) — the authenticated actor, or 401.
+async fn auth_me(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    match authed_actor(&app, &headers) {
+        Some(a) => Json(json!({ "id": a.id, "handle": a.handle, "kind": a.kind, "accountable": a.is_accountable() })).into_response(),
+        None => (StatusCode::UNAUTHORIZED, "not signed in").into_response(),
+    }
+}
+
+/// Resolve the `Authorization: Bearer <token>` header to its actor, if valid.
+fn authed_actor(app: &App, headers: &axum::http::HeaderMap) -> Option<Actor> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))?;
+    let actor_id = app.auth.lock().unwrap().tokens.get(token).cloned()?;
+    app.store.actor(&actor_id)
+}
+
+/// The authoring identity: the **authenticated** actor (Bearer token) when signed in, else the
+/// body-supplied `actor_id` (for curl/scripts). Either way it must be accountable.
+#[allow(clippy::result_large_err)]
+fn require_actor(app: &App, headers: &axum::http::HeaderMap, actor_id: &str) -> Result<Actor, Response> {
+    if let Some(a) = authed_actor(app, headers) {
+        return if a.is_accountable() {
+            Ok(a)
+        } else {
+            Err((StatusCode::FORBIDDEN, "authenticated actor is not accountable").into_response())
+        };
+    }
+    require_accountable(app, actor_id)
+}
+
 /// The accountability gate: an authoring action must be by a registered actor that chains to a
 /// human. Returns the actor, or a 403 response to short-circuit the handler.
 #[allow(clippy::result_large_err)] // the Err IS the HTTP response the caller returns
@@ -348,9 +436,10 @@ async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(Str
 async fn ingest_session(
     State(app): State<App>,
     Path((tenant, repo, id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(resp) = require_accountable(&app, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+    if let Err(resp) = require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
         return resp;
     }
     // The task is authoritative from the CHANGE's own intent, never the caller — so a session
@@ -384,10 +473,11 @@ async fn reviews(State(app): State<App>, Path((tenant, repo)): Path<(String, Str
 async fn create_review(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
-    let reviewer = match require_accountable(&app, body.get("reviewer").and_then(Value::as_str).unwrap_or("")) {
+    let reviewer = match require_actor(&app, &headers, body.get("reviewer").and_then(Value::as_str).unwrap_or("")) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -480,9 +570,10 @@ async fn prs(State(app): State<App>, Path((tenant, repo)): Path<(String, String)
 async fn verify_change(
     State(app): State<App>,
     Path((tenant, repo, id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(resp) = require_accountable(&app, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+    if let Err(resp) = require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
         return resp;
     }
     let green = body.get("green").and_then(Value::as_bool).unwrap_or(true);
@@ -499,10 +590,11 @@ async fn verify_change(
 async fn create_pr(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
-    let actor = match require_accountable(&app, body.get("author").and_then(Value::as_str).unwrap_or("")) {
+    let actor = match require_actor(&app, &headers, body.get("author").and_then(Value::as_str).unwrap_or("")) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -549,12 +641,13 @@ async fn issues(State(app): State<App>, Path((tenant, repo)): Path<(String, Stri
 async fn create_issue(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
-    // Accountability gate: the author must be a registered actor that chains to a human.
+    // Accountability gate: the author is the signed-in actor (or the body actor for scripts).
     let author_id = body.get("author").and_then(Value::as_str).unwrap_or("");
-    let actor = match require_accountable(&app, author_id) {
+    let actor = match require_actor(&app, &headers, author_id) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -631,11 +724,12 @@ async fn create_issue(
 async fn update_issue(
     State(app): State<App>,
     Path((tenant, repo, number)): Path<(String, String, u64)>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
     // A transition is an authoring action — the acting actor must chain to a human.
-    let acting = match require_accountable(&app, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+    let acting = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
         Ok(a) => a,
         Err(resp) => return resp,
     };

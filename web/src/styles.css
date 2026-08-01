@@ -205,3 +205,10 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .rp-findings .sev.warn { background: #241f12; color: #e6c27a; }
 .rp-findings .sev.blocker { background: #2a1618; color: #ff9b9b; }
 .rp-findings .fnote { color: #cdd3df; }
+
+.signin { display: flex; align-items: center; gap: 6px; margin-left: 12px; font-size: 13px; }
+.signin input { width: 12rem; padding: 4px 8px; border-radius: 6px; border: 1px solid #2a3040; background: #12151c; color: inherit; font: inherit; }
+.signin button, .signin .link { padding: 4px 10px; border-radius: 6px; border: 1px solid #2f8f6b; background: #14231d; color: #7ee2b8; font: inherit; font-size: 12px; cursor: pointer; }
+.signin .signed-in { color: #8b93a7; display: flex; align-items: center; gap: 8px; }
+.signin .signed-in b.human { color: #7ee2b8; } .signin .signed-in b.agent { color: #8fb4ff; }
+.signin .link { background: none; border: 0; color: #8fb4ff; padding: 0; }

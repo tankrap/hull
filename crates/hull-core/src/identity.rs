@@ -6,14 +6,34 @@
 //! are the next layer; this establishes the identities and the structural accountability gate.
 
 use crate::{Actor, ActorKind, Delegation, DelegationHop, Lifetime};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
+
+/// Verify that `signature_hex` is a valid Ed25519 signature of `message` by the actor whose id is
+/// `actor_id_hex` (the id **is** the public key). This is how an actor proves it holds the private
+/// key at login — authorship becomes cryptographic, not a claim.
+pub fn verify(actor_id_hex: &str, message: &[u8], signature_hex: &str) -> bool {
+    let Ok(pk) = hex::decode(actor_id_hex) else { return false };
+    let Ok(pk): Result<[u8; 32], _> = pk.try_into() else { return false };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk) else { return false };
+    let Ok(sig) = hex::decode(signature_hex) else { return false };
+    let Ok(sig): Result<[u8; 64], _> = sig.try_into() else { return false };
+    vk.verify(message, &Signature::from_bytes(&sig)).is_ok()
+}
 
 /// A freshly minted identity: the public [`Actor`] Hull stores, plus the Ed25519 **secret key**
 /// (hex) returned to the caller ONCE. Hull never persists the secret.
 pub struct Minted {
     pub actor: Actor,
     pub secret_key: String,
+}
+
+/// A cryptographically-random hex string of `bytes` bytes — for login nonces and session tokens.
+pub fn random_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut b = vec![0u8; bytes];
+    OsRng.fill_bytes(&mut b);
+    hex::encode(b)
 }
 
 fn keypair() -> (String, String) {
@@ -87,6 +107,21 @@ mod tests {
         // multi-hop: an agent delegating a sub-agent still roots at the human
         let sub = mint_agent("agent:fix", &agent.actor, "issues:close", Lifetime::Static).unwrap();
         assert_eq!(sub.actor.human_principal(), Some(&human.id));
+    }
+
+    #[test]
+    fn signature_verifies_key_possession() {
+        // sign a message with the minted secret, verify against the actor id (public key)
+        let m = mint_human("justin");
+        let sk_bytes: [u8; 32] = hex::decode(&m.secret_key).unwrap().try_into().unwrap();
+        let sk = SigningKey::from_bytes(&sk_bytes);
+        let msg = b"hull-login:nonce-123";
+        let sig = ed25519_dalek::Signer::sign(&sk, msg);
+        assert!(verify(&m.actor.id, msg, &hex::encode(sig.to_bytes())));
+        assert!(!verify(&m.actor.id, b"different message", &hex::encode(sig.to_bytes())));
+        // a different actor's id must not verify this signature
+        let other = mint_human("other").actor.id;
+        assert!(!verify(&other, msg, &hex::encode(sig.to_bytes())));
     }
 
     #[test]

@@ -1,4 +1,8 @@
 import { useEffect, useRef, useState } from "react";
+import * as ed from "@noble/ed25519";
+
+const hexToBytes = (h: string) => Uint8Array.from((h.match(/../g) ?? []).map((x) => parseInt(x, 16)));
+const bytesToHex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 
 // Mirrors hull-server's activity model.
 type RepoActivity = {
@@ -58,7 +62,53 @@ export function App() {
     return () => clearInterval(t);
   }, []);
 
-  // Registered actors + who we're acting as (every authoring action must be an accountable actor).
+  // Auth: sign in by proving possession of an actor's Ed25519 key → session token.
+  const [token, setToken] = useState<string>(() => localStorage.getItem("hull_token") ?? "");
+  const [me, setMe] = useState<{ id: string; handle: string; kind: string } | null>(null);
+  const [secretInput, setSecretInput] = useState("");
+  const authHeaders = (): Record<string, string> => (token ? { authorization: `Bearer ${token}` } : {});
+  useEffect(() => {
+    if (!token) {
+      setMe(null);
+      return;
+    }
+    fetch("/api/auth/me", { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((m) => setMe(m))
+      .catch(() => setMe(null));
+  }, [token]);
+  const signIn = async () => {
+    const secret = secretInput.trim();
+    if (!secret) return;
+    try {
+      const skBytes = hexToBytes(secret);
+      const actor = bytesToHex(await ed.getPublicKeyAsync(skBytes));
+      const { nonce } = await fetch("/api/auth/challenge").then((r) => r.json());
+      const sig = await ed.signAsync(new TextEncoder().encode(`hull-login:${nonce}`), skBytes);
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ actor, nonce, signature: bytesToHex(sig) }),
+      });
+      if (!res.ok) {
+        alert(await res.text());
+        return;
+      }
+      const { token: t } = await res.json();
+      localStorage.setItem("hull_token", t);
+      setToken(t);
+      setSecretInput("");
+    } catch (e) {
+      alert("bad secret key");
+    }
+  };
+  const signOut = () => {
+    localStorage.removeItem("hull_token");
+    setToken("");
+    setMe(null);
+  };
+
+  // Registered actors + who we're acting as (when not signed in, the body actor for demo use).
   const [actors, setActors] = useState<Actor[]>([]);
   const [actingAs, setActingAs] = useState<string>("");
   useEffect(() => {
@@ -110,7 +160,7 @@ export function App() {
   const transition = async (number: number, action: "close" | "reopen") => {
     await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues/${number}`, {
       method: "PATCH",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...authHeaders() },
       body: JSON.stringify({ action, actor: actingAs, ...(action === "close" ? { reason: "completed" } : {}) }),
     });
     loadIssues();
@@ -143,7 +193,7 @@ export function App() {
   const submitReview = async (prNumber: number) => {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         target: `pr:${prNumber}`,
         reviewer: actingAs,
@@ -168,7 +218,7 @@ export function App() {
     if (!prTitle.trim()) return;
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...authHeaders() },
       body: JSON.stringify({ title: prTitle.trim(), author: actingAs }),
     });
     if (res.ok) {
@@ -187,7 +237,7 @@ export function App() {
       : null;
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         title: form.title.trim(),
         author: actingAs,
@@ -262,6 +312,25 @@ export function App() {
             aria-label="tenant"
           />
         </label>
+        <div className="signin">
+          {me ? (
+            <span className="signed-in">
+              signed in as <b className={me.kind}>{me.handle}</b>
+              <button className="link" onClick={signOut}>sign out</button>
+            </span>
+          ) : (
+            <>
+              <input
+                type="password"
+                placeholder="secret key to sign in"
+                value={secretInput}
+                onChange={(e) => setSecretInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && signIn()}
+              />
+              <button onClick={signIn}>Sign in</button>
+            </>
+          )}
+        </div>
         <div className="bell-wrap">
           <button className="bell" onClick={() => setShowNotifs((s) => !s)} title="notifications">
             🔔{notifs.length > 0 && <span className="bell-count">{notifs.length}</span>}
