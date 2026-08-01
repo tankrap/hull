@@ -855,6 +855,9 @@ export function App() {
                     <span className="blob">⬡ {c.blob.slice(0, 10)}</span>
                   </button>
                 ))}
+                {it.labels.map((l) => (
+                  <button key={l} className="row-label" title="filter by this label" onClick={() => setQ(l)}>{l}</button>
+                ))}
                 {it.assignees.map((id) => (
                   <span key={id} className="assignee-chip" title="assignee">
                     ◎ {handleOf(id)}

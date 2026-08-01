@@ -422,3 +422,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .chip .x{background:none;border:none;color:var(--muted);cursor:pointer;padding:0;font-size:13px;line-height:1}
 .chip .x:hover{color:#cf222e}
 .label-add input{font-size:12px;padding:3px 8px;border:1px solid var(--line);border-radius:999px;background:var(--surface);color:var(--ink)}
+
+/* Label chip on issue row (click to filter) */
+.row-label{font-size:11px;color:var(--accent);border:1px solid color-mix(in srgb,var(--accent) 35%,var(--line));background:color-mix(in srgb,var(--accent) 8%,transparent);border-radius:999px;padding:1px 8px;cursor:pointer}
+.row-label:hover{background:color-mix(in srgb,var(--accent) 16%,transparent)}
