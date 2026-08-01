@@ -290,7 +290,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .board .card-assignees { font-size: 11px; color: #d6b98f; margin-top: 6px; }
 
 /* Organization card (home) */
-.org-card{display:flex;align-items:center;gap:14px;padding:10px 18px;margin:0 0 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel);flex-wrap:wrap}
+.org-card{display:flex;align-items:center;gap:14px;padding:10px 18px;margin:0 0 14px;border:1px solid var(--line);border-radius:10px;background:var(--surface);flex-wrap:wrap}
 .org-card .org-name{font-weight:650;letter-spacing:.2px}
 .org-card .org-members{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
 .org-card .mem{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;background:var(--bg)}
@@ -328,7 +328,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .check-result.green{color:#1a7f37}
 .check-result.red{color:#cf222e}
 .check-result.errored{color:#9a6700}
-.check-result .memo-tag{font-size:10px;text-transform:uppercase;letter-spacing:.4px;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--muted);font-weight:600}
+.check-result .memo-tag{font-size:10px;text-transform:uppercase;letter-spacing:.4px;background:var(--surface);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--muted);font-weight:600}
 .check-result .check-summary{font-weight:400;color:var(--muted);font-family:ui-monospace,monospace;font-size:11px}
 .checks-note{font-size:12px;margin:8px 0}
 .linklike{background:none;border:none;color:#0969da;cursor:pointer;padding:0;font:inherit;text-decoration:underline}
@@ -340,7 +340,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .auto-review-bar .muted{font-size:12px}
 
 /* Mirror panel (repo view) */
-.mirror-panel{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;margin:0 0 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel);font-size:13px}
+.mirror-panel{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;margin:0 0 12px;border:1px solid var(--line);border-radius:9px;background:var(--surface);font-size:13px}
 .mirror-badge{font-weight:700;color:#0969da;border:1px solid #0969da55;background:#0969da12;border-radius:999px;padding:2px 10px;font-size:12px}
 .mirror-panel code{font-family:ui-monospace,monospace}
 .mirror-note{width:100%;font-size:11px}
@@ -350,7 +350,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .notif .nk.ci_failed{color:#cf222e}
 .notif .nk.mirror_pushed{color:#0969da}
 .notif .nk.review_posted{color:#8250df}
-.nbcast{font-size:9px;text-transform:uppercase;letter-spacing:.4px;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:0 5px;color:var(--muted);margin-left:4px}
+.nbcast{font-size:9px;text-transform:uppercase;letter-spacing:.4px;background:var(--surface);border:1px solid var(--line);border-radius:4px;padding:0 5px;color:var(--muted);margin-left:4px}
 
 /* Issue ↔ PR linkage chips */
 .resolved-chip{font-size:11px;color:#1a7f37;border:1px solid #1a7f3744;background:#1a7f3710;border-radius:999px;padding:2px 9px;font-family:ui-monospace,monospace}
@@ -366,7 +366,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .whoami{background:none;border:none;font:inherit;font-weight:650;cursor:pointer;padding:0}
 .whoami.human{color:var(--accent,#0969da)}
 .whoami.agent{color:#8250df}
-.profile-drop{position:absolute;top:130%;right:0;z-index:30;width:360px;max-width:80vw;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.18);padding:14px}
+.profile-drop{position:absolute;top:130%;right:0;z-index:30;width:360px;max-width:80vw;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 40px #000a;padding:14px}
 .profile-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
 .profile-row{display:flex;flex-direction:column;gap:4px;margin:9px 0}
 .pk-label{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
@@ -378,7 +378,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .memberships .role{font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);border-left:1px solid var(--line);padding-left:6px}
 
 /* CI panel (repo view) */
-.ci-panel{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;margin:0 0 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel);font-size:13px}
+.ci-panel{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 14px;margin:0 0 12px;border:1px solid var(--line);border-radius:9px;background:var(--surface);font-size:13px}
 .ci-badge{font-weight:700;color:#6639ba;border:1px solid #6639ba55;background:#6639ba12;border-radius:999px;padding:2px 10px;font-size:12px}
 .ci-panel code{font-family:ui-monospace,monospace}
 .ci-form{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:auto}

@@ -676,7 +676,8 @@ export function App() {
             {isTenantOwner && (
               <form className="ci-form" onSubmit={(e) => { e.preventDefault(); saveCiConfig(false); }}>
                 <input className="ci-url" placeholder="https://your-ci/hull" value={ciUrl} onChange={(e) => setCiUrl(e.target.value)} spellCheck={false} />
-                <input className="ci-secret" type="password" placeholder="shared secret (optional)" value={ciSecret} onChange={(e) => setCiSecret(e.target.value)} />
+                <input className="ci-secret" type="text" placeholder="shared secret (optional)" value={ciSecret} onChange={(e) => setCiSecret(e.target.value)} spellCheck={false} />
+                <button type="button" className="link" title="generate a random 32-byte secret" onClick={() => setCiSecret(bytesToHex(crypto.getRandomValues(new Uint8Array(32))))}>generate</button>
                 <button type="submit">Set</button>
                 {ciConfig.source === "repo" && <button type="button" className="link" onClick={() => saveCiConfig(true)}>clear</button>}
                 <a className="ci-spec-link" href="https://github.com/tankrap/hull/blob/main/CI-SPEC.md" target="_blank" rel="noreferrer">spec ↗</a>
