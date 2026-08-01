@@ -14,11 +14,12 @@ pub mod repos;
 
 use activity::{ActivityEvent, ActivityHub};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::sse::{Event, Sse},
     routing::{get, post},
     Json, Router,
 };
+use std::collections::HashMap;
 use futures::stream::Stream;
 use hull_core::store::{InMemory, Store};
 use hull_core::*;
@@ -100,8 +101,11 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     axum::serve(listener, router).await.expect("serve");
 }
 
-async fn home(State(app): State<App>) -> Json<Value> {
-    Json(json!({ "repos": app.hub.home() }))
+/// Home for a tenant: `GET /api/home?tenant=acme` (defaults to `local`). The tenant will come from
+/// the authenticated session once auth lands (NEW-1166); until then it's an explicit param.
+async fn home(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+    let tenant = q.get("tenant").map(String::as_str).unwrap_or("local");
+    Json(json!({ "tenant": tenant, "repos": app.hub.home(tenant) }))
 }
 
 /// The repos actually hosted on disk (the filesystem registry), plus the seeded domain repos.
@@ -125,10 +129,20 @@ async fn plugins_list(State(app): State<App>) -> Json<Value> {
     Json(json!({ "plugins": app.registry.plugins() }))
 }
 
-/// SSE: stream live activity events as they arrive.
-async fn feed(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(app.hub.subscribe())
-        .filter_map(|ev| ev.ok().and_then(|ev| Event::default().json_data(&ev).ok()).map(Ok));
+/// SSE: stream live activity for one tenant — `GET /api/feed?tenant=acme` (defaults to `local`).
+/// Events for other tenants are filtered out, so a subscriber only ever sees its own fleet.
+async fn feed(
+    State(app): State<App>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let tenant = q.get("tenant").cloned().unwrap_or_else(|| "local".into());
+    let stream = BroadcastStream::new(app.hub.subscribe()).filter_map(move |ev| {
+        let te = ev.ok()?;
+        if te.tenant != tenant {
+            return None; // not this subscriber's tenant
+        }
+        Event::default().json_data(&te.event).ok().map(Ok)
+    });
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
@@ -196,7 +210,7 @@ fn spawn_fake_source(hub: Arc<ActivityHub>) {
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             let mut ev = script[i % script.len()].clone();
             stamp(&mut ev, now());
-            hub.publish(ev);
+            hub.publish("local", ev); // demo events live under the `local` tenant
             i += 1;
         }
     });

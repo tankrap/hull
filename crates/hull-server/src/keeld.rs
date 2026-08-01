@@ -12,22 +12,28 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// One local keeld to aggregate: the repo it serves and its QUIC address.
+/// One local keeld to aggregate: the tenant + repo it serves and its QUIC address.
 #[derive(Debug, Clone)]
 pub struct KeeldEndpoint {
+    pub tenant: String,
     pub repo: String,
     pub addr: SocketAddr,
 }
 
-/// Parse `HULL_KEELD` — a comma-separated list of `repo@host:port` (e.g. `hull@127.0.0.1:9000`).
-/// Empty/unset → no real sources (the caller falls back to the demo source).
+/// Parse `HULL_KEELD` — a comma-separated list of `[tenant/]repo@host:port`
+/// (e.g. `tankrap/hull@127.0.0.1:9000`). A bare `repo@…` uses the `local` tenant. Empty/unset →
+/// no real sources (the caller falls back to the demo source).
 pub fn endpoints_from_env() -> Vec<KeeldEndpoint> {
     let Ok(spec) = std::env::var("HULL_KEELD") else { return Vec::new() };
     spec.split(',')
         .filter_map(|s| {
-            let (repo, addr) = s.trim().split_once('@')?;
+            let (name, addr) = s.trim().split_once('@')?;
             let addr = addr.trim().parse().ok()?;
-            Some(KeeldEndpoint { repo: repo.trim().to_string(), addr })
+            let (tenant, repo) = match name.trim().split_once('/') {
+                Some((t, r)) => (t.to_string(), r.to_string()),
+                None => ("local".to_string(), name.trim().to_string()),
+            };
+            Some(KeeldEndpoint { tenant, repo, addr })
         })
         .collect()
 }
@@ -60,10 +66,10 @@ async fn stream_once(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = keel_net::Client::connect(ep.addr).await?;
     let mut events = client.subscribe().await?;
-    eprintln!("hull: subscribed to keeld for repo '{}' at {}", ep.repo, ep.addr);
+    eprintln!("hull: subscribed to keeld for {}/{} at {}", ep.tenant, ep.repo, ep.addr);
     while let Some(bytes) = events.next().await {
         if let Some(ev) = map_event(&bytes, &ep.repo) {
-            hub.publish(ev);
+            hub.publish(&ep.tenant, ev);
         }
     }
     Ok(())
@@ -105,10 +111,11 @@ mod tests {
 
     #[test]
     fn parses_endpoint_spec() {
-        std::env::set_var("HULL_KEELD", "hull@127.0.0.1:9000, keel@127.0.0.1:9001");
+        std::env::set_var("HULL_KEELD", "tankrap/hull@127.0.0.1:9000, keel@127.0.0.1:9001");
         let eps = endpoints_from_env();
         assert_eq!(eps.len(), 2);
-        assert_eq!(eps[0].repo, "hull");
+        assert_eq!((eps[0].tenant.as_str(), eps[0].repo.as_str()), ("tankrap", "hull"));
+        assert_eq!((eps[1].tenant.as_str(), eps[1].repo.as_str()), ("local", "keel")); // bare → local
         assert_eq!(eps[1].addr.port(), 9001);
         std::env::remove_var("HULL_KEELD");
     }

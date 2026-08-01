@@ -60,32 +60,42 @@ pub struct RepoActivity {
     pub hot_files: Vec<String>,
 }
 
-/// Central hub: broadcasts events to SSE subscribers and maintains per-repo activity.
+/// An event tagged with the tenant it belongs to — the unit on the broadcast bus. SSE subscribers
+/// filter by their own tenant so one org never sees another's fleet (NEW-1169).
+#[derive(Debug, Clone)]
+pub struct TenantEvent {
+    pub tenant: String,
+    pub event: ActivityEvent,
+}
+
+/// Central hub: broadcasts tenant-tagged events to SSE subscribers and maintains **per-tenant**
+/// repo activity, so the situation room is scoped to the viewing org.
 pub struct ActivityHub {
-    tx: broadcast::Sender<ActivityEvent>,
-    ranker: RwLock<Ranker>,
+    tx: broadcast::Sender<TenantEvent>,
+    /// tenant → its repo ranking.
+    rankers: RwLock<HashMap<String, Ranker>>,
 }
 
 impl ActivityHub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
-        ActivityHub { tx, ranker: RwLock::new(Ranker::default()) }
+        ActivityHub { tx, rankers: RwLock::new(HashMap::new()) }
     }
 
-    /// Subscribe to the live event stream (one receiver per SSE connection).
-    pub fn subscribe(&self) -> broadcast::Receiver<ActivityEvent> {
+    /// Subscribe to the raw (tenant-tagged) stream; the caller filters to its tenant.
+    pub fn subscribe(&self) -> broadcast::Receiver<TenantEvent> {
         self.tx.subscribe()
     }
 
-    /// Ingest an event: update the ranking and fan it out to subscribers.
-    pub fn publish(&self, ev: ActivityEvent) {
-        self.ranker.write().unwrap().observe(&ev);
-        let _ = self.tx.send(ev); // no subscribers is fine
+    /// Ingest an event for `tenant`: update that tenant's ranking and fan out on the bus.
+    pub fn publish(&self, tenant: &str, ev: ActivityEvent) {
+        self.rankers.write().unwrap().entry(tenant.to_string()).or_default().observe(&ev);
+        let _ = self.tx.send(TenantEvent { tenant: tenant.to_string(), event: ev }); // no subscribers is fine
     }
 
-    /// The home page: repos ranked by live activity (busy first), then recency.
-    pub fn home(&self) -> Vec<RepoActivity> {
-        self.ranker.read().unwrap().ranked()
+    /// The home page for one tenant: its repos ranked by live activity (busy first), then recency.
+    pub fn home(&self, tenant: &str) -> Vec<RepoActivity> {
+        self.rankers.read().unwrap().get(tenant).map(Ranker::ranked).unwrap_or_default()
     }
 }
 
@@ -144,4 +154,36 @@ fn dedup_push_front(list: &mut Vec<String>, item: &str, cap: usize) {
     list.retain(|x| x != item);
     list.insert(0, item.to_string());
     list.truncate(cap);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn brief(repo: &str) -> ActivityEvent {
+        ActivityEvent::AgentBrief {
+            actor: "agent:x".into(),
+            repo: repo.into(),
+            file: "f.rs".into(),
+            task: "t".into(),
+            ts: 1,
+        }
+    }
+
+    #[test]
+    fn home_is_scoped_per_tenant() {
+        let hub = ActivityHub::new();
+        hub.publish("acme", brief("acme-web"));
+        hub.publish("acme", brief("acme-api"));
+        hub.publish("globex", brief("globex-svc"));
+
+        let acme: Vec<_> = hub.home("acme").into_iter().map(|r| r.repo).collect();
+        let globex: Vec<_> = hub.home("globex").into_iter().map(|r| r.repo).collect();
+
+        assert_eq!(acme.len(), 2);
+        assert!(acme.contains(&"acme-web".to_string()) && acme.contains(&"acme-api".to_string()));
+        assert!(!acme.contains(&"globex-svc".to_string()), "acme must not see globex's repos");
+        assert_eq!(globex, vec!["globex-svc".to_string()]);
+        assert!(hub.home("unknown").is_empty()); // a tenant with no activity sees nothing
+    }
 }
