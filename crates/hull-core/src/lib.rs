@@ -248,6 +248,26 @@ pub struct PullRequest {
     pub created_unix: u64,
 }
 
+/// A keel session ingested for a hosted change (via `keel capture`) and associated by change id —
+/// the session-carrying bridge across the git boundary, where the native `Change.session` is lost.
+/// This is what fills a review's package with the task/reasoning/operations that produced the code.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub repo: String,
+    pub change: String,
+    pub task: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub lesson: String,
+    #[serde(default)]
+    pub tool_calls: usize,
+    #[serde(default)]
+    pub tokens_in: u64,
+    #[serde(default)]
+    pub tokens_out: u64,
+}
+
 /// A review of a target (a PR, or a keel change/session) — first-class, like keel's own reviews.
 /// The reviewer is an [`Actor`], so an **agent** can review (independent-by-construction: a model
 /// from a different family than the author), and every verdict is accountable.

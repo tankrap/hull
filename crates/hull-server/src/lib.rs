@@ -145,6 +145,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
+        .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
         // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
@@ -307,9 +308,55 @@ async fn why(
 /// it changed vs its parent — the keel-native "what does this touch" that anchors a review.
 async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
     match app.repos.change_info(&tenant, &repo, &id) {
-        Some(info) => Json(json!({ "change": info })),
+        Some(mut info) => {
+            // If the change carries no NATIVE keel session (e.g. it arrived over git), fall back to
+            // a session ingested for it (`keel capture` → POST …/session) — the session-carrying
+            // bridge across the git boundary.
+            if info.session.is_none() {
+                if let Some(sr) = app.store.session_record(&format!("{tenant}/{repo}"), &id) {
+                    info.session = Some(repos::SessionSummary {
+                        task: sr.task,
+                        model: sr.model,
+                        lesson: sr.lesson,
+                        tool_calls: sr.tool_calls,
+                        tokens_in: sr.tokens_in,
+                        tokens_out: sr.tokens_out,
+                    });
+                }
+            }
+            Json(json!({ "change": info }))
+        }
         None => Json(json!({ "change": null })),
     }
+}
+
+/// Ingest a keel session for a change (`POST …/change/:id/session`) — the output of `keel capture`,
+/// associated by change id. Gated to an accountable actor. Fills the review package for a change
+/// that crossed the git boundary (where the native `Change.session` was lost).
+async fn ingest_session(
+    State(app): State<App>,
+    Path((tenant, repo, id)): Path<(String, String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = require_accountable(&app, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        return resp;
+    }
+    let task = body.get("task").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if task.is_empty() {
+        return (StatusCode::BAD_REQUEST, "task is required").into_response();
+    }
+    let record = SessionRecord {
+        repo: format!("{tenant}/{repo}"),
+        change: id,
+        task,
+        model: body.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
+        lesson: body.get("lesson").and_then(Value::as_str).unwrap_or("").to_string(),
+        tool_calls: body.get("tool_calls").and_then(Value::as_u64).unwrap_or(0) as usize,
+        tokens_in: body.get("tokens_in").and_then(Value::as_u64).unwrap_or(0),
+        tokens_out: body.get("tokens_out").and_then(Value::as_u64).unwrap_or(0),
+    };
+    app.store.put_session_record(record.clone());
+    (StatusCode::CREATED, Json(json!({ "session": record }))).into_response()
 }
 
 /// List reviews for a hosted repo (`GET /api/repos/:tenant/:repo/reviews`); the client filters by

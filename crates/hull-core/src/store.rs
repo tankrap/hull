@@ -2,7 +2,7 @@
 //! (accounts/issues/projects as relational rows) that references keel objects by content address.
 //! Keeping this a trait means the server, tests, and the eventual SQL store all share one shape.
 
-use crate::{Account, Actor, Issue, Project, PullRequest, Repo, Review};
+use crate::{Account, Actor, Issue, Project, PullRequest, Repo, Review, SessionRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,6 +26,9 @@ pub trait Store: Send + Sync {
     fn prs(&self, repo: &str) -> Vec<PullRequest>;
     fn put_review(&self, review: Review);
     fn reviews(&self, repo: &str) -> Vec<Review>;
+    /// Associate an ingested keel session with a change (latest write wins per change).
+    fn put_session_record(&self, record: SessionRecord);
+    fn session_record(&self, repo: &str, change: &str) -> Option<SessionRecord>;
     fn put_project(&self, project: Project);
     fn projects(&self, owner: &str) -> Vec<Project>;
 }
@@ -39,6 +42,7 @@ pub struct InMemory {
     issues: RwLock<Vec<Issue>>,
     prs: RwLock<Vec<PullRequest>>,
     reviews: RwLock<Vec<Review>>,
+    sessions: RwLock<Vec<SessionRecord>>,
     projects: RwLock<Vec<Project>>,
 }
 
@@ -98,6 +102,14 @@ impl Store for InMemory {
     fn reviews(&self, repo: &str) -> Vec<Review> {
         self.reviews.read().unwrap().iter().filter(|r| r.repo == repo).cloned().collect()
     }
+    fn put_session_record(&self, record: SessionRecord) {
+        let mut g = self.sessions.write().unwrap();
+        g.retain(|s| !(s.repo == record.repo && s.change == record.change));
+        g.push(record);
+    }
+    fn session_record(&self, repo: &str, change: &str) -> Option<SessionRecord> {
+        self.sessions.read().unwrap().iter().find(|s| s.repo == repo && s.change == change).cloned()
+    }
     fn put_project(&self, project: Project) {
         self.projects.write().unwrap().push(project);
     }
@@ -121,6 +133,8 @@ struct Snapshot {
     prs: Vec<PullRequest>,
     #[serde(default)]
     reviews: Vec<Review>,
+    #[serde(default)]
+    sessions: Vec<SessionRecord>,
     #[serde(default)]
     projects: Vec<Project>,
 }
@@ -228,6 +242,15 @@ impl Store for FileStore {
     }
     fn reviews(&self, repo: &str) -> Vec<Review> {
         self.inner.read().unwrap().reviews.iter().filter(|r| r.repo == repo).cloned().collect()
+    }
+    fn put_session_record(&self, record: SessionRecord) {
+        self.mutate(|s| {
+            s.sessions.retain(|x| !(x.repo == record.repo && x.change == record.change));
+            s.sessions.push(record);
+        });
+    }
+    fn session_record(&self, repo: &str, change: &str) -> Option<SessionRecord> {
+        self.inner.read().unwrap().sessions.iter().find(|s| s.repo == repo && s.change == change).cloned()
     }
     fn put_project(&self, project: Project) {
         self.mutate(|s| s.projects.push(project));
