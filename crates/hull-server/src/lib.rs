@@ -103,6 +103,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/why", get(why))
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
+        .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
         // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
@@ -250,6 +251,15 @@ async fn why(
     let path = q.get("path").map(String::as_str).unwrap_or("");
     let prov = app.repos.why(&tenant, &repo, path, 10);
     Json(json!({ "path": path, "provenance": prov }))
+}
+
+/// Expand a keel change (`GET /api/repos/:tenant/:repo/change/:id`): intent, author, and the files
+/// it changed vs its parent — the keel-native "what does this touch" that anchors a review.
+async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
+    match app.repos.change_info(&tenant, &repo, &id) {
+        Some(info) => Json(json!({ "change": info })),
+        None => Json(json!({ "change": null })),
+    }
 }
 
 /// List reviews for a hosted repo (`GET /api/repos/:tenant/:repo/reviews`); the client filters by

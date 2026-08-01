@@ -154,3 +154,25 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .review-form select, .review-form input { padding: 6px 9px; border-radius: 6px; border: 1px solid #2a3040; background: #12151c; color: inherit; font: inherit; }
 .review-form input { flex: 1 1 240px; }
 .review-form button { padding: 6px 14px; border-radius: 6px; border: 1px solid #2f8f6b; background: #14231d; color: #7ee2b8; font: inherit; cursor: pointer; }
+
+/* review row clickable + review page */
+.review.clickable { width: 100%; text-align: left; background: none; border: 0; cursor: pointer; padding: 4px 0; font: inherit; }
+.review.clickable:hover .rv-summary { color: #8fb4ff; }
+.review-page .top .back { background: none; border: 0; color: #8fb4ff; cursor: pointer; font: inherit; font-size: 14px; }
+.review-main { max-width: 900px; margin: 0 auto; padding: 20px 24px 60px; display: flex; flex-direction: column; gap: 16px; }
+.rp-head { display: flex; align-items: center; gap: 12px; }
+.rp-head h1 { font-size: 20px; margin: 0; }
+.rp-head .verdict { font-size: 12px; text-transform: uppercase; padding: 3px 10px; border-radius: 20px; background: #1c2432; color: #9fb2d6; }
+.rp-head .verdict.approve { background: #14231d; color: #7ee2b8; }
+.rp-head .verdict.reject, .rp-head .verdict.request_changes { background: #2a1618; color: #ff9b9b; }
+.rp-card { background: #12151c; border: 1px solid #20263a; border-radius: 10px; padding: 14px 16px; }
+.rp-card h3 { margin: 0 0 8px; font-size: 14px; color: #cdd3df; }
+.rp-card h4 { margin: 12px 0 6px; font-size: 13px; color: #9fb2d6; }
+.rp-card .summary { color: #cdd3df; }
+.rp-card .badge { font-size: 12px; padding: 2px 8px; border-radius: 20px; margin-left: 6px; }
+.rp-card .badge.ok { background: #14231d; color: #7ee2b8; } .rp-card .badge.warn { background: #2a1618; color: #ff9b9b; }
+.rp-card b.human { color: #7ee2b8; } .rp-card b.agent { color: #8fb4ff; }
+.rp-files { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 3px; }
+.rp-files .fst { display: inline-block; width: 16px; text-align: center; border-radius: 4px; font-size: 11px; }
+.rp-files .fst.added { background: #14231d; color: #7ee2b8; } .rp-files .fst.modified { background: #1c2432; color: #8fb4ff; } .rp-files .fst.deleted { background: #2a1618; color: #ff9b9b; }
+.muted-card { opacity: .8; border-style: dashed; }

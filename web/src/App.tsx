@@ -114,6 +114,7 @@ export function App() {
   // Reviews (first-class), loaded per repo and filtered to a PR target.
   const [reviews, setReviews] = useState<Review[]>([]);
   const [openPr, setOpenPr] = useState<number | null>(null);
+  const [openReview, setOpenReview] = useState<Review | null>(null);
   const [reviewForm, setReviewForm] = useState({ verdict: "approve", summary: "" });
   const loadReviews = () =>
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`)
@@ -211,6 +212,19 @@ export function App() {
     };
     return () => es.close();
   }, [tenant]);
+
+  if (openReview) {
+    return (
+      <ReviewPage
+        review={openReview}
+        pr={prs.find((p) => `pr:${p.number}` === openReview.target) ?? null}
+        actors={actors}
+        tenant={tenant}
+        repo={issueRepo}
+        onBack={() => setOpenReview(null)}
+      />
+    );
+  }
 
   return (
     <div className="app">
@@ -464,11 +478,11 @@ export function App() {
                 <div className="reviews">
                   {prReviews.length === 0 && <p className="muted">no reviews yet</p>}
                   {prReviews.map((r) => (
-                    <div className="review" key={r.id}>
+                    <button className="review clickable" key={r.id} onClick={() => setOpenReview(r)} title="open review">
                       <span className={"verdict " + r.verdict}>{r.verdict.replace("_", " ")}</span>
                       <b className={actors.find((a) => a.id === r.reviewer)?.kind ?? ""}>{handleOf(r.reviewer)}</b>
-                      <span className="rv-summary">{r.summary}</span>
-                    </div>
+                      <span className="rv-summary">{r.summary || "open review →"}</span>
+                    </button>
                   ))}
                   <div className="review-form">
                     <select
@@ -494,6 +508,121 @@ export function App() {
           })}
         </ul>
       </section>
+    </div>
+  );
+}
+
+/** The review "package" — a dedicated page synthesizing what a reviewer needs, not a one-liner. */
+function ReviewPage({
+  review,
+  pr,
+  actors,
+  tenant,
+  repo,
+  onBack,
+}: {
+  review: Review;
+  pr: PR | null;
+  actors: Actor[];
+  tenant: string;
+  repo: string;
+  onBack: () => void;
+}) {
+  type ChangeInfo = { id: string; intent: string; author: string; files: { path: string; status: string }[] };
+  const [change, setChange] = useState<ChangeInfo | null>(null);
+  const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
+  const reviewerActor = actors.find((a) => a.id === review.reviewer);
+  const changeId = pr?.changes[0];
+  useEffect(() => {
+    if (!changeId) return;
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}`)
+      .then((r) => r.json())
+      .then((d) => setChange(d.change))
+      .catch(() => {});
+  }, [changeId, tenant, repo]);
+
+  const independent = pr ? pr.author !== review.reviewer : true;
+  const risk =
+    pr?.verification === "green"
+      ? "low — keel verify is green"
+      : change && change.files.length > 8
+        ? "elevated — unverified and a broad change"
+        : "moderate — unverified";
+
+  return (
+    <div className="app review-page">
+      <header className="top">
+        <button className="back" onClick={onBack}>
+          ← situation room
+        </button>
+        <div className="tag">review package · synthesized understanding, not a diff</div>
+      </header>
+      <main className="review-main">
+        <div className="rp-head">
+          <span className={"verdict " + review.verdict}>{review.verdict.replace("_", " ")}</span>
+          <h1>{pr ? `PR !${pr.number} · ${pr.title}` : review.target}</h1>
+        </div>
+
+        <section className="rp-card">
+          <h3>Reviewer</h3>
+          <p>
+            <b className={reviewerActor?.kind}>{handleOf(review.reviewer)}</b> ({reviewerActor?.kind ?? "actor"})
+            {reviewerActor?.human_root && (
+              <>
+                {" "}· accountable to human <code>{reviewerActor.human_root.slice(0, 10)}</code>
+              </>
+            )}
+            {independent ? (
+              <span className="badge ok"> independent of the author</span>
+            ) : (
+              <span className="badge warn"> same as the author</span>
+            )}
+          </p>
+          {review.summary && <p className="summary">{review.summary}</p>}
+        </section>
+
+        <section className="rp-card">
+          <h3>Proposed change</h3>
+          {change ? (
+            <>
+              <p>
+                <span className="blob">⬡ {change.id.slice(0, 12)}</span> · {change.intent} ·{" "}
+                <span className="muted">{change.author.split(" ")[0]}</span>
+              </p>
+              <h4>
+                What it touches <span className="muted">({change.files.length} files — from keel)</span>
+              </h4>
+              <ul className="rp-files">
+                {change.files.map((f) => (
+                  <li key={f.path}>
+                    <span className={"fst " + f.status}>{f.status[0].toUpperCase()}</span> <code>{f.path}</code>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <p className="muted">resolving the change from keel…</p>
+          )}
+        </section>
+
+        <section className="rp-card">
+          <h3>Risk read</h3>
+          <p>
+            verification: <b>{pr?.verification ?? "—"}</b> · risk: <b>{risk}</b>
+          </p>
+        </section>
+
+        <section className="rp-card muted-card">
+          <h3>
+            Session context <span className="muted">(from the keel session that produced this change)</span>
+          </h3>
+          <p className="muted">
+            task · reasoning · semantic operations · tests &amp; CI — these come from the keel session behind the
+            change. Not yet populated for a change pushed over plain git; wiring the session-linked review package
+            is the next slice.
+          </p>
+        </section>
+      </main>
     </div>
   );
 }

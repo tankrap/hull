@@ -127,6 +127,79 @@ pub struct Provenance {
     pub author: String,
 }
 
+/// A file changed by a keel change (vs its first parent) — the "what does this touch" for a review.
+#[derive(serde::Serialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub status: String, // added | modified | deleted
+}
+
+/// The keel change a PR proposes, expanded for the review page.
+#[derive(serde::Serialize)]
+pub struct ChangeInfo {
+    pub id: String,
+    pub intent: String,
+    pub author: String,
+    pub files: Vec<ChangedFile>,
+}
+
+const MODE_DIR: u32 = 0o040000;
+
+/// Recursively flatten a tree to `path -> blob id`.
+fn flatten_tree(store: &Store, tree: ObjectId, prefix: &str, out: &mut HashMap<String, ObjectId>, depth: u32) {
+    if depth > 64 {
+        return;
+    }
+    let entries = match store.get(&tree).ok().flatten() {
+        Some(Object::Tree(t)) => t.entries,
+        _ => return,
+    };
+    for e in entries {
+        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        if e.mode == MODE_DIR {
+            flatten_tree(store, e.id, &path, out, depth + 1);
+        } else {
+            out.insert(path, e.id);
+        }
+    }
+}
+
+impl RepoHost {
+    /// Expand the keel change `hex` in a hosted repo: its intent/author and the files it changed vs
+    /// its first parent (keel-native — "what does this change touch"). `None` if not found.
+    pub fn change_info(&self, tenant: &str, repo: &str, hex: &str) -> Option<ChangeInfo> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let cid = ObjectId::from_hex(hex)?;
+        let change = match store.get(&cid).ok()?? {
+            Object::Change(c) => c,
+            _ => return None,
+        };
+        let mut head = HashMap::new();
+        flatten_tree(&store, change.tree, "", &mut head, 0);
+        let mut parent = HashMap::new();
+        if let Some(p) = change.parents.first() {
+            if let Some(Object::Change(pc)) = store.get(p).ok().flatten() {
+                flatten_tree(&store, pc.tree, "", &mut parent, 0);
+            }
+        }
+        let mut files = Vec::new();
+        for (path, blob) in &head {
+            match parent.get(path) {
+                None => files.push(ChangedFile { path: path.clone(), status: "added".into() }),
+                Some(pb) if pb != blob => files.push(ChangedFile { path: path.clone(), status: "modified".into() }),
+                _ => {}
+            }
+        }
+        for path in parent.keys() {
+            if !head.contains_key(path) {
+                files.push(ChangedFile { path: path.clone(), status: "deleted".into() });
+            }
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Some(ChangeInfo { id: hex.to_string(), intent: change.intent, author: change.author, files })
+    }
+}
+
 impl RepoHost {
     /// First-parent history where `path`'s content changed vs its parent — i.e. the changes (and
     /// authors/agents) that actually touched it. This is `keel why` over a hosted repo, the spine
