@@ -11,9 +11,11 @@ async fn main() {
     // reconciliation reviewer stays the default, so the core is fully functional on its own.
     hull_server::run(hull_server::Options::default(), |reg| {
         if let Some(key) = reg.config("OPENROUTER_API_KEY") {
-            let model = reg.config("HULL_REVIEW_MODEL").unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string());
-            eprintln!("hull: OpenRouter AI reviewer active (model {model})");
-            reg.set_reviewer(std::sync::Arc::new(hull_review_openrouter::OpenRouterReviewer::new(key, model)));
+            // D4 model tiering: a cheap triage model screens; only escalations hit the deep model.
+            let screen = reg.config("HULL_REVIEW_MODEL").unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string());
+            let deep = reg.config("HULL_REVIEW_MODEL_DEEP").unwrap_or_else(|| "anthropic/claude-opus-4.8".to_string());
+            eprintln!("hull: OpenRouter AI reviewer active (triage {screen} → deep {deep})");
+            reg.set_reviewer(std::sync::Arc::new(hull_review_openrouter::OpenRouterReviewer::new(key, screen, deep)));
         }
     })
     .await;
