@@ -19,6 +19,8 @@ pub trait Store: Send + Sync {
     fn repos(&self) -> Vec<Repo>;
     fn put_issue(&self, issue: Issue);
     fn issues(&self, repo: &str) -> Vec<Issue>;
+    /// Replace an existing issue, matched by `repo` + `number`. Returns true if one was replaced.
+    fn replace_issue(&self, issue: Issue) -> bool;
     fn put_pr(&self, pr: PullRequest);
     fn prs(&self, repo: &str) -> Vec<PullRequest>;
     fn put_project(&self, project: Project);
@@ -66,6 +68,16 @@ impl Store for InMemory {
     }
     fn issues(&self, repo: &str) -> Vec<Issue> {
         self.issues.read().unwrap().iter().filter(|i| i.repo == repo).cloned().collect()
+    }
+    fn replace_issue(&self, issue: Issue) -> bool {
+        let mut g = self.issues.write().unwrap();
+        match g.iter_mut().find(|i| i.repo == issue.repo && i.number == issue.number) {
+            Some(slot) => {
+                *slot = issue;
+                true
+            }
+            None => false,
+        }
     }
     fn put_pr(&self, pr: PullRequest) {
         self.prs.write().unwrap().push(pr);
@@ -172,6 +184,20 @@ impl Store for FileStore {
     }
     fn issues(&self, repo: &str) -> Vec<Issue> {
         self.inner.read().unwrap().issues.iter().filter(|i| i.repo == repo).cloned().collect()
+    }
+    fn replace_issue(&self, issue: Issue) -> bool {
+        let mut g = self.inner.write().unwrap();
+        let replaced = match g.issues.iter_mut().find(|i| i.repo == issue.repo && i.number == issue.number) {
+            Some(slot) => {
+                *slot = issue;
+                true
+            }
+            None => false,
+        };
+        if replaced {
+            self.save(&g);
+        }
+        replaced
     }
     fn put_pr(&self, pr: PullRequest) {
         self.mutate(|s| s.prs.push(pr));

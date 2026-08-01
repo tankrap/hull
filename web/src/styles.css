@@ -98,3 +98,8 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 
 .repo { cursor: pointer; transition: border-color .12s ease; }
 .repo.selected { border-color: #2f8f6b; box-shadow: 0 0 0 1px #2f8f6b33; }
+
+.issue .by { margin-left: auto; }
+.issue .act { padding: 3px 12px; border-radius: 6px; font: inherit; font-size: 12px; cursor: pointer; border: 1px solid #2a3040; background: #12151c; color: #cdd3df; }
+.issue .act.close { border-color: #2f8f6b; color: #7ee2b8; }
+.issue .act.reopen { border-color: #3a5a8f; color: #8fb4ff; }

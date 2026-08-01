@@ -50,6 +50,15 @@ export function App() {
     loadIssues();
   }, [tenant, issueRepo]);
 
+  const transition = async (number: number, action: "close" | "reopen") => {
+    await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues/${number}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(action === "close" ? { action, reason: "completed" } : { action }),
+    });
+    loadIssues();
+  };
+
   const createIssue = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!form.title.trim()) return;
@@ -213,6 +222,15 @@ export function App() {
                 </a>
               ))}
               <span className="by">{it.author}</span>
+              {it.status.state === "open" ? (
+                <button className="act close" onClick={() => transition(it.number, "close")}>
+                  Close
+                </button>
+              ) : (
+                <button className="act reopen" onClick={() => transition(it.number, "reopen")}>
+                  Reopen
+                </button>
+              )}
             </li>
           ))}
         </ul>

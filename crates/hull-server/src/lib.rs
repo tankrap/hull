@@ -98,6 +98,7 @@ fn make_router(app: App) -> Router {
         .route("/api/feed", get(feed))
         .route("/api/repos", get(repos_list))
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
+        .route("/api/repos/:tenant/:repo/issues/:number", axum::routing::patch(update_issue))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
         // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
@@ -230,6 +231,40 @@ async fn create_issue(
         ActivityEvent::Issue { repo, number, action: "opened".into(), actor: author, ts: now() },
     );
     (StatusCode::CREATED, Json(json!({ "issue": issue }))).into_response()
+}
+
+/// Transition an issue (`PATCH /api/repos/:tenant/:repo/issues/:number`) with
+/// `{"action":"close","reason":"completed|not_planned|cancelled|duplicate"}` or
+/// `{"action":"reopen"}`. Emits a tenant-scoped event so the change shows live.
+async fn update_issue(
+    State(app): State<App>,
+    Path((tenant, repo, number)): Path<(String, String, u64)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let Some(mut issue) = app.store.issues(&key).into_iter().find(|i| i.number == number) else {
+        return (StatusCode::NOT_FOUND, "no such issue").into_response();
+    };
+    let action = body.get("action").and_then(Value::as_str).unwrap_or("");
+    match action {
+        "close" => {
+            let reason = match body.get("reason").and_then(Value::as_str) {
+                Some("not_planned") => CloseReason::NotPlanned,
+                Some("cancelled") => CloseReason::Cancelled,
+                Some("duplicate") => CloseReason::Duplicate,
+                _ => CloseReason::Completed,
+            };
+            issue.status = IssueStatus::Closed { reason };
+        }
+        "reopen" => issue.status = IssueStatus::Open,
+        _ => return (StatusCode::BAD_REQUEST, "action must be 'close' or 'reopen'").into_response(),
+    }
+    app.store.replace_issue(issue.clone());
+    app.hub.publish(
+        &tenant,
+        ActivityEvent::Issue { repo, number, action: action.into(), actor: issue.author.clone(), ts: now() },
+    );
+    Json(json!({ "issue": issue })).into_response()
 }
 
 /// Server-side secret scan (the backstop) — built-in engine **plus** any plugin rulesets.
