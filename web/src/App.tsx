@@ -59,6 +59,15 @@ export function App() {
   }, []);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
 
+  // Navigation feel: clicking a repo scrolls to its issues; clicking an issue expands its detail.
+  const issuesRef = useRef<HTMLElement>(null);
+  const [openIssue, setOpenIssue] = useState<number | null>(null);
+  const selectRepo = (repo: string) => {
+    setIssueRepo(repo);
+    setOpenIssue(null);
+    setTimeout(() => issuesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+  };
+
   // Toggle keel-native provenance ("who/what touched this path") under a code-ref.
   const showWhy = async (key: string, path: string) => {
     if (prov[key]) {
@@ -170,8 +179,8 @@ export function App() {
               <article
                 className={"repo" + (r.repo === issueRepo ? " selected" : "")}
                 key={r.repo}
-                onClick={() => setIssueRepo(r.repo)}
-                title="show this repo's issues"
+                onClick={() => selectRepo(r.repo)}
+                title="open this repo's issues"
               >
                 <div className="repo-head">
                   <span className="repo-name">{r.repo}</span>
@@ -211,7 +220,7 @@ export function App() {
         </section>
       </main>
 
-      <section className="issues">
+      <section className="issues" ref={issuesRef}>
         <h2>
           Issues <span className="muted">{tenant}/{issueRepo}</span>
           <span className="counts">
@@ -273,7 +282,14 @@ export function App() {
                   {it.status.state === "open" ? "open" : it.status.reason ?? "closed"}
                 </span>
                 <span className="num">#{it.number}</span>
-                <span className="it-title">{it.title}</span>
+                <button
+                  className="it-title"
+                  onClick={() => setOpenIssue(openIssue === it.number ? null : it.number)}
+                  title="open issue"
+                >
+                  {openIssue === it.number ? "▾ " : "▸ "}
+                  {it.title}
+                </button>
                 {it.code_refs.map((c, i) => (
                   <button
                     key={i}
@@ -306,6 +322,22 @@ export function App() {
                   </button>
                 )}
               </div>
+              {openIssue === it.number && (
+                <div className="issue-detail">
+                  <div className="meta">
+                    <span>opened by <b className={actors.find((a) => a.id === it.author)?.kind ?? ""}>{handleOf(it.author)}</b></span>
+                    {it.assignees.length > 0 && (
+                      <span>· assigned to {it.assignees.map((id) => handleOf(id)).join(", ")}</span>
+                    )}
+                    <span>· {it.status.state === "open" ? "open" : `closed (${it.status.reason ?? "closed"})`}</span>
+                  </div>
+                  {it.body && <p className="body">{it.body}</p>}
+                  {it.code_refs.length === 0 && <p className="muted">no code references</p>}
+                  {it.code_refs.length > 0 && (
+                    <p className="muted">code references (click a ⬡ anchor above for keel provenance)</p>
+                  )}
+                </div>
+              )}
               {it.code_refs.map((c) => {
                 const key = `${it.number}:${c.path}`;
                 return prov[key] ? (
