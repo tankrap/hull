@@ -360,3 +360,19 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .acting-note{margin-left:auto;font-size:12px;color:var(--muted)}
 .acting-note .link{font-size:12px}
 .signin .link[title]{opacity:.85}
+
+/* Profile / identity dropdown */
+.signed-in{position:relative}
+.whoami{background:none;border:none;font:inherit;font-weight:650;cursor:pointer;padding:0}
+.whoami.human{color:var(--accent,#0969da)}
+.whoami.agent{color:#8250df}
+.profile-drop{position:absolute;top:130%;right:0;z-index:30;width:360px;max-width:80vw;background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.18);padding:14px}
+.profile-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.profile-row{display:flex;flex-direction:column;gap:4px;margin:9px 0}
+.pk-label{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+.profile-drop .pk{font-family:ui-monospace,monospace;font-size:11px;word-break:break-all;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:5px 7px}
+.chain .hop b{font-weight:650}
+.chain .arrow{color:var(--muted)}
+.memberships{display:flex;gap:6px;flex-wrap:wrap}
+.memberships .mem{display:inline-flex;align-items:center;gap:6px;font-size:12px;border:1px solid var(--line);border-radius:999px;padding:2px 9px}
+.memberships .role{font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);border-left:1px solid var(--line);padding-left:6px}

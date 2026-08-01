@@ -78,6 +78,21 @@ export function App() {
       .then((m) => setMe(m))
       .catch(() => setMe(null));
   }, [token]);
+  // Full profile — identity, accountability chain, org memberships.
+  type Profile = {
+    id: string; handle: string; kind: string; accountable: boolean; human_root: string | null;
+    delegation: { principal: string; handle: string; kind: string; scope: string }[];
+    memberships: { account: string; role: string }[];
+  };
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [showProfile, setShowProfile] = useState(false);
+  useEffect(() => {
+    if (!token) { setProfile(null); return; }
+    fetch("/api/me", { headers: { authorization: `Bearer ${token}` } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then(setProfile)
+      .catch(() => setProfile(null));
+  }, [token, me]);
   // Register a fresh human identity and sign in with it — one click to a usable session.
   const registerAndSignIn = async () => {
     const handle = prompt("handle for your new identity", "you") ?? "";
@@ -424,8 +439,48 @@ export function App() {
         <div className="signin">
           {me ? (
             <span className="signed-in">
-              signed in as <b className={me.kind}>{me.handle}</b>
+              signed in as{" "}
+              <button className={"whoami " + me.kind} onClick={() => setShowProfile((s) => !s)} title="your identity & accountability">
+                {me.handle} ▾
+              </button>
               <button className="link" onClick={signOut}>sign out</button>
+              {showProfile && profile && (
+                <div className="profile-drop">
+                  <div className="profile-head">
+                    <b className={profile.kind}>{profile.handle}</b> <span className="muted">{profile.kind}</span>
+                    {profile.accountable && <span className="badge ok">accountable</span>}
+                  </div>
+                  <div className="profile-row">
+                    <span className="pk-label">actor id (public key)</span>
+                    <code className="pk" title="your Ed25519 public key — this IS your identity; it can't be rotated without becoming a different actor">{profile.id}</code>
+                  </div>
+                  {profile.kind === "agent" && profile.delegation.length > 0 && (
+                    <div className="profile-row">
+                      <span className="pk-label">accountability chain</span>
+                      <span className="chain">
+                        {profile.delegation.map((h, i) => (
+                          <span key={i} className="hop">
+                            <b className={h.kind}>{h.handle}</b>
+                            {i < profile.delegation.length - 1 && <span className="arrow"> → </span>}
+                          </span>
+                        ))}
+                      </span>
+                    </div>
+                  )}
+                  <div className="profile-row">
+                    <span className="pk-label">memberships</span>
+                    {profile.memberships.length > 0 ? (
+                      <span className="memberships">
+                        {profile.memberships.map((m, i) => (
+                          <span key={i} className="mem">{m.account}<span className="role">{m.role}</span></span>
+                        ))}
+                      </span>
+                    ) : (
+                      <span className="muted">none</span>
+                    )}
+                  </div>
+                </div>
+              )}
             </span>
           ) : (
             <>

@@ -218,6 +218,7 @@ fn make_router(app: App) -> Router {
         .route("/api/auth/challenge", get(auth_challenge))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/me", get(auth_me))
+        .route("/api/me", get(me_profile))
         .route("/api/notifications", get(notifications_list))
         .route("/api/repos", get(repos_list))
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
@@ -500,6 +501,66 @@ async fn auth_me(State(app): State<App>, headers: axum::http::HeaderMap) -> Resp
     match authed_actor(&app, &headers) {
         Some(a) => Json(json!({ "id": a.id, "handle": a.handle, "kind": a.kind, "accountable": a.is_accountable() })).into_response(),
         None => (StatusCode::UNAUTHORIZED, "not signed in").into_response(),
+    }
+}
+
+/// The signed-in actor's full profile (`GET /api/me`): identity, **accountability chain** (for an
+/// agent, the delegation hops back to its human root), and org memberships + roles. The mirror of
+/// "who am I and what am I allowed to be" — read-only; there is no key rotation because the actor id
+/// *is* the public key (rotating it would be a different actor).
+async fn me_profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    let Some(a) = authed_actor(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "not signed in").into_response();
+    };
+    let handle_of = |id: &str| app.store.actor(id).map(|x| x.handle).unwrap_or_else(|| id.chars().take(10).collect());
+    let chain: Vec<Value> = a
+        .delegation
+        .as_ref()
+        .map(|d| {
+            d.chain
+                .iter()
+                .map(|h| json!({ "principal": h.principal, "handle": handle_of(&h.principal), "kind": h.kind, "scope": h.scope }))
+                .collect()
+        })
+        .unwrap_or_default();
+    let memberships: Vec<Value> = app
+        .store
+        .accounts()
+        .into_iter()
+        .filter_map(|acct| {
+            acct.members.iter().find(|m| m.actor == a.id).map(|m| json!({ "account": acct.handle, "role": m.role }))
+        })
+        .collect();
+    Json(json!({
+        "id": a.id,
+        "handle": a.handle,
+        "kind": a.kind,
+        "accountable": a.is_accountable(),
+        "human_root": a.human_principal(),
+        "delegation": chain,
+        "memberships": memberships,
+    }))
+    .into_response()
+}
+
+/// Verify a service-to-service shared secret from a request header — for webhook-style endpoints
+/// (mirror inbound, CI callbacks) invoked by other *systems*, not signed-in users. If no secret is
+/// configured the endpoint is **disabled** (refuse rather than run unauthenticated). Length-safe
+/// constant-time-ish comparison.
+#[allow(clippy::result_large_err)]
+fn verify_service_secret(headers: &axum::http::HeaderMap, header: &str, expected: Option<&str>) -> Result<(), Response> {
+    match expected {
+        Some(s) if !s.is_empty() => {
+            let presented = headers.get(header).and_then(|v| v.to_str().ok()).unwrap_or("");
+            let ok = presented.len() == s.len()
+                && presented.bytes().zip(s.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
+            if ok {
+                Ok(())
+            } else {
+                Err((StatusCode::UNAUTHORIZED, format!("bad or missing {header}")).into_response())
+            }
+        }
+        _ => Err((StatusCode::FORBIDDEN, "endpoint disabled: no shared secret configured").into_response()),
     }
 }
 
@@ -1043,7 +1104,10 @@ async fn mirror_inbound(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(resp) = require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+    // Webhook auth: a forge calls this, not a signed-in user — gate on the shared mirror secret
+    // (`HULL_MIRROR_SECRET`), like the CI callback. No secret configured ⇒ endpoint disabled.
+    let secret = std::env::var("HULL_MIRROR_SECRET").ok();
+    if let Err(resp) = verify_service_secret(&headers, "X-Hull-Mirror-Secret", secret.as_deref()) {
         return resp;
     }
     let external_id = body.get("external_id").and_then(Value::as_str).unwrap_or("").trim().to_string();
