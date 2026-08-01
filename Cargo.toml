@@ -5,7 +5,6 @@ members = [
     "crates/hull-scan",
     "crates/hull-plugin",
     "crates/hull-server",
-    "crates/hull-review-openrouter",
 ]
 # Plugins are NOT in this public repo — closed hosted plugins live in a separate private repo that
 # depends on this one (the `hull-plugin` SDK + `hull-server` library). See PLUGINS.md.
