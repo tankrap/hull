@@ -1340,8 +1340,23 @@ function ReviewPage({
 
         {shownLedger && shownLedger.claims.length > 0 && (() => {
           const ledger = shownLedger;
+          const POSITIVE = ["verified_mechanically", "verified_read_only", "self_attested"];
           const n = (s: string) => ledger.claims.filter((c) => c.status === s).length;
+          const supported = ledger.claims.filter((c) => POSITIVE.includes(c.status)).length;
           const contradicted = n("contradicted");
+          const selfAtt = n("self_attested");
+          const needs = n("needs_judgment");
+          // status → glyph, label, css class
+          const meta: Record<string, [string, string]> = {
+            verified_mechanically: ["✓", "verified"],
+            verified_read_only: ["◎", "read-only"],
+            self_attested: ["⚠", "self-attested"],
+            contradicted: ["✗", "contradicted"],
+            needs_judgment: ["?", "needs judgment"],
+          };
+          // Order: contradicted first (surface at top), then needs-judgment, then positives.
+          const order: Record<string, number> = { contradicted: 0, needs_judgment: 1, self_attested: 2, verified_read_only: 3, verified_mechanically: 4 };
+          const claims = [...ledger.claims].sort((a, b) => (order[a.status] ?? 5) - (order[b.status] ?? 5));
           return (
             <section className="rp-card reconcile">
               <h3>
@@ -1351,19 +1366,21 @@ function ReviewPage({
                 </span>
               </h3>
               <div className="recon-summary">
-                <span className="rc supported">{n("supported")} supported</span>
+                <span className="rc supported">{supported} verified</span>
+                {selfAtt > 0 && <span className="rc self">{selfAtt} self-attested</span>}
                 <span className="rc contradicted">{contradicted} contradicted</span>
-                <span className="rc unsupported">{n("unsupported")} unconfirmed</span>
+                <span className="rc unsupported">{needs} needs judgment</span>
               </div>
               {contradicted > 0 && (
                 <p className="recon-warn">⚠ {contradicted} claim{contradicted > 1 ? "s" : ""} the change's own facts contradict — do not merge without resolving.</p>
               )}
               <ul className="recon-claims">
-                {ledger.claims.map((c) => (
+                {claims.map((c) => (
                   <li key={c.id} className={"claim " + c.status}>
                     <div className="claim-head">
-                      <span className={"cstat " + c.status}>{c.status === "supported" ? "✓" : c.status === "contradicted" ? "✗" : "?"}</span>
+                      <span className={"cstat " + c.status} title={(meta[c.status] ?? ["?", c.status])[1]}>{(meta[c.status] ?? ["?"])[0]}</span>
                       <span className="claim-text">{c.text}</span>
+                      <span className="claim-status-label">{(meta[c.status] ?? ["", c.status])[1]}</span>
                       <span className="claim-src">{c.source}</span>
                     </div>
                     {c.evidence.length > 0 && (

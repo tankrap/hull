@@ -564,7 +564,13 @@ impl RepoHost {
             .filter(|s| s.change.is_empty() || s.change == hex)
             .map(|s| s.title)
             .collect();
-        hull_core::reconcile::ChangeFacts { files, ops, verification, secrets, added_text }
+        // Does the change add its own tests? (Green then reads as self-attested, not mechanical.)
+        let adds_tests = diff.iter().any(|f| {
+            let p = f.path.to_lowercase();
+            f.status != "deleted"
+                && (p.contains("/tests/") || p.contains("test_") || p.contains("_test.") || p.contains(".test.") || p.contains(".spec.") || p.ends_with("_test.rs") || p.contains("#[test]"))
+        });
+        hull_core::reconcile::ChangeFacts { files, ops, verification, secrets, added_text, adds_tests }
     }
 }
 

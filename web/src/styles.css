@@ -444,3 +444,14 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .sev.warn{color:#9a6700;border-color:#9a670055;background:#9a670012}
 .sev.info{color:var(--muted)}
 .rp-findings .fnote{flex:1}
+
+/* C4 status engine — richer claim statuses */
+.cstat.verified_mechanically{background:#1a7f37}
+.cstat.verified_read_only{background:#2f7f6f}
+.cstat.self_attested{background:#9a6700}
+.cstat.contradicted{background:#cf222e}
+.cstat.needs_judgment{background:#8b949e}
+.claim-status-label{font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);margin-left:auto}
+.claim.contradicted{border-color:#cf222e66;background:#cf222e0a}
+.claim.self_attested{border-color:#9a670055}
+.rc.self{color:#9a6700;border-color:#9a670055;background:#9a670012}

@@ -25,9 +25,17 @@ impl ClaimLedger {
     pub fn contradicted(&self) -> usize {
         self.claims.iter().filter(|c| c.status == ClaimStatus::Contradicted).count()
     }
-    /// Count with corroborating evidence.
+    /// Count with any corroborating evidence (mechanical / read-only / self-attested).
     pub fn supported(&self) -> usize {
-        self.claims.iter().filter(|c| c.status == ClaimStatus::Supported).count()
+        self.claims.iter().filter(|c| c.status.is_positive()).count()
+    }
+    /// Count that need a human's judgment (no evidence either way).
+    pub fn needs_judgment(&self) -> usize {
+        self.claims.iter().filter(|c| c.status == ClaimStatus::NeedsJudgment).count()
+    }
+    /// Count self-attested (green but the change tests itself) — a caution, not a verification.
+    pub fn self_attested(&self) -> usize {
+        self.claims.iter().filter(|c| c.status == ClaimStatus::SelfAttested).count()
     }
 }
 
@@ -54,13 +62,27 @@ pub enum ClaimSource {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimStatus {
-    /// Facts corroborate the claim.
-    Supported,
+    /// A mechanical check corroborates it — green keel verification (tests/CI) or a clean secret
+    /// scan. The strongest positive available without running new probes.
+    VerifiedMechanically,
+    /// The reconciliation engine **read** the diff and found the claimed symbol/file/code. A real
+    /// but weak positive — it confirms presence, not behavior.
+    VerifiedReadOnly,
+    /// Green, but the change **adds its own tests** — the passing tests may only cover this same
+    /// change. Flagged, not independently verified.
+    SelfAttested,
     /// Facts actively contradict it (claimed green tests but verification is red; claimed no
-    /// secrets but the scan found one).
+    /// secrets but the scan found one; plan says X, diff does Y).
     Contradicted,
-    /// Nothing in the change speaks to it either way — a reviewer must judge it manually.
-    Unsupported,
+    /// Nothing in the change speaks to it either way — a human must judge it.
+    NeedsJudgment,
+}
+
+impl ClaimStatus {
+    /// A positive (corroborated) status — any of the three "verified"/"attested" kinds.
+    pub fn is_positive(&self) -> bool {
+        matches!(self, ClaimStatus::VerifiedMechanically | ClaimStatus::VerifiedReadOnly | ClaimStatus::SelfAttested)
+    }
 }
 
 /// A fact that bears on a claim, and whether it corroborates or undermines it.
@@ -88,6 +110,9 @@ pub struct ChangeFacts {
     /// corroborated by what the diff literally introduced (an `onclick`, a css class, a string) even
     /// when no named function/type op captures it.
     pub added_text: String,
+    /// Whether the change **adds test files** — so a green "tests pass" claim is self-attested (the
+    /// change may only be tested by its own new tests) rather than mechanically verified.
+    pub adds_tests: bool,
 }
 
 /// Reconcile a change's narrative against its facts. `intent` and `lesson` are the prose; `facts`
@@ -238,12 +263,23 @@ fn judge(text: &str, source: ClaimSource, facts: &ChangeFacts) -> Claim {
         }
     }
 
+    // C4 status engine. Contradiction always wins. Otherwise rank the positive evidence: a mechanical
+    // check (green verification / clean secret scan) beats a read-only diff match; a mechanical
+    // *verification* on a change that adds its own tests is only self-attested.
     let status = if evidence.iter().any(|e| !e.supports) {
         ClaimStatus::Contradicted
+    } else if evidence.iter().any(|e| e.supports && e.kind == "verification") {
+        if facts.adds_tests {
+            ClaimStatus::SelfAttested
+        } else {
+            ClaimStatus::VerifiedMechanically
+        }
+    } else if evidence.iter().any(|e| e.supports && e.kind == "secret-scan") {
+        ClaimStatus::VerifiedMechanically
     } else if evidence.iter().any(|e| e.supports) {
-        ClaimStatus::Supported
+        ClaimStatus::VerifiedReadOnly
     } else {
-        ClaimStatus::Unsupported
+        ClaimStatus::NeedsJudgment
     };
 
     Claim { id: claim_id(&lower), text: text.to_string(), source, status, evidence }
@@ -290,6 +326,7 @@ mod tests {
             verification: "green".into(),
             secrets: vec![],
             added_text: String::new(),
+            adds_tests: false,
         }
     }
 
@@ -297,7 +334,7 @@ mod tests {
     fn supported_symbol_claim() {
         let l = reconcile("c1", "feat(hull): add add_member handler", "", &facts());
         let claim = l.claims.iter().find(|c| c.text.contains("add_member")).unwrap();
-        assert_eq!(claim.status, ClaimStatus::Supported);
+        assert_eq!(claim.status, ClaimStatus::VerifiedReadOnly);
         assert!(claim.evidence.iter().any(|e| e.detail.contains("add_member")));
     }
 
@@ -305,7 +342,16 @@ mod tests {
     fn green_verification_supports_test_claim() {
         let l = reconcile("c1", "wrote tests for membership", "", &facts());
         let claim = l.claims.iter().find(|c| c.text.contains("tests")).unwrap();
-        assert_eq!(claim.status, ClaimStatus::Supported);
+        assert_eq!(claim.status, ClaimStatus::VerifiedMechanically);
+    }
+
+    #[test]
+    fn green_but_change_adds_tests_is_self_attested() {
+        let mut f = facts();
+        f.adds_tests = true;
+        let l = reconcile("c1", "tests pass", "", &f);
+        let claim = l.claims.iter().find(|c| c.text.contains("tests")).unwrap();
+        assert_eq!(claim.status, ClaimStatus::SelfAttested);
     }
 
     #[test]
@@ -330,7 +376,7 @@ mod tests {
     #[test]
     fn unrelated_claim_is_unsupported() {
         let l = reconcile("c1", "refactored the pagination cursor", "", &facts());
-        assert!(l.claims.iter().all(|c| c.status == ClaimStatus::Unsupported));
+        assert!(l.claims.iter().all(|c| c.status == ClaimStatus::NeedsJudgment));
     }
 
     #[test]
@@ -341,7 +387,7 @@ mod tests {
         f.added_text = "const selectrepo = () => { onclick handler makes the repo clickable }".into();
         let l = reconcile("c1", "make the repo clickable", "", &f);
         let claim = l.claims.iter().find(|c| c.text.contains("clickable")).unwrap();
-        assert_eq!(claim.status, ClaimStatus::Supported);
+        assert_eq!(claim.status, ClaimStatus::VerifiedReadOnly);
         assert!(claim.evidence.iter().any(|e| e.detail.contains("added code references")));
     }
 
