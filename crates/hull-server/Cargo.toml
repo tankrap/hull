@@ -20,6 +20,10 @@ path = "src/main.rs"
 hull-core = { path = "../hull-core" }
 hull-scan = { path = "../hull-scan" }
 hull-plugin = { path = "../hull-plugin" }
+# keel substrate, embedded directly (no serialization boundary). Pinned to a keel git-rev so the
+# build is reproducible and standalone (no sibling checkout needed); bump the rev to adopt keel
+# changes. Formalizing this embedding API (semver the embedded crates) is Linear NEW-1168.
+keel-net = { git = "https://github.com/tankrap/keel", rev = "6827a3443de3c9be2e66887c8038310e32dddc37", package = "keel-net" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = "0.7"

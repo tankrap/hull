@@ -8,6 +8,7 @@
 //! `/api/repos/:repo/issues` · `/api/scan` · `/api/plugins`.
 
 pub mod activity;
+pub mod keeld;
 pub mod plugins;
 
 use activity::{ActivityEvent, ActivityHub};
@@ -50,7 +51,15 @@ pub fn router(registry: Registry) -> Router {
     let store = Arc::new(InMemory::new());
     seed(&store);
     let hub = Arc::new(ActivityHub::new());
-    spawn_fake_source(hub.clone());
+    // Real keeld QUIC bridge when HULL_KEELD names one or more daemons; otherwise the demo source
+    // keeps the scaffold alive end-to-end. (Set e.g. HULL_KEELD=hull@127.0.0.1:9000.)
+    let endpoints = keeld::endpoints_from_env();
+    if endpoints.is_empty() {
+        spawn_fake_source(hub.clone());
+    } else {
+        eprintln!("hull-server: bridging {} keeld daemon(s) over QUIC", endpoints.len());
+        keeld::spawn_keeld_sources(hub.clone(), endpoints);
+    }
     let app = App { store, hub, registry: Arc::new(registry) };
     Router::new()
         .route("/health", get(|| async { "ok" }))
