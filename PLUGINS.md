@@ -75,56 +75,66 @@ prompt-injected or malicious change could escape into the core server.
 
 When adding a capability, decide its class first; if it runs repo code, it's out-of-process.
 
-## Building a CI runner (custom CI system)
+## Connecting a CI system
 
-`CiRunner` is the seam for a bring-your-own CI/CD system. **You implement one method**; the core does
-the rest.
+Hull is a **dumb dispatcher**: it does not run a queue, schedule runners, or know anything about the
+CI on the other side. On a check it POSTs a **standard job payload** to a configured HTTP endpoint;
+that system (queue, runners, whatever) posts the verdict back. There are two integration shapes —
+the HTTP contract is the primary one.
 
-```rust
-use hull_plugin::{CiRunner, CiRequest, CiOutcome, CiStatus, Registry};
-use std::sync::Arc;
+### A. External CI over HTTP (recommended — language-agnostic)
 
-struct MyRunner { /* client to your sandboxed runner fleet */ }
+**Configure the endpoint** — per repo, or an instance default, else the built-in local runner:
 
-impl CiRunner for MyRunner {
-    fn run(&self, req: &CiRequest) -> CiOutcome {
-        // req.workdir  — a fresh checkout of the change's tree (already materialized for you)
-        // req.tree_id  — the keel tree content-address (stable id for this exact source)
-        // req.repo / req.change — identifiers for logging/routing
-        //
-        // DISPATCH the job to an isolated sandbox (separate process/VM, no core creds, egress
-        // limited, ephemeral) and await the verdict. Do NOT run repo tests in this process.
-        let verdict = self.submit(&req.tree_id, &req.workdir); // your call
-        CiOutcome {
-            status: if verdict.passed { CiStatus::Green } else { CiStatus::Red },
-            summary: verdict.summary,
-            memoized: false, // leave false — the core sets this when it serves from the memo
-        }
-    }
-}
-
-// register it (in a server binary's plugin hook, or a hosted crate's register()):
-pub fn register(reg: &mut Registry) { reg.set_ci_runner(Arc::new(MyRunner::new())); }
-// hull_server::run(opts, |reg| my_ci::register(reg))
+```
+PUT /api/repos/:tenant/:repo/ci-config     { "by": "<owner>", "url": "https://ci.example/hull", "secret": "…" }
+GET /api/repos/:tenant/:repo/ci-config     → { url, has_secret, source: "repo" | "instance" | "none …" }
 ```
 
-**What the core already handles — do not re-implement:**
-- Resolving a change to its keel **tree** and materializing the checkout at `req.workdir`.
-- **Content-addressed memoization** keyed by `tree_id`: an unchanged tree is an instant cache hit and
-  your `run` is never called. You get caching for free.
-- Writing the green/red back to **keel verification** (which the reconciliation ledger and the merge
-  gate consume) and firing `ci_passed` / `ci_failed` notifications.
-- The `POST …/change/:id/check` endpoint, its accountability gate, and the `{force}` memo-bypass.
+Resolution order per check: **repo config → instance default (`HULL_CI_URL` / `HULL_CI_SECRET`) →
+built-in local runner** (so a bare OSS instance still runs CI). Setting the endpoint is owner/admin
+gated.
 
-**The one rule that matters (security):** `CiRunner` runs a PR's tests, i.e. **untrusted code**. Your
-`run` must be a *dispatch client* to an isolated sandbox — never execute the repo's tests in the core
-server's address space. The built-in [`default_local_ci`] runs a detected command
-(`cargo test` / `npm test`, or `HULL_CI_CMD`) as a local child process for self-hosting convenience;
-a production runner replaces it with sandboxed execution and is what you're building.
+**Dispatch — Hull → your CI** (POST to the configured `url`; `X-Hull-CI-Secret` header if a secret is
+set):
 
-**Return `Errored`** (not `Red`) when you can't produce a verdict (no test command, timeout, infra
-failure) — the core memoizes only real `Green`/`Red` verdicts, so an infra blip won't get cached as a
-failing tree.
+```json
+{
+  "repo": "tankrap/hull",
+  "change": "<keel change id>",
+  "tree_id": "<keel tree content-address>",
+  "intent": "<change intent>",
+  "author": "<author>",
+  "git_url": "https://hull.example/tankrap/hull",   // clone this…
+  "ref": "<keel change id>",                          // …and check out this ref
+  "callback_url": "https://hull.example/api/repos/tankrap/hull/change/<id>/ci-result"
+}
+```
+
+Your CI clones `git_url` at `ref`, runs whatever it wants on its own sandboxed runners, then:
+
+**Callback — your CI → Hull** (POST `callback_url`, echo the `X-Hull-CI-Secret`):
+
+```json
+{ "status": "green" | "red" | "errored", "summary": "42 tests, 0 failed" }
+```
+
+Hull then memoizes the verdict by `tree_id`, writes keel verification (which the reconciliation
+ledger + merge gate consume), and notifies. That's the whole contract — **two HTTP calls**.
+
+**What Hull handles so your CI doesn't:** change→tree resolution; **content-addressed memoization**
+(an identical tree is an instant hit — Hull never dispatches it again); a de-dupe guard so a tree
+already in flight isn't dispatched twice; verification write-back; `ci_passed`/`ci_failed`
+notifications; the `/check` endpoint + `{force}` bypass. Return **`errored`** (not `red`) for infra
+failures so a blip isn't cached as a failing tree.
+
+### B. In-process `CiRunner` (self-host convenience)
+
+For a runner compiled into the server, implement `CiRunner::run(&CiRequest) -> CiOutcome` (given a
+materialized `req.workdir`) and `reg.set_ci_runner(...)`. The built-in [`default_local_ci`]
+(`cargo test`/`npm test`, or `HULL_CI_CMD`) is exactly this — the no-config fallback. **Because it
+runs untrusted PR code in-process, this shape is only for local/self-host use; anything hosted uses
+shape A** and runs tests on isolated, sandboxed runners it controls.
 
 ## Capability roadmap
 

@@ -12,7 +12,8 @@
 
 use hull_plugin::{CiOutcome, CiRequest, CiStatus, Registry};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -44,6 +45,18 @@ impl CiMemo {
 
     fn get(&self, tree: &str) -> Option<MemoEntry> {
         self.map.lock().unwrap().get(tree).cloned()
+    }
+
+    /// The memoized verdict for a tree, as a [`CiOutcome`] (with `memoized: true`), if any.
+    pub fn get_memoized(&self, tree: &str) -> Option<CiOutcome> {
+        self.get(tree).map(|hit| {
+            let status = match hit.status.as_str() {
+                "green" => CiStatus::Green,
+                "red" => CiStatus::Red,
+                _ => CiStatus::Errored,
+            };
+            CiOutcome { status, summary: hit.summary, memoized: true }
+        })
     }
 
     fn put(&self, tree: &str, entry: MemoEntry) {
@@ -112,6 +125,131 @@ pub fn run_check(
         apply_verification(repos, tenant, repo, change, outcome.status);
     }
     outcome
+}
+
+// ── external CI dispatch ─────────────────────────────────────────────────────────────────────────
+//
+// Hull is a dumb dispatcher: it POSTs a standard job payload to the CI endpoint a repo configures
+// (or the instance default), and the CI system — queue, runners, whatever — posts the verdict back
+// to the callback URL. Hull owns no queue and knows nothing about the CI's internals.
+
+/// A repo's CI endpoint: where to POST the job, and the shared secret that authenticates both the
+/// dispatch and the callback.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoCi {
+    pub url: String,
+    #[serde(default)]
+    pub secret: String,
+}
+
+/// Persisted per-repo CI endpoints + an in-memory guard against double-dispatching the same tree
+/// while its verdict is outstanding.
+pub struct CiConfig {
+    path: PathBuf,
+    map: Mutex<HashMap<String, RepoCi>>,
+    inflight: Mutex<HashSet<String>>, // tree ids currently dispatched, awaiting a callback
+}
+
+/// Where an effective CI config came from — for the `GET …/ci-config` response.
+pub enum CiSource {
+    Repo,
+    Instance,
+    None,
+}
+
+impl CiConfig {
+    /// Load per-repo config from `HULL_CI_CONFIG` (default `~/.hull/ci-config.json`).
+    pub fn from_env() -> Self {
+        let path = std::env::var("HULL_CI_CONFIG").map(PathBuf::from).unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(format!("{home}/.hull/ci-config.json"))
+        });
+        let map = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        CiConfig { path, map: Mutex::new(map), inflight: Mutex::new(HashSet::new()) }
+    }
+
+    /// The repo's own configured endpoint (not the instance default).
+    pub fn get(&self, repo: &str) -> Option<RepoCi> {
+        self.map.lock().unwrap().get(repo).cloned().filter(|c| !c.url.is_empty())
+    }
+
+    /// Set (or clear, with an empty url) a repo's CI endpoint.
+    pub fn set(&self, repo: &str, cfg: RepoCi) {
+        let mut m = self.map.lock().unwrap();
+        if cfg.url.is_empty() {
+            m.remove(repo);
+        } else {
+            m.insert(repo.to_string(), cfg);
+        }
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(j) = serde_json::to_string_pretty(&*m) {
+            let _ = std::fs::write(&self.path, j);
+        }
+    }
+
+    /// The effective endpoint for a repo: its own config, else the hull-instance default
+    /// (`HULL_CI_URL` / `HULL_CI_SECRET`), else none (fall back to the built-in local runner).
+    pub fn resolve(&self, repo: &str) -> (Option<RepoCi>, CiSource) {
+        if let Some(c) = self.get(repo) {
+            return (Some(c), CiSource::Repo);
+        }
+        if let Ok(url) = std::env::var("HULL_CI_URL") {
+            if !url.is_empty() {
+                return (Some(RepoCi { url, secret: std::env::var("HULL_CI_SECRET").unwrap_or_default() }), CiSource::Instance);
+            }
+        }
+        (None, CiSource::None)
+    }
+
+    pub fn mark_inflight(&self, tree: &str) -> bool {
+        self.inflight.lock().unwrap().insert(tree.to_string())
+    }
+    pub fn is_inflight(&self, tree: &str) -> bool {
+        self.inflight.lock().unwrap().contains(tree)
+    }
+    pub fn clear_inflight(&self, tree: &str) {
+        self.inflight.lock().unwrap().remove(tree);
+    }
+}
+
+/// The **standard dispatch payload** Hull POSTs to a CI endpoint. This is the contract a CI system
+/// integrates against — stable regardless of what's on the other side.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_body(tenant: &str, repo: &str, change: &str, tree: &str, intent: &str, author: &str, base_url: &str) -> Value {
+    let base = base_url.trim_end_matches('/');
+    json!({
+        "repo": format!("{tenant}/{repo}"),
+        "change": change,
+        "tree_id": tree,
+        "intent": intent,
+        "author": author,
+        // The runner clones this and checks out `ref` (the change id) — Hull serves git at /:t/:r.
+        "git_url": format!("{base}/{tenant}/{repo}"),
+        "ref": change,
+        // Where the CI system POSTs its verdict when done.
+        "callback_url": format!("{base}/api/repos/{tenant}/{repo}/change/{change}/ci-result"),
+    })
+}
+
+/// Finalize a verdict delivered by the CI system's callback: memoize by tree (green/red only), write
+/// keel verification, and release the in-flight guard. Returns the parsed status.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize(repos: &RepoHost, memo: &CiMemo, config: &CiConfig, tenant: &str, repo: &str, change: &str, status: &str, summary: &str) -> CiStatus {
+    let st = match status {
+        "green" => CiStatus::Green,
+        "red" => CiStatus::Red,
+        _ => CiStatus::Errored,
+    };
+    if let Some(tree) = repos.change_tree(tenant, repo, change) {
+        if matches!(st, CiStatus::Green | CiStatus::Red) {
+            memo.put(&tree, MemoEntry { status: status_str(st).into(), summary: summary.to_string() });
+            apply_verification(repos, tenant, repo, change, st);
+        }
+        config.clear_inflight(&tree);
+    }
+    st
 }
 
 fn apply_verification(repos: &RepoHost, tenant: &str, repo: &str, change: &str, status: CiStatus) {

@@ -98,6 +98,11 @@ struct App {
     notifications: Arc<Mutex<Vec<Notification>>>,
     auth: Arc<Mutex<AuthState>>,
     ci: Arc<ci::CiMemo>,
+    ci_config: Arc<ci::CiConfig>,
+    /// Outbound HTTP for dispatching CI jobs to a repo's configured endpoint. Cheap to clone.
+    http: reqwest::Client,
+    /// Hull's own public base URL, used to build the clone + callback URLs in a dispatch payload.
+    public_url: Arc<str>,
     mirror: Arc<mirror::MirrorLedger>,
 }
 
@@ -132,6 +137,9 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         notifications,
         auth: Arc::new(Mutex::new(AuthState::default())),
         ci: Arc::new(ci::CiMemo::from_env()),
+        ci_config: Arc::new(ci::CiConfig::from_env()),
+        http: reqwest::Client::new(),
+        public_url: std::env::var("HULL_PUBLIC_URL").unwrap_or_else(|_| "http://127.0.0.1:8930".into()).into(),
         mirror: Arc::new(mirror::MirrorLedger::from_env()),
     }
 }
@@ -201,6 +209,8 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
         .route("/api/repos/:tenant/:repo/change/:id/ledger", get(change_ledger))
         .route("/api/repos/:tenant/:repo/change/:id/check", post(run_check_handler))
+        .route("/api/repos/:tenant/:repo/change/:id/ci-result", post(ci_result))
+        .route("/api/repos/:tenant/:repo/ci-config", get(get_ci_config).put(set_ci_config))
         .route("/api/repos/:tenant/:repo/security", get(repo_security))
         .route("/api/repos/:tenant/:repo/owners", get(owners_list).post(set_owners))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
@@ -646,30 +656,190 @@ async fn run_check_handler(
         return resp;
     }
     let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
-    // The runner blocks (spawns a test process); keep the async runtime free.
-    let (repos, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
-    let (t, r, c) = (tenant.clone(), repo.clone(), id.clone());
-    let outcome = tokio::task::spawn_blocking(move || ci::run_check(&repos, &registry, &ci, &t, &r, &c, force))
-        .await
-        .unwrap_or(hull_plugin::CiOutcome {
-            status: hull_plugin::CiStatus::Errored,
-            summary: "runner panicked".into(),
-            memoized: false,
-        });
-    let status = match outcome.status {
+    match resolve_check(&app, &tenant, &repo, &id, force).await {
+        CiResolution::Done(o) => {
+            let status = ci_status_str(o.status);
+            if matches!(o.status, hull_plugin::CiStatus::Green | hull_plugin::CiStatus::Red) {
+                notify_ci(&app, &tenant, &repo, &id, status, &o.summary);
+            }
+            Json(json!({ "status": status, "summary": o.summary, "memoized": o.memoized })).into_response()
+        }
+        CiResolution::Dispatched { url } => {
+            Json(json!({ "status": "dispatched", "summary": format!("job posted to {url}; awaiting result"), "memoized": false })).into_response()
+        }
+        CiResolution::Pending => {
+            Json(json!({ "status": "pending", "summary": "a check for this tree is already running", "memoized": false })).into_response()
+        }
+        CiResolution::Failed(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+/// Outcome of triggering a check: either resolved now (memo hit or the built-in local runner) or
+/// handed off to an external CI, whose verdict arrives later via the `ci-result` callback.
+enum CiResolution {
+    Done(hull_plugin::CiOutcome),
+    Dispatched { url: String },
+    Pending,
+    Failed(String),
+}
+
+/// Trigger a change's checks. If the repo (or the instance) configures an external CI endpoint, POST
+/// the standard job payload there and return — Hull owns no queue and waits for a callback.
+/// Otherwise run the built-in local runner inline. A content-addressed memo hit short-circuits both.
+async fn resolve_check(app: &App, tenant: &str, repo: &str, change: &str, force: bool) -> CiResolution {
+    let Some(tree) = app.repos.change_tree(tenant, repo, change) else {
+        return CiResolution::Failed("unknown change".into());
+    };
+    // Memo hit: an identical tree already has a verdict — no dispatch, no run.
+    if !force {
+        if let Some(o) = app.ci.get_memoized(&tree) {
+            app.repos.set_verification(tenant, repo, change, o.status == hull_plugin::CiStatus::Green);
+            return CiResolution::Done(o);
+        }
+    }
+    let key = format!("{tenant}/{repo}");
+    match app.ci_config.resolve(&key).0 {
+        Some(cfg) => {
+            // Don't re-dispatch a tree whose verdict is still outstanding (not a queue — just dedupe).
+            if !force && app.ci_config.is_inflight(&tree) {
+                return CiResolution::Pending;
+            }
+            let (intent, author) = app
+                .repos
+                .change_info(tenant, repo, change)
+                .map(|i| (i.intent, i.author))
+                .unwrap_or_default();
+            let payload = ci::dispatch_body(tenant, repo, change, &tree, &intent, &author, &app.public_url);
+            app.ci_config.mark_inflight(&tree);
+            let mut req = app.http.post(&cfg.url).json(&payload);
+            if !cfg.secret.is_empty() {
+                req = req.header("X-Hull-CI-Secret", &cfg.secret);
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => CiResolution::Dispatched { url: cfg.url },
+                Ok(resp) => {
+                    app.ci_config.clear_inflight(&tree);
+                    CiResolution::Failed(format!("CI endpoint returned {}", resp.status()))
+                }
+                Err(e) => {
+                    app.ci_config.clear_inflight(&tree);
+                    CiResolution::Failed(format!("could not reach CI endpoint: {e}"))
+                }
+            }
+        }
+        None => {
+            // No external CI configured: the built-in local runner (blocking — keep the runtime free).
+            let (repos, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
+            let (t, r, c) = (tenant.to_string(), repo.to_string(), change.to_string());
+            let outcome = tokio::task::spawn_blocking(move || ci::run_check(&repos, &registry, &ci, &t, &r, &c, force))
+                .await
+                .unwrap_or(hull_plugin::CiOutcome { status: hull_plugin::CiStatus::Errored, summary: "runner panicked".into(), memoized: false });
+            CiResolution::Done(outcome)
+        }
+    }
+}
+
+fn ci_status_str(s: hull_plugin::CiStatus) -> &'static str {
+    match s {
         hull_plugin::CiStatus::Green => "green",
         hull_plugin::CiStatus::Red => "red",
         hull_plugin::CiStatus::Errored => "errored",
-    };
-    if matches!(outcome.status, hull_plugin::CiStatus::Green | hull_plugin::CiStatus::Red) {
-        app.registry.notify(&hull_plugin::NotifyEvent {
-            kind: if status == "green" { "ci_passed".into() } else { "ci_failed".into() },
-            to: vec![],
-            summary: format!("checks {status} for {tenant}/{repo}@{}: {}", &id[..id.len().min(12)], outcome.summary),
-            change: Some(id.clone()),
-        });
     }
-    Json(json!({ "status": status, "summary": outcome.summary, "memoized": outcome.memoized })).into_response()
+}
+
+fn notify_ci(app: &App, tenant: &str, repo: &str, change: &str, status: &str, summary: &str) {
+    app.registry.notify(&hull_plugin::NotifyEvent {
+        kind: if status == "green" { "ci_passed".into() } else { "ci_failed".into() },
+        to: vec![],
+        summary: format!("checks {status} for {tenant}/{repo}@{}: {}", &change[..change.len().min(12)], summary),
+        change: Some(change.to_string()),
+    });
+}
+
+/// The CI system's verdict callback (`POST …/change/:id/ci-result`) — the other half of the standard
+/// contract. Authenticated by the shared secret (`X-Hull-CI-Secret`). Body: `{status, summary}`.
+/// Hull memoizes the verdict by tree, writes keel verification, and notifies.
+async fn ci_result(
+    State(app): State<App>,
+    Path((tenant, repo, id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let (cfg, _src) = app.ci_config.resolve(&key);
+    // If a secret is configured, the callback must present it.
+    if let Some(ci::RepoCi { secret, .. }) = cfg.as_ref() {
+        if !secret.is_empty() {
+            let presented = headers.get("X-Hull-CI-Secret").and_then(|v| v.to_str().ok()).unwrap_or("");
+            if presented != secret {
+                return (StatusCode::UNAUTHORIZED, "bad or missing X-Hull-CI-Secret").into_response();
+            }
+        }
+    }
+    let status = body.get("status").and_then(Value::as_str).unwrap_or("").to_string();
+    if !matches!(status.as_str(), "green" | "red" | "errored") {
+        return (StatusCode::BAD_REQUEST, "status must be green | red | errored").into_response();
+    }
+    let summary = body.get("summary").and_then(Value::as_str).unwrap_or("").to_string();
+    let st = ci::finalize(&app.repos, &app.ci, &app.ci_config, &tenant, &repo, &id, &status, &summary);
+    if matches!(st, hull_plugin::CiStatus::Green | hull_plugin::CiStatus::Red) {
+        notify_ci(&app, &tenant, &repo, &id, ci_status_str(st), &summary);
+    }
+    Json(json!({ "recorded": status })).into_response()
+}
+
+/// A repo's CI endpoint config (`GET/PUT …/ci-config`). GET reports the effective endpoint and where
+/// it comes from (repo / instance default / none), never leaking the secret. PUT (owner-gated) sets
+/// or clears the repo's own endpoint.
+async fn get_ci_config(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+    let key = format!("{tenant}/{repo}");
+    let (cfg, src) = app.ci_config.resolve(&key);
+    let source = match src {
+        ci::CiSource::Repo => "repo",
+        ci::CiSource::Instance => "instance",
+        ci::CiSource::None => "none (built-in local runner)",
+    };
+    Json(json!({
+        "url": cfg.as_ref().map(|c| c.url.clone()),
+        "has_secret": cfg.as_ref().map(|c| !c.secret.is_empty()).unwrap_or(false),
+        "source": source,
+    }))
+}
+
+async fn set_ci_config(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let acting = match require_actor(&app, &headers, body.get("by").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Owner-gated: only an owner/admin of the repo's account may point it at a CI system.
+    if !is_repo_admin(&app, &tenant, &repo, &acting.id) {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin can set the CI endpoint").into_response();
+    }
+    let url = body.get("url").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let secret = body.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
+    app.ci_config.set(&key, ci::RepoCi { url: url.clone(), secret });
+    Json(json!({ "url": url, "cleared": url.is_empty() })).into_response()
+}
+
+/// Is `actor` an Owner/Admin of the account that owns `tenant/repo`?
+fn is_repo_admin(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
+    let name = format!("{tenant}/{repo}");
+    let Some(owner) = app.store.repos().into_iter().find(|r| r.name == name || r.name == repo).map(|r| r.owner) else {
+        // No repo record — fall back to: any owner/admin of the tenant org.
+        return app.store.accounts().iter().any(|a| a.handle == tenant && a.members.iter().any(|m| m.actor == actor && matches!(m.role, Role::Owner | Role::Admin)));
+    };
+    app.store
+        .accounts()
+        .into_iter()
+        .find(|a| a.id == owner)
+        .map(|a| a.members.iter().any(|m| m.actor == actor && matches!(m.role, Role::Owner | Role::Admin)))
+        .unwrap_or(false)
 }
 
 /// Ingest a keel session for a change (`POST …/change/:id/session`) — the output of `keel capture`,
@@ -1014,12 +1184,14 @@ async fn perform_auto_review(
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "PR has no change to review".into()));
     };
 
-    // 1. Run the change's checks (refreshes keel verification, memoized by tree).
-    let (repos, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
-    let (t, r, c) = (tenant.to_string(), repo.to_string(), change.clone());
-    let check = tokio::task::spawn_blocking(move || ci::run_check(&repos, &registry, &ci, &t, &r, &c, false))
-        .await
-        .ok();
+    // 1. Trigger the change's checks — local run resolves now; an external CI is dispatched and its
+    //    verdict lands later via callback (the review posts on current verification either way).
+    let check_label = match resolve_check(app, tenant, repo, &change, false).await {
+        CiResolution::Done(o) => ci_status_str(o.status).to_string(),
+        CiResolution::Dispatched { .. } => "dispatched".into(),
+        CiResolution::Pending => "running".into(),
+        CiResolution::Failed(_) => "not-run".into(),
+    };
     let verification = app.repos.verification(tenant, repo, &change).unwrap_or_else(|| "unverified".into());
 
     // 2. Reconcile the change's narrative against its facts.
@@ -1060,11 +1232,7 @@ async fn perform_auto_review(
         ledger.claims.len(),
         ledger.supported(),
         contradicted,
-        check.as_ref().map(|o| match o.status {
-            hull_plugin::CiStatus::Green => "green",
-            hull_plugin::CiStatus::Red => "red",
-            hull_plugin::CiStatus::Errored => "not-run",
-        }).unwrap_or("unknown"),
+        check_label,
         match verdict {
             Verdict::Approve => "Narrative matches the change and checks are green — approving.",
             Verdict::RequestChanges => "The change contradicts its own stated intent — requesting changes.",

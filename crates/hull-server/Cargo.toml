@@ -39,3 +39,6 @@ flate2 = "1"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
+# Outbound HTTP: Hull dispatches a standard CI job payload to the repo's configured CI endpoint
+# (Hull owns no queue — the CI system does whatever it wants and posts the verdict back).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
