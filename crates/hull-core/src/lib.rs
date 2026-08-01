@@ -281,6 +281,8 @@ pub struct Review {
     pub verdict: Verdict,
     #[serde(default)]
     pub summary: String,
+    #[serde(default)]
+    pub findings: Vec<ReviewFinding>,
     pub created_unix: u64,
 }
 
@@ -291,6 +293,19 @@ pub enum Verdict {
     RequestChanges,
     Reject,
     Comment,
+}
+
+/// A specific issue a review raises, anchored to a file (and optionally a line). What turns a
+/// review from a verdict into an actual review.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewFinding {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// `info` | `warn` | `blocker`.
+    #[serde(default)]
+    pub severity: String,
+    pub note: String,
 }
 
 /// Mirror of keel's verification (from `keel verify`) — first-class in Hull.

@@ -411,6 +411,23 @@ async fn create_review(
             }
         }
     }
+    let findings: Vec<ReviewFinding> = body
+        .get("findings")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    let path = f.get("path").and_then(Value::as_str)?.to_string();
+                    Some(ReviewFinding {
+                        path,
+                        line: f.get("line").and_then(Value::as_u64).map(|n| n as u32),
+                        severity: f.get("severity").and_then(Value::as_str).unwrap_or("info").to_string(),
+                        note: f.get("note").and_then(Value::as_str).unwrap_or("").to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let count = app.store.reviews(&key).len();
     let review = Review {
         id: format!("rv_{}_{}", key.replace('/', "_"), count + 1),
@@ -419,6 +436,7 @@ async fn create_review(
         reviewer: reviewer.id.clone(),
         verdict,
         summary: body.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
+        findings,
         created_unix: now(),
     };
     app.store.put_review(review.clone());

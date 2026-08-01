@@ -17,7 +17,8 @@ type ActivityEvent =
 
 type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable: boolean; human_root: string | null };
 type PR = { number: number; title: string; author: string; changes: string[]; verification: string };
-type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string };
+type Finding = { path: string; line?: number; severity: string; note: string };
+type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string; findings: Finding[] };
 type CodeRef = { repo: string; blob: string; path: string; line_start: number; line_end?: number };
 type Issue = {
   number: number;
@@ -130,7 +131,7 @@ export function App() {
   const [reviews, setReviews] = useState<Review[]>([]);
   const [openPr, setOpenPr] = useState<number | null>(null);
   const [openReview, setOpenReview] = useState<Review | null>(null);
-  const [reviewForm, setReviewForm] = useState({ verdict: "approve", summary: "" });
+  const [reviewForm, setReviewForm] = useState({ verdict: "approve", summary: "", findPath: "", findNote: "", findSev: "warn" });
   const loadReviews = () =>
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`)
       .then((r) => r.json())
@@ -148,10 +149,14 @@ export function App() {
         reviewer: actingAs,
         verdict: reviewForm.verdict,
         summary: reviewForm.summary.trim(),
+        findings:
+          reviewForm.findPath.trim() && reviewForm.findNote.trim()
+            ? [{ path: reviewForm.findPath.trim(), severity: reviewForm.findSev, note: reviewForm.findNote.trim() }]
+            : [],
       }),
     });
     if (res.ok) {
-      setReviewForm({ verdict: "approve", summary: "" });
+      setReviewForm({ verdict: "approve", summary: "", findPath: "", findNote: "", findSev: "warn" });
       loadReviews();
     } else {
       alert(await res.text());
@@ -519,6 +524,9 @@ export function App() {
                       <span className={"verdict " + r.verdict}>{r.verdict.replace("_", " ")}</span>
                       <b className={actors.find((a) => a.id === r.reviewer)?.kind ?? ""}>{handleOf(r.reviewer)}</b>
                       <span className="rv-summary">{r.summary || "open review →"}</span>
+                      {r.findings?.length > 0 && (
+                        <span className="find-count">{r.findings.length} finding{r.findings.length > 1 ? "s" : ""}</span>
+                      )}
                     </button>
                   ))}
                   <div className="review-form">
@@ -537,6 +545,27 @@ export function App() {
                       onChange={(e) => setReviewForm({ ...reviewForm, summary: e.target.value })}
                     />
                     <button onClick={() => submitReview(p.number)}>Submit review</button>
+                    <div className="finding-row">
+                      <span className="muted">finding (optional):</span>
+                      <input
+                        className="fp"
+                        placeholder="path"
+                        value={reviewForm.findPath}
+                        onChange={(e) => setReviewForm({ ...reviewForm, findPath: e.target.value })}
+                        spellCheck={false}
+                      />
+                      <select value={reviewForm.findSev} onChange={(e) => setReviewForm({ ...reviewForm, findSev: e.target.value })}>
+                        <option value="info">info</option>
+                        <option value="warn">warn</option>
+                        <option value="blocker">blocker</option>
+                      </select>
+                      <input
+                        className="fn"
+                        placeholder="what's wrong"
+                        value={reviewForm.findNote}
+                        onChange={(e) => setReviewForm({ ...reviewForm, findNote: e.target.value })}
+                      />
+                    </div>
                   </div>
                 </div>
               )}
@@ -639,6 +668,21 @@ function ReviewPage({
           </p>
           {review.summary && <p className="summary">{review.summary}</p>}
         </section>
+
+        {review.findings?.length > 0 && (
+          <section className="rp-card">
+            <h3>Findings <span className="muted">({review.findings.length})</span></h3>
+            <ul className="rp-findings">
+              {review.findings.map((f, i) => (
+                <li key={i}>
+                  <span className={"sev " + f.severity}>{f.severity}</span>
+                  <code>{f.path}{f.line ? `:${f.line}` : ""}</code>
+                  <span className="fnote">{f.note}</span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
 
         <section className="rp-card">
           <h3>Proposed change</h3>
