@@ -856,9 +856,30 @@ function ReviewPage({
 
         <section className="rp-card">
           <h3>
-            Changes <span className="muted">({diff.length} files) · operations, then the diff</span>
+            Changes <span className="muted">({diff.length} files) · what changed, as operations</span>
           </h3>
           {diff.length === 0 && <p className="muted">no textual changes (or binary)</p>}
+          {diff.length > 0 &&
+            (() => {
+              const allOps = [...new Set(diff.flatMap((f) => f.ops))];
+              const count = (t: string) => diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === t).length, 0), 0);
+              return (
+                <div className="ops-summary">
+                  <div className="ops-title">
+                    Semantic operations <span className="shape">· {diff.length} files · +{count("add")} / -{count("del")}</span>
+                  </div>
+                  {allOps.length > 0 ? (
+                    <div className="ops-list">
+                      {allOps.map((o, i) => (
+                        <span className={"op " + (o.startsWith("removed") ? "del" : "add")} key={i}>{o}</span>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="muted">no signature-level operations — see the line diff below</div>
+                  )}
+                </div>
+              );
+            })()}
           {diff.map((f) => (
             <div className="fdiff" key={f.path}>
               <button className="fdiff-head" onClick={() => setOpenFile(openFile === f.path ? null : f.path)}>

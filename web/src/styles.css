@@ -263,3 +263,10 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .dl.add { background: #0f2018; color: #a8e6c8; } .dl.add .mark { color: #4caf7d; }
 .dl.del { background: #24141600; background: #201113; color: #f0a8ab; } .dl.del .mark { color: #d8595e; }
 .dl.ctx { color: #8b93a7; }
+
+.ops-summary { background: #0e1a16; border: 1px solid #1c3a2c; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
+.ops-summary .ops-title { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #7ee2b8; margin-bottom: 8px; }
+.ops-summary .ops-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.ops-summary .op { font-size: 12.5px; padding: 3px 9px; border-radius: 6px; background: #14231d; color: #a8e6c8; border: 1px solid #1f4030; }
+.ops-summary .op.del { background: #201113; color: #f0a8ab; border-color: #3a1c1f; }
+.ops-summary .ops-title .shape { color: #8b93a7; font-weight: 400; text-transform: none; letter-spacing: 0; }

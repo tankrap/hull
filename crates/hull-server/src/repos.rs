@@ -198,8 +198,16 @@ pub struct FileDiff {
 const MAX_DIFF_FILES: usize = 40;
 const MAX_BLOB_FOR_DIFF: usize = 256 * 1024; // skip huge/binary blobs
 
-/// Best-effort operations from a set of hunks: detect definitions added/removed by signature.
+/// The leading identifier after a keyword (`fn foo` → `foo`).
+fn ident_after(s: &str) -> String {
+    s.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect()
+}
+
+/// Best-effort semantic operations from hunks: detect definitions added/removed by signature across
+/// Rust / TS-JS / Python / CSS. Heuristic, not a real semantic diff (which is roadmapped), but it
+/// turns "+40 lines" into "added fn `verify`".
 fn semantic_ops(hunks: &[keel_store::Hunk]) -> Vec<String> {
+    // keyword → label, for `KEYWORD name …`
     let kinds = [
         ("fn ", "fn"), ("function ", "fn"), ("def ", "fn"),
         ("struct ", "struct"), ("enum ", "enum"), ("class ", "class"),
@@ -217,17 +225,54 @@ fn semantic_ops(hunks: &[keel_store::Hunk]) -> Vec<String> {
             for p in ["pub ", "async ", "export ", "default ", "public ", "private ", "static "] {
                 t = t.strip_prefix(p).unwrap_or(t);
             }
+            // imports
             if t.starts_with("use ") || t.starts_with("import ") || t.starts_with("from ") {
                 ops.push(format!("{verb} import"));
                 continue;
             }
+            // `KEYWORD name`
+            let mut matched = false;
             for (pat, label) in kinds {
                 if let Some(rest) = t.strip_prefix(pat) {
-                    let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    let name = ident_after(rest);
                     if !name.is_empty() {
                         ops.push(format!("{verb} {label} `{name}`"));
                     }
+                    matched = true;
                     break;
+                }
+            }
+            if matched {
+                continue;
+            }
+            // TS/JS: `const Name = (…) =>` / `= async`, and destructured hooks `const [x, setX] = useState`
+            if let Some(rest) = t.strip_prefix("const ").or_else(|| t.strip_prefix("let ")) {
+                if rest.trim_start().starts_with('[') {
+                    if rest.contains("useState") || rest.contains("useRef") || rest.contains("useReducer") {
+                        let name = ident_after(rest.trim_start().trim_start_matches('['));
+                        if !name.is_empty() {
+                            ops.push(format!("{verb} state `{name}`"));
+                        }
+                    }
+                    continue;
+                }
+                let name = ident_after(rest);
+                let looks_fn = rest.contains("=>") || rest.contains("= (") || rest.contains("=(") || rest.contains("= async");
+                if !name.is_empty() && looks_fn {
+                    let label = if name.chars().next().is_some_and(char::is_uppercase) { "component" } else { "fn" };
+                    ops.push(format!("{verb} {label} `{name}`"));
+                }
+                continue;
+            }
+            // CSS rule: a line with a selector before `{` (single-line rules included)
+            if let Some(brace) = t.find('{') {
+                let sel = t[..brace].trim();
+                let ok = sel
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c == '.' || c == '#' || c == ':' || c == '*' || c == '&' || c == '-' || c.is_alphabetic());
+                if !sel.is_empty() && sel.len() < 60 && ok && !sel.contains('(') && !sel.contains('=') && !sel.contains(';') {
+                    ops.push(format!("{verb} style `{sel}`"));
                 }
             }
         }
