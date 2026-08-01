@@ -167,6 +167,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/why", get(why))
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/merge", post(merge_pr))
+        .route("/api/repos/:tenant/:repo/prs/:number/auto-review", post(auto_review))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
@@ -786,6 +787,116 @@ async fn create_review(
             });
         }
     }
+    (StatusCode::CREATED, Json(json!({ "review": review }))).into_response()
+}
+
+/// **Agent auto-review** (`POST /api/repos/:tenant/:repo/prs/:number/auto-review`) — the reviewer
+/// runtime producing an accountable review. An **agent** actor runs the change's checks, reconciles
+/// its claims against the facts, and posts a real [`Review`]: findings for every contradicted claim,
+/// and a verdict (request-changes if anything is contradicted; approve only if checks are green and
+/// claims hold up). Gated: the reviewer must be an agent, accountable, and independent of the PR
+/// author — an agent can never rubber-stamp its own work.
+async fn auto_review(
+    State(app): State<App>,
+    Path((tenant, repo, number)): Path<(String, String, u64)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let reviewer = match require_actor(&app, &headers, body.get("reviewer").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if reviewer.kind != hull_core::ActorKind::Agent {
+        return (StatusCode::FORBIDDEN, "auto-review must be performed by an agent actor").into_response();
+    }
+    let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+        return (StatusCode::NOT_FOUND, "no such PR").into_response();
+    };
+    if pr.author == reviewer.id {
+        return (StatusCode::CONFLICT, "an agent cannot auto-review its own PR — review must be independent").into_response();
+    }
+    let Some(change) = pr.changes.first().cloned() else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "PR has no change to review").into_response();
+    };
+
+    // 1. Run the change's checks (refreshes keel verification, memoized by tree).
+    let (repos, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
+    let (t, r, c) = (tenant.clone(), repo.clone(), change.clone());
+    let check = tokio::task::spawn_blocking(move || ci::run_check(&repos, &registry, &ci, &t, &r, &c, false))
+        .await
+        .ok();
+    let verification = app.repos.verification(&tenant, &repo, &change).unwrap_or_else(|| "unverified".into());
+
+    // 2. Reconcile the change's narrative against its facts.
+    let Some(info) = app.repos.change_info(&tenant, &repo, &change) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "cannot resolve change").into_response();
+    };
+    let lesson = app.store.session_record(&key, &change).map(|s| s.lesson).unwrap_or_default();
+    let facts = app.repos.facts(&tenant, &repo, &change);
+    let ledger = hull_core::reconcile::reconcile(&change, &info.intent, &lesson, &facts);
+
+    // 3. Synthesize findings from contradicted claims (blockers) and, when there are contradictions,
+    //    surface unsupported claims as info the human reviewer should confirm.
+    let anchor = info.files.first().map(|f| f.path.clone()).unwrap_or_else(|| format!("change:{}", &change[..change.len().min(12)]));
+    let mut findings: Vec<ReviewFinding> = Vec::new();
+    for claim in &ledger.claims {
+        use hull_core::reconcile::ClaimStatus;
+        if claim.status == ClaimStatus::Contradicted {
+            let ev = claim.evidence.iter().find(|e| !e.supports).map(|e| e.detail.clone()).unwrap_or_default();
+            findings.push(ReviewFinding {
+                path: anchor.clone(),
+                line: None,
+                severity: "blocker".into(),
+                note: format!("Claim not supported by the change: “{}” — {ev}", claim.text),
+            });
+        }
+    }
+
+    // 4. Verdict.
+    let contradicted = ledger.contradicted();
+    let verdict = if contradicted > 0 {
+        Verdict::RequestChanges
+    } else if verification == "green" && ledger.supported() > 0 {
+        Verdict::Approve
+    } else {
+        Verdict::Comment
+    };
+    let summary = format!(
+        "Agent reconciliation review: {} claims — {} supported, {} contradicted; checks {}. {}",
+        ledger.claims.len(),
+        ledger.supported(),
+        contradicted,
+        check.as_ref().map(|o| match o.status {
+            hull_plugin::CiStatus::Green => "green",
+            hull_plugin::CiStatus::Red => "red",
+            hull_plugin::CiStatus::Errored => "not-run",
+        }).unwrap_or("unknown"),
+        match verdict {
+            Verdict::Approve => "Narrative matches the change and checks are green — approving.",
+            Verdict::RequestChanges => "The change contradicts its own stated intent — requesting changes.",
+            _ => "Checks are not green or nothing corroborates the intent — leaving a comment for a human.",
+        }
+    );
+
+    let count = app.store.reviews(&key).len();
+    let review = Review {
+        id: format!("rv_{}_{}", key.replace('/', "_"), count + 1),
+        repo: key.clone(),
+        target: format!("pr:{number}"),
+        reviewer: reviewer.id.clone(),
+        verdict,
+        summary,
+        findings,
+        created_unix: now(),
+    };
+    app.store.put_review(review.clone());
+    app.registry.notify(&NotifyEvent {
+        kind: "review_posted".into(),
+        to: vec![pr.author.clone()],
+        summary: format!("{} auto-reviewed PR !{number}: {:?}", reviewer.handle, review.verdict),
+        change: Some(change),
+    });
     (StatusCode::CREATED, Json(json!({ "review": review }))).into_response()
 }
 

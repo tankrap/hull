@@ -332,3 +332,9 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .check-result .check-summary{font-weight:400;color:var(--muted);font-family:ui-monospace,monospace;font-size:11px}
 .checks-note{font-size:12px;margin:8px 0}
 .linklike{background:none;border:none;color:#0969da;cursor:pointer;padding:0;font:inherit;text-decoration:underline}
+
+/* Agent auto-review trigger */
+.auto-review-bar{display:flex;align-items:center;gap:10px;margin:8px 0;flex-wrap:wrap}
+.auto-review-btn{background:linear-gradient(90deg,#6639ba,#8250df);color:#fff;border:none;border-radius:7px;padding:6px 13px;font-weight:600;cursor:pointer}
+.auto-review-btn:disabled{opacity:.6;cursor:progress}
+.auto-review-bar .muted{font-size:12px}

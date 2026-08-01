@@ -250,6 +250,31 @@ export function App() {
     }
   };
 
+  const [autoReviewing, setAutoReviewing] = useState<number | null>(null);
+  const autoReview = async (prNumber: number) => {
+    const agent = actors.find((a) => a.kind === "agent");
+    if (!agent) {
+      alert("no agent actor registered to run an auto-review");
+      return;
+    }
+    setAutoReviewing(prNumber);
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${prNumber}/auto-review`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ reviewer: agent.id }),
+      });
+      if (res.ok) {
+        loadReviews();
+        loadPrs();
+      } else {
+        alert(await res.text());
+      }
+    } finally {
+      setAutoReviewing(null);
+    }
+  };
+
   const mergePr = async (number: number) => {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${number}/merge`, {
       method: "POST",
@@ -749,6 +774,12 @@ export function App() {
                       )}
                     </button>
                   ))}
+                  <div className="auto-review-bar">
+                    <button className="auto-review-btn" disabled={autoReviewing === p.number} onClick={() => autoReview(p.number)}>
+                      {autoReviewing === p.number ? "agent reviewing…" : "⬡ Agent auto-review"}
+                    </button>
+                    <span className="muted">runs checks + reconciles the change's claims, then posts an accountable agent review</span>
+                  </div>
                   <div className="review-form">
                     <select
                       value={reviewForm.verdict}
