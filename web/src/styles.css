@@ -69,3 +69,29 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
   width: 9rem; padding: 4px 8px; border-radius: 6px; border: 1px solid #2a3040;
   background: #12151c; color: inherit; font: inherit;
 }
+
+/* Issues panel */
+.issues { padding: 0 24px 40px; }
+.issues h2 { margin: 8px 0 12px; }
+.issue-form { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.issue-form input {
+  padding: 7px 10px; border-radius: 7px; border: 1px solid #2a3040;
+  background: #12151c; color: inherit; font: inherit;
+}
+.issue-form input:first-child { flex: 1 1 260px; }
+.issue-form input.path { flex: 1 1 320px; }
+.issue-form input.line { width: 64px; }
+.issue-form button {
+  padding: 7px 16px; border-radius: 7px; border: 1px solid #2f8f6b;
+  background: #14231d; color: #7ee2b8; font: inherit; cursor: pointer;
+}
+.issue-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.issue { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: #12151c; border: 1px solid #20263400; border-radius: 8px; }
+.issue:hover { border-color: #2a3040; }
+.issue .state { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 2px 7px; border-radius: 20px; background: #14231d; color: #7ee2b8; }
+.issue .state.closed { background: #241a24; color: #c98bd6; }
+.issue .num { color: #8b93a7; font-variant-numeric: tabular-nums; }
+.issue .it-title { font-weight: 500; }
+.issue .coderef { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; color: #9fb2d6; background: #0e1420; padding: 2px 8px; border-radius: 6px; border: 1px solid #1c2740; }
+.issue .coderef .blob { color: #6fa8ff; font-size: 12px; }
+.issue .by { margin-left: auto; color: #8b93a7; font-size: 12px; }

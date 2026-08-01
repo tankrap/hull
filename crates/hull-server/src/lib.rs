@@ -17,7 +17,9 @@ pub mod repos;
 use activity::{ActivityEvent, ActivityHub};
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     response::sse::{Event, Sse},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -79,7 +81,7 @@ fn make_router(app: App) -> Router {
         .route("/api/home", get(home))
         .route("/api/feed", get(feed))
         .route("/api/repos", get(repos_list))
-        .route("/api/repos/:repo/issues", get(issues))
+        .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
         // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
@@ -149,8 +151,66 @@ async fn repos_list(State(app): State<App>) -> Json<Value> {
     Json(json!({ "hosted": app.repos.list(), "repos": app.store.repos() }))
 }
 
-async fn issues(State(app): State<App>, Path(repo): Path<String>) -> Json<Value> {
-    Json(json!({ "issues": app.store.issues(&repo) }))
+/// List issues for a hosted repo (`GET /api/repos/:tenant/:repo/issues`).
+async fn issues(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+    Json(json!({ "issues": app.store.issues(&format!("{tenant}/{repo}")) }))
+}
+
+/// Open an issue (`POST /api/repos/:tenant/:repo/issues`). An optional `code_ref` `{path, line_start,
+/// line_end?}` is resolved to a keel **blob id** at HEAD, so the reference is content-addressed and
+/// survives edits (the keel-native advantage over `file#L42`). Opening an issue also emits an event
+/// to the tenant's situation room.
+async fn create_issue(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let title = body.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title is required").into_response();
+    }
+    let mut code_refs = Vec::new();
+    if let Some(cr) = body.get("code_ref").filter(|v| !v.is_null()) {
+        if let Some(path) = cr.get("path").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            // resolve to a content-addressed keel blob; None if the path isn't in HEAD
+            let Some(anchor) = app.repos.resolve_blob(&tenant, &repo, path) else {
+                return (StatusCode::UNPROCESSABLE_ENTITY, format!("path '{path}' not found in {key}@HEAD")).into_response();
+            };
+            code_refs.push(CodeRef {
+                repo: key.clone(),
+                blob: anchor.blob,
+                path: path.to_string(),
+                line_start: cr.get("line_start").and_then(Value::as_u64).unwrap_or(1) as u32,
+                line_end: cr.get("line_end").and_then(Value::as_u64).map(|n| n as u32),
+            });
+        }
+    }
+    let number = app.store.issues(&key).iter().map(|i| i.number).max().unwrap_or(0) + 1;
+    let author = body.get("author").and_then(Value::as_str).unwrap_or("agent:anonymous").to_string();
+    let issue = Issue {
+        id: format!("iss_{}_{number}", key.replace('/', "_")),
+        repo: key,
+        number,
+        title,
+        body: body.get("body").and_then(Value::as_str).unwrap_or("").to_string(),
+        author: author.clone(),
+        assignees: vec![],
+        labels: vec![],
+        projects: vec![],
+        status: IssueStatus::Open,
+        code_refs,
+        referenced_actors: vec![],
+        linked_prs: vec![],
+        resolved_by: None,
+        created_unix: now(),
+    };
+    app.store.put_issue(issue.clone());
+    app.hub.publish(
+        &tenant,
+        ActivityEvent::Issue { repo, number, action: "opened".into(), actor: author, ts: now() },
+    );
+    (StatusCode::CREATED, Json(json!({ "issue": issue }))).into_response()
 }
 
 /// Server-side secret scan (the backstop) — built-in engine **plus** any plugin rulesets.

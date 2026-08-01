@@ -13,7 +13,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use keel_store::Store;
+use keel_store::{Object, ObjectId, Store};
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
@@ -86,6 +86,51 @@ impl RepoHost {
         self.open.lock().unwrap().insert(key, store.clone());
         Ok(Some(store))
     }
+}
+
+/// A resolved content-addressed anchor: the keel blob id a path currently maps to at HEAD, plus the
+/// change id that HEAD is — so an issue's line-ref survives edits (the blob stays valid) and can be
+/// traced to the change/agent that produced it (`keel why`).
+pub struct BlobAnchor {
+    pub blob: String,
+    pub change: String,
+}
+
+impl RepoHost {
+    /// Resolve `path` in a hosted repo to the keel blob it points at in HEAD's tree. This is what
+    /// makes a Hull code-ref content-addressed rather than a fragile `file#L42`. `None` if the repo
+    /// or path doesn't exist. Reuses the cached store (no second LMDB open).
+    pub fn resolve_blob(&self, tenant: &str, repo: &str, path: &str) -> Option<BlobAnchor> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let head = store.get_ref("main").ok()??;
+        let tree = match store.get(&head).ok()?? {
+            Object::Change(c) => c.tree,
+            _ => return None,
+        };
+        let blob = resolve_path_in_tree(&store, tree, path)?;
+        Some(BlobAnchor { blob: blob.to_hex(), change: head.to_hex() })
+    }
+}
+
+/// Walk `tree` down `path` (`/`-separated) to the blob id at the leaf.
+fn resolve_path_in_tree(store: &Store, tree: ObjectId, path: &str) -> Option<ObjectId> {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut cur = tree;
+    for (i, part) in parts.iter().enumerate() {
+        let entries = match store.get(&cur).ok()?? {
+            Object::Tree(t) => t.entries,
+            _ => return None,
+        };
+        let entry = entries.into_iter().find(|e| e.name == *part)?;
+        if i == parts.len() - 1 {
+            return Some(entry.id);
+        }
+        cur = entry.id;
+    }
+    None
 }
 
 /// A repo/tenant path segment must be a plain name — no traversal, separators, or dotfiles.
