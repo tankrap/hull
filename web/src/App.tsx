@@ -77,8 +77,25 @@ export function App() {
       .then((m) => setMe(m))
       .catch(() => setMe(null));
   }, [token]);
-  const signIn = async () => {
-    const secret = secretInput.trim();
+  // Register a fresh human identity and sign in with it — one click to a usable session.
+  const registerAndSignIn = async () => {
+    const handle = prompt("handle for your new identity", "you") ?? "";
+    if (!handle.trim()) return;
+    const res = await fetch("/api/actors", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ handle: handle.trim(), kind: "human" }),
+    });
+    if (!res.ok) {
+      alert(await res.text());
+      return;
+    }
+    const { secret_key } = await res.json();
+    await signInWith(secret_key);
+    alert("Your secret key (save it to sign in again):\n\n" + secret_key);
+  };
+  const signIn = () => signInWith(secretInput.trim());
+  const signInWith = async (secret: string) => {
     if (!secret) return;
     try {
       const skBytes = hexToBytes(secret);
@@ -328,6 +345,7 @@ export function App() {
                 onKeyDown={(e) => e.key === "Enter" && signIn()}
               />
               <button onClick={signIn}>Sign in</button>
+              <button className="link" onClick={registerAndSignIn}>new identity</button>
             </>
           )}
         </div>
