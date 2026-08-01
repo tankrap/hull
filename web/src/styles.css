@@ -320,3 +320,15 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .claim-ev li.ok::before{content:"✓ ";color:#1a7f37}
 .claim-ev li.bad::before{content:"✗ "}
 .ev-kind{font-family:ui-monospace,monospace;font-size:11px;opacity:.75;border:1px solid var(--line);border-radius:4px;padding:0 5px;margin-right:4px}
+
+/* CI runner (review page) */
+.act.run-checks{background:#0969da;color:#fff;border-color:#0969da}
+.act.run-checks:disabled{opacity:.6;cursor:progress}
+.check-result{display:inline-flex;align-items:center;gap:8px;margin-left:10px;font-size:13px;font-weight:600;text-transform:capitalize}
+.check-result.green{color:#1a7f37}
+.check-result.red{color:#cf222e}
+.check-result.errored{color:#9a6700}
+.check-result .memo-tag{font-size:10px;text-transform:uppercase;letter-spacing:.4px;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--muted);font-weight:600}
+.check-result .check-summary{font-weight:400;color:var(--muted);font-family:ui-monospace,monospace;font-size:11px}
+.checks-note{font-size:12px;margin:8px 0}
+.linklike{background:none;border:none;color:#0969da;cursor:pointer;padding:0;font:inherit;text-decoration:underline}

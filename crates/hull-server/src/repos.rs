@@ -503,6 +503,28 @@ impl RepoHost {
         store.set_verification(&cid, v).is_ok()
     }
 
+    /// The keel **tree id** (content address) of a change — what makes a CI result memoizable: the
+    /// same tree always yields the same verdict.
+    pub fn change_tree(&self, tenant: &str, repo: &str, hex: &str) -> Option<String> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let cid = ObjectId::from_hex(hex)?;
+        match store.get(&cid).ok()?? {
+            Object::Change(c) => Some(c.tree.to_hex()),
+            _ => None,
+        }
+    }
+
+    /// Materialize a change's tree onto `dir` (a fresh checkout to run checks against).
+    pub fn checkout_change(&self, tenant: &str, repo: &str, hex: &str, dir: &std::path::Path) -> bool {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return false };
+        let Some(cid) = ObjectId::from_hex(hex) else { return false };
+        let tree = match store.get(&cid) {
+            Ok(Some(Object::Change(c))) => c.tree,
+            _ => return false,
+        };
+        keel_store::snapshot::checkout(&store, tree, dir).is_ok()
+    }
+
     /// The observable facts of a change — touched files, semantic operations, verification, and
     /// secret findings — the ground truth a [`reconcile`](hull_core::reconcile) run judges claims
     /// against.

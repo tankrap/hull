@@ -8,6 +8,7 @@
 //! `/api/repos/:repo/issues` · `/api/scan` · `/api/plugins`.
 
 pub mod activity;
+pub mod ci;
 pub mod ingress;
 pub mod keeld;
 pub mod plugins;
@@ -95,6 +96,7 @@ struct App {
     repos: repos::RepoHost,
     notifications: Arc<Mutex<Vec<Notification>>>,
     auth: Arc<Mutex<AuthState>>,
+    ci: Arc<ci::CiMemo>,
 }
 
 impl repos::HasRepoHost for App {
@@ -127,6 +129,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         repos: repos::RepoHost::from_env(),
         notifications,
         auth: Arc::new(Mutex::new(AuthState::default())),
+        ci: Arc::new(ci::CiMemo::from_env()),
     }
 }
 
@@ -168,6 +171,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
         .route("/api/repos/:tenant/:repo/change/:id/ledger", get(change_ledger))
+        .route("/api/repos/:tenant/:repo/change/:id/check", post(run_check_handler))
         .route("/api/repos/:tenant/:repo/security", get(repo_security))
         .route("/api/repos/:tenant/:repo/owners", get(owners_list).post(set_owners))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
@@ -581,6 +585,46 @@ async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(Str
         }
         None => Json(json!({ "change": null })),
     }
+}
+
+/// Run the change's checks (`POST …/change/:id/check`) — the reviewer runtime. Checks out the
+/// change's keel tree, runs its detected test command (or a hosted runner), memoizes the verdict by
+/// tree id, and writes the resulting green/red to keel verification. Accountable-only. Body may set
+/// `{"force": true}` to bypass the content-addressed memo. Returns `{status, summary, memoized}`.
+async fn run_check_handler(
+    State(app): State<App>,
+    Path((tenant, repo, id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        return resp;
+    }
+    let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
+    // The runner blocks (spawns a test process); keep the async runtime free.
+    let (repos, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
+    let (t, r, c) = (tenant.clone(), repo.clone(), id.clone());
+    let outcome = tokio::task::spawn_blocking(move || ci::run_check(&repos, &registry, &ci, &t, &r, &c, force))
+        .await
+        .unwrap_or(hull_plugin::CiOutcome {
+            status: hull_plugin::CiStatus::Errored,
+            summary: "runner panicked".into(),
+            memoized: false,
+        });
+    let status = match outcome.status {
+        hull_plugin::CiStatus::Green => "green",
+        hull_plugin::CiStatus::Red => "red",
+        hull_plugin::CiStatus::Errored => "errored",
+    };
+    if matches!(outcome.status, hull_plugin::CiStatus::Green | hull_plugin::CiStatus::Red) {
+        app.registry.notify(&hull_plugin::NotifyEvent {
+            kind: if status == "green" { "ci_passed".into() } else { "ci_failed".into() },
+            to: vec![],
+            summary: format!("checks {status} for {tenant}/{repo}@{}: {}", &id[..id.len().min(12)], outcome.summary),
+            change: Some(id.clone()),
+        });
+    }
+    Json(json!({ "status": status, "summary": outcome.summary, "memoized": outcome.memoized })).into_response()
 }
 
 /// Ingest a keel session for a change (`POST …/change/:id/session`) — the output of `keel capture`,

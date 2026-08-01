@@ -873,6 +873,27 @@ function ReviewPage({
     loadChange();
   };
 
+  const [checking, setChecking] = useState(false);
+  const [checkResult, setCheckResult] = useState<{ status: string; summary: string; memoized: boolean } | null>(null);
+  const runChecks = async (force: boolean) => {
+    if (!changeId) return;
+    setChecking(true);
+    setCheckResult(null);
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/check`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ actor: review.reviewer, force }),
+      });
+      setCheckResult(await res.json());
+      loadChange(); // verification was written back by the runner
+    } catch {
+      setCheckResult({ status: "errored", summary: "request failed", memoized: false });
+    } finally {
+      setChecking(false);
+    }
+  };
+
   const independent = pr ? pr.author !== review.reviewer : true;
   const verification = change?.verification ?? "unverified";
   const risk =
@@ -1061,8 +1082,30 @@ function ReviewPage({
             keel verification: <span className={"verif " + verification}>{verification}</span> · risk: <b>{risk}</b>
           </p>
           <div className="verify-actions">
-            <button className="act close" onClick={() => verify(true)}>Mark keel-verify green</button>
-            <button className="act reopen" onClick={() => verify(false)}>Mark red</button>
+            <button className="act run-checks" disabled={checking} onClick={() => runChecks(false)}>
+              {checking ? "running checks…" : "Run checks"}
+            </button>
+            {checkResult && (
+              <span className={"check-result " + checkResult.status}>
+                {checkResult.status}
+                {checkResult.memoized && <span className="memo-tag">memoized</span>}
+                <span className="check-summary">{checkResult.summary}</span>
+              </span>
+            )}
+          </div>
+          <p className="muted checks-note">
+            Checks run the change's own tree in a fresh checkout and memoize by content — an unchanged
+            tree is an instant cache hit. The result writes back to keel verification above.
+            {checkResult && (
+              <>
+                {" "}
+                <button className="linklike" disabled={checking} onClick={() => runChecks(true)}>re-run (bypass memo)</button>
+              </>
+            )}
+          </p>
+          <div className="verify-actions">
+            <button className="act close" onClick={() => verify(true)}>Override: green</button>
+            <button className="act reopen" onClick={() => verify(false)}>Override: red</button>
           </div>
         </section>
 
