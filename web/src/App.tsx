@@ -302,6 +302,29 @@ export function App() {
   useEffect(() => {
     loadReviews();
   }, [tenant, issueRepo]);
+
+  // Discussion comments (the conversation layer over reviews).
+  type Comment = { id: string; target: string; author: string; body: string; created_unix: number };
+  const [comments, setComments] = useState<Comment[]>([]);
+  const [commentDraft, setCommentDraft] = useState<Record<number, string>>({});
+  const loadComments = () =>
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/comments`)
+      .then((r) => r.json())
+      .then((d) => setComments(d.comments ?? []))
+      .catch(() => {});
+  useEffect(() => { loadComments(); }, [tenant, issueRepo]);
+  const postComment = async (prNumber: number) => {
+    if (!canAct) return alert("Sign in to act.");
+    const body = (commentDraft[prNumber] ?? "").trim();
+    if (!body) return;
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/comments`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ target: `pr:${prNumber}`, body }),
+    });
+    if (res.ok) { setCommentDraft((d) => ({ ...d, [prNumber]: "" })); loadComments(); }
+    else alert(await res.text());
+  };
   const submitReview = async (prNumber: number) => {
     if (!canAct) return alert("Sign in to act.");
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`, {
@@ -986,6 +1009,26 @@ export function App() {
                         value={reviewForm.findNote}
                         onChange={(e) => setReviewForm({ ...reviewForm, findNote: e.target.value })}
                       />
+                    </div>
+                  </div>
+                  <div className="pr-thread">
+                    <h5>Discussion <span className="muted">humans and agents, one accountable thread</span></h5>
+                    {comments.filter((c) => c.target === `pr:${p.number}`).sort((a, b) => a.created_unix - b.created_unix).map((c) => (
+                      <div className="cmt" key={c.id}>
+                        <b className={actors.find((a) => a.id === c.author)?.kind ?? ""}>{handleOf(c.author)}</b>
+                        <span className="cmt-body">{c.body}</span>
+                      </div>
+                    ))}
+                    {comments.filter((c) => c.target === `pr:${p.number}`).length === 0 && <div className="muted cmt-empty">no comments yet</div>}
+                    <div className="cmt-form">
+                      <input
+                        placeholder={canAct ? "comment…" : "sign in to comment"}
+                        disabled={!canAct}
+                        value={commentDraft[p.number] ?? ""}
+                        onChange={(e) => setCommentDraft((d) => ({ ...d, [p.number]: e.target.value }))}
+                        onKeyDown={(e) => e.key === "Enter" && postComment(p.number)}
+                      />
+                      <button disabled={!canAct} onClick={() => postComment(p.number)}>Comment</button>
                     </div>
                   </div>
                 </div>

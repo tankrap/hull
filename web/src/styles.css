@@ -389,3 +389,13 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 /* Mint-agent action in profile */
 .profile-actions{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
 .mint-agent{background:#8250df;color:#fff;border:none;border-radius:7px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer}
+
+/* PR discussion thread */
+.pr-thread{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.pr-thread h5{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}
+.cmt{display:flex;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:13px}
+.cmt b{flex:0 0 auto}
+.cmt-body{white-space:pre-wrap;word-break:break-word}
+.cmt-empty{font-size:12px;padding:4px 0}
+.cmt-form{display:flex;gap:6px;margin-top:8px}
+.cmt-form input{flex:1;font-size:13px;padding:5px 9px;border:1px solid var(--line);border-radius:7px;background:var(--surface)}

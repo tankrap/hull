@@ -316,6 +316,20 @@ pub enum Verdict {
     Comment,
 }
 
+/// A discussion comment on a target (a PR `pr:1`, or a review id) — the conversation layer over the
+/// structured verdict/findings. Author is an [`Actor`], so a **human and an agent hold the same
+/// thread**: an agent can post its reasoning and a human can reply, accountably, in one place.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Comment {
+    pub id: String,
+    pub repo: String,
+    /// What this comments on, e.g. `pr:1`.
+    pub target: String,
+    pub author: ActorId,
+    pub body: String,
+    pub created_unix: u64,
+}
+
 /// A specific issue a review raises, anchored to a file (and optionally a line). What turns a
 /// review from a verdict into an actual review.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

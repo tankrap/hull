@@ -230,6 +230,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/mirror", get(mirror_status))
         .route("/api/repos/:tenant/:repo/mirror/inbound", post(mirror_inbound))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
+        .route("/api/repos/:tenant/:repo/comments", get(comments_list).post(create_comment))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
         .route("/api/repos/:tenant/:repo/change/:id/ledger", get(change_ledger))
@@ -1136,6 +1137,62 @@ async fn mirror_inbound(
 /// target (e.g. `pr:1`).
 async fn reviews(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
     Json(json!({ "reviews": app.store.reviews(&format!("{tenant}/{repo}")) }))
+}
+
+/// Discussion comments for a repo (`GET /api/repos/:tenant/:repo/comments`); the client filters by
+/// `target` (e.g. `pr:1`). The conversation layer over the structured review.
+async fn comments_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+    Json(json!({ "comments": app.store.comments(&format!("{tenant}/{repo}")) }))
+}
+
+/// Post a comment (`POST /api/repos/:tenant/:repo/comments`) — `{target, body}`. Authored by the
+/// signed-in actor (human or agent), so a review thread is one accountable conversation. Notifies the
+/// PR's author and reviewers.
+async fn create_comment(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let author = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let target = body.get("target").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let text = body.get("body").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if target.is_empty() || text.is_empty() {
+        return (StatusCode::BAD_REQUEST, "target and body are required").into_response();
+    }
+    let count = app.store.comments(&key).len();
+    let comment = Comment {
+        id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
+        repo: key.clone(),
+        target: target.clone(),
+        author: author.id.clone(),
+        body: text,
+        created_unix: now(),
+    };
+    app.store.put_comment(comment.clone());
+    // Notify the PR's author + reviewers (not the commenter).
+    if let Some(num) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
+        if let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == num) {
+            let mut to: Vec<String> = pr.reviewers.clone();
+            to.push(pr.author.clone());
+            to.retain(|a| a != &author.id);
+            to.sort();
+            to.dedup();
+            if !to.is_empty() {
+                app.registry.notify(&NotifyEvent {
+                    kind: "comment_posted".into(),
+                    to,
+                    summary: format!("{} commented on PR !{num}", author.handle),
+                    change: pr.changes.first().cloned(),
+                });
+            }
+        }
+    }
+    (StatusCode::CREATED, Json(json!({ "comment": comment }))).into_response()
 }
 
 /// Post a review (`POST /api/repos/:tenant/:repo/reviews`) — `{target, reviewer, verdict, summary}`.
