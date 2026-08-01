@@ -80,6 +80,10 @@ export function App() {
     setOpenIssue(null);
     setTimeout(() => issuesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
   };
+  // Default the issues/PRs repo to whatever's actually active, so it's never stuck on a stale name.
+  useEffect(() => {
+    if (repos.length && !repos.some((r) => r.repo === issueRepo)) setIssueRepo(repos[0].repo);
+  }, [repos]);
 
   // Toggle keel-native provenance ("who/what touched this path") under a code-ref.
   const showWhy = async (key: string, path: string) => {
@@ -276,7 +280,12 @@ export function App() {
         <section>
           <h2>Repositories <span className="muted">by live activity</span></h2>
           <div className="repos">
-            {repos.length === 0 && <div className="empty">waiting for activity…</div>}
+            {repos.length === 0 && (
+              <div className="empty">
+                no active repos for <b>{tenant}</b> — host one:{" "}
+                <code>git push http://localhost:8930/{tenant}/&lt;repo&gt; main</code>
+              </div>
+            )}
             {repos.map((r) => (
               <article
                 className={"repo" + (r.repo === issueRepo ? " selected" : "")}

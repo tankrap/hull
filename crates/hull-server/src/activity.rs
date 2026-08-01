@@ -9,7 +9,7 @@
 //! [`KeeldSource`] (M3) will `keel_net::Client::connect(addr).subscribe()` and feed the same hub —
 //! the ingestion shape is identical, only the source changes.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use tokio::sync::broadcast;
@@ -49,7 +49,7 @@ impl ActivityEvent {
 }
 
 /// A repo's current standing on the home page.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoActivity {
     pub repo: String,
     pub score: f64,
@@ -69,17 +69,43 @@ pub struct TenantEvent {
 }
 
 /// Central hub: broadcasts tenant-tagged events to SSE subscribers and maintains **per-tenant**
-/// repo activity, so the situation room is scoped to the viewing org.
+/// repo activity, so the situation room is scoped to the viewing org. Optionally persisted to disk
+/// so the home page survives a restart (NEW-1169).
 pub struct ActivityHub {
     tx: broadcast::Sender<TenantEvent>,
     /// tenant → its repo ranking.
     rankers: RwLock<HashMap<String, Ranker>>,
+    persist: Option<std::path::PathBuf>,
 }
 
 impl ActivityHub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
-        ActivityHub { tx, rankers: RwLock::new(HashMap::new()) }
+        ActivityHub { tx, rankers: RwLock::new(HashMap::new()), persist: None }
+    }
+
+    /// Like [`new`](Self::new) but loads any persisted ranking from `path` and remembers it for
+    /// [`flush`](Self::flush), so the situation room survives restarts.
+    pub fn with_persistence(path: std::path::PathBuf) -> Self {
+        let rankers = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<HashMap<String, Ranker>>(&b).ok())
+            .unwrap_or_default();
+        let (tx, _) = broadcast::channel(1024);
+        ActivityHub { tx, rankers: RwLock::new(rankers), persist: Some(path) }
+    }
+
+    /// Write the current ranking to disk (no-op if persistence is off). Called on a timer.
+    pub fn flush(&self) {
+        let Some(path) = &self.persist else { return };
+        let snap = self.rankers.read().unwrap();
+        if let Ok(bytes) = serde_json::to_vec(&*snap) {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let tmp = path.with_extension("json.tmp");
+            let _ = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, path));
+        }
     }
 
     /// Subscribe to the raw (tenant-tagged) stream; the caller filters to its tenant.
@@ -107,7 +133,7 @@ impl Default for ActivityHub {
 
 /// Decaying activity accounting. Each event adds weight to its repo; `ranked()` orders by score.
 /// (Scaffold uses simple accumulation + recency; M3 adds time-decay tied to wall clock.)
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Ranker {
     repos: HashMap<String, RepoActivity>,
 }

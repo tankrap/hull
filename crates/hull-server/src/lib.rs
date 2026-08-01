@@ -192,8 +192,20 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
         registry.plugins().len(),
         registry.plugins().iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
     );
-    let hub = Arc::new(ActivityHub::new());
+    // Persist the situation-room ranking next to the domain store so it survives restarts.
+    let activity_path = data_path().with_file_name("activity.json");
+    let hub = Arc::new(ActivityHub::with_persistence(activity_path));
     wire_sources(&hub);
+    {
+        // Flush the ranking to disk on a timer (crash-only; the timer is the durability point).
+        let hub_flush = hub.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                hub_flush.flush();
+            }
+        });
+    }
     if let Some(addr) = ingress_addr() {
         ingress::spawn(addr, hub.clone()); // daemons dial in via hull-agent
     }
