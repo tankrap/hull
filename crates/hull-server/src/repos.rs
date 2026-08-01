@@ -97,6 +97,13 @@ pub struct BlobAnchor {
 }
 
 impl RepoHost {
+    /// The keel change id at HEAD of a hosted repo (hex), or `None` if the repo/ref is missing.
+    /// A PR proposes real keel changes, so it anchors to this content address.
+    pub fn head_change(&self, tenant: &str, repo: &str) -> Option<String> {
+        let store = self.store(tenant, repo, false).ok()??;
+        store.get_ref("main").ok()?.map(|id| id.to_hex())
+    }
+
     /// Resolve `path` in a hosted repo to the keel blob it points at in HEAD's tree. This is what
     /// makes a Hull code-ref content-addressed rather than a fragile `file#L42`. `None` if the repo
     /// or path doesn't exist. Reuses the cached store (no second LMDB open).

@@ -16,6 +16,7 @@ type ActivityEvent =
   | { kind: "issue"; repo: string; number: number; action: string; actor: string; ts: number };
 
 type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable: boolean; human_root: string | null };
+type PR = { number: number; title: string; author: string; changes: string[]; verification: string };
 type CodeRef = { repo: string; blob: string; path: string; line_start: number; line_end?: number };
 type Issue = {
   number: number;
@@ -96,6 +97,33 @@ export function App() {
       body: JSON.stringify({ action, actor: actingAs, ...(action === "close" ? { reason: "completed" } : {}) }),
     });
     loadIssues();
+  };
+
+  // Pull requests for the selected repo.
+  const [prs, setPrs] = useState<PR[]>([]);
+  const [prTitle, setPrTitle] = useState("");
+  const loadPrs = () =>
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs`)
+      .then((r) => r.json())
+      .then((d) => setPrs(d.prs ?? []))
+      .catch(() => {});
+  useEffect(() => {
+    loadPrs();
+  }, [tenant, issueRepo]);
+  const createPr = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!prTitle.trim()) return;
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: prTitle.trim(), author: actingAs }),
+    });
+    if (res.ok) {
+      setPrTitle("");
+      loadPrs();
+    } else {
+      alert(await res.text());
+    }
   };
 
   const createIssue = async (e: React.FormEvent) => {
@@ -356,6 +384,38 @@ export function App() {
                   </ul>
                 ) : null;
               })}
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section className="issues prs">
+        <h2>
+          Pull requests <span className="muted">{tenant}/{issueRepo}</span>
+        </h2>
+        <form className="issue-form" onSubmit={createPr}>
+          <input
+            placeholder="Open a PR from HEAD…"
+            value={prTitle}
+            onChange={(e) => setPrTitle(e.target.value)}
+          />
+          <button type="submit">Open PR</button>
+        </form>
+        <ul className="issue-list">
+          {prs.length === 0 && <li className="empty">no pull requests yet</li>}
+          {[...prs].sort((a, b) => b.number - a.number).map((p) => (
+            <li key={p.number} className="issue">
+              <div className="issue-row">
+                <span className={"verif " + p.verification}>{p.verification}</span>
+                <span className="num">!{p.number}</span>
+                <span className="it-title">{p.title}</span>
+                <span className="coderef" title={`proposes keel change ${p.changes[0]}`}>
+                  <span className="blob">⬡ {(p.changes[0] ?? "").slice(0, 10)}</span>
+                </span>
+                <span className={"by " + (actors.find((a) => a.id === p.author)?.kind ?? "")}>
+                  {handleOf(p.author)}
+                </span>
+              </div>
             </li>
           ))}
         </ul>

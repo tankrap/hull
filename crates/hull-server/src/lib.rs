@@ -101,6 +101,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
         .route("/api/repos/:tenant/:repo/issues/:number", axum::routing::patch(update_issue))
         .route("/api/repos/:tenant/:repo/why", get(why))
+        .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
         // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
@@ -248,6 +249,55 @@ async fn why(
     let path = q.get("path").map(String::as_str).unwrap_or("");
     let prov = app.repos.why(&tenant, &repo, path, 10);
     Json(json!({ "path": path, "provenance": prov }))
+}
+
+/// List pull requests for a hosted repo (`GET /api/repos/:tenant/:repo/prs`).
+async fn prs(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+    Json(json!({ "prs": app.store.prs(&format!("{tenant}/{repo}")) }))
+}
+
+/// Open a PR (`POST /api/repos/:tenant/:repo/prs`). It proposes real keel changes: `changes` may be
+/// given explicitly, else it anchors to the repo's current HEAD change (content-addressed). Author
+/// is gated by the accountability rule. Verification mirrors keel and starts Unverified.
+async fn create_pr(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let actor = match require_accountable(&app, body.get("author").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let title = body.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title is required").into_response();
+    }
+    let changes: Vec<String> = match body.get("changes").and_then(Value::as_array) {
+        Some(arr) => arr.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+        None => app.repos.head_change(&tenant, &repo).into_iter().collect(),
+    };
+    if changes.is_empty() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "no changes to propose (empty repo?)").into_response();
+    }
+    let number = app.store.prs(&key).iter().map(|p| p.number).max().unwrap_or(0) + 1;
+    let pr = PullRequest {
+        id: format!("pr_{}_{number}", key.replace('/', "_")),
+        repo: key,
+        number,
+        title,
+        author: actor.id,
+        changes,
+        verification: Verification::Unverified,
+        reviewers: vec![],
+        created_unix: now(),
+    };
+    app.store.put_pr(pr.clone());
+    app.hub.publish(
+        &tenant,
+        ActivityEvent::Push { actor: actor.handle, repo, change: pr.changes[0].clone(), ts: now() },
+    );
+    (StatusCode::CREATED, Json(json!({ "pr": pr }))).into_response()
 }
 
 /// List issues for a hosted repo (`GET /api/repos/:tenant/:repo/issues`).
