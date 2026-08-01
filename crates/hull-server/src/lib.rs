@@ -96,6 +96,7 @@ fn make_router(app: App) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/api/home", get(home))
         .route("/api/feed", get(feed))
+        .route("/api/actors", get(actors_list).post(register_actor))
         .route("/api/repos", get(repos_list))
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
         .route("/api/repos/:tenant/:repo/issues/:number", axum::routing::patch(update_issue))
@@ -172,6 +173,70 @@ async fn repos_list(State(app): State<App>) -> Json<Value> {
     Json(json!({ "hosted": app.repos.list(), "repos": app.store.repos() }))
 }
 
+/// Registered actors (public — no secret keys), each with its accountability root.
+async fn actors_list(State(app): State<App>) -> Json<Value> {
+    let actors: Vec<Value> = app
+        .store
+        .actors()
+        .into_iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "handle": a.handle,
+                "kind": a.kind,
+                "accountable": a.is_accountable(),
+                "human_root": a.human_principal(),
+            })
+        })
+        .collect();
+    Json(json!({ "actors": actors }))
+}
+
+/// Register (mint) an actor with a real Ed25519 keypair (`POST /api/actors`). A `human` is its own
+/// root; an `agent` must name `delegated_by` (an existing accountable actor) and gets a delegation
+/// chain rooting at that human — enforcing "no unaccountable agents" at mint. The secret key is
+/// returned ONCE and never stored.
+async fn register_actor(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let handle = body.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if handle.is_empty() {
+        return (StatusCode::BAD_REQUEST, "handle is required").into_response();
+    }
+    let minted = match body.get("kind").and_then(Value::as_str).unwrap_or("human") {
+        "human" => identity::mint_human(&handle),
+        "agent" => {
+            let Some(parent_id) = body.get("delegated_by").and_then(Value::as_str) else {
+                return (StatusCode::UNPROCESSABLE_ENTITY, "an agent must be 'delegated_by' a human actor").into_response();
+            };
+            let Some(parent) = app.store.actor(parent_id) else {
+                return (StatusCode::UNPROCESSABLE_ENTITY, format!("delegated_by: unknown actor '{parent_id}'")).into_response();
+            };
+            let scope = body.get("scope").and_then(Value::as_str).unwrap_or("*");
+            match identity::mint_agent(&handle, &parent, scope, Lifetime::Ephemeral { expires_unix: 0 }) {
+                Some(m) => m,
+                None => return (StatusCode::UNPROCESSABLE_ENTITY, "the delegating actor is not accountable (must chain to a human)").into_response(),
+            }
+        }
+        _ => return (StatusCode::BAD_REQUEST, "kind must be 'human' or 'agent'").into_response(),
+    };
+    app.store.put_actor(minted.actor.clone());
+    (StatusCode::CREATED, Json(json!({ "actor": minted.actor, "secret_key": minted.secret_key }))).into_response()
+}
+
+/// The accountability gate: an authoring action must be by a registered actor that chains to a
+/// human. Returns the actor, or a 403 response to short-circuit the handler.
+#[allow(clippy::result_large_err)] // the Err IS the HTTP response the caller returns
+fn require_accountable(app: &App, actor_id: &str) -> Result<Actor, Response> {
+    match app.store.actor(actor_id) {
+        Some(a) if a.is_accountable() => Ok(a),
+        Some(_) => Err((StatusCode::FORBIDDEN, "actor is not accountable (no human root)").into_response()),
+        None => Err((
+            StatusCode::FORBIDDEN,
+            format!("unknown actor '{actor_id}' — register it at POST /api/actors first (nothing is authored anonymously)"),
+        )
+            .into_response()),
+    }
+}
+
 /// Keel-native provenance for a path (`GET /api/repos/:tenant/:repo/why?path=…`): the changes and
 /// authors/agents that touched it. This is the spine that makes a code-ref traceable, not just a
 /// pointer — something GitHub has no representation for.
@@ -200,6 +265,12 @@ async fn create_issue(
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
+    // Accountability gate: the author must be a registered actor that chains to a human.
+    let author_id = body.get("author").and_then(Value::as_str).unwrap_or("");
+    let actor = match require_accountable(&app, author_id) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     let title = body.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title is required").into_response();
@@ -221,7 +292,7 @@ async fn create_issue(
         }
     }
     let number = app.store.issues(&key).iter().map(|i| i.number).max().unwrap_or(0) + 1;
-    let author = body.get("author").and_then(Value::as_str).unwrap_or("agent:anonymous").to_string();
+    let author = actor.id.clone();
     let issue = Issue {
         id: format!("iss_{}_{number}", key.replace('/', "_")),
         repo: key,
@@ -256,6 +327,11 @@ async fn update_issue(
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
+    // A transition is an authoring action — the acting actor must chain to a human.
+    let acting = match require_accountable(&app, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     let Some(mut issue) = app.store.issues(&key).into_iter().find(|i| i.number == number) else {
         return (StatusCode::NOT_FOUND, "no such issue").into_response();
     };
@@ -276,7 +352,7 @@ async fn update_issue(
     app.store.replace_issue(issue.clone());
     app.hub.publish(
         &tenant,
-        ActivityEvent::Issue { repo, number, action: action.into(), actor: issue.author.clone(), ts: now() },
+        ActivityEvent::Issue { repo, number, action: action.into(), actor: acting.handle, ts: now() },
     );
     Json(json!({ "issue": issue })).into_response()
 }
@@ -310,7 +386,8 @@ async fn feed(
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
-/// Seed a little sample data so the scaffold is explorable.
+/// Seed a little sample data so the scaffold is explorable — including real accountable actors: a
+/// human, and an agent delegated by that human (so there's an accountable author to open issues).
 fn seed(store: &dyn Store) {
     store.put_account(Account {
         id: "acct_tankrap".into(),
@@ -326,14 +403,22 @@ fn seed(store: &dyn Store) {
             default_branch: "main".into(),
         });
     }
+    // A human root + an agent it delegated — both real Ed25519 identities.
+    let human = identity::mint_human("justin").actor;
+    store.put_actor(human.clone());
+    if let Some(agent) =
+        identity::mint_agent("agent:reviewer", &human, "issues:*", Lifetime::Static)
+    {
+        store.put_actor(agent.actor);
+    }
     store.put_issue(Issue {
         id: "iss_1".into(),
         repo: "repo_keel".into(),
         number: 1,
         title: "Track symlinks in status".into(),
         body: "status/diff should match git on symlinks.".into(),
-        author: "agent:opus-4-8".into(),
-        assignees: vec!["agent:opus-4-8".into()],
+        author: human.id,
+        assignees: vec![],
         labels: vec!["status".into()],
         projects: vec![],
         status: IssueStatus::Closed { reason: CloseReason::Completed },

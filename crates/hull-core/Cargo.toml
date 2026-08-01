@@ -8,3 +8,7 @@ description = "Hull domain model — accounts, actors (human/agent identities), 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Real Ed25519 identities — an actor's id IS its public key, so authorship is a keypair, not a claim.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+hex = "0.4"

@@ -13,6 +13,7 @@ use std::sync::RwLock;
 pub trait Store: Send + Sync {
     fn put_actor(&self, actor: Actor);
     fn actor(&self, id: &str) -> Option<Actor>;
+    fn actors(&self) -> Vec<Actor>;
     fn put_account(&self, account: Account);
     fn accounts(&self) -> Vec<Account>;
     fn put_repo(&self, repo: Repo);
@@ -50,6 +51,9 @@ impl Store for InMemory {
     }
     fn actor(&self, id: &str) -> Option<Actor> {
         self.actors.read().unwrap().get(id).cloned()
+    }
+    fn actors(&self) -> Vec<Actor> {
+        self.actors.read().unwrap().values().cloned().collect()
     }
     fn put_account(&self, account: Account) {
         self.accounts.write().unwrap().insert(account.id.clone(), account);
@@ -162,6 +166,9 @@ impl Store for FileStore {
     }
     fn actor(&self, id: &str) -> Option<Actor> {
         self.inner.read().unwrap().actors.get(id).cloned()
+    }
+    fn actors(&self) -> Vec<Actor> {
+        self.inner.read().unwrap().actors.values().cloned().collect()
     }
     fn put_account(&self, account: Account) {
         self.mutate(|s| {

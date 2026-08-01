@@ -118,3 +118,8 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .prov .ch { color: #6fa8ff; }
 .prov .intent { color: #cdd3df; }
 .prov .by { margin-left: auto; color: #8b93a7; font-size: 12px; }
+
+.issues h2 .acting { margin-left: 16px; font-size: 13px; color: #8b93a7; font-weight: 400; }
+.issues h2 .acting select { padding: 3px 8px; border-radius: 6px; border: 1px solid #2a3040; background: #12151c; color: #cdd3df; font: inherit; }
+.issue .by.human { color: #7ee2b8; }
+.issue .by.agent { color: #8fb4ff; }

@@ -11,6 +11,7 @@
 //! This module is storage-agnostic: types + a [`Store`] trait, with an in-memory implementation for
 //! the scaffold. M1+ swaps in a SQL-backed store (accounts/issues) that references keel by id.
 
+pub mod identity;
 pub mod store;
 
 use serde::{Deserialize, Serialize};

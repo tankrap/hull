@@ -15,6 +15,7 @@ type ActivityEvent =
   | { kind: "push"; actor: string; repo: string; change: string; ts: number }
   | { kind: "issue"; repo: string; number: number; action: string; actor: string; ts: number };
 
+type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable: boolean; human_root: string | null };
 type CodeRef = { repo: string; blob: string; path: string; line_start: number; line_end?: number };
 type Issue = {
   number: number;
@@ -42,6 +43,21 @@ export function App() {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [prov, setProv] = useState<Record<string, { change: string; intent: string; author: string }[]>>({});
 
+  // Registered actors + who we're acting as (every authoring action must be an accountable actor).
+  const [actors, setActors] = useState<Actor[]>([]);
+  const [actingAs, setActingAs] = useState<string>("");
+  useEffect(() => {
+    fetch("/api/actors")
+      .then((r) => r.json())
+      .then((d) => {
+        const list: Actor[] = d.actors ?? [];
+        setActors(list);
+        setActingAs((cur) => cur || list.find((a) => a.kind === "human")?.id || list[0]?.id || "");
+      })
+      .catch(() => {});
+  }, []);
+  const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
+
   // Toggle keel-native provenance ("who/what touched this path") under a code-ref.
   const showWhy = async (key: string, path: string) => {
     if (prov[key]) {
@@ -67,7 +83,7 @@ export function App() {
     await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues/${number}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(action === "close" ? { action, reason: "completed" } : { action }),
+      body: JSON.stringify({ action, actor: actingAs, ...(action === "close" ? { reason: "completed" } : {}) }),
     });
     loadIssues();
   };
@@ -81,7 +97,7 @@ export function App() {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ title: form.title.trim(), author: "you@hull", code_ref }),
+      body: JSON.stringify({ title: form.title.trim(), author: actingAs, code_ref }),
     });
     if (res.ok) {
       setForm({ title: "", path: "", line: "" });
@@ -196,6 +212,16 @@ export function App() {
             {issues.filter((i) => i.status.state === "open").length} open ·{" "}
             {issues.filter((i) => i.status.state !== "open").length} closed
           </span>
+          <label className="acting">
+            acting as&nbsp;
+            <select value={actingAs} onChange={(e) => setActingAs(e.target.value)}>
+              {actors.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.handle} ({a.kind}){a.accountable ? "" : " ⚠ unaccountable"}
+                </option>
+              ))}
+            </select>
+          </label>
         </h2>
         <form className="issue-form" onSubmit={createIssue}>
           <input
@@ -244,7 +270,9 @@ export function App() {
                     <span className="blob">⬡ {c.blob.slice(0, 10)}</span>
                   </button>
                 ))}
-                <span className="by">{it.author}</span>
+                <span className={"by " + (actors.find((a) => a.id === it.author)?.kind ?? "")}>
+                  {handleOf(it.author)}
+                </span>
                 {it.status.state === "open" ? (
                   <button className="act close" onClick={() => transition(it.number, "close")}>
                     Close
