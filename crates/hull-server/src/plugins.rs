@@ -2,7 +2,7 @@
 //! with no plugins), then any feature-gated plugins. **This function is the open-core seam** — the
 //! hosted build adds one line behind its own feature to register private plugins.
 
-use hull_plugin::{AuthProvider, NotifyEvent, Notifier, Plugin, Registry};
+use hull_plugin::{AuthProvider, DotenvConfig, EnvConfig, FileSecretConfig, NotifyEvent, Notifier, Plugin, Registry};
 use std::sync::Arc;
 
 /// Build the registry: core built-ins first (so the OSS core is self-sufficient), then whatever
@@ -30,6 +30,12 @@ impl Plugin for CorePlugin {
     fn register(&self, reg: &mut Registry) {
         reg.add_notifier(Arc::new(LogNotifier));
         reg.add_auth_provider(Arc::new(KeypairAuth));
+        // Config/secret resolution, tried in this order: process env, then a file-secret whose path
+        // is given by env (HULL_SECRET_FILE_<KEY> — e.g. ~/.openrouter), then a dotenv file. A hosted
+        // plugin adds Infisical/Vault ahead of these.
+        reg.add_config_provider(Arc::new(EnvConfig));
+        reg.add_config_provider(Arc::new(FileSecretConfig));
+        reg.add_config_provider(Arc::new(DotenvConfig::load()));
     }
 }
 

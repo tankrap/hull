@@ -60,6 +60,20 @@ cd ../hull-hosted && cargo run -p hull-hosted-server
 `tankrap/hull-hosted`'s `hull-hosted-plugins` is the reference — an open-source plugin looks the same
 (the only difference is where the crate lives and whether it's public).
 
+### Config & secrets (pluggable)
+
+Capabilities that need config or secrets (a model key, a webhook secret) resolve them through
+`reg.config("KEY")` — never by reading a hardcoded path. The core installs three `ConfigProvider`s,
+tried in order:
+
+1. **env** — process environment (`KEY`).
+2. **file-secret** — a value stored in a file whose *path* is given by env: `HULL_SECRET_FILE_<KEY>`
+   (e.g. `HULL_SECRET_FILE_OPENROUTER_API_KEY=~/.openrouter`). The file's trimmed contents are the value.
+3. **dotenv** — `KEY=VALUE` lines from `HULL_ENV_FILE` (default `.env`).
+
+A hosted plugin adds Infisical / Vault / a cloud secret manager with `reg.add_config_provider(...)`,
+tried ahead of these — same seam, no core change.
+
 ## Two plugin classes: in-process policy vs out-of-process execution
 
 Not every capability may run in the server's address space. **A capability that executes untrusted
@@ -144,9 +158,15 @@ shape A** and runs tests on isolated, sandboxed runners it controls.
 
 `Reviewer` is the seam for the review *judgment* (distinct from `CiRunner`, which is the *execution*).
 The OSS core ships the **reconciliation** reviewer as the default (`default_review` — deterministic
-claims-vs-facts, Epic C). A hosted plugin swaps in the **sandbox + model-backed** reviewer (e.g.
-driving [opencode](https://github.com/sst/opencode) or another agent harness to read the change and
-produce a verdict).
+claims-vs-facts, Epic C). A hosted plugin swaps in the **model-backed** reviewer.
+
+A working one ships in this repo: **`hull-review-openrouter`** reviews the change with a model over
+[OpenRouter](https://openrouter.ai) and returns a constrained-schema verdict, falling back to
+reconciliation on any error. Its API key + model come from the **pluggable config** (below) —
+`OPENROUTER_API_KEY`, `HULL_REVIEW_MODEL` (default `anthropic/claude-sonnet-5`) — never a hardcoded
+path or secret. The `hull-server` binary activates it only when a key resolves, so the OSS core stays
+model-free; in the real open-core split it moves to the hosted binary. Your own reviewer is the same
+shape:
 
 ```rust
 impl Reviewer for OpencodeReviewer {

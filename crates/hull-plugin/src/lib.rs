@@ -46,6 +46,78 @@ pub trait AuthProvider: Send + Sync {
     fn authenticate(&self, credential: &str) -> Option<String>;
 }
 
+// ── config / secrets ────────────────────────────────────────────────────────────────────────────
+
+/// Resolve a config value or secret by key (e.g. `OPENROUTER_API_KEY`). The core ships
+/// env / file-secret / dotenv providers; a hosted plugin adds Infisical, Vault, AWS/GCP secret
+/// managers, etc. — **no provider hardcodes a path or a secret**. Providers are tried in order; the
+/// first non-empty value wins. `None` means "not mine — try the next provider".
+pub trait ConfigProvider: Send + Sync {
+    fn name(&self) -> &str;
+    fn get(&self, key: &str) -> Option<String>;
+}
+
+/// Process environment variables (`FOO` → `std::env::var("FOO")`).
+pub struct EnvConfig;
+impl ConfigProvider for EnvConfig {
+    fn name(&self) -> &str {
+        "env"
+    }
+    fn get(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok().filter(|v| !v.is_empty())
+    }
+}
+
+/// A secret whose VALUE lives in a file, with the **path supplied by env**
+/// `HULL_SECRET_FILE_<KEY>` — so e.g. `~/.openrouter` is configured at deploy time, never baked into
+/// the app. The file's trimmed contents are the value. A leading `~/` expands to `$HOME`.
+pub struct FileSecretConfig;
+impl ConfigProvider for FileSecretConfig {
+    fn name(&self) -> &str {
+        "file-secret"
+    }
+    fn get(&self, key: &str) -> Option<String> {
+        let raw = std::env::var(format!("HULL_SECRET_FILE_{key}")).ok().filter(|p| !p.is_empty())?;
+        let path = match raw.strip_prefix("~/") {
+            Some(rest) => format!("{}/{rest}", std::env::var("HOME").unwrap_or_default()),
+            None => raw,
+        };
+        std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+}
+
+/// A dotenv file of `KEY=VALUE` lines. Path from `HULL_ENV_FILE` (default `.env`); `#` comments and
+/// surrounding quotes are handled. Loaded once at startup.
+pub struct DotenvConfig {
+    map: std::collections::HashMap<String, String>,
+}
+impl DotenvConfig {
+    pub fn load() -> Self {
+        let path = std::env::var("HULL_ENV_FILE").unwrap_or_else(|_| ".env".into());
+        let mut map = std::collections::HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            for line in text.lines() {
+                let l = line.trim();
+                if l.is_empty() || l.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = l.split_once('=') {
+                    map.insert(k.trim().to_string(), v.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+        DotenvConfig { map }
+    }
+}
+impl ConfigProvider for DotenvConfig {
+    fn name(&self) -> &str {
+        "dotenv"
+    }
+    fn get(&self, key: &str) -> Option<String> {
+        self.map.get(key).cloned().filter(|v| !v.is_empty())
+    }
+}
+
 /// Mirror a landed change to an external forge (GitHub is the first target — the top adoption lever:
 /// a team keeps its GitHub while Hull hosts the agent-native layer). The core default
 /// [`LogMirror`] is a dry-run that records what it *would* push (so the loop-prevention and
@@ -307,6 +379,7 @@ pub struct Registry {
     ci_runner: Option<Arc<dyn CiRunner>>,
     mirror: Option<Arc<dyn Mirror>>,
     reviewer: Option<Arc<dyn Reviewer>>,
+    config_providers: Vec<Arc<dyn ConfigProvider>>,
 }
 
 /// What `/api/plugins` reports.
@@ -349,6 +422,10 @@ impl Registry {
     pub fn set_reviewer(&mut self, r: Arc<dyn Reviewer>) {
         self.reviewer = Some(r);
     }
+    /// Add a config/secret provider. Tried in registration order; a hosted plugin adds Infisical/Vault.
+    pub fn add_config_provider(&mut self, c: Arc<dyn ConfigProvider>) {
+        self.config_providers.push(c);
+    }
 
     /// Installed plugins (for `/api/plugins`).
     pub fn plugins(&self) -> &[PluginInfo] {
@@ -384,6 +461,11 @@ impl Registry {
             Some(r) => r.run(req),
             None => default_local_ci(req),
         }
+    }
+
+    /// Resolve a config value / secret by key, trying each provider in order. Never logs the value.
+    pub fn config(&self, key: &str) -> Option<String> {
+        self.config_providers.iter().find_map(|p| p.get(key))
     }
 
     /// Produce a review package: the installed reviewer (hosted AI) if any, else the OSS

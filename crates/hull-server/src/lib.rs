@@ -1458,7 +1458,7 @@ async fn perform_auto_review(
     let facts = app.repos.facts(tenant, repo, &change);
     let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
     let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
-    let pkg = app.registry.review(&hull_plugin::ReviewRequest {
+    let review_req = hull_plugin::ReviewRequest {
         repo: key.clone(),
         change: change.clone(),
         intent: info.intent.clone(),
@@ -1466,7 +1466,12 @@ async fn perform_auto_review(
         author: info.author.clone(),
         source_url,
         facts,
-    });
+    };
+    // The reviewer may make a blocking model call (the OpenRouter reviewer); keep the runtime free.
+    let registry = app.registry.clone();
+    let pkg = tokio::task::spawn_blocking(move || registry.review(&review_req))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "reviewer panicked".to_string()))?;
 
     // 3. Persist the package as a Review under the agent reviewer.
     let verdict = match pkg.verdict {

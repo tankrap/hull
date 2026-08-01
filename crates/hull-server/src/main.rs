@@ -6,6 +6,15 @@
 
 #[tokio::main]
 async fn main() {
-    // No extra plugins — just the core built-ins.
-    hull_server::run(hull_server::Options::default(), |_reg| {}).await;
+    // Deployment wiring (belongs in the hosted binary in the real split): activate the OpenRouter AI
+    // reviewer *only* when a key resolves through the pluggable config — no key ⇒ the OSS
+    // reconciliation reviewer stays the default, so the core is fully functional on its own.
+    hull_server::run(hull_server::Options::default(), |reg| {
+        if let Some(key) = reg.config("OPENROUTER_API_KEY") {
+            let model = reg.config("HULL_REVIEW_MODEL").unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string());
+            eprintln!("hull: OpenRouter AI reviewer active (model {model})");
+            reg.set_reviewer(std::sync::Arc::new(hull_review_openrouter::OpenRouterReviewer::new(key, model)));
+        }
+    })
+    .await;
 }

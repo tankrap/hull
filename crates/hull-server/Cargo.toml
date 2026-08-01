@@ -20,6 +20,9 @@ path = "src/main.rs"
 hull-core = { path = "../hull-core" }
 hull-scan = { path = "../hull-scan" }
 hull-plugin = { path = "../hull-plugin" }
+# AI reviewer (Epic D). Wired in the binary only, gated on config (no key → OSS reconciliation
+# default), so the core lib stays model-free. In the real open-core split this lives in hull-hosted.
+hull-review-openrouter = { path = "../hull-review-openrouter" }
 # keel substrate, embedded directly (no serialization boundary). Pinned to a keel git-rev so the
 # build is reproducible and standalone (no sibling checkout needed); bump the rev to adopt keel
 # changes. Formalizing this embedding API (semver the embedded crates) is Linear NEW-1168.
