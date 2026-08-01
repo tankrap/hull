@@ -227,6 +227,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/merge", post(merge_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/auto-review", post(auto_review))
+        .route("/api/repos/:tenant/:repo/prs/:number/reviewers", post(request_reviewer))
         .route("/api/repos/:tenant/:repo/mirror", get(mirror_status))
         .route("/api/repos/:tenant/:repo/mirror/inbound", post(mirror_inbound))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
@@ -952,6 +953,39 @@ async fn ingest_session(
 
 /// Merge a PR (`POST /api/repos/:tenant/:repo/prs/:number/merge`). The review gate: the acting actor
 /// must be accountable, the change must be keel-verify **green**, and there must be an **approve**
+/// Request a review from an actor (`POST …/prs/:number/reviewers` with `{reviewer}`). Adds them to
+/// the PR's reviewers and notifies them (`review_requested`). Any signed-in actor may request.
+async fn request_reviewer(
+    State(app): State<App>,
+    Path((tenant, repo, number)): Path<(String, String, u64)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let requester = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let reviewer = body.get("reviewer").and_then(Value::as_str).unwrap_or("").to_string();
+    if app.store.actor(&reviewer).is_none() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "reviewer must be a registered actor").into_response();
+    }
+    let Some(mut pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+        return (StatusCode::NOT_FOUND, "no such PR").into_response();
+    };
+    if !pr.reviewers.contains(&reviewer) {
+        pr.reviewers.push(reviewer.clone());
+        app.store.replace_pr(pr.clone());
+    }
+    app.registry.notify(&NotifyEvent {
+        kind: "review_requested".into(),
+        to: vec![reviewer.clone()],
+        summary: format!("{} requested your review on PR !{number}", requester.handle),
+        change: pr.changes.first().cloned(),
+    });
+    Json(json!({ "pr": pr })).into_response()
+}
+
 /// review by someone **other than the author** (independent — no self-merge). Records who merged.
 async fn merge_pr(
     State(app): State<App>,

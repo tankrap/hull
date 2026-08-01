@@ -402,6 +402,16 @@ export function App() {
   };
 
   const [autoReviewing, setAutoReviewing] = useState<number | null>(null);
+  const requestReviewer = async (prNumber: number, reviewer: string) => {
+    if (!canAct || !reviewer) return;
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${prNumber}/reviewers`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ reviewer }),
+    });
+    if (res.ok) loadPrs();
+    else alert(await res.text());
+  };
   const autoReview = async (prNumber: number) => {
     if (!canAct) return alert("Sign in to act.");
     setAutoReviewing(prNumber);
@@ -1078,6 +1088,14 @@ export function App() {
                       {autoReviewing === p.number ? "agent reviewing…" : "⬡ Agent auto-review"}
                     </button>
                     <span className="muted">runs checks + reconciles the change's claims, then posts an accountable agent review</span>
+                    {canAct && (
+                      <select className="req-reviewer" value="" onChange={(e) => { requestReviewer(p.number, e.target.value); e.target.value = ""; }}>
+                        <option value="">request a reviewer…</option>
+                        {actors.filter((a) => a.id !== p.author && !p.reviewers?.includes(a.id)).map((a) => (
+                          <option key={a.id} value={a.id}>{a.handle} ({a.kind})</option>
+                        ))}
+                      </select>
+                    )}
                   </div>
                   <div className="review-form">
                     <select
