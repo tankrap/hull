@@ -28,7 +28,7 @@ type PR = { number: number; title: string; author: string; changes: string[]; ve
 type Finding = { path: string; line?: number; severity: string; note: string };
 type ClaimEv = { kind: string; detail: string; supports: boolean };
 type LedgerSnap = { change: string; claims: { id: string; text: string; source: string; status: string; evidence: ClaimEv[] }[] };
-type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string; findings: Finding[]; ledger?: LedgerSnap };
+type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string; findings: Finding[]; ledger?: LedgerSnap; artifact_id?: string };
 type CodeRef = { repo: string; blob: string; path: string; line_start: number; line_end?: number };
 type Issue = {
   number: number;
@@ -1405,6 +1405,15 @@ function ReviewPage({
             )}
           </p>
           {review.summary && <p className="summary">{review.summary}</p>}
+          {review.artifact_id && (
+            <p className="audit-artifact">
+              <span className="muted">audit artifact</span>{" "}
+              <a href={`/api/repos/${encodeURIComponent(tenant)}/${repo}/artifacts/${review.artifact_id}`} target="_blank" rel="noreferrer" title="content-addressed record of why this verdict was reached — immutable">
+                ⬡ {review.artifact_id.slice(0, 12)}
+              </a>{" "}
+              <span className="muted">· content-addressed, immutable</span>
+            </p>
+          )}
         </section>
 
         {shownLedger && shownLedger.claims.length > 0 && (() => {

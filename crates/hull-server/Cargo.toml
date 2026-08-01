@@ -48,3 +48,5 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Content-addressed source fetch: a CI/reviewer runner pulls the change's keel TREE (by tree_id) as
 # a tar archive — keel-native, NOT git. git smart-HTTP stays strictly for interop/mirroring.
 tar = "0.4"
+# Content-address the review audit artifact (D8) — same hash family keel uses.
+blake3 = "1"

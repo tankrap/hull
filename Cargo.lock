@@ -763,6 +763,7 @@ name = "hull-server"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "blake3",
  "flate2",
  "futures",
  "hull-core",

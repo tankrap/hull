@@ -487,3 +487,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .verified-fold[open] summary::before{content:"▾ "}
 .verified-fold .recon-claims{margin-top:6px;opacity:.85}
 .claim-none{padding:8px 0}
+
+/* D8 audit artifact link */
+.audit-artifact{font-size:12px;margin-top:6px}
+.audit-artifact a{font-family:ui-monospace,monospace;color:var(--accent)}

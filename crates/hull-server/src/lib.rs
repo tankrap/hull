@@ -8,6 +8,7 @@
 //! `/api/repos/:repo/issues` · `/api/scan` · `/api/plugins`.
 
 pub mod activity;
+pub mod artifacts;
 pub mod autonomy;
 pub mod ci;
 pub mod claims;
@@ -101,6 +102,7 @@ struct App {
     auth: Arc<Mutex<AuthState>>,
     ci: Arc<ci::CiMemo>,
     claims: Arc<claims::ClaimResolutions>,
+    artifacts: Arc<artifacts::ArtifactStore>,
     autonomy: Arc<autonomy::AutonomyStore>,
     ci_config: Arc<ci::CiConfig>,
     /// Outbound HTTP for dispatching CI jobs to a repo's configured endpoint. Cheap to clone.
@@ -142,6 +144,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         auth: Arc::new(Mutex::new(AuthState::default())),
         ci: Arc::new(ci::CiMemo::from_env()),
         claims: Arc::new(claims::ClaimResolutions::from_env()),
+        artifacts: Arc::new(artifacts::ArtifactStore::from_env()),
         autonomy: Arc::new(autonomy::AutonomyStore::from_env()),
         ci_config: Arc::new(ci::CiConfig::from_env()),
         http: reqwest::Client::new(),
@@ -238,6 +241,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/mirror", get(mirror_status))
         .route("/api/repos/:tenant/:repo/mirror/inbound", post(mirror_inbound))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
+        .route("/api/repos/:tenant/:repo/artifacts/:id", get(get_artifact))
         .route("/api/repos/:tenant/:repo/comments", get(comments_list).post(create_comment))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
@@ -1436,6 +1440,16 @@ async fn reviews(State(app): State<App>, Path((tenant, repo)): Path<(String, Str
     Json(json!({ "reviews": app.store.reviews(&format!("{tenant}/{repo}")) }))
 }
 
+/// The content-addressed review **audit artifact** (`GET …/artifacts/:id`) — the immutable record of
+/// why a review reached its verdict (inputs, models, ledger, findings). The `:id` is a BLAKE3
+/// content address, so the answer to "why did the reviewer pass this?" can't be altered after.
+async fn get_artifact(State(app): State<App>, Path((_tenant, _repo, id)): Path<(String, String, String)>) -> Response {
+    match app.artifacts.get(&id) {
+        Some(a) => Json(json!({ "artifact_id": id, "artifact": a })).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such artifact").into_response(),
+    }
+}
+
 /// Discussion comments for a repo (`GET /api/repos/:tenant/:repo/comments`); the client filters by
 /// `target` (e.g. `pr:1`). The conversation layer over the structured review.
 async fn comments_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
@@ -1565,6 +1579,7 @@ async fn create_review(
         summary: body.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
         findings,
         ledger: None,
+        artifact_id: None,
         created_unix: now(),
     };
     app.store.put_review(review.clone());
@@ -1657,6 +1672,11 @@ async fn perform_auto_review(
     let facts = app.repos.facts(tenant, repo, &change);
     let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
     let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
+    // Capture the reviewer's INPUTS for the audit artifact before `facts` moves into the request.
+    let artifact_inputs = json!({
+        "intent": info.intent, "author": info.author, "author_model": author_model,
+        "files": facts.files, "ops": facts.ops, "verification": facts.verification, "secrets": facts.secrets,
+    });
     let review_req = hull_plugin::ReviewRequest {
         repo: key.clone(),
         change: change.clone(),
@@ -1685,8 +1705,27 @@ async fn perform_auto_review(
         .map(|f| ReviewFinding { path: f.path, line: f.line, severity: f.severity, note: f.note })
         .collect();
     let count = app.store.reviews(&key).len();
+    let rid = format!("rv_{}_{}", key.replace('/', "_"), count + 1);
+    // D8 — content-addressed audit artifact: the full record of why this verdict was reached.
+    let artifact = json!({
+        "review_id": rid,
+        "repo": key, "change": change, "tree_id": tree,
+        "reviewer": reviewer.id, "reviewer_handle": reviewer.handle,
+        "verdict": format!("{verdict:?}"),
+        "summary": pkg.summary,
+        "checks": check_label,
+        "findings": findings.clone(),
+        "ledger": pkg.ledger.clone(),
+        "inputs": artifact_inputs,
+        "models": {
+            "screen": app.registry.config("HULL_REVIEW_MODEL"),
+            "deep": app.registry.config("HULL_REVIEW_MODEL_DEEP"),
+        },
+        "created_unix": now(),
+    });
+    let artifact_id = app.artifacts.put(artifact);
     let review = Review {
-        id: format!("rv_{}_{}", key.replace('/', "_"), count + 1),
+        id: rid,
         repo: key.clone(),
         target: format!("pr:{number}"),
         reviewer: reviewer.id.clone(),
@@ -1694,6 +1733,7 @@ async fn perform_auto_review(
         summary: format!("{} · checks {check_label}", pkg.summary),
         findings,
         ledger: pkg.ledger,
+        artifact_id: Some(artifact_id),
         created_unix: now(),
     };
     app.store.put_review(review.clone());

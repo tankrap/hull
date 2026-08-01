@@ -304,6 +304,10 @@ pub struct Review {
     /// what the review actually decided on. `None` for a manual human review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<reconcile::ClaimLedger>,
+    /// Content address (BLAKE3) of the full audit artifact for this review (inputs, models, ledger,
+    /// findings) — "why did the reviewer pass this?" Fetchable at `…/artifacts/:id`. (D8)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
     pub created_unix: u64,
 }
 
