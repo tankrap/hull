@@ -22,23 +22,28 @@ type ActivityEvent =
 export function App() {
   const [repos, setRepos] = useState<RepoActivity[]>([]);
   const [events, setEvents] = useState<ActivityEvent[]>([]);
+  const [tenant, setTenant] = useState<string>(
+    () => new URLSearchParams(location.search).get("tenant") || "tankrap",
+  );
   const feedRef = useRef<EventSource | null>(null);
 
-  // Poll the activity-ranked home (M3 will push this too; polling is fine for the scaffold).
+  // Poll the activity-ranked home for the selected tenant (each org sees only its own fleet).
   useEffect(() => {
+    setRepos([]);
     const load = () =>
-      fetch("/api/home")
+      fetch(`/api/home?tenant=${encodeURIComponent(tenant)}`)
         .then((r) => r.json())
         .then((d) => setRepos(d.repos ?? []))
         .catch(() => {});
     load();
     const t = setInterval(load, 2000);
     return () => clearInterval(t);
-  }, []);
+  }, [tenant]);
 
-  // Live event stream over SSE.
+  // Live event stream over SSE, scoped to the selected tenant.
   useEffect(() => {
-    const es = new EventSource("/api/feed");
+    setEvents([]);
+    const es = new EventSource(`/api/feed?tenant=${encodeURIComponent(tenant)}`);
     feedRef.current = es;
     es.onmessage = (m) => {
       try {
@@ -49,7 +54,7 @@ export function App() {
       }
     };
     return () => es.close();
-  }, []);
+  }, [tenant]);
 
   return (
     <div className="app">
@@ -58,6 +63,15 @@ export function App() {
           <span className="logo">⬡</span> Hull
         </div>
         <div className="tag">situation room · what the fleet is doing right now</div>
+        <label className="tenant">
+          tenant&nbsp;
+          <input
+            value={tenant}
+            onChange={(e) => setTenant(e.target.value.trim())}
+            spellCheck={false}
+            aria-label="tenant"
+          />
+        </label>
       </header>
 
       <main className="grid">

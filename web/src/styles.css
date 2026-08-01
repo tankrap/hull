@@ -63,3 +63,9 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .ev-lesson { border-left-color: var(--accent); }
 .ev-push { border-left-color: var(--human); }
 .ev-issue { border-left-color: var(--muted); }
+
+.top .tenant { margin-left: auto; font-size: 13px; color: var(--muted, #8b93a7); display: flex; align-items: center; }
+.top .tenant input {
+  width: 9rem; padding: 4px 8px; border-radius: 6px; border: 1px solid #2a3040;
+  background: #12151c; color: inherit; font: inherit;
+}
