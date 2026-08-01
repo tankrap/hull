@@ -75,6 +75,57 @@ prompt-injected or malicious change could escape into the core server.
 
 When adding a capability, decide its class first; if it runs repo code, it's out-of-process.
 
+## Building a CI runner (custom CI system)
+
+`CiRunner` is the seam for a bring-your-own CI/CD system. **You implement one method**; the core does
+the rest.
+
+```rust
+use hull_plugin::{CiRunner, CiRequest, CiOutcome, CiStatus, Registry};
+use std::sync::Arc;
+
+struct MyRunner { /* client to your sandboxed runner fleet */ }
+
+impl CiRunner for MyRunner {
+    fn run(&self, req: &CiRequest) -> CiOutcome {
+        // req.workdir  — a fresh checkout of the change's tree (already materialized for you)
+        // req.tree_id  — the keel tree content-address (stable id for this exact source)
+        // req.repo / req.change — identifiers for logging/routing
+        //
+        // DISPATCH the job to an isolated sandbox (separate process/VM, no core creds, egress
+        // limited, ephemeral) and await the verdict. Do NOT run repo tests in this process.
+        let verdict = self.submit(&req.tree_id, &req.workdir); // your call
+        CiOutcome {
+            status: if verdict.passed { CiStatus::Green } else { CiStatus::Red },
+            summary: verdict.summary,
+            memoized: false, // leave false — the core sets this when it serves from the memo
+        }
+    }
+}
+
+// register it (in a server binary's plugin hook, or a hosted crate's register()):
+pub fn register(reg: &mut Registry) { reg.set_ci_runner(Arc::new(MyRunner::new())); }
+// hull_server::run(opts, |reg| my_ci::register(reg))
+```
+
+**What the core already handles — do not re-implement:**
+- Resolving a change to its keel **tree** and materializing the checkout at `req.workdir`.
+- **Content-addressed memoization** keyed by `tree_id`: an unchanged tree is an instant cache hit and
+  your `run` is never called. You get caching for free.
+- Writing the green/red back to **keel verification** (which the reconciliation ledger and the merge
+  gate consume) and firing `ci_passed` / `ci_failed` notifications.
+- The `POST …/change/:id/check` endpoint, its accountability gate, and the `{force}` memo-bypass.
+
+**The one rule that matters (security):** `CiRunner` runs a PR's tests, i.e. **untrusted code**. Your
+`run` must be a *dispatch client* to an isolated sandbox — never execute the repo's tests in the core
+server's address space. The built-in [`default_local_ci`] runs a detected command
+(`cargo test` / `npm test`, or `HULL_CI_CMD`) as a local child process for self-hosting convenience;
+a production runner replaces it with sandboxed execution and is what you're building.
+
+**Return `Errored`** (not `Red`) when you can't produce a verdict (no test command, timeout, infra
+failure) — the core memoizes only real `Green`/`Red` verdicts, so an infra blip won't get cached as a
+failing tree.
+
 ## Capability roadmap
 
 The SDK starts with the in-process trio `SecretRuleset`, `Notifier`, `AuthProvider`. Planned:
