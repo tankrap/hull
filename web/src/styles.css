@@ -406,3 +406,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 
 /* Repo search/filter box */
 .repo-search{margin-left:12px;min-width:180px;font-size:13px;padding:5px 10px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--ink)}
+
+/* Unread notification highlight */
+.notif.unread{background:color-mix(in srgb, var(--accent) 8%, transparent);border-radius:6px}
+.notif.unread .ns{font-weight:600}

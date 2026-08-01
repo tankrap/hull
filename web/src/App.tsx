@@ -62,6 +62,18 @@ export function App() {
   // Notifications recorded by the core Notifier plugin capability (poll).
   const [notifs, setNotifs] = useState<{ kind: string; to: string[]; summary: string; ts: number; broadcast?: boolean }[]>([]);
   const [showNotifs, setShowNotifs] = useState(false);
+  // Unread tracking: the badge counts only notifications newer than what you've last opened.
+  const [seenTs, setSeenTs] = useState<number>(() => Number(localStorage.getItem("hull_notif_seen") ?? 0));
+  const toggleNotifs = () =>
+    setShowNotifs((s) => {
+      const opening = !s;
+      if (opening && notifs.length) {
+        const maxTs = Math.max(...notifs.map((n) => n.ts));
+        setSeenTs(maxTs);
+        localStorage.setItem("hull_notif_seen", String(maxTs));
+      }
+      return opening;
+    });
 
   // Auth: sign in by proving possession of an actor's Ed25519 key → session token.
   const [token, setToken] = useState<string>(() => localStorage.getItem("hull_token") ?? "");
@@ -589,8 +601,8 @@ export function App() {
           )}
         </div>
         <div className="bell-wrap">
-          <button className="bell" onClick={() => setShowNotifs((s) => !s)} title="notifications">
-            🔔{notifs.length > 0 && <span className="bell-count">{notifs.length}</span>}
+          <button className="bell" onClick={toggleNotifs} title="notifications">
+            🔔{notifs.filter((n) => n.ts > seenTs).length > 0 && <span className="bell-count">{notifs.filter((n) => n.ts > seenTs).length}</span>}
           </button>
           {showNotifs && (
             <div className="notif-drop">
@@ -607,7 +619,7 @@ export function App() {
                   n.kind === "code_owner_referenced" ? "⬡" :
                   n.kind === "mirror_pushed" ? "⇄" : "•";
                 return (
-                  <div className="notif" key={i}>
+                  <div className={"notif" + (n.ts > seenTs ? " unread" : "")} key={i}>
                     <span className={"nk " + n.kind}>{icon} {n.kind.replace(/_/g, " ")}</span>
                     {n.broadcast && <span className="nbcast">team</span>}
                     <span className="ns">{n.summary}</span>
