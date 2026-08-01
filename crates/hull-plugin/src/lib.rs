@@ -276,9 +276,25 @@ pub struct ReviewRequest {
     pub intent: String,
     pub lesson: String,
     pub author: String,
+    /// The model that *authored* the change (from the keel session), if known — so the reviewer can
+    /// pick an independent model family (D5). Empty when the change had no captured session.
+    pub author_model: String,
     /// keel-native content-addressed source (a `…/tree/:tree_id/tar` URL). NOT git.
     pub source_url: String,
     pub facts: hull_core::reconcile::ChangeFacts,
+}
+
+/// The "family" of a model id for independence checks — vendor + line, with the trailing version and
+/// `-fast` suffix stripped (`anthropic/claude-sonnet-5` → `anthropic/claude-sonnet`). Two ids share a
+/// family iff a reviewer using one would not be meaningfully independent of an author using the other.
+pub fn model_family(id: &str) -> String {
+    let id = id.trim().to_lowercase();
+    let id = id.strip_suffix("-fast").unwrap_or(&id);
+    // Drop a trailing version token (digits/dots) after the last '-'.
+    match id.rsplit_once('-') {
+        Some((head, tail)) if tail.chars().all(|c| c.is_ascii_digit() || c == '.') && !tail.is_empty() => head.to_string(),
+        _ => id.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -492,5 +508,22 @@ impl Registry {
             Some(m) => m.push(req),
             None => LogMirror.push(req),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_family;
+
+    #[test]
+    fn independence_by_model_family() {
+        // Same line, different version → same family (not independent).
+        assert_eq!(model_family("anthropic/claude-sonnet-5"), model_family("anthropic/claude-sonnet-4.6"));
+        // Different lines → different family (independent).
+        assert_ne!(model_family("anthropic/claude-sonnet-5"), model_family("anthropic/claude-opus-4.8"));
+        // Different vendors → different family.
+        assert_ne!(model_family("anthropic/claude-sonnet-5"), model_family("openai/gpt-4o"));
+        // -fast suffix doesn't change the family.
+        assert_eq!(model_family("anthropic/claude-opus-4.8-fast"), model_family("anthropic/claude-opus-4.8"));
     }
 }

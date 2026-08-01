@@ -1454,7 +1454,9 @@ async fn perform_auto_review(
     let Some(info) = app.repos.change_info(tenant, repo, &change) else {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "cannot resolve change".into()));
     };
-    let lesson = app.store.session_record(&key, &change).map(|s| s.lesson).unwrap_or_default();
+    let session = app.store.session_record(&key, &change);
+    let lesson = session.as_ref().map(|s| s.lesson.clone()).unwrap_or_default();
+    let author_model = session.as_ref().map(|s| s.model.clone()).unwrap_or_default();
     let facts = app.repos.facts(tenant, repo, &change);
     let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
     let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
@@ -1464,6 +1466,7 @@ async fn perform_auto_review(
         intent: info.intent.clone(),
         lesson,
         author: info.author.clone(),
+        author_model,
         source_url,
         facts,
     };

@@ -16,7 +16,7 @@
 //!
 //! Key + models come from Hull's pluggable config — no hardcoded path or secret.
 
-use hull_plugin::{default_review, ReviewFinding, ReviewPackage, ReviewRequest, ReviewVerdict, Reviewer};
+use hull_plugin::{default_review, model_family, ReviewFinding, ReviewPackage, ReviewRequest, ReviewVerdict, Reviewer};
 use serde_json::{json, Value};
 
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -153,11 +153,18 @@ impl Reviewer for OpenRouterReviewer {
                 return default_review(req);
             }
         };
-        // Escalate to the deep model only when the triage isn't a clean, low-risk approve.
+        // D5 — reviewer independence: if the triage model shares the *author's* model family, a clean
+        // approve isn't independent. Force the deep pass (a different family) so the final verdict
+        // comes from a model independent of the author.
+        let same_family_as_author =
+            !req.author_model.is_empty() && model_family(&self.screen_model) == model_family(&req.author_model);
+
+        // Escalate to the deep model when the triage isn't a clean low-risk approve, or for independence.
         let flagged = triage.pkg.verdict != ReviewVerdict::Approve
             || triage.risk == "high"
             || triage.instruction_like
-            || triage.pkg.findings.iter().any(|f| f.severity == "blocker" || f.severity == "warn");
+            || triage.pkg.findings.iter().any(|f| f.severity == "blocker" || f.severity == "warn")
+            || same_family_as_author;
 
         let mut pkg = if !flagged {
             triage.pkg
@@ -174,6 +181,11 @@ impl Reviewer for OpenRouterReviewer {
         };
         // Attach the reconciliation ledger as corroborating evidence.
         pkg.ledger = default_review(req).ledger;
+        // D5 — record the deciding model's independence from the author.
+        let decider = if flagged { &self.deep_model } else { &self.screen_model };
+        if !req.author_model.is_empty() && model_family(decider) == model_family(&req.author_model) {
+            pkg.summary = format!("{} · ⚠ reduced independence: reviewer shares the author's model family", pkg.summary);
+        }
         pkg
     }
 }
