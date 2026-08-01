@@ -25,7 +25,7 @@ use axum::{
 };
 use std::collections::HashMap;
 use futures::stream::Stream;
-use hull_core::store::{InMemory, Store};
+use hull_core::store::{FileStore, InMemory, Store};
 use hull_core::*;
 use hull_plugin::Registry;
 use serde_json::{json, Value};
@@ -47,7 +47,7 @@ impl Default for Options {
 
 #[derive(Clone)]
 struct App {
-    store: Arc<InMemory>,
+    store: Arc<dyn Store>,
     hub: Arc<ActivityHub>,
     registry: Arc<Registry>,
     repos: repos::RepoHost,
@@ -65,13 +65,29 @@ impl repos::HasRepoHost for App {
 pub fn router(registry: Registry) -> Router {
     let hub = Arc::new(ActivityHub::new());
     wire_sources(&hub);
-    make_router(build_app(registry, hub))
+    // Tests/embedding use an ephemeral in-memory store; `run` uses the durable FileStore.
+    let store: Arc<dyn Store> = Arc::new(InMemory::new());
+    seed_if_empty(&*store);
+    make_router(build_app(registry, hub, store))
 }
 
-fn build_app(registry: Registry, hub: Arc<ActivityHub>) -> App {
-    let store = Arc::new(InMemory::new());
-    seed(&store);
+fn build_app(registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store>) -> App {
     App { store, hub, registry: Arc::new(registry), repos: repos::RepoHost::from_env() }
+}
+
+/// Path to the durable domain snapshot (`HULL_DATA_DIR`/store.json, default `~/.hull/data`).
+fn data_path() -> std::path::PathBuf {
+    let dir = std::env::var("HULL_DATA_DIR").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        format!("{home}/.hull/data")
+    });
+    std::path::PathBuf::from(dir).join("store.json")
+}
+
+fn seed_if_empty(store: &dyn Store) {
+    if store.accounts().is_empty() {
+        seed(store);
+    }
 }
 
 fn make_router(app: App) -> Router {
@@ -133,7 +149,10 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     if let Some(addr) = ingress_addr() {
         ingress::spawn(addr, hub.clone()); // daemons dial in via hull-agent
     }
-    let router = make_router(build_app(registry, hub));
+    let store: Arc<dyn Store> = Arc::new(FileStore::open(data_path()));
+    eprintln!("hull-server: domain store at {}", data_path().display());
+    seed_if_empty(&*store);
+    let router = make_router(build_app(registry, hub, store));
     let listener = tokio::net::TcpListener::bind(&opts.addr).await.expect("bind");
     eprintln!("hull-server listening on http://{}", opts.addr);
     axum::serve(listener, router).await.expect("serve");
@@ -243,7 +262,7 @@ async fn feed(
 }
 
 /// Seed a little sample data so the scaffold is explorable.
-fn seed(store: &InMemory) {
+fn seed(store: &dyn Store) {
     store.put_account(Account {
         id: "acct_tankrap".into(),
         kind: AccountKind::Organization,
