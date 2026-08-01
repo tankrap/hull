@@ -711,7 +711,8 @@ async fn resolve_check(app: &App, tenant: &str, repo: &str, change: &str, force:
                 .unwrap_or_default();
             let payload = ci::dispatch_body(tenant, repo, change, &tree, &intent, &author, &app.public_url);
             app.ci_config.mark_inflight(&tree);
-            let mut req = app.http.post(&cfg.url).json(&payload);
+            // `X-Hull-CI-Version` lets a CI integration branch on the contract version (see CI-SPEC.md).
+            let mut req = app.http.post(&cfg.url).header("X-Hull-CI-Version", ci::CONTRACT_VERSION).json(&payload);
             if !cfg.secret.is_empty() {
                 req = req.header("X-Hull-CI-Secret", &cfg.secret);
             }

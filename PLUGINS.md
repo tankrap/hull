@@ -84,6 +84,10 @@ the HTTP contract is the primary one.
 
 ### A. External CI over HTTP (recommended — language-agnostic)
 
+> **The full normative contract is [`CI-SPEC.md`](./CI-SPEC.md)** (field reference, status semantics,
+> auth, versioning, conformance checklist) with a reference implementation at
+> [`scripts/fake-ci.py`](./scripts/fake-ci.py). The summary below is orientation.
+
 **Configure the endpoint** — per repo, or an instance default, else the built-in local runner:
 
 ```

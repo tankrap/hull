@@ -214,6 +214,10 @@ impl CiConfig {
     }
 }
 
+/// The version of the CI integration contract Hull speaks (sent as `X-Hull-CI-Version`). See
+/// `CI-SPEC.md`. Bump only on a breaking change to the dispatch/callback shape.
+pub const CONTRACT_VERSION: &str = "1";
+
 /// The **standard dispatch payload** Hull POSTs to a CI endpoint. This is the contract a CI system
 /// integrates against — stable regardless of what's on the other side.
 #[allow(clippy::too_many_arguments)]
