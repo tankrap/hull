@@ -1446,10 +1446,15 @@ async fn reviews(State(app): State<App>, Path((tenant, repo)): Path<(String, Str
 /// The content-addressed review **audit artifact** (`GET …/artifacts/:id`) — the immutable record of
 /// why a review reached its verdict (inputs, models, ledger, findings). The `:id` is a BLAKE3
 /// content address, so the answer to "why did the reviewer pass this?" can't be altered after.
-async fn get_artifact(State(app): State<App>, Path((_tenant, _repo, id)): Path<(String, String, String)>) -> Response {
+async fn get_artifact(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Response {
+    // Scope to the requesting repo — the store is content-addressed and global, so we must check the
+    // artifact belongs here rather than serving any id cross-tenant. (Fix from the dogfood review of
+    // PR !2.)
     match app.artifacts.get(&id) {
-        Some(a) => Json(json!({ "artifact_id": id, "artifact": a })).into_response(),
-        None => (StatusCode::NOT_FOUND, "no such artifact").into_response(),
+        Some(a) if a.get("repo").and_then(Value::as_str) == Some(&format!("{tenant}/{repo}")) => {
+            Json(json!({ "artifact_id": id, "artifact": a })).into_response()
+        }
+        _ => (StatusCode::NOT_FOUND, "no such artifact").into_response(),
     }
 }
 
@@ -1690,9 +1695,13 @@ async fn perform_auto_review(
         source_url,
         facts,
     };
-    // D9 — incremental re-review: an unchanged tree reuses its cached verdict (skip the model call);
-    // a changed tree (different diff) has a different key, so it re-reviews. `force` bypasses.
-    let (verdict, findings, ledger, base_summary, from_cache) = match app.review_cache.get(&tree) {
+    // D9 — incremental re-review: reuse the cached verdict when nothing that feeds it changed. The
+    // key is tree **+ verification** (a review's inputs are the diff AND the green/red signal), so a
+    // changed diff OR a flipped verification re-reviews; an identical (tree, verification) is cached.
+    // (Fix from the dogfood review of PR !1: keying on tree alone would serve a stale verdict after a
+    // red→green flip on the same tree.)
+    let cache_key = format!("{tree}:{}", app.repos.verification(tenant, repo, &change).unwrap_or_default());
+    let (verdict, findings, ledger, base_summary, from_cache) = match app.review_cache.get(&cache_key) {
         Some(cr) => {
             let v = match cr.verdict.as_str() {
                 "approve" => Verdict::Approve,
@@ -1719,7 +1728,7 @@ async fn perform_auto_review(
                 Verdict::RequestChanges => "request_changes",
                 _ => "comment",
             };
-            app.review_cache.put(&tree, reviewcache::CachedReview {
+            app.review_cache.put(&cache_key, reviewcache::CachedReview {
                 verdict: verdict_str.into(),
                 summary: pkg.summary.clone(),
                 findings: f.iter().map(|x| reviewcache::CachedFinding { path: x.path.clone(), line: x.line, severity: x.severity.clone(), note: x.note.clone() }).collect(),
