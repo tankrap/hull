@@ -102,6 +102,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/issues/:number", axum::routing::patch(update_issue))
         .route("/api/repos/:tenant/:repo/why", get(why))
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
+        .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
         // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
@@ -249,6 +250,59 @@ async fn why(
     let path = q.get("path").map(String::as_str).unwrap_or("");
     let prov = app.repos.why(&tenant, &repo, path, 10);
     Json(json!({ "path": path, "provenance": prov }))
+}
+
+/// List reviews for a hosted repo (`GET /api/repos/:tenant/:repo/reviews`); the client filters by
+/// target (e.g. `pr:1`).
+async fn reviews(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+    Json(json!({ "reviews": app.store.reviews(&format!("{tenant}/{repo}")) }))
+}
+
+/// Post a review (`POST /api/repos/:tenant/:repo/reviews`) — `{target, reviewer, verdict, summary}`.
+/// The reviewer must be an accountable actor. Review is independent by construction: a PR's author
+/// cannot approve their own PR (matches the "never self-merge / human review gate" rule).
+async fn create_review(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let reviewer = match require_accountable(&app, body.get("reviewer").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let target = body.get("target").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if target.is_empty() {
+        return (StatusCode::BAD_REQUEST, "target is required (e.g. 'pr:1')").into_response();
+    }
+    let verdict = match body.get("verdict").and_then(Value::as_str) {
+        Some("approve") => Verdict::Approve,
+        Some("request_changes") => Verdict::RequestChanges,
+        Some("reject") => Verdict::Reject,
+        _ => Verdict::Comment,
+    };
+    // Independent-review rule: you can't approve your own PR.
+    if verdict == Verdict::Approve {
+        if let Some(num) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
+            if let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == num) {
+                if pr.author == reviewer.id {
+                    return (StatusCode::CONFLICT, "a PR author cannot approve their own PR — review must be independent").into_response();
+                }
+            }
+        }
+    }
+    let count = app.store.reviews(&key).len();
+    let review = Review {
+        id: format!("rv_{}_{}", key.replace('/', "_"), count + 1),
+        repo: key,
+        target,
+        reviewer: reviewer.id,
+        verdict,
+        summary: body.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
+        created_unix: now(),
+    };
+    app.store.put_review(review.clone());
+    (StatusCode::CREATED, Json(json!({ "review": review }))).into_response()
 }
 
 /// List pull requests for a hosted repo (`GET /api/repos/:tenant/:repo/prs`).

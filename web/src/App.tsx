@@ -17,6 +17,7 @@ type ActivityEvent =
 
 type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable: boolean; human_root: string | null };
 type PR = { number: number; title: string; author: string; changes: string[]; verification: string };
+type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string };
 type CodeRef = { repo: string; blob: string; path: string; line_start: number; line_end?: number };
 type Issue = {
   number: number;
@@ -110,6 +111,37 @@ export function App() {
   useEffect(() => {
     loadPrs();
   }, [tenant, issueRepo]);
+  // Reviews (first-class), loaded per repo and filtered to a PR target.
+  const [reviews, setReviews] = useState<Review[]>([]);
+  const [openPr, setOpenPr] = useState<number | null>(null);
+  const [reviewForm, setReviewForm] = useState({ verdict: "approve", summary: "" });
+  const loadReviews = () =>
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`)
+      .then((r) => r.json())
+      .then((d) => setReviews(d.reviews ?? []))
+      .catch(() => {});
+  useEffect(() => {
+    loadReviews();
+  }, [tenant, issueRepo]);
+  const submitReview = async (prNumber: number) => {
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        target: `pr:${prNumber}`,
+        reviewer: actingAs,
+        verdict: reviewForm.verdict,
+        summary: reviewForm.summary.trim(),
+      }),
+    });
+    if (res.ok) {
+      setReviewForm({ verdict: "approve", summary: "" });
+      loadReviews();
+    } else {
+      alert(await res.text());
+    }
+  };
+
   const createPr = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!prTitle.trim()) return;
@@ -403,21 +435,63 @@ export function App() {
         </form>
         <ul className="issue-list">
           {prs.length === 0 && <li className="empty">no pull requests yet</li>}
-          {[...prs].sort((a, b) => b.number - a.number).map((p) => (
+          {[...prs].sort((a, b) => b.number - a.number).map((p) => {
+            const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
+            return (
             <li key={p.number} className="issue">
               <div className="issue-row">
                 <span className={"verif " + p.verification}>{p.verification}</span>
                 <span className="num">!{p.number}</span>
-                <span className="it-title">{p.title}</span>
+                <button
+                  className="it-title"
+                  onClick={() => setOpenPr(openPr === p.number ? null : p.number)}
+                  title="open reviews"
+                >
+                  {openPr === p.number ? "▾ " : "▸ "}
+                  {p.title}
+                </button>
                 <span className="coderef" title={`proposes keel change ${p.changes[0]}`}>
                   <span className="blob">⬡ {(p.changes[0] ?? "").slice(0, 10)}</span>
                 </span>
+                {prReviews.length > 0 && (
+                  <span className="review-count" title="reviews">{prReviews.length} review{prReviews.length > 1 ? "s" : ""}</span>
+                )}
                 <span className={"by " + (actors.find((a) => a.id === p.author)?.kind ?? "")}>
                   {handleOf(p.author)}
                 </span>
               </div>
+              {openPr === p.number && (
+                <div className="reviews">
+                  {prReviews.length === 0 && <p className="muted">no reviews yet</p>}
+                  {prReviews.map((r) => (
+                    <div className="review" key={r.id}>
+                      <span className={"verdict " + r.verdict}>{r.verdict.replace("_", " ")}</span>
+                      <b className={actors.find((a) => a.id === r.reviewer)?.kind ?? ""}>{handleOf(r.reviewer)}</b>
+                      <span className="rv-summary">{r.summary}</span>
+                    </div>
+                  ))}
+                  <div className="review-form">
+                    <select
+                      value={reviewForm.verdict}
+                      onChange={(e) => setReviewForm({ ...reviewForm, verdict: e.target.value })}
+                    >
+                      <option value="approve">approve</option>
+                      <option value="request_changes">request changes</option>
+                      <option value="reject">reject</option>
+                      <option value="comment">comment</option>
+                    </select>
+                    <input
+                      placeholder={`review as ${handleOf(actingAs)}…`}
+                      value={reviewForm.summary}
+                      onChange={(e) => setReviewForm({ ...reviewForm, summary: e.target.value })}
+                    />
+                    <button onClick={() => submitReview(p.number)}>Submit review</button>
+                  </div>
+                </div>
+              )}
             </li>
-          ))}
+            );
+          })}
         </ul>
       </section>
     </div>

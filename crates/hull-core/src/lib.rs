@@ -248,6 +248,31 @@ pub struct PullRequest {
     pub created_unix: u64,
 }
 
+/// A review of a target (a PR, or a keel change/session) — first-class, like keel's own reviews.
+/// The reviewer is an [`Actor`], so an **agent** can review (independent-by-construction: a model
+/// from a different family than the author), and every verdict is accountable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Review {
+    pub id: String,
+    pub repo: String,
+    /// What is under review, e.g. `pr:1` or a keel change id.
+    pub target: String,
+    pub reviewer: ActorId,
+    pub verdict: Verdict,
+    #[serde(default)]
+    pub summary: String,
+    pub created_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Approve,
+    RequestChanges,
+    Reject,
+    Comment,
+}
+
 /// Mirror of keel's verification (from `keel verify`) — first-class in Hull.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

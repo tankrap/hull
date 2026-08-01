@@ -2,7 +2,7 @@
 //! (accounts/issues/projects as relational rows) that references keel objects by content address.
 //! Keeping this a trait means the server, tests, and the eventual SQL store all share one shape.
 
-use crate::{Account, Actor, Issue, Project, PullRequest, Repo};
+use crate::{Account, Actor, Issue, Project, PullRequest, Repo, Review};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,6 +24,8 @@ pub trait Store: Send + Sync {
     fn replace_issue(&self, issue: Issue) -> bool;
     fn put_pr(&self, pr: PullRequest);
     fn prs(&self, repo: &str) -> Vec<PullRequest>;
+    fn put_review(&self, review: Review);
+    fn reviews(&self, repo: &str) -> Vec<Review>;
     fn put_project(&self, project: Project);
     fn projects(&self, owner: &str) -> Vec<Project>;
 }
@@ -36,6 +38,7 @@ pub struct InMemory {
     repos: RwLock<HashMap<String, Repo>>,
     issues: RwLock<Vec<Issue>>,
     prs: RwLock<Vec<PullRequest>>,
+    reviews: RwLock<Vec<Review>>,
     projects: RwLock<Vec<Project>>,
 }
 
@@ -89,6 +92,12 @@ impl Store for InMemory {
     fn prs(&self, repo: &str) -> Vec<PullRequest> {
         self.prs.read().unwrap().iter().filter(|p| p.repo == repo).cloned().collect()
     }
+    fn put_review(&self, review: Review) {
+        self.reviews.write().unwrap().push(review);
+    }
+    fn reviews(&self, repo: &str) -> Vec<Review> {
+        self.reviews.read().unwrap().iter().filter(|r| r.repo == repo).cloned().collect()
+    }
     fn put_project(&self, project: Project) {
         self.projects.write().unwrap().push(project);
     }
@@ -110,6 +119,8 @@ struct Snapshot {
     issues: Vec<Issue>,
     #[serde(default)]
     prs: Vec<PullRequest>,
+    #[serde(default)]
+    reviews: Vec<Review>,
     #[serde(default)]
     projects: Vec<Project>,
 }
@@ -211,6 +222,12 @@ impl Store for FileStore {
     }
     fn prs(&self, repo: &str) -> Vec<PullRequest> {
         self.inner.read().unwrap().prs.iter().filter(|p| p.repo == repo).cloned().collect()
+    }
+    fn put_review(&self, review: Review) {
+        self.mutate(|s| s.reviews.push(review));
+    }
+    fn reviews(&self, repo: &str) -> Vec<Review> {
+        self.inner.read().unwrap().reviews.iter().filter(|r| r.repo == repo).cloned().collect()
     }
     fn put_project(&self, project: Project) {
         self.mutate(|s| s.projects.push(project));
