@@ -14,8 +14,13 @@ async fn main() {
             // D4 model tiering: a cheap triage model screens; only escalations hit the deep model.
             let screen = reg.config("HULL_REVIEW_MODEL").unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string());
             let deep = reg.config("HULL_REVIEW_MODEL_DEEP").unwrap_or_else(|| "anthropic/claude-opus-4.8".to_string());
-            eprintln!("hull: OpenRouter AI reviewer active (triage {screen} → deep {deep})");
-            reg.set_reviewer(std::sync::Arc::new(hull_review_openrouter::OpenRouterReviewer::new(key, screen, deep)));
+            // D6 — provider allowlist (comma-separated vendors, e.g. "anthropic,openai"); empty = any.
+            let allow: Vec<String> = reg
+                .config("HULL_REVIEW_PROVIDER_ALLOWLIST")
+                .map(|s| s.split(',').map(|v| v.trim().to_lowercase()).filter(|v| !v.is_empty()).collect())
+                .unwrap_or_default();
+            eprintln!("hull: OpenRouter AI reviewer active (triage {screen} → deep {deep}; allow={allow:?})");
+            reg.set_reviewer(std::sync::Arc::new(hull_review_openrouter::OpenRouterReviewer::new(key, screen, deep, allow)));
         }
     })
     .await;

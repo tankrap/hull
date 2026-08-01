@@ -28,6 +28,10 @@ pub struct OpenRouterReviewer {
     screen_model: String,
     /// Expensive model, invoked only on escalation.
     deep_model: String,
+    /// D6 — provider allowlist: vendor prefixes (before `/`) the reviewer may send code to. Empty =
+    /// allow any. A model outside the allowlist is refused (→ reconciliation fallback), so change
+    /// content never reaches an unapproved provider.
+    allowed_vendors: Vec<String>,
     agent: ureq::Agent,
 }
 
@@ -39,9 +43,18 @@ struct Triage {
 }
 
 impl OpenRouterReviewer {
-    pub fn new(api_key: String, screen_model: String, deep_model: String) -> Self {
+    pub fn new(api_key: String, screen_model: String, deep_model: String, allowed_vendors: Vec<String>) -> Self {
         let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(120)).build();
-        OpenRouterReviewer { api_key, screen_model, deep_model, agent }
+        OpenRouterReviewer { api_key, screen_model, deep_model, allowed_vendors, agent }
+    }
+
+    /// D6 — is a model's vendor on the allowlist? (Empty allowlist ⇒ allow any.)
+    fn vendor_allowed(&self, model: &str) -> bool {
+        if self.allowed_vendors.is_empty() {
+            return true;
+        }
+        let vendor = model.split('/').next().unwrap_or("").to_lowercase();
+        self.allowed_vendors.iter().any(|v| v == &vendor)
     }
 
     /// The untrusted change context, delimited so a model treats it strictly as data.
@@ -64,6 +77,9 @@ impl OpenRouterReviewer {
 
     /// One model call → parsed JSON object (fence-tolerant, reasoning disabled for a clean verdict).
     fn chat(&self, model: &str, system: &str, user: &str) -> Result<Value, String> {
+        if !self.vendor_allowed(model) {
+            return Err(format!("provider not on allowlist: {model}"));
+        }
         let body = json!({
             "model": model,
             "temperature": 0.2,
