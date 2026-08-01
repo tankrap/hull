@@ -258,7 +258,7 @@ fn make_router(app: App) -> Router {
         // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
         .route("/:tenant/:repo/info/refs", get(repos::info_refs::<App>))
         .route("/:tenant/:repo/git-upload-pack", post(repos::upload_pack::<App>))
-        .route("/:tenant/:repo/git-receive-pack", post(repos::receive_pack::<App>))
+        .route("/:tenant/:repo/git-receive-pack", post(receive_pack_handler))
         .with_state(app)
 }
 
@@ -1009,6 +1009,28 @@ fn is_repo_admin(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Git push endpoint, wrapped so that **every successful push runs CI** on the new HEAD change —
+/// independent of autonomy tier (CI is a mechanical check, not an autonomous action). Fire-and-forget
+/// (memoized by tree, so an unchanged tree is a no-op); dispatched to the configured CI or the local
+/// runner.
+async fn receive_pack_handler(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let resp = repos::receive_pack(State(app.clone()), Path((tenant.clone(), repo.clone())), headers, body).await;
+    if resp.status().is_success() {
+        if let Some(change) = app.repos.head_change(&tenant, &repo) {
+            let (app2, t, r) = (app.clone(), tenant.clone(), repo.clone());
+            tokio::spawn(async move {
+                let _ = resolve_check(&app2, &t, &r, &change, false).await;
+            });
+        }
+    }
+    resp
+}
+
 /// The id of the account that owns `tenant/repo` (for the account-level policy fallback).
 fn repo_account_id(app: &App, tenant: &str, repo: &str) -> Option<String> {
     let name = format!("{tenant}/{repo}");
@@ -1679,8 +1701,56 @@ async fn perform_auto_review(
         kind: "review_posted".into(),
         to: vec![pr.author.clone()],
         summary: format!("{} auto-reviewed PR !{number}: {:?}", reviewer.handle, review.verdict),
-        change: Some(change),
+        change: Some(change.clone()),
     });
+
+    // Auto-triage (T2+): a review that requests changes turns its blocker findings into a triaged
+    // issue — automatic issue triage out of reviews. Gated by the repo's autonomy tier.
+    let acct = repo_account_id(app, tenant, repo);
+    let tier = app.autonomy.effective(tenant, repo, acct.as_deref()).tier;
+    if tier >= hull_core::AutonomyTier::T2 && review.verdict == Verdict::RequestChanges {
+        let blockers: Vec<&ReviewFinding> = review.findings.iter().filter(|f| f.severity == "blocker").collect();
+        if !blockers.is_empty() {
+            // Don't re-triage the same PR: skip if an open from-review issue already links it.
+            let already = app
+                .store
+                .issues(&key)
+                .into_iter()
+                .any(|i| i.labels.iter().any(|l| l == "from-review") && i.linked_prs.contains(&pr.id) && matches!(i.status, IssueStatus::Open));
+            if !already {
+                let inum = app.store.issues(&key).iter().map(|i| i.number).max().unwrap_or(0) + 1;
+                let body = blockers.iter().map(|f| format!("- {} ({})", f.note, f.path)).collect::<Vec<_>>().join("\n");
+                let issue = Issue {
+                    id: format!("iss_{}_{inum}", key.replace('/', "_")),
+                    repo: key.clone(),
+                    number: inum,
+                    title: format!("Review flagged {} blocker(s) on PR !{number}", blockers.len()),
+                    body: format!("Auto-triaged from {}'s review of PR !{number}:\n\n{body}", reviewer.handle),
+                    author: reviewer.id.clone(),
+                    assignees: vec![pr.author.clone()],
+                    labels: vec!["from-review".into()],
+                    projects: vec![],
+                    status: IssueStatus::Open,
+                    code_refs: vec![],
+                    referenced_actors: vec![],
+                    linked_prs: vec![pr.id.clone()],
+                    resolved_by: None,
+                    created_unix: now(),
+                };
+                app.store.put_issue(issue);
+                app.registry.notify(&NotifyEvent {
+                    kind: "issue_triaged".into(),
+                    to: vec![pr.author.clone()],
+                    summary: format!("auto-triaged issue #{inum} from the review of PR !{number}"),
+                    change: Some(change.clone()),
+                });
+                app.hub.publish(
+                    tenant,
+                    ActivityEvent::Issue { repo: repo.to_string(), number: inum, action: "opened".into(), actor: reviewer.handle.clone(), ts: now() },
+                );
+            }
+        }
+    }
     Ok(review)
 }
 
