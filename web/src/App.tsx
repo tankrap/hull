@@ -37,9 +37,8 @@ export function App() {
   );
   const feedRef = useRef<EventSource | null>(null);
 
-  // Issues for the hosted `hull` repo under the selected tenant (M2). The repo is fixed to `hull`
-  // for this view; a repo picker is a later slice.
-  const issueRepo = "hull";
+  // Issues for the selected repo under the selected tenant (M2). Click a repo card to switch.
+  const [issueRepo, setIssueRepo] = useState<string>("hull");
   const [issues, setIssues] = useState<Issue[]>([]);
   const [form, setForm] = useState({ title: "", path: "", line: "" });
   const loadIssues = () =>
@@ -49,7 +48,7 @@ export function App() {
       .catch(() => {});
   useEffect(() => {
     loadIssues();
-  }, [tenant]);
+  }, [tenant, issueRepo]);
 
   const createIssue = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -124,7 +123,12 @@ export function App() {
           <div className="repos">
             {repos.length === 0 && <div className="empty">waiting for activity…</div>}
             {repos.map((r) => (
-              <article className="repo" key={r.repo}>
+              <article
+                className={"repo" + (r.repo === issueRepo ? " selected" : "")}
+                key={r.repo}
+                onClick={() => setIssueRepo(r.repo)}
+                title="show this repo's issues"
+              >
                 <div className="repo-head">
                   <span className="repo-name">{r.repo}</span>
                   <span className="score" title="live activity score">{r.score.toFixed(0)}</span>

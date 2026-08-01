@@ -95,3 +95,6 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .issue .coderef { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; color: #9fb2d6; background: #0e1420; padding: 2px 8px; border-radius: 6px; border: 1px solid #1c2740; }
 .issue .coderef .blob { color: #6fa8ff; font-size: 12px; }
 .issue .by { margin-left: auto; color: #8b93a7; font-size: 12px; }
+
+.repo { cursor: pointer; transition: border-color .12s ease; }
+.repo.selected { border-color: #2f8f6b; box-shadow: 0 0 0 1px #2f8f6b33; }
