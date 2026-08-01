@@ -10,6 +10,7 @@
 pub mod activity;
 pub mod keeld;
 pub mod plugins;
+pub mod repos;
 
 use activity::{ActivityEvent, ActivityHub};
 use axum::{
@@ -44,6 +45,13 @@ struct App {
     store: Arc<InMemory>,
     hub: Arc<ActivityHub>,
     registry: Arc<Registry>,
+    repos: repos::RepoHost,
+}
+
+impl repos::HasRepoHost for App {
+    fn repo_host(&self) -> &repos::RepoHost {
+        &self.repos
+    }
 }
 
 /// Build the router with an already-assembled registry (handy for tests / embedding).
@@ -60,15 +68,20 @@ pub fn router(registry: Registry) -> Router {
         eprintln!("hull-server: bridging {} keeld daemon(s) over QUIC", endpoints.len());
         keeld::spawn_keeld_sources(hub.clone(), endpoints);
     }
-    let app = App { store, hub, registry: Arc::new(registry) };
+    let app = App { store, hub, registry: Arc::new(registry), repos: repos::RepoHost::from_env() };
+    eprintln!("hull-server: hosting keel repos under {}", app.repos.root().display());
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/api/home", get(home))
         .route("/api/feed", get(feed))
-        .route("/api/repos", get(repos))
+        .route("/api/repos", get(repos_list))
         .route("/api/repos/:repo/issues", get(issues))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
+        // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
+        .route("/:tenant/:repo/info/refs", get(repos::info_refs::<App>))
+        .route("/:tenant/:repo/git-upload-pack", post(repos::upload_pack::<App>))
+        .route("/:tenant/:repo/git-receive-pack", post(repos::receive_pack::<App>))
         .with_state(app)
 }
 
@@ -91,8 +104,9 @@ async fn home(State(app): State<App>) -> Json<Value> {
     Json(json!({ "repos": app.hub.home() }))
 }
 
-async fn repos(State(app): State<App>) -> Json<Value> {
-    Json(json!({ "repos": app.store.repos() }))
+/// The repos actually hosted on disk (the filesystem registry), plus the seeded domain repos.
+async fn repos_list(State(app): State<App>) -> Json<Value> {
+    Json(json!({ "hosted": app.repos.list(), "repos": app.store.repos() }))
 }
 
 async fn issues(State(app): State<App>, Path(repo): Path<String>) -> Json<Value> {

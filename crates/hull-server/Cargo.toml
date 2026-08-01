@@ -24,9 +24,13 @@ hull-plugin = { path = "../hull-plugin" }
 # build is reproducible and standalone (no sibling checkout needed); bump the rev to adopt keel
 # changes. Formalizing this embedding API (semver the embedded crates) is Linear NEW-1168.
 keel-net = { git = "https://github.com/tankrap/keel", rev = "6827a3443de3c9be2e66887c8038310e32dddc37", package = "keel-net" }
+keel-git = { git = "https://github.com/tankrap/keel", rev = "6827a3443de3c9be2e66887c8038310e32dddc37", package = "keel-git" }
+keel-store = { git = "https://github.com/tankrap/keel", rev = "6827a3443de3c9be2e66887c8038310e32dddc37", package = "keel-store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
+# git gzip-compresses the upload-pack request body by default; decode it before handing to keel-git.
+flate2 = "1"
