@@ -76,8 +76,9 @@ async fn stream_once(
 }
 
 /// Map a keeld coordination event (JSON) to an [`ActivityEvent`], tagging it with `repo`. Unknown
-/// kinds are skipped rather than erroring, so new keeld event types don't break the bridge.
-fn map_event(bytes: &[u8], repo: &str) -> Option<ActivityEvent> {
+/// kinds are skipped rather than erroring, so new keeld event types don't break the bridge. Shared
+/// with the QUIC ingress, which receives the same raw keeld events forwarded by `hull-agent`.
+pub(crate) fn map_event(bytes: &[u8], repo: &str) -> Option<ActivityEvent> {
     let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
     let str_of = |k: &str| v.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();

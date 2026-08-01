@@ -8,8 +8,10 @@
 //! `/api/repos/:repo/issues` · `/api/scan` · `/api/plugins`.
 
 pub mod activity;
+pub mod ingress;
 pub mod keeld;
 pub mod plugins;
+pub mod quic;
 pub mod repos;
 
 use activity::{ActivityEvent, ActivityHub};
@@ -55,21 +57,22 @@ impl repos::HasRepoHost for App {
     }
 }
 
-/// Build the router with an already-assembled registry (handy for tests / embedding).
+/// Build the router with an already-assembled registry (handy for tests / embedding). Wires a
+/// coordination source (real keeld bridge or the demo) but NOT the QUIC ingress — [`run`] starts
+/// that, so tests don't bind a UDP port.
 pub fn router(registry: Registry) -> Router {
+    let hub = Arc::new(ActivityHub::new());
+    wire_sources(&hub);
+    make_router(build_app(registry, hub))
+}
+
+fn build_app(registry: Registry, hub: Arc<ActivityHub>) -> App {
     let store = Arc::new(InMemory::new());
     seed(&store);
-    let hub = Arc::new(ActivityHub::new());
-    // Real keeld QUIC bridge when HULL_KEELD names one or more daemons; otherwise the demo source
-    // keeps the scaffold alive end-to-end. (Set e.g. HULL_KEELD=hull@127.0.0.1:9000.)
-    let endpoints = keeld::endpoints_from_env();
-    if endpoints.is_empty() {
-        spawn_fake_source(hub.clone());
-    } else {
-        eprintln!("hull-server: bridging {} keeld daemon(s) over QUIC", endpoints.len());
-        keeld::spawn_keeld_sources(hub.clone(), endpoints);
-    }
-    let app = App { store, hub, registry: Arc::new(registry), repos: repos::RepoHost::from_env() };
+    App { store, hub, registry: Arc::new(registry), repos: repos::RepoHost::from_env() }
+}
+
+fn make_router(app: App) -> Router {
     eprintln!("hull-server: hosting keel repos under {}", app.repos.root().display());
     Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -86,6 +89,34 @@ pub fn router(registry: Registry) -> Router {
         .with_state(app)
 }
 
+/// Wire a coordination source into `hub`: the `hull-agent` ingress (below, started by `run`) is the
+/// hosted path, but a local dev can also point hull OUT at a keeld with `HULL_KEELD`. With neither,
+/// the demo source keeps the scaffold alive end-to-end.
+fn wire_sources(hub: &Arc<ActivityHub>) {
+    let endpoints = keeld::endpoints_from_env();
+    if endpoints.is_empty() {
+        spawn_fake_source(hub.clone());
+    } else {
+        eprintln!("hull-server: bridging {} keeld daemon(s) over QUIC (dev outbound)", endpoints.len());
+        keeld::spawn_keeld_sources(hub.clone(), endpoints);
+    }
+}
+
+/// The QUIC ingress bind address (`HULL_INGRESS_ADDR`, default `127.0.0.1:8931`); `off` disables it.
+fn ingress_addr() -> Option<std::net::SocketAddr> {
+    let s = std::env::var("HULL_INGRESS_ADDR").unwrap_or_else(|_| "127.0.0.1:8931".into());
+    if s.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    match s.parse() {
+        Ok(a) => Some(a),
+        Err(_) => {
+            eprintln!("hull-server: invalid HULL_INGRESS_ADDR '{s}' — ingress disabled");
+            None
+        }
+    }
+}
+
 /// Run the server. `register_plugins` is the open-core hook: core built-ins are installed first,
 /// then this closure runs to add any extra (hosted) plugins.
 pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
@@ -95,7 +126,12 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
         registry.plugins().len(),
         registry.plugins().iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
     );
-    let router = router(registry);
+    let hub = Arc::new(ActivityHub::new());
+    wire_sources(&hub);
+    if let Some(addr) = ingress_addr() {
+        ingress::spawn(addr, hub.clone()); // daemons dial in via hull-agent
+    }
+    let router = make_router(build_app(registry, hub));
     let listener = tokio::net::TcpListener::bind(&opts.addr).await.expect("bind");
     eprintln!("hull-server listening on http://{}", opts.addr);
     axum::serve(listener, router).await.expect("serve");

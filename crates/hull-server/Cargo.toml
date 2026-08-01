@@ -34,3 +34,8 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 # git gzip-compresses the upload-pack request body by default; decode it before handing to keel-git.
 flate2 = "1"
+# QUIC ingress: daemons (via hull-agent) dial IN and stream coordination events up. Same stack as
+# keel-net so the wire is consistent.
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
