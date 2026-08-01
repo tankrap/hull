@@ -164,6 +164,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/prs/:number/merge", post(merge_pr))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
+        .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
@@ -403,6 +404,12 @@ async fn why(
     let path = q.get("path").map(String::as_str).unwrap_or("");
     let prov = app.repos.why(&tenant, &repo, path, 10);
     Json(json!({ "path": path, "provenance": prov }))
+}
+
+/// The diff of a change (`GET /api/repos/:tenant/:repo/change/:id/diff`): per-file line hunks plus a
+/// semantic-operations summary — the review's diff viewer.
+async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
+    Json(json!({ "files": app.repos.diff(&tenant, &repo, &id) }))
 }
 
 /// Expand a keel change (`GET /api/repos/:tenant/:repo/change/:id`): intent, author, and the files

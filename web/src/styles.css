@@ -245,3 +245,21 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .merge-btn { padding: 5px 16px; border-radius: 6px; border: 1px solid #7c4fbf; background: #1c1526; color: #c98bd6; font: inherit; font-size: 13px; cursor: pointer; }
 .merge-btn:hover { background: #241a30; }
 .merged-note { color: #c98bd6; font-weight: 500; }
+
+/* diff viewer on the review page */
+.fdiff { border: 1px solid #1c2432; border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+.fdiff-head { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: #0e1420; border: 0; padding: 8px 12px; cursor: pointer; font: inherit; color: inherit; flex-wrap: wrap; }
+.fdiff-head:hover { background: #111826; }
+.fdiff-head .fst { display: inline-block; width: 16px; text-align: center; border-radius: 4px; font-size: 11px; }
+.fdiff-head .fst.added { background: #14231d; color: #7ee2b8; } .fdiff-head .fst.modified { background: #1c2432; color: #8fb4ff; } .fdiff-head .fst.deleted { background: #2a1618; color: #ff9b9b; }
+.fdiff-head .ops { display: flex; gap: 6px; flex-wrap: wrap; }
+.fdiff-head .op { font-size: 11px; padding: 2px 7px; border-radius: 20px; background: #14231d; color: #7ee2b8; }
+.fdiff-head .op.del { background: #2a1618; color: #ff9b9b; }
+.fdiff-head .expand { margin-left: auto; color: #8b93a7; font-size: 12px; }
+.hunks { background: #0b0e14; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; overflow-x: auto; }
+.hunk-h { color: #6b7280; padding: 4px 12px; background: #0e1420; }
+.dl { padding: 0 12px; white-space: pre; }
+.dl .mark { display: inline-block; width: 12px; color: #6b7280; }
+.dl.add { background: #0f2018; color: #a8e6c8; } .dl.add .mark { color: #4caf7d; }
+.dl.del { background: #24141600; background: #201113; color: #f0a8ab; } .dl.del .mark { color: #d8595e; }
+.dl.ctx { color: #8b93a7; }

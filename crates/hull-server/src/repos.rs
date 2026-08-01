@@ -13,7 +13,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use keel_store::{Object, ObjectId, Store, Verification};
+use keel_store::{diff_lines, Object, ObjectId, Store, Tag, Verification};
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
@@ -171,6 +171,72 @@ fn verification_str(v: Verification) -> String {
 
 const MODE_DIR: u32 = 0o040000;
 
+#[derive(serde::Serialize)]
+pub struct DiffLineOut {
+    pub tag: String, // add | del | ctx
+    pub text: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct HunkOut {
+    pub old_start: usize,
+    pub new_start: usize,
+    pub lines: Vec<DiffLineOut>,
+}
+
+/// A file's diff for the review viewer: the line hunks plus a best-effort **semantic operations**
+/// summary derived from them (added/removed functions/types/imports) — "what changed" as operations,
+/// not just text (the review-should-show-the-operation idea; full semantic diff is roadmapped).
+#[derive(serde::Serialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub status: String,
+    pub ops: Vec<String>,
+    pub hunks: Vec<HunkOut>,
+}
+
+const MAX_DIFF_FILES: usize = 40;
+const MAX_BLOB_FOR_DIFF: usize = 256 * 1024; // skip huge/binary blobs
+
+/// Best-effort operations from a set of hunks: detect definitions added/removed by signature.
+fn semantic_ops(hunks: &[keel_store::Hunk]) -> Vec<String> {
+    let kinds = [
+        ("fn ", "fn"), ("function ", "fn"), ("def ", "fn"),
+        ("struct ", "struct"), ("enum ", "enum"), ("class ", "class"),
+        ("trait ", "trait"), ("interface ", "interface"), ("type ", "type"),
+    ];
+    let mut ops = Vec::new();
+    for h in hunks {
+        for l in &h.lines {
+            let verb = match l.tag {
+                Tag::Add => "added",
+                Tag::Del => "removed",
+                Tag::Context => continue,
+            };
+            let mut t = l.text.trim_start();
+            for p in ["pub ", "async ", "export ", "default ", "public ", "private ", "static "] {
+                t = t.strip_prefix(p).unwrap_or(t);
+            }
+            if t.starts_with("use ") || t.starts_with("import ") || t.starts_with("from ") {
+                ops.push(format!("{verb} import"));
+                continue;
+            }
+            for (pat, label) in kinds {
+                if let Some(rest) = t.strip_prefix(pat) {
+                    let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    if !name.is_empty() {
+                        ops.push(format!("{verb} {label} `{name}`"));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    ops.sort();
+    ops.dedup();
+    ops
+}
+
 /// Recursively flatten a tree to `path -> blob id`.
 fn flatten_tree(store: &Store, tree: ObjectId, prefix: &str, out: &mut HashMap<String, ObjectId>, depth: u32) {
     if depth > 64 {
@@ -236,6 +302,73 @@ impl RepoHost {
             _ => None,
         });
         Some(ChangeInfo { id: hex.to_string(), intent: change.intent, author: change.author, verification, files, session })
+    }
+
+    /// The per-file diff of a change vs its first parent — line hunks + a semantic-ops summary.
+    pub fn diff(&self, tenant: &str, repo: &str, hex: &str) -> Vec<FileDiff> {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return Vec::new() };
+        let Some(cid) = ObjectId::from_hex(hex) else { return Vec::new() };
+        let change = match store.get(&cid).ok().flatten() {
+            Some(Object::Change(c)) => c,
+            _ => return Vec::new(),
+        };
+        let mut head = HashMap::new();
+        flatten_tree(&store, change.tree, "", &mut head, 0);
+        let mut parent = HashMap::new();
+        if let Some(p) = change.parents.first() {
+            if let Some(Object::Change(pc)) = store.get(p).ok().flatten() {
+                flatten_tree(&store, pc.tree, "", &mut parent, 0);
+            }
+        }
+        let read = |id: &ObjectId| -> Option<String> {
+            match store.get(id).ok().flatten() {
+                Some(Object::Blob(b)) if b.len() <= MAX_BLOB_FOR_DIFF => Some(String::from_utf8_lossy(&b).into_owned()),
+                _ => None,
+            }
+        };
+        // union of paths, changed only
+        let mut paths: Vec<&String> = head.keys().chain(parent.keys()).collect();
+        paths.sort();
+        paths.dedup();
+        let mut out = Vec::new();
+        for path in paths {
+            let (h, p) = (head.get(path), parent.get(path));
+            let status = match (p, h) {
+                (None, Some(_)) => "added",
+                (Some(_), None) => "deleted",
+                (Some(a), Some(b)) if a != b => "modified",
+                _ => continue,
+            };
+            let old = p.and_then(read).unwrap_or_default();
+            let new = h.and_then(read).unwrap_or_default();
+            let hunks = diff_lines(&old, &new);
+            let ops = semantic_ops(&hunks);
+            let hunks_out = hunks
+                .into_iter()
+                .map(|hk| HunkOut {
+                    old_start: hk.old_start,
+                    new_start: hk.new_start,
+                    lines: hk
+                        .lines
+                        .into_iter()
+                        .map(|l| DiffLineOut {
+                            tag: match l.tag {
+                                Tag::Add => "add",
+                                Tag::Del => "del",
+                                Tag::Context => "ctx",
+                            }
+                            .to_string(),
+                            text: l.text,
+                        })
+                        .collect(),
+                })
+                .collect();
+            out.push(FileDiff { path: path.clone(), status: status.to_string(), ops, hunks: hunks_out });
+            if out.len() >= MAX_DIFF_FILES {
+                break;
+            }
+        }
+        out
     }
 
     /// The keel verification state of a change (`green`/`red`/`unverified`), or `None` if missing.

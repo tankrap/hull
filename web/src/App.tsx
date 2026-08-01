@@ -738,7 +738,11 @@ function ReviewPage({
     files: { path: string; status: string }[];
     session?: Session;
   };
+  type DiffLine = { tag: string; text: string };
+  type FileDiff = { path: string; status: string; ops: string[]; hunks: { old_start: number; new_start: number; lines: DiffLine[] }[] };
   const [change, setChange] = useState<ChangeInfo | null>(null);
+  const [diff, setDiff] = useState<FileDiff[]>([]);
+  const [openFile, setOpenFile] = useState<string | null>(null);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
   const reviewerActor = actors.find((a) => a.id === review.reviewer);
   const changeId = pr?.changes[0];
@@ -750,6 +754,13 @@ function ReviewPage({
       .catch(() => {});
   };
   useEffect(loadChange, [changeId, tenant, repo]);
+  useEffect(() => {
+    if (!changeId) return;
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/diff`)
+      .then((r) => r.json())
+      .then((d) => setDiff(d.files ?? []))
+      .catch(() => {});
+  }, [changeId, tenant, repo]);
 
   const verify = async (green: boolean) => {
     if (!changeId) return;
@@ -841,6 +852,44 @@ function ReviewPage({
           ) : (
             <p className="muted">resolving the change from keel…</p>
           )}
+        </section>
+
+        <section className="rp-card">
+          <h3>
+            Changes <span className="muted">({diff.length} files) · operations, then the diff</span>
+          </h3>
+          {diff.length === 0 && <p className="muted">no textual changes (or binary)</p>}
+          {diff.map((f) => (
+            <div className="fdiff" key={f.path}>
+              <button className="fdiff-head" onClick={() => setOpenFile(openFile === f.path ? null : f.path)}>
+                <span className={"fst " + f.status}>{f.status[0].toUpperCase()}</span>
+                <code>{f.path}</code>
+                {f.ops.length > 0 && (
+                  <span className="ops">
+                    {f.ops.slice(0, 5).map((o, i) => (
+                      <span className={"op " + (o.startsWith("removed") ? "del" : "add")} key={i}>{o}</span>
+                    ))}
+                  </span>
+                )}
+                <span className="expand">{openFile === f.path ? "hide diff ▾" : "diff ▸"}</span>
+              </button>
+              {openFile === f.path && (
+                <div className="hunks">
+                  {f.hunks.map((h, i) => (
+                    <div className="hunk" key={i}>
+                      <div className="hunk-h">@@ -{h.old_start} +{h.new_start} @@</div>
+                      {h.lines.map((l, j) => (
+                        <div className={"dl " + l.tag} key={j}>
+                          <span className="mark">{l.tag === "add" ? "+" : l.tag === "del" ? "-" : " "}</span>
+                          {l.text}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
         </section>
 
         <section className="rp-card">
