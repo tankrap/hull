@@ -212,3 +212,30 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .signin .signed-in { color: #8b93a7; display: flex; align-items: center; gap: 8px; }
 .signin .signed-in b.human { color: #7ee2b8; } .signin .signed-in b.agent { color: #8fb4ff; }
 .signin .link { background: none; border: 0; color: #8fb4ff; padding: 0; }
+
+/* ── cleaner two-view layout ─────────────────────────────────────────────── */
+.top { display: flex; align-items: center; gap: 14px; padding: 12px 24px; border-bottom: 1px solid #20263a; flex-wrap: nowrap; }
+.top .brand { background: none; border: 0; color: #e6e9ef; font: inherit; font-weight: 700; font-size: 17px; cursor: pointer; display: flex; align-items: center; gap: 6px; padding: 0; }
+.top .brand .logo { color: #7ee2b8; }
+.top .breadcrumb { display: flex; align-items: center; gap: 8px; color: #8b93a7; font-size: 14px; }
+.top .breadcrumb .sep { color: #3a4151; }
+.top .breadcrumb b { color: #e6e9ef; }
+.top .breadcrumb .link { background: none; border: 0; color: #8fb4ff; cursor: pointer; font: inherit; padding: 0; }
+.top .tag { color: #8b93a7; font-size: 14px; }
+.top .spacer { flex: 1; }
+
+.repo-view { max-width: 1000px; margin: 0 auto; padding: 12px 24px 64px; }
+.tabs { display: flex; align-items: center; gap: 2px; border-bottom: 1px solid #20263a; margin-bottom: 18px; }
+.tabs .tab { background: none; border: 0; border-bottom: 2px solid transparent; color: #8b93a7; padding: 10px 16px; cursor: pointer; font: inherit; font-size: 14px; }
+.tabs .tab:hover { color: #cdd3df; }
+.tabs .tab.active { color: #e6e9ef; border-bottom-color: #2f8f6b; }
+.tabs .tab .muted { font-variant-numeric: tabular-nums; }
+.tabs .acting { margin-left: auto; font-size: 13px; color: #8b93a7; }
+.tabs .acting select { padding: 3px 8px; border-radius: 6px; border: 1px solid #2a3040; background: #12151c; color: #cdd3df; font: inherit; }
+/* sections inside the repo view no longer carry their own page padding */
+.repo-view .issues, .repo-view .prs { padding: 0; }
+.repo-view .issues h2, .repo-view .prs h2 { display: none; }
+
+/* home grid a touch calmer */
+.grid { padding: 20px 24px; }
+.grid h2 { font-size: 15px; }

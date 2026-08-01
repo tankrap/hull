@@ -140,13 +140,15 @@ export function App() {
   }, []);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
 
-  // Navigation feel: clicking a repo scrolls to its issues; clicking an issue expands its detail.
-  const issuesRef = useRef<HTMLElement>(null);
+  // Two views: Home (situation room) and a focused Repo view with Issues / PRs tabs.
+  const [view, setView] = useState<"home" | "repo">("home");
+  const [tab, setTab] = useState<"issues" | "prs">("issues");
   const [openIssue, setOpenIssue] = useState<number | null>(null);
   const selectRepo = (repo: string) => {
     setIssueRepo(repo);
     setOpenIssue(null);
-    setTimeout(() => issuesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+    setTab("issues");
+    setView("repo");
   };
   // Default the issues/PRs repo to whatever's actually active, so it's never stuck on a stale name.
   useEffect(() => {
@@ -316,10 +318,21 @@ export function App() {
   return (
     <div className="app">
       <header className="top">
-        <div className="brand">
+        <button className="brand" onClick={() => setView("home")} title="home">
           <span className="logo">⬡</span> Hull
+        </button>
+        <div className="breadcrumb">
+          {view === "repo" ? (
+            <>
+              <button className="link" onClick={() => setView("home")}>{tenant}</button>
+              <span className="sep">/</span>
+              <b>{issueRepo}</b>
+            </>
+          ) : (
+            <span className="tag">situation room</span>
+          )}
         </div>
-        <div className="tag">situation room · what the fleet is doing right now</div>
+        <div className="spacer" />
         <label className="tenant">
           tenant&nbsp;
           <input
@@ -368,9 +381,10 @@ export function App() {
         </div>
       </header>
 
+      {view === "home" && (
       <main className="grid">
         <section>
-          <h2>Repositories <span className="muted">by live activity</span></h2>
+          <h2>Repositories <span className="muted">by live activity — click one to open it</span></h2>
           <div className="repos">
             {repos.length === 0 && (
               <div className="empty">
@@ -422,25 +436,33 @@ export function App() {
           </ul>
         </section>
       </main>
+      )}
 
-      <section className="issues" ref={issuesRef}>
-        <h2>
-          Issues <span className="muted">{tenant}/{issueRepo}</span>
-          <span className="counts">
-            {issues.filter((i) => i.status.state === "open").length} open ·{" "}
-            {issues.filter((i) => i.status.state !== "open").length} closed
-          </span>
-          <label className="acting">
-            acting as&nbsp;
-            <select value={actingAs} onChange={(e) => setActingAs(e.target.value)}>
-              {actors.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.handle} ({a.kind}){a.accountable ? "" : " ⚠ unaccountable"}
-                </option>
-              ))}
-            </select>
-          </label>
-        </h2>
+      {view === "repo" && (
+      <main className="repo-view">
+        <div className="tabs">
+          <button className={"tab" + (tab === "issues" ? " active" : "")} onClick={() => setTab("issues")}>
+            Issues <span className="muted">{issues.filter((i) => i.status.state === "open").length}</span>
+          </button>
+          <button className={"tab" + (tab === "prs" ? " active" : "")} onClick={() => setTab("prs")}>
+            Pull requests <span className="muted">{prs.length}</span>
+          </button>
+          {!me && (
+            <label className="acting">
+              acting as&nbsp;
+              <select value={actingAs} onChange={(e) => setActingAs(e.target.value)}>
+                {actors.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.handle} ({a.kind})
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+        </div>
+
+        {tab === "issues" && (
+        <section className="issues">
         <form className="issue-form" onSubmit={createIssue}>
           <input
             placeholder="Open an issue…"
@@ -562,12 +584,11 @@ export function App() {
             </li>
           ))}
         </ul>
-      </section>
+        </section>
+        )}
 
-      <section className="issues prs">
-        <h2>
-          Pull requests <span className="muted">{tenant}/{issueRepo}</span>
-        </h2>
+        {tab === "prs" && (
+        <section className="issues prs">
         <form className="issue-form" onSubmit={createPr}>
           <input
             placeholder="Open a PR from HEAD…"
@@ -660,7 +681,10 @@ export function App() {
             );
           })}
         </ul>
-      </section>
+        </section>
+        )}
+      </main>
+      )}
     </div>
   );
 }
