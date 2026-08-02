@@ -1229,28 +1229,45 @@ async fn merge_pr(
     State(app): State<App>,
     Path((tenant, repo, number)): Path<(String, String, u64)>,
     headers: axum::http::HeaderMap,
-    Json(body): Json<Value>,
+    Json(_body): Json<Value>,
 ) -> Response {
-    let key = format!("{tenant}/{repo}");
-    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+    let actor = match require_actor(&app, &headers, "") {
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    match perform_merge(&app, &tenant, &repo, number, &actor).await {
+        Ok((pr, closed)) => Json(json!({ "pr": pr, "closed_issues": closed })).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+/// The merge gate + merge, shared by the endpoint and the T3 auto-merge flow. Enforces: green
+/// keel-verify, an independent approval (human always counts; an agent's counts per the autonomy
+/// tier and never for a protected path, D11). Returns the merged PR + the issues it auto-closed.
+#[allow(clippy::result_large_err)]
+async fn perform_merge(
+    app: &App,
+    tenant: &str,
+    repo: &str,
+    number: u64,
+    actor: &hull_core::Actor,
+) -> Result<(PullRequest, Vec<u64>), (StatusCode, String)> {
+    let key = format!("{tenant}/{repo}");
     let Some(mut pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
-        return (StatusCode::NOT_FOUND, "no such PR").into_response();
+        return Err((StatusCode::NOT_FOUND, "no such PR".into()));
     };
     if pr.state == PrState::Merged {
-        return (StatusCode::CONFLICT, "already merged").into_response();
+        return Err((StatusCode::CONFLICT, "already merged".into()));
     }
     // green keel verification of the proposed change
     let green = pr
         .changes
         .first()
-        .and_then(|c| app.repos.verification(&tenant, &repo, c))
+        .and_then(|c| app.repos.verification(tenant, repo, c))
         .map(|v| v == "green")
         .unwrap_or(false);
     if !green {
-        return (StatusCode::CONFLICT, "cannot merge: change is not keel-verify green").into_response();
+        return Err((StatusCode::CONFLICT, "cannot merge: change is not keel-verify green".into()));
     }
     // Independent approving reviews (approver != PR author), split by actor kind.
     let approvals: Vec<ActorId> = app
@@ -1264,15 +1281,15 @@ async fn merge_pr(
     let agent_approval = approvals.iter().any(|a| app.store.actor(a).map(|x| x.kind == hull_core::ActorKind::Agent).unwrap_or(false));
 
     // Autonomy policy: when may an AGENT's approve stand in for a human's?
-    let acct = repo_account_id(&app, &tenant, &repo);
-    let eff = app.autonomy.effective(&tenant, &repo, acct.as_deref());
+    let acct = repo_account_id(app, tenant, repo);
+    let eff = app.autonomy.effective(tenant, repo, acct.as_deref());
     let change = pr.changes.first().cloned().unwrap_or_default();
-    let files: Vec<String> = app.repos.change_info(&tenant, &repo, &change).map(|i| i.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
+    let files: Vec<String> = app.repos.change_info(tenant, repo, &change).map(|i| i.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
     let protected = autonomy::touches_protected(&files, &eff.protected_paths);
     let contradicted = {
         let lesson = app.store.session_record(&key, &change).map(|s| s.lesson).unwrap_or_default();
-        let intent = app.repos.change_info(&tenant, &repo, &change).map(|i| i.intent).unwrap_or_default();
-        hull_core::reconcile::reconcile(&change, &intent, &lesson, &app.repos.facts(&tenant, &repo, &change)).contradicted() > 0
+        let intent = app.repos.change_info(tenant, repo, &change).map(|i| i.intent).unwrap_or_default();
+        hull_core::reconcile::reconcile(&change, &intent, &lesson, &app.repos.facts(tenant, repo, &change)).contradicted() > 0
     };
     let low_risk = !protected && !contradicted; // green is already required above
     let agent_approve_counts = match eff.tier {
@@ -1289,18 +1306,18 @@ async fn merge_pr(
         } else {
             "needs an approving review from someone other than the author"
         };
-        return (StatusCode::CONFLICT, format!("cannot merge: {why}")).into_response();
+        return Err((StatusCode::CONFLICT, format!("cannot merge: {why}")));
     }
     pr.state = PrState::Merged;
     pr.merged_by = Some(actor.id.clone());
     app.store.replace_pr(pr.clone());
     app.hub.publish(
-        &tenant,
-        ActivityEvent::Push { actor: actor.handle, repo: repo.clone(), change: pr.changes.first().cloned().unwrap_or_default(), ts: now() },
+        tenant,
+        ActivityEvent::Push { actor: actor.handle.clone(), repo: repo.to_string(), change: pr.changes.first().cloned().unwrap_or_default(), ts: now() },
     );
     // Outbound mirror on change-land — guarded by loop prevention + idempotency.
     if let Some(change) = pr.changes.first() {
-        mirror_out(&app, &tenant, &repo, change);
+        mirror_out(app, tenant, repo, change);
     }
     // Auto-close the issues this PR fixes, stamping the resolving keel change as provenance.
     let resolving = pr.changes.first().cloned();
@@ -1330,7 +1347,7 @@ async fn merge_pr(
             }
         }
     }
-    Json(json!({ "pr": pr, "closed_issues": closed })).into_response()
+    Ok((pr, closed))
 }
 
 /// Issue numbers a PR closes: from closing keywords in the title (`fixes #12`, `closes #3`,
@@ -1823,6 +1840,23 @@ async fn perform_auto_review(
                     ActivityEvent::Issue { repo: repo.to_string(), number: inum, action: "opened".into(), actor: reviewer.handle.clone(), ts: now() },
                 );
             }
+        }
+    }
+
+    // AI merge (T3): if the agent approved and the change is mergeable (green, non-protected), the
+    // agent merges it autonomously — the top of the autonomy ladder. The merge gate still runs, so a
+    // protected path or a non-green change is refused even here (D11).
+    if tier >= hull_core::AutonomyTier::T3 && review.verdict == Verdict::Approve {
+        match perform_merge(app, tenant, repo, number, reviewer).await {
+            Ok((_, closed)) => {
+                app.registry.notify(&NotifyEvent {
+                    kind: "auto_merged".into(),
+                    to: vec![pr.author.clone()],
+                    summary: format!("{} auto-merged PR !{number} (autonomy T3){}", reviewer.handle, if closed.is_empty() { String::new() } else { format!(", closed #{:?}", closed) }),
+                    change: Some(change.clone()),
+                });
+            }
+            Err((_, why)) => eprintln!("hull: T3 auto-merge of PR !{number} declined: {why}"),
         }
     }
     Ok(review)
