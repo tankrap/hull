@@ -1698,37 +1698,58 @@ function ReviewPage({
                 </div>
               );
             })()}
-          {diff.map((f) => (
-            <div className="fdiff" key={f.path}>
-              <button className="fdiff-head" onClick={() => setOpenFile(openFile === f.path ? null : f.path)}>
-                <span className={"fst " + f.status}>{f.status[0].toUpperCase()}</span>
-                <code>{f.path}</code>
-                {f.ops.length > 0 && (
-                  <span className="ops">
-                    {f.ops.slice(0, 5).map((o, i) => (
-                      <span className={"op " + (o.startsWith("removed") ? "del" : "add")} key={i}>{o}</span>
-                    ))}
-                  </span>
+          {diff.length > 0 && (() => {
+            // F4/F3 — semantic-first, risk-ordered reading budget: behavioral changes first (they
+            // need attention), then reformatted/mechanical last. Each file is tagged with its class.
+            const cls = (p: string) => (semantic?.behavioral.includes(p) ? "behavioral" : semantic?.whitespace_only.includes(p) ? "reformatted" : "changed");
+            const rank: Record<string, number> = { behavioral: 0, changed: 1, reformatted: 2 };
+            const ordered = [...diff].sort((a, b) => (rank[cls(a.path)] ?? 1) - (rank[cls(b.path)] ?? 1));
+            const beh = ordered.filter((f) => cls(f.path) === "behavioral").length;
+            return (
+              <>
+                {semantic && (semantic.behavioral.length + semantic.whitespace_only.length + semantic.moves.length) > 0 && (
+                  <div className="muted" style={{ fontSize: 12.5, margin: "4px 0 10px" }}>
+                    Reading order — {beh > 0 ? <b>{beh} behavioral first</b> : <span>no behavioral changes</span>}
+                    {semantic.whitespace_only.length > 0 && <> · {semantic.whitespace_only.length} reformatted</>}
+                    {semantic.moves.length > 0 && <> · {semantic.moves.length} moved</>}
+                  </div>
                 )}
-                <span className="expand">{openFile === f.path ? "hide diff ▾" : "diff ▸"}</span>
-              </button>
-              {openFile === f.path && (
-                <div className="hunks">
-                  {f.hunks.map((h, i) => (
-                    <div className="hunk" key={i}>
-                      <div className="hunk-h">@@ -{h.old_start} +{h.new_start} @@</div>
-                      {h.lines.map((l, j) => (
-                        <div className={"dl " + l.tag} key={j}>
-                          <span className="mark">{l.tag === "add" ? "+" : l.tag === "del" ? "-" : " "}</span>
-                          {l.text}
-                        </div>
-                      ))}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
+                {ordered.map((f) => (
+                  <div className="fdiff" key={f.path}>
+                    <button className="fdiff-head" onClick={() => setOpenFile(openFile === f.path ? null : f.path)}>
+                      <span className={"fst " + f.status}>{f.status[0].toUpperCase()}</span>
+                      <code>{f.path}</code>
+                      {cls(f.path) === "behavioral" && <span className="badge warn" style={{ padding: "1px 7px" }} title="a real content change — read this">behavioral</span>}
+                      {cls(f.path) === "reformatted" && <span className="op" style={{ background: "var(--brass-wash)", color: "var(--brass-text)" }} title="whitespace only — low risk">reformatted</span>}
+                      {f.ops.length > 0 && (
+                        <span className="ops">
+                          {f.ops.slice(0, 5).map((o, i) => (
+                            <span className={"op " + (o.startsWith("removed") ? "del" : "add")} key={i}>{o}</span>
+                          ))}
+                        </span>
+                      )}
+                      <span className="expand">{openFile === f.path ? "hide diff ▾" : "diff ▸"}</span>
+                    </button>
+                    {openFile === f.path && (
+                      <div className="hunks">
+                        {f.hunks.map((h, i) => (
+                          <div className="hunk" key={i}>
+                            <div className="hunk-h">@@ -{h.old_start} +{h.new_start} @@</div>
+                            {h.lines.map((l, j) => (
+                              <div className={"dl " + l.tag} key={j}>
+                                <span className="mark">{l.tag === "add" ? "+" : l.tag === "del" ? "-" : " "}</span>
+                                {l.text}
+                              </div>
+                            ))}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </>
+            );
+          })()}
         </section>
 
         <section className="rp-card">
