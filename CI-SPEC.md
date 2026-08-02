@@ -218,6 +218,28 @@ Because de-dup is best-effort (in-memory), your system **SHOULD** itself be idem
 `(tree_id)` or per `callback_url`: a duplicate dispatch **MUST** be safe to run, and a duplicate
 callback for an already-recorded tree simply re-affirms the same verdict.
 
+### 9.1 Test independence (a change may not verify itself)
+
+A change that **adds or modifies its own tests** cannot use those tests as evidence for approval — a
+green run over tests the change authored is circular. Hull enforces this, and it needs **nothing from
+you**: it is a property of *which tree Hull dispatches*, not of your reporting.
+
+When a change touches any test file, Hull composes an **independence tree** — the change's new code,
+but with every touched test **restored to the parent's version** (or **dropped** if the change newly
+added it) — and dispatches that tree as an ordinary job (§5). Because the tree is content-addressed,
+it dispatches and memoizes exactly like any other:
+
+- The composed tree is **green** ⇒ the tests the change *did not author* pass against its new code →
+  `verified_mechanically` (genuine independent evidence; eligible for auto-approval).
+- **red** ⇒ a pre-existing test fails against the new code — the change **broke or weakened** a test
+  (restoring the real test surfaces the failure the change's edit hid) → **contradiction**, merge
+  blocked.
+- **errored / no tests** ⇒ no pre-existing test exercises the change → `self_attested`: green, but not
+  independently verified → escalates to a human/independent reviewer.
+
+Your CI does not special-case this: you receive a normal dispatch for a normal `tree_id` and run the
+suite you find in the tree. The independence guarantee is entirely in what Hull chooses to send.
+
 ---
 
 ## 10. Timeouts, retries, lost callbacks
@@ -275,3 +297,61 @@ def on_dispatch(req):
 - **Breaking** changes (renamed/removed fields, changed semantics) bump the version. Hull MAY, for a
   transition period, support multiple versions and let an endpoint negotiate via the header.
 - Treat any field not defined in this document as reserved.
+
+---
+
+## 14. Security & isolation (running untrusted code)
+
+**A CI job executes untrusted code.** The tree it runs — `build.rs`, proc-macros, test bodies,
+`npm` lifecycle scripts, a `Makefile` — is written by whoever authored the change, which on an open
+or multi-tenant instance is **not** someone you trust. A runner that executes a job on the
+control-plane host, or on a box that holds any credential, is a full remote-code-execution and
+credential-exfiltration hole. This section is normative for any runner that accepts changes from
+untrusted authors.
+
+### 14.1 Isolation boundary
+
+- Each job **MUST** run in a **single-use, hardware-or-kernel-isolated sandbox** — a microVM
+  (**Firecracker**, Cloud Hypervisor) or an equivalently strong boundary (gVisor, a locked-down
+  container). A shared interpreter, a bare `chroot`, or a plain host subprocess is **NOT** sufficient.
+- A sandbox **MUST NOT** be reused across jobs. Destroy the whole microVM/rootfs after each job so
+  nothing (a planted binary, a poisoned cache, a lingering process) survives into the next job.
+- The runner **MUST NEVER** execute job code on the control-plane host or on any host with access to
+  Hull's secrets, the CI shared secret, or cloud-provider credentials.
+
+### 14.2 Credentials & environment
+
+- The job environment **MUST** be scrubbed: pass only an explicit allowlist of benign variables. It
+  **MUST NOT** contain the `X-Hull-CI-Secret`, cloud keys, registry tokens, or `source_url` auth.
+- The runner **MUST** block access to the **cloud metadata endpoint** (`169.254.169.254`, `fd00:ec2::254`)
+  — a classic path from RCE to instance-role credentials.
+- Fetch `source_url` and post the callback **from the control plane / a broker**, not from inside the
+  sandbox, so the secret never enters untrusted territory. If the sandbox must fetch, use a
+  single-use, source-scoped token (reserved; see §6) — never the CI secret.
+
+### 14.3 Network
+
+- Default **egress-deny**. A job **SHOULD** run with no outbound network. Where dependency resolution
+  needs it, restrict egress to an allowlisted, authenticated **package proxy** — never the open
+  internet, never Hull's internal network.
+- No inbound network to the sandbox.
+
+### 14.4 Privilege & resources
+
+- Run as a **non-root**, unprivileged user; **read-only** root filesystem; a writable **tmpfs**
+  scratch that dies with the job.
+- **Drop all capabilities**, set `no-new-privileges`, apply a **default-deny seccomp** profile.
+- Enforce **CPU, memory, PID, and disk** limits and a **wall-clock timeout** (report `errored` when
+  it fires — §7). Cap captured output so a job can't OOM the runner by flooding logs.
+- No host filesystem mounts into the sandbox beyond the extracted tree.
+
+### 14.5 Reporting
+
+- Treat everything from the job — exit status, stdout/stderr, any file it writes — as **untrusted
+  data**. Truncate and sanitize `summary` before returning it (§7); never let job output smuggle
+  control characters or forge additional fields.
+
+> Hull's built-in local runner (§4, the "None" fallback) executes on the host **without** these
+> protections. It exists
+> for single-tenant self-hosting where every author is trusted. **Do not** point it at untrusted or
+> multi-tenant input — configure a conforming sandboxed endpoint instead.

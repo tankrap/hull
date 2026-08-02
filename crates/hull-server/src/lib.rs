@@ -743,7 +743,7 @@ async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(S
         .map(|s| s.lesson.clone())
         .or_else(|| app.store.session_record(&format!("{tenant}/{repo}"), &id).map(|s| s.lesson))
         .unwrap_or_default();
-    let facts = app.repos.facts(&tenant, &repo, &id);
+    let facts = facts_with_independence(&app, &tenant, &repo, &id).await;
     let ledger = hull_core::reconcile::reconcile(&id, &info.intent, &lesson, &facts);
     // Overlay human resolutions onto the claims (a resolved needs-judgment claim stops being an open
     // question). Serialize the ledger, then attach `resolution` per claim by id.
@@ -912,6 +912,36 @@ async fn resolve_check(app: &App, tenant: &str, repo: &str, change: &str, force:
             CiResolution::Done(outcome)
         }
     }
+}
+
+/// The **independence-filtered** verification for a change: re-run its checks with every test it
+/// added or modified neutralized (restored to the parent's version, or dropped if newly added), so a
+/// change can't approve itself by writing or weakening its own passing test. `None` when the change
+/// touched no tests (the whole suite is already independent) — reconciliation then uses the plain
+/// verification. Runs off the async runtime; the composed tree is content-addressed and memoized.
+async fn independent_verification(app: &App, tenant: &str, repo: &str, change: &str) -> Option<hull_core::reconcile::Independent> {
+    use hull_core::reconcile::Independent;
+    // Cheap gate first: no touched tests ⇒ nothing to neutralize ⇒ no separate run.
+    if app.repos.changed_test_files(tenant, repo, change).is_empty() {
+        return None;
+    }
+    let tree = app.repos.compose_independence_tree(tenant, repo, change)?;
+    let (repos, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
+    let (t, r, tr) = (tenant.to_string(), repo.to_string(), tree);
+    let outcome = tokio::task::spawn_blocking(move || ci::run_check_tree(&repos, &registry, &ci, &t, &r, &tr)).await.ok()?;
+    Some(match outcome.status {
+        hull_plugin::CiStatus::Green => Independent::Green,
+        hull_plugin::CiStatus::Red => Independent::Red,
+        hull_plugin::CiStatus::Errored => Independent::None,
+    })
+}
+
+/// A change's [`facts`](RepoHost::facts) enriched with the independence-filtered verification — the
+/// version reconciliation and the reviewer should use everywhere a verdict is derived.
+async fn facts_with_independence(app: &App, tenant: &str, repo: &str, change: &str) -> hull_core::reconcile::ChangeFacts {
+    let mut f = app.repos.facts(tenant, repo, change);
+    f.independent_verification = independent_verification(app, tenant, repo, change).await;
+    f
 }
 
 fn ci_status_str(s: hull_plugin::CiStatus) -> &'static str {
@@ -1290,7 +1320,8 @@ async fn perform_merge(
     let contradicted = {
         let lesson = app.store.session_record(&key, &change).map(|s| s.lesson).unwrap_or_default();
         let intent = app.repos.change_info(tenant, repo, &change).map(|i| i.intent).unwrap_or_default();
-        hull_core::reconcile::reconcile(&change, &intent, &lesson, &app.repos.facts(tenant, repo, &change)).contradicted() > 0
+        let facts = facts_with_independence(app, tenant, repo, &change).await;
+        hull_core::reconcile::reconcile(&change, &intent, &lesson, &facts).contradicted() > 0
     };
     let low_risk = !protected && !contradicted; // green is already required above
     let agent_approve_counts = match eff.tier {
@@ -1699,7 +1730,7 @@ async fn perform_auto_review(
     let session = app.store.session_record(&key, &change);
     let lesson = session.as_ref().map(|s| s.lesson.clone()).unwrap_or_default();
     let author_model = session.as_ref().map(|s| s.model.clone()).unwrap_or_default();
-    let facts = app.repos.facts(tenant, repo, &change);
+    let facts = facts_with_independence(app, tenant, repo, &change).await;
     let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
     let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
     // Capture the reviewer's INPUTS for the audit artifact before `facts` moves into the request.

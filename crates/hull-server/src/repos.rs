@@ -628,13 +628,74 @@ impl RepoHost {
             .filter(|s| s.change.is_empty() || s.change == hex)
             .map(|s| s.title)
             .collect();
-        // Does the change add its own tests? (Green then reads as self-attested, not mechanical.)
-        let adds_tests = diff.iter().any(|f| {
-            let p = f.path.to_lowercase();
-            f.status != "deleted"
-                && (p.contains("/tests/") || p.contains("test_") || p.contains("_test.") || p.contains(".test.") || p.contains(".spec.") || p.ends_with("_test.rs") || p.contains("#[test]"))
-        });
-        hull_core::reconcile::ChangeFacts { files, ops, verification, secrets, added_text, adds_tests }
+        // Does the change add its own tests? (The coarse fallback when independence isn't computed:
+        // green then reads as self-attested, not mechanical.) `independent_verification` is filled in
+        // at the App layer, which can run the independence check; `facts()` stays cheap and I/O-light.
+        let adds_tests = diff.iter().any(|f| f.status != "deleted" && hull_core::reconcile::is_test_path(&f.path));
+        hull_core::reconcile::ChangeFacts { files, ops, verification, secrets, added_text, adds_tests, independent_verification: None }
+    }
+
+    /// The test files a change **added or modified** (deletions included — dropping a test is also a
+    /// way to make a suite pass). Cheap: diff-only, no checkout. Empty ⇒ the whole suite is
+    /// pre-existing, so the change can't have tampered with what verifies it.
+    pub fn changed_test_files(&self, tenant: &str, repo: &str, hex: &str) -> Vec<String> {
+        self.diff(tenant, repo, hex)
+            .into_iter()
+            .filter(|f| hull_core::reconcile::is_test_path(&f.path))
+            .map(|f| (f.path, f.status))
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    /// Compose the **independence tree** for a change: its new code, but with every test file it
+    /// touched *restored to the parent's version* (or dropped if the change newly added it). Running
+    /// checks on this tree answers "does the change pass the tests it did **not** author?" — it can't
+    /// approve itself by adding or weakening a test. Returns the composed tree id, or `None` if the
+    /// change touched no tests (nothing to neutralize) or has no parent to restore from.
+    pub fn compose_independence_tree(&self, tenant: &str, repo: &str, hex: &str) -> Option<String> {
+        let changed_tests = self.changed_test_files(tenant, repo, hex);
+        if changed_tests.is_empty() {
+            return None;
+        }
+        let store = self.store(tenant, repo, false).ok()??;
+        let cid = ObjectId::from_hex(hex)?;
+        let change = match store.get(&cid).ok()?? {
+            Object::Change(c) => c,
+            _ => return None,
+        };
+        let parent = *change.parents.first()?; // need a baseline to restore pre-existing tests from
+        let parent_tree = match store.get(&parent).ok()?? {
+            Object::Change(c) => c.tree,
+            _ => return None,
+        };
+
+        let base = std::env::temp_dir().join(format!("hull-indep-{}-{}", &hex[..hex.len().min(12)], std::process::id()));
+        let newdir = base.join("new");
+        let pdir = base.join("parent");
+        let _ = std::fs::remove_dir_all(&base);
+        if keel_store::snapshot::checkout(&store, change.tree, &newdir).is_err()
+            || keel_store::snapshot::checkout(&store, parent_tree, &pdir).is_err()
+        {
+            let _ = std::fs::remove_dir_all(&base);
+            return None;
+        }
+        // Neutralize each touched test: restore the parent's copy, or drop it if the change added it.
+        for path in &changed_tests {
+            let target = newdir.join(path);
+            let parent_copy = pdir.join(path);
+            if parent_copy.is_file() {
+                let _ = std::fs::create_dir_all(target.parent().unwrap_or(&newdir));
+                let _ = std::fs::copy(&parent_copy, &target); // restore pre-change (unweakened) test
+            } else {
+                let _ = std::fs::remove_file(&target); // change newly added this test → drop it
+            }
+        }
+        let composed = keel_store::snapshot::snapshot_uncached(&store, &newdir).ok();
+        let _ = std::fs::remove_dir_all(&base);
+        let composed = composed?;
+        // Keep the composed tree reachable so it survives GC between compose and CI run.
+        let _ = store.set_ref(&format!("hull/indep/{}", composed.to_hex()), &composed);
+        Some(composed.to_hex())
     }
 }
 
@@ -847,6 +908,66 @@ mod tests {
         std::fs::create_dir_all(tmp.join("acme/not-a-repo")).unwrap(); // no .keel/store → skipped
         let host = RepoHost::new(&tmp);
         assert_eq!(host.list(), vec!["acme/api".to_string(), "acme/web".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Build a tree from a set of (path, contents) files and return its keel tree id.
+    fn tree_from(store: &Store, base: &std::path::Path, tag: &str, files: &[(&str, &str)]) -> ObjectId {
+        let dir = base.join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        for (p, c) in files {
+            let fp = dir.join(p);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, c).unwrap();
+        }
+        keel_store::snapshot::snapshot_uncached(store, &dir).unwrap()
+    }
+
+    fn commit(store: &Store, parents: Vec<ObjectId>, tree: ObjectId) -> ObjectId {
+        let change = keel_store::Change {
+            parents,
+            tree,
+            session: None,
+            intent: "c".into(),
+            author: "t".into(),
+            timestamp: 0,
+            verification: keel_store::Verification::Unverified,
+        };
+        store.put(&Object::Change(change)).unwrap()
+    }
+
+    #[test]
+    fn independence_tree_restores_modified_tests_and_drops_added_ones() {
+        // A change that weakens its own test (and adds a new passing one) must not verify itself:
+        // the composed independence tree restores the *parent's* test and drops the newly-added one.
+        let tmp = std::env::temp_dir().join(format!("hull-indep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("t/r/.keel/store")).unwrap();
+        let host = RepoHost::new(&tmp);
+        let composed_hex = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            // Parent: real code + a strict test.
+            let parent_tree = tree_from(&store, &tmp, "parent", &[
+                ("src/lib.rs", "pub fn f() -> i32 { 2 }\n"),
+                ("tests/check.rs", "#[test] fn strict() { assert_eq!(f(), 2); }\n"),
+            ]);
+            let parent = commit(&store, vec![], parent_tree);
+            // Child: same code, but the test is WEAKENED, plus a NEW self-serving test.
+            let child_tree = tree_from(&store, &tmp, "child", &[
+                ("src/lib.rs", "pub fn f() -> i32 { 2 }\n"),
+                ("tests/check.rs", "#[test] fn strict() { assert!(true); }\n"), // weakened
+                ("tests/added.rs", "#[test] fn mine() { assert!(true); }\n"),   // newly added
+            ]);
+            let child = commit(&store, vec![parent], child_tree);
+            host.compose_independence_tree("t", "r", &child.to_hex()).expect("composes when tests change")
+        };
+        // Materialize the composed tree and inspect it.
+        let out = tmp.join("out");
+        assert!(host.checkout_tree("t", "r", &composed_hex, &out));
+        let restored = std::fs::read_to_string(out.join("tests/check.rs")).unwrap();
+        assert!(restored.contains("assert_eq!(f(), 2)"), "modified test restored to parent's strict version");
+        assert!(!out.join("tests/added.rs").exists(), "newly-added test dropped from the independence tree");
+        assert!(out.join("src/lib.rs").exists(), "non-test code kept");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

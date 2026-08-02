@@ -87,6 +87,38 @@ impl ClaimStatus {
     }
 }
 
+/// The **independence-filtered** verification result: a change's checks re-run with any tests it
+/// *added or modified* excluded (restored to their pre-change form, or dropped if newly added). This
+/// is the honest answer to "does the change pass tests it did **not** author?" — a change must not be
+/// allowed to approve itself by writing (or weakening) its own passing test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Independent {
+    /// Pre-existing, unmodified tests pass against the new code. Genuine mechanical verification.
+    Green,
+    /// A test the change did **not** author fails against the new code — the change breaks a
+    /// pre-existing test, or weakened/removed one that (restored) now fails. A hard contradiction.
+    Red,
+    /// No pre-existing test exercises the change — the only relevant tests are ones it added/modified.
+    /// There is no independent signal, so a green run is self-attested, not verified.
+    None,
+}
+
+/// Path-based heuristic for "this file is a test." Used to decide which files a change touched are
+/// tests (so they can be discounted from the approval signal). Path-only — it cannot see inline unit
+/// tests (`#[cfg(test)]` inside a source file); those are conservatively caught by [`ChangeFacts::adds_tests`].
+pub fn is_test_path(path: &str) -> bool {
+    let p = path.to_lowercase();
+    // A `tests` / `test` / `__tests__` / `spec` path segment (anywhere, including the root), or a
+    // conventional test-file name (`foo_test.rs`, `test_foo.py`, `x.test.ts`, `x.spec.ts`).
+    p.split('/').any(|s| matches!(s, "tests" | "test" | "__tests__" | "spec"))
+        || p.contains("test_")
+        || p.contains("_test.")
+        || p.contains(".test.")
+        || p.contains(".spec.")
+        || p.ends_with("_test.rs")
+        || p.ends_with("_test.go")
+}
+
 /// A fact that bears on a claim, and whether it corroborates or undermines it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Evidence {
@@ -113,8 +145,14 @@ pub struct ChangeFacts {
     /// when no named function/type op captures it.
     pub added_text: String,
     /// Whether the change **adds test files** — so a green "tests pass" claim is self-attested (the
-    /// change may only be tested by its own new tests) rather than mechanically verified.
+    /// change may only be tested by its own new tests) rather than mechanically verified. This is the
+    /// coarse fallback used when [`independent_verification`](Self::independent_verification) is `None`.
     pub adds_tests: bool,
+    /// The independence-filtered verification (tests the change added/modified excluded), when Hull
+    /// computed it. `Some(_)` overrides the coarse `adds_tests` heuristic with a real signal;
+    /// `None` means it wasn't computed (e.g. the change touched no tests, so the full suite is already
+    /// independent) and reconciliation falls back to `verification` + `adds_tests`.
+    pub independent_verification: Option<Independent>,
 }
 
 /// Reconcile a change's narrative against its facts. `intent` and `lesson` are the prose; `facts`
@@ -188,19 +226,46 @@ fn judge(text: &str, source: ClaimSource, facts: &ChangeFacts) -> Claim {
     let mut evidence = Vec::new();
 
     // --- Verification claims (tests / CI / green) -------------------------------------------
+    // Prefer the independence-filtered signal when Hull computed it: a change can't verify itself by
+    // adding or weakening its own tests. Fall back to the plain verification when it wasn't computed.
     if mentions(&lower, &["test", "verif", "ci ", " ci", "green", "passes", "passing"]) {
-        match facts.verification.as_str() {
-            "green" => evidence.push(Evidence {
+        match facts.independent_verification {
+            Some(Independent::Green) => evidence.push(Evidence {
                 kind: "verification".into(),
-                detail: "keel verification is green".into(),
+                detail: "independent verification is green — tests the change did not author pass against the new code".into(),
                 supports: true,
             }),
-            "red" => evidence.push(Evidence {
+            Some(Independent::Red) => evidence.push(Evidence {
                 kind: "verification".into(),
-                detail: "keel verification is red — the change claims tests but they do not pass".into(),
+                detail: "independent verification is red — a pre-existing test the change did not author fails (it broke or weakened a test)".into(),
                 supports: false,
             }),
-            _ => {}
+            Some(Independent::None) => {
+                // No pre-existing test exercises the change; only its own tests do. A green run here is
+                // self-attested — record the green as weak support (the status engine downgrades it).
+                if facts.verification == "green" {
+                    evidence.push(Evidence {
+                        kind: "verification".into(),
+                        detail: "verification is green, but only the change's own tests exercise it (no independent coverage)".into(),
+                        supports: true,
+                    });
+                } else if facts.verification == "red" {
+                    evidence.push(Evidence { kind: "verification".into(), detail: "keel verification is red".into(), supports: false });
+                }
+            }
+            None => match facts.verification.as_str() {
+                "green" => evidence.push(Evidence {
+                    kind: "verification".into(),
+                    detail: "keel verification is green".into(),
+                    supports: true,
+                }),
+                "red" => evidence.push(Evidence {
+                    kind: "verification".into(),
+                    detail: "keel verification is red — the change claims tests but they do not pass".into(),
+                    supports: false,
+                }),
+                _ => {}
+            },
         }
     }
 
@@ -266,15 +331,21 @@ fn judge(text: &str, source: ClaimSource, facts: &ChangeFacts) -> Claim {
     }
 
     // C4 status engine. Contradiction always wins. Otherwise rank the positive evidence: a mechanical
-    // check (green verification / clean secret scan) beats a read-only diff match; a mechanical
-    // *verification* on a change that adds its own tests is only self-attested.
+    // check (green verification / clean secret scan) beats a read-only diff match. A supporting
+    // *verification* is mechanical only if it's independent of the change — otherwise self-attested.
     let status = if evidence.iter().any(|e| !e.supports) {
         ClaimStatus::Contradicted
     } else if evidence.iter().any(|e| e.supports && e.kind == "verification") {
-        if facts.adds_tests {
-            ClaimStatus::SelfAttested
-        } else {
-            ClaimStatus::VerifiedMechanically
+        match facts.independent_verification {
+            // Proven independent → mechanical, even if the change also adds tests of its own.
+            Some(Independent::Green) => ClaimStatus::VerifiedMechanically,
+            // Only the change's own tests cover it → self-attested regardless of `adds_tests`.
+            Some(Independent::None) => ClaimStatus::SelfAttested,
+            // Red is already handled by the contradiction branch above; unreachable here.
+            Some(Independent::Red) => ClaimStatus::Contradicted,
+            // Not computed → coarse fallback: adds-its-own-tests downgrades green to self-attested.
+            None if facts.adds_tests => ClaimStatus::SelfAttested,
+            None => ClaimStatus::VerifiedMechanically,
         }
     } else if evidence.iter().any(|e| e.supports && e.kind == "secret-scan") {
         ClaimStatus::VerifiedMechanically
@@ -329,6 +400,7 @@ mod tests {
             secrets: vec![],
             added_text: String::new(),
             adds_tests: false,
+            independent_verification: None,
         }
     }
 
@@ -354,6 +426,52 @@ mod tests {
         let l = reconcile("c1", "tests pass", "", &f);
         let claim = l.claims.iter().find(|c| c.text.contains("tests")).unwrap();
         assert_eq!(claim.status, ClaimStatus::SelfAttested);
+    }
+
+    #[test]
+    fn independent_green_is_mechanical_even_when_change_adds_tests() {
+        // The change adds its own tests, but pre-existing tests (the ones it did NOT author) also
+        // pass against the new code — that's genuine independent verification, not self-attestation.
+        let mut f = facts();
+        f.adds_tests = true;
+        f.independent_verification = Some(Independent::Green);
+        let l = reconcile("c1", "tests pass", "", &f);
+        let claim = l.claims.iter().find(|c| c.text.contains("tests")).unwrap();
+        assert_eq!(claim.status, ClaimStatus::VerifiedMechanically);
+    }
+
+    #[test]
+    fn independent_none_is_self_attested_even_without_adds_tests_flag() {
+        // Full suite is green, but no pre-existing test exercises the change — only its own do.
+        let mut f = facts();
+        f.adds_tests = false; // the coarse flag would say "mechanical"; the real signal says otherwise
+        f.independent_verification = Some(Independent::None);
+        let l = reconcile("c1", "tests pass", "", &f);
+        let claim = l.claims.iter().find(|c| c.text.contains("tests")).unwrap();
+        assert_eq!(claim.status, ClaimStatus::SelfAttested);
+    }
+
+    #[test]
+    fn independent_red_contradicts_even_when_full_suite_is_green() {
+        // The change weakened its own test so the full suite is green, but restoring the pre-existing
+        // test (independence run) fails — the claim is contradicted, and the green can't hide it.
+        let mut f = facts();
+        f.verification = "green".into();
+        f.independent_verification = Some(Independent::Red);
+        let l = reconcile("c1", "all tests passing", "", &f);
+        let claim = l.claims.iter().find(|c| c.text.contains("tests")).unwrap();
+        assert_eq!(claim.status, ClaimStatus::Contradicted);
+        assert_eq!(l.contradicted(), 1);
+    }
+
+    #[test]
+    fn test_path_detection() {
+        assert!(is_test_path("crates/foo/tests/integration.rs"));
+        assert!(is_test_path("src/parser_test.rs"));
+        assert!(is_test_path("web/src/App.test.ts"));
+        assert!(is_test_path("api/handlers.spec.ts"));
+        assert!(!is_test_path("crates/foo/src/lib.rs"));
+        assert!(!is_test_path("README.md"));
     }
 
     #[test]

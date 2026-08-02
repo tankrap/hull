@@ -127,6 +127,32 @@ pub fn run_check(
     outcome
 }
 
+/// Run (or serve from memo) checks for a **bare tree** — no associated change, no keel-verification
+/// write. This is how the independence check runs its composed tree (new code + pre-existing tests).
+/// Memoized by tree id like any other run, so an identical composed tree is judged once.
+pub fn run_check_tree(repos: &RepoHost, registry: &Registry, memo: &CiMemo, tenant: &str, repo: &str, tree: &str) -> CiOutcome {
+    if let Some(hit) = memo.get(tree) {
+        let status = match hit.status.as_str() {
+            "green" => CiStatus::Green,
+            "red" => CiStatus::Red,
+            _ => CiStatus::Errored,
+        };
+        return CiOutcome { status, summary: hit.summary, memoized: true };
+    }
+    let dir = std::env::temp_dir().join(format!("hull-ci-{}-{}", &tree[..tree.len().min(16)], std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if !repos.checkout_tree(tenant, repo, tree, &dir) {
+        return CiOutcome { status: CiStatus::Errored, summary: "checkout failed".into(), memoized: false };
+    }
+    let req = CiRequest { repo: format!("{tenant}/{repo}"), change: String::new(), tree_id: tree.to_string(), workdir: dir.clone() };
+    let outcome = registry.run_ci(&req);
+    let _ = std::fs::remove_dir_all(&dir);
+    if matches!(outcome.status, CiStatus::Green | CiStatus::Red) {
+        memo.put(tree, MemoEntry { status: status_str(outcome.status).into(), summary: outcome.summary.clone() });
+    }
+    outcome
+}
+
 // ── external CI dispatch ─────────────────────────────────────────────────────────────────────────
 //
 // Hull is a dumb dispatcher: it POSTs a standard job payload to the CI endpoint a repo configures
