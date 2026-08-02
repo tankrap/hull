@@ -960,7 +960,22 @@ async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(S
         .or_else(|| app.store.session_record(&format!("{tenant}/{repo}"), &id).map(|s| s.lesson))
         .unwrap_or_default();
     let facts = facts_with_independence(&app, &tenant, &repo, &id).await;
-    let ledger = hull_core::reconcile::reconcile(&id, &info.intent, &lesson, &facts);
+    // C1 — fold in the acceptance criteria of any issue a PR proposing this change closes, so the
+    // standalone ledger matches what the review reconciled against.
+    let key = format!("{tenant}/{repo}");
+    let review_intent = {
+        let issues = app.store.issues(&key);
+        let acceptance: Vec<String> = app
+            .store
+            .prs(&key)
+            .into_iter()
+            .filter(|p| p.changes.contains(&id))
+            .flat_map(|p| closing_issue_numbers(&p.title, &[]))
+            .filter_map(|n| issues.iter().find(|i| i.number == n).map(|i| format!("Closes #{}: {}. {}", i.number, i.title, i.body)))
+            .collect();
+        if acceptance.is_empty() { info.intent.clone() } else { format!("{}\n{}", info.intent, acceptance.join("\n")) }
+    };
+    let ledger = hull_core::reconcile::reconcile(&id, &review_intent, &lesson, &facts);
     // Overlay human resolutions onto the claims (a resolved needs-judgment claim stops being an open
     // question). Serialize the ledger, then attach `resolution` per claim by id.
     let resolutions = app.claims.for_change(&format!("{tenant}/{repo}"), &id);
@@ -1976,12 +1991,24 @@ async fn perform_auto_review(
     let session = app.store.session_record(&key, &change);
     let lesson = session.as_ref().map(|s| s.lesson.clone()).unwrap_or_default();
     let author_model = session.as_ref().map(|s| s.model.clone()).unwrap_or_default();
+    // C1 — claim extraction from the issue's acceptance criteria: when this PR closes an issue, fold
+    // that issue's title + body into the reviewed narrative, so the reconciliation verifies the change
+    // against **what the issue asked for**, not just what the change's own message claims.
+    let review_intent = {
+        let issues = app.store.issues(&key);
+        let acceptance: Vec<String> = closing_issue_numbers(&pr.title, &[])
+            .into_iter()
+            .filter_map(|n| issues.iter().find(|i| i.number == n))
+            .map(|i| format!("Closes #{}: {}. {}", i.number, i.title, i.body))
+            .collect();
+        if acceptance.is_empty() { info.intent.clone() } else { format!("{}\n{}", info.intent, acceptance.join("\n")) }
+    };
     let facts = facts_with_independence(app, tenant, repo, &change).await;
     let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
     let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
     // Capture the reviewer's INPUTS for the audit artifact before `facts` moves into the request.
     let artifact_inputs = json!({
-        "intent": info.intent, "author": info.author, "author_model": author_model,
+        "intent": review_intent, "author": info.author, "author_model": author_model,
         "files": facts.files, "ops": facts.ops, "verification": facts.verification, "secrets": facts.secrets,
     });
     // B6 — pure-move fast-track: a byte-identical relocation has no behavioral logic to review, so
@@ -1995,14 +2022,14 @@ async fn perform_auto_review(
         !autonomy::touches_protected(&touched, &app.autonomy.effective(tenant, repo, acct.as_deref()).protected_paths)
     };
     let (verdict, findings, ledger, base_summary, from_cache) = if mechanical {
-        let ledger = hull_core::reconcile::reconcile(&change, &info.intent, &lesson, &facts);
+        let ledger = hull_core::reconcile::reconcile(&change, &review_intent, &lesson, &facts);
         let n = semantic.moves.len();
         (Verdict::Approve, Vec::new(), Some(ledger), format!("pure move — {n} file{} relocated with byte-identical content (verified by content address); no behavioral review needed", if n == 1 { "" } else { "s" }), false)
     } else {
     let review_req = hull_plugin::ReviewRequest {
         repo: key.clone(),
         change: change.clone(),
-        intent: info.intent.clone(),
+        intent: review_intent.clone(),
         lesson,
         author: info.author.clone(),
         author_model,
