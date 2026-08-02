@@ -288,6 +288,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/mirror", get(mirror_status))
         .route("/api/repos/:tenant/:repo/mirror/push", post(mirror_push_now))
         .route("/api/repos/:tenant/:repo/mirror/inbound", post(mirror_inbound))
+        .route("/api/repos/:tenant/:repo/mirror/github", post(mirror_github_webhook))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/artifacts/:id", get(get_artifact))
         .route("/api/repos/:tenant/:repo/comments", get(comments_list).post(create_comment))
@@ -1639,6 +1640,90 @@ fn closing_issue_numbers(title: &str, explicit: &[u64]) -> Vec<u64> {
 /// Push a landed change out to the external forge, if the repo is mirrored — but only if the change
 /// didn't originate on the other side (loop prevention) and hasn't already been pushed (idempotency).
 /// A no-op when no mirror is configured. Returns whether a push happened (for the inbound test path).
+/// Constant-time byte compare (don't leak signature validity via timing).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The **GitHub App push webhook** (`POST …/mirror/github`) — the inbound half of two-way mirroring.
+/// GitHub calls this on every push. We verify the App's `X-Hub-Signature-256` HMAC, then (for
+/// `main`, non-duplicate, not our own echoed-back push) fetch + bridge the forge's git into keel,
+/// with the committer's forge login mapped to a hull actor (NEW-1176) and origin stamped `github`
+/// so it never loops back out (NEW-1173).
+async fn mirror_github_webhook(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // Auth: HMAC-SHA256 of the raw body with the App's webhook secret. No secret ⇒ endpoint disabled.
+    let Some(secret) = app.registry.config("GITHUB_WEBHOOK_SECRET") else {
+        return (StatusCode::NOT_IMPLEMENTED, "no GitHub webhook secret configured").into_response();
+    };
+    let sig = headers.get("X-Hub-Signature-256").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let expected = {
+        use hmac::{Hmac, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key length");
+        mac.update(&body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    };
+    if !ct_eq(sig.as_bytes(), expected.as_bytes()) {
+        return (StatusCode::UNAUTHORIZED, "invalid webhook signature").into_response();
+    }
+    // GitHub pings the endpoint with a `ping` event on setup — acknowledge it.
+    if headers.get("X-GitHub-Event").and_then(|v| v.to_str().ok()) == Some("ping") {
+        return Json(json!({ "pong": true })).into_response();
+    }
+    let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+    let git_ref = v.get("ref").and_then(Value::as_str).unwrap_or("");
+    let after = v.get("after").and_then(Value::as_str).unwrap_or("").to_string();
+    let login = v.get("sender").and_then(|s| s.get("login")).and_then(Value::as_str).unwrap_or("").to_string();
+    let git_author = v.get("pusher").and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or("mirror").to_string();
+    let delivery = headers.get("X-GitHub-Delivery").and_then(|d| d.to_str().ok()).unwrap_or(&after).to_string();
+
+    if git_ref != "refs/heads/main" {
+        return Json(json!({ "ignored": git_ref })).into_response();
+    }
+    // Idempotency: GitHub redelivers; a repeat delivery is a no-op.
+    if !app.mirror.mark_processed(&format!("in:{delivery}")) {
+        return Json(json!({ "duplicate": true, "change": after })).into_response();
+    }
+    // Loop prevention: if this commit originated on hull (our own outbound push echoed back), don't
+    // re-import it.
+    if app.mirror.origin(&after).as_deref() == Some("hull") {
+        return Json(json!({ "loop_skipped": after })).into_response();
+    }
+    app.mirror.set_origin(&after, "github");
+
+    // Import: fetch the forge's git and bridge into keel (off the async runtime — it shells git).
+    let key = format!("{tenant}/{repo}");
+    let result = tokio::task::spawn_blocking({
+        let (registry, key2) = (app.registry.clone(), key.clone());
+        move || registry.mirror_pull_in(&key2)
+    })
+    .await
+    .unwrap_or(hull_plugin::MirrorResult { ok: false, external_ref: None, detail: "import task panicked".into() });
+
+    // Accountability mapping across the mirror (NEW-1176): resolve the committer's forge login.
+    let attributed = if login.is_empty() { None } else { app.mirror.resolve_github(&login) };
+    app.mirror.record_inbound(mirror::Inbound {
+        repo: key,
+        change: after.clone(),
+        external_id: delivery,
+        git_author,
+        github_login: login,
+        attributed_actor: attributed.clone(),
+        ts: now(),
+    });
+    (if result.ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY }, Json(json!({
+        "imported": result.ok, "change": after, "detail": result.detail, "origin": "github",
+        "attributed_actor": attributed,
+    }))).into_response()
+}
+
 /// Manually push a repo's current HEAD to its configured mirror (`POST …/mirror/push`) — an initial
 /// sync / "sync now" for an accountable actor, independent of the on-land trigger. Bypasses the
 /// per-change idempotency guard so a re-sync always runs; loop-origin is still recorded.
@@ -1662,6 +1747,11 @@ async fn mirror_push_now(State(app): State<App>, headers: axum::http::HeaderMap,
     .unwrap_or(hull_plugin::MirrorResult { ok: false, external_ref: None, detail: "mirror task panicked".into() });
     if result.ok {
         app.mirror.set_origin(&change, "hull");
+        // Also stamp the pushed git sha (external_ref) as hull-origin — that's the key the inbound
+        // webhook sees (`after`), so our own push echoing back is recognized and not re-imported.
+        if let Some(sha) = &result.external_ref {
+            app.mirror.set_origin(sha, "hull");
+        }
         app.mirror.record_outbound(mirror::Outbound { repo: key, change: change.clone(), target, external_ref: result.external_ref.clone().unwrap_or_default(), ts: now() });
     }
     (if result.ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY }, Json(json!({ "ok": result.ok, "change": change, "detail": result.detail }))).into_response()
@@ -1686,11 +1776,15 @@ fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
     });
     if result.ok {
         app.mirror.set_origin(change, "hull");
+        // Stamp the pushed git sha as hull-origin too (the loop key the inbound webhook's `after` uses).
+        if let Some(sha) = &result.external_ref {
+            app.mirror.set_origin(sha, "hull");
+        }
         app.mirror.record_outbound(mirror::Outbound {
             repo: key,
             change: change.to_string(),
             target: target.clone(),
-            external_ref: result.external_ref.unwrap_or_default(),
+            external_ref: result.external_ref.clone().unwrap_or_default(),
             ts: now(),
         });
         app.registry.notify(&NotifyEvent {

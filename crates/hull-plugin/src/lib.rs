@@ -130,6 +130,12 @@ pub trait Mirror: Send + Sync {
     fn target(&self, repo: &str) -> Option<String>;
     /// Push one landed change outbound. Returns an external ref (a sha / PR url) on success.
     fn push(&self, req: &MirrorPush) -> MirrorResult;
+    /// Pull the forge's current state for `repo` **into** hull (the inbound half of a two-way mirror):
+    /// fetch the forge's git and ingest it into hull's keel store. Called by the inbound webhook after
+    /// signature + loop checks pass. Default: unsupported (a one-way/dry-run mirror does nothing).
+    fn pull_in(&self, _repo: &str) -> MirrorResult {
+        MirrorResult { ok: false, external_ref: None, detail: "inbound pull not supported by this mirror".into() }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +564,12 @@ impl Registry {
         match &self.mirror {
             Some(m) => m.push(req),
             None => LogMirror.push(req),
+        }
+    }
+    pub fn mirror_pull_in(&self, repo: &str) -> MirrorResult {
+        match &self.mirror {
+            Some(m) => m.pull_in(repo),
+            None => MirrorResult { ok: false, external_ref: None, detail: "no mirror configured".into() },
         }
     }
 }
