@@ -1984,6 +1984,21 @@ async fn perform_auto_review(
         "intent": info.intent, "author": info.author, "author_model": author_model,
         "files": facts.files, "ops": facts.ops, "verification": facts.verification, "secrets": facts.secrets,
     });
+    // B6 — pure-move fast-track: a byte-identical relocation has no behavioral logic to review, so
+    // approve it mechanically and skip the (expensive) model review. CI-green is still required by
+    // the merge gate — a move can break the build via path changes, which CI catches. Protected
+    // paths (auth/, migrations/, .hull/) are never fast-tracked; they always get a full review.
+    let semantic = app.repos.semantic_summary(tenant, repo, &change);
+    let touched: Vec<String> = semantic.moves.iter().flat_map(|m| [m.from.clone(), m.to.clone()]).chain(semantic.added.iter().cloned()).chain(semantic.deleted.iter().cloned()).chain(semantic.modified.iter().cloned()).collect();
+    let mechanical = semantic.pure_move && {
+        let acct = repo_account_id(app, tenant, repo);
+        !autonomy::touches_protected(&touched, &app.autonomy.effective(tenant, repo, acct.as_deref()).protected_paths)
+    };
+    let (verdict, findings, ledger, base_summary, from_cache) = if mechanical {
+        let ledger = hull_core::reconcile::reconcile(&change, &info.intent, &lesson, &facts);
+        let n = semantic.moves.len();
+        (Verdict::Approve, Vec::new(), Some(ledger), format!("pure move — {n} file{} relocated with byte-identical content (verified by content address); no behavioral review needed", if n == 1 { "" } else { "s" }), false)
+    } else {
     let review_req = hull_plugin::ReviewRequest {
         repo: key.clone(),
         change: change.clone(),
@@ -2000,7 +2015,7 @@ async fn perform_auto_review(
     // (Fix from the dogfood review of PR !1: keying on tree alone would serve a stale verdict after a
     // red→green flip on the same tree.)
     let cache_key = format!("{tree}:{}", app.repos.verification(tenant, repo, &change).unwrap_or_default());
-    let (verdict, findings, ledger, base_summary, from_cache) = match app.review_cache.get(&cache_key) {
+    match app.review_cache.get(&cache_key) {
         Some(cr) => {
             let v = match cr.verdict.as_str() {
                 "approve" => Verdict::Approve,
@@ -2034,6 +2049,7 @@ async fn perform_auto_review(
                 ledger: pkg.ledger.clone(),
             });
             (v, f, pkg.ledger, pkg.summary, false)
+        }
         }
     };
     let count = app.store.reviews(&key).len();
