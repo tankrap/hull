@@ -280,16 +280,24 @@ pub struct Move {
     pub blob: String,
 }
 
-/// A content-addressed classification of a change: which files were purely moved vs really changed.
-/// `pure_move` (every change is a move, no content touched) marks a mechanical, behavior-preserving
-/// change — the low-risk case a reviewer (or an auto-approve policy) can treat differently.
+/// A content-addressed classification of a change (B1 + B4): which files were purely moved,
+/// reformatted (whitespace-only), or really changed. `pure_move` = every change is a move (the
+/// strongest behavior-preserving case). `mechanical` = the whole change is moves and/or
+/// whitespace-only edits with no added/deleted/behavioral content — low-risk, though only
+/// `pure_move` is *provably* behavior-preserving (whitespace can be semantic, e.g. Python).
 #[derive(serde::Serialize)]
 pub struct SemanticSummary {
     pub moves: Vec<Move>,
     pub added: Vec<String>,
     pub deleted: Vec<String>,
+    /// All content-differing files (the union; `whitespace_only` + `behavioral` partition it).
     pub modified: Vec<String>,
+    /// Modified files whose only change is whitespace (reindent, trailing space, blank lines).
+    pub whitespace_only: Vec<String>,
+    /// Modified files with a real (non-whitespace) content change — the behavioral set.
+    pub behavioral: Vec<String>,
     pub pure_move: bool,
+    pub mechanical: bool,
 }
 
 /// The leading identifier after a keyword (`fn foo` → `foo`).
@@ -625,7 +633,7 @@ impl RepoHost {
     /// path is provably the same bytes — where git can only guess by similarity. A change whose every
     /// file-level change is a move is `pure_move`: mechanical and behavior-preserving.
     pub fn semantic_summary(&self, tenant: &str, repo: &str, hex: &str) -> SemanticSummary {
-        let empty = || SemanticSummary { moves: vec![], added: vec![], deleted: vec![], modified: vec![], pure_move: false };
+        let empty = || SemanticSummary { moves: vec![], added: vec![], deleted: vec![], modified: vec![], whitespace_only: vec![], behavioral: vec![], pure_move: false, mechanical: false };
         let Ok(Some(store)) = self.store(tenant, repo, false) else { return empty() };
         let Some(cid) = ObjectId::from_hex(hex) else { return empty() };
         let change = match store.get(&cid).ok().flatten() {
@@ -663,9 +671,33 @@ impl RepoHost {
         let leftover_deleted: Vec<String> = deleted.iter().enumerate().filter(|(i, _)| !used_del[*i]).map(|(_, (p, _))| p.clone()).collect();
         moves.sort_by(|a, b| a.to.cmp(&b.to));
         leftover_added.sort();
-        // Pure move: at least one move, and nothing else actually changed content.
+        // B4 — split modified files into whitespace-only (reformat) vs behavioral (real content). Two
+        // blobs whose contents match once whitespace is normalized differ only in formatting.
+        let read = |id: &ObjectId| -> Option<String> {
+            match store.get(id).ok().flatten() {
+                Some(Object::Blob(b)) if b.len() <= MAX_BLOB_FOR_DIFF => Some(String::from_utf8_lossy(&b).into_owned()),
+                _ => None,
+            }
+        };
+        // Whitespace-insensitive comparison: drop every whitespace char (catches reindent, blank-line
+        // and around-symbol spacing changes from a formatter). A hint only — never an auto-approve
+        // signal (whitespace can be semantic, e.g. Python), so the rare merge like `a b`→`ab` is safe.
+        let normalized = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let mut whitespace_only = Vec::new();
+        for p in &modified {
+            if let (Some(o), Some(n)) = (parent.get(p).and_then(&read), head.get(p).and_then(&read)) {
+                if normalized(&o) == normalized(&n) {
+                    whitespace_only.push(p.clone());
+                }
+            }
+        }
+        whitespace_only.sort();
+        let behavioral: Vec<String> = modified.iter().filter(|p| !whitespace_only.contains(*p)).cloned().collect();
+        // Pure move: at least one move, and nothing else changed at all.
         let pure_move = !moves.is_empty() && leftover_added.is_empty() && leftover_deleted.is_empty() && modified.is_empty();
-        SemanticSummary { moves, added: leftover_added, deleted: leftover_deleted, modified, pure_move }
+        // Mechanical: only moves and/or whitespace edits — no added/deleted/behavioral content.
+        let mechanical = leftover_added.is_empty() && leftover_deleted.is_empty() && behavioral.is_empty() && (!moves.is_empty() || !whitespace_only.is_empty());
+        SemanticSummary { moves, added: leftover_added, deleted: leftover_deleted, modified, whitespace_only, behavioral, pure_move, mechanical }
     }
 
     /// The observable facts of a change — touched files, semantic operations, verification, and
@@ -1038,6 +1070,33 @@ mod tests {
         assert!(!m.pure_move, "a move alongside a content edit is NOT a pure move");
         assert_eq!(m.moves.len(), 1); // the move is still detected
         assert_eq!(m.modified, vec!["README".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn whitespace_only_edit_is_mechanical_not_behavioral() {
+        let tmp = std::env::temp_dir().join(format!("hull-ws-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("t/r/.keel/store")).unwrap();
+        let host = RepoHost::new(&tmp);
+        let (ws_hex, beh_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let p = commit(&store, vec![], tree_from(&store, &tmp, "p", &[("a.rs", "fn f(){x}\n")]));
+            // reformat only — same tokens, different whitespace
+            let ws = commit(&store, vec![p], tree_from(&store, &tmp, "ws", &[("a.rs", "fn f() {\n    x\n}\n")]));
+            // real content change
+            let beh = commit(&store, vec![p], tree_from(&store, &tmp, "beh", &[("a.rs", "fn f(){y}\n")]));
+            (ws.to_hex(), beh.to_hex())
+        };
+        let w = host.semantic_summary("t", "r", &ws_hex);
+        assert_eq!(w.whitespace_only, vec!["a.rs".to_string()]);
+        assert!(w.behavioral.is_empty());
+        assert!(w.mechanical && !w.pure_move, "a whitespace reformat is mechanical but not a pure move");
+
+        let b = host.semantic_summary("t", "r", &beh_hex);
+        assert_eq!(b.behavioral, vec!["a.rs".to_string()]);
+        assert!(b.whitespace_only.is_empty());
+        assert!(!b.mechanical, "a real content edit is behavioral");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -1285,7 +1285,7 @@ function ReviewPage({
   type Ledger = { change: string; claims: Claim[] };
   const [change, setChange] = useState<ChangeInfo | null>(null);
   const [diff, setDiff] = useState<FileDiff[]>([]);
-  type Semantic = { moves: { from: string; to: string; blob: string }[]; added: string[]; deleted: string[]; modified: string[]; pure_move: boolean };
+  type Semantic = { moves: { from: string; to: string; blob: string }[]; added: string[]; deleted: string[]; modified: string[]; whitespace_only: string[]; behavioral: string[]; pure_move: boolean; mechanical: boolean };
   const [semantic, setSemantic] = useState<Semantic | null>(null);
   const [ledger, setLedger] = useState<Ledger | null>(null);
   const [openFile, setOpenFile] = useState<string | null>(null);
@@ -1646,11 +1646,20 @@ function ReviewPage({
           <h3>
             Changes <span className="muted">({diff.length} files) · what changed, as operations</span>
             {semantic?.pure_move && <span className="badge ok" title="every file was relocated with byte-identical content (proven by content address) — behavior-preserving"> ⇄ pure move</span>}
+            {semantic?.mechanical && !semantic.pure_move && <span className="badge warn" title="only moves and/or whitespace reformatting — likely mechanical, but whitespace can be semantic (e.g. Python), so not auto-approved"> mechanical</span>}
+            {semantic && semantic.behavioral.length > 0 && <span className="muted" style={{ fontWeight: 400, fontSize: 12 }}> · {semantic.behavioral.length} behavioral</span>}
           </h3>
           {semantic && semantic.moves.length > 0 && (
             <ul className="rp-files" style={{ marginBottom: 10 }}>
               {semantic.moves.map((m, i) => (
                 <li key={i}><span className="op add">renamed</span> <code>{m.from}</code> <span className="muted">→</span> <code>{m.to}</code> <span className="muted" title="same content-address — an exact move, not a git similarity guess">⬡ {m.blob.slice(0, 10)}</span></li>
+              ))}
+            </ul>
+          )}
+          {semantic && semantic.whitespace_only.length > 0 && (
+            <ul className="rp-files" style={{ marginBottom: 10 }}>
+              {semantic.whitespace_only.map((p, i) => (
+                <li key={i}><span className="op" style={{ background: "var(--brass-wash)", color: "var(--brass-text)" }}>reformatted</span> <code>{p}</code> <span className="muted">whitespace only</span></li>
               ))}
             </ul>
           )}
