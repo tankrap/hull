@@ -286,6 +286,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/prs/:number/reviewers", post(request_reviewer))
         .route("/api/repos/:tenant/:repo/prs/:number/fix", post(fix_finding))
         .route("/api/repos/:tenant/:repo/mirror", get(mirror_status))
+        .route("/api/repos/:tenant/:repo/mirror/push", post(mirror_push_now))
         .route("/api/repos/:tenant/:repo/mirror/inbound", post(mirror_inbound))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/artifacts/:id", get(get_artifact))
@@ -1638,6 +1639,34 @@ fn closing_issue_numbers(title: &str, explicit: &[u64]) -> Vec<u64> {
 /// Push a landed change out to the external forge, if the repo is mirrored — but only if the change
 /// didn't originate on the other side (loop prevention) and hasn't already been pushed (idempotency).
 /// A no-op when no mirror is configured. Returns whether a push happened (for the inbound test path).
+/// Manually push a repo's current HEAD to its configured mirror (`POST …/mirror/push`) — an initial
+/// sync / "sync now" for an accountable actor, independent of the on-land trigger. Bypasses the
+/// per-change idempotency guard so a re-sync always runs; loop-origin is still recorded.
+async fn mirror_push_now(State(app): State<App>, headers: axum::http::HeaderMap, Path((tenant, repo)): Path<(String, String)>) -> Response {
+    let key = format!("{tenant}/{repo}");
+    if let Err(resp) = require_actor(&app, &headers, "") {
+        return resp;
+    }
+    let Some(target) = app.registry.mirror_target(&key) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "no mirror target configured for this repo").into_response();
+    };
+    let Some(change) = app.repos.head_change(&tenant, &repo) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "repo has no HEAD change to push").into_response();
+    };
+    let (intent, author) = app.repos.change_info(&tenant, &repo, &change).map(|i| (i.intent, i.author)).unwrap_or_default();
+    let result = tokio::task::spawn_blocking({
+        let (registry, key, change) = (app.registry.clone(), key.clone(), change.clone());
+        move || registry.mirror_push(&hull_plugin::MirrorPush { repo: key, change, intent, author })
+    })
+    .await
+    .unwrap_or(hull_plugin::MirrorResult { ok: false, external_ref: None, detail: "mirror task panicked".into() });
+    if result.ok {
+        app.mirror.set_origin(&change, "hull");
+        app.mirror.record_outbound(mirror::Outbound { repo: key, change: change.clone(), target, external_ref: result.external_ref.clone().unwrap_or_default(), ts: now() });
+    }
+    (if result.ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY }, Json(json!({ "ok": result.ok, "change": change, "detail": result.detail }))).into_response()
+}
+
 fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
     let key = format!("{tenant}/{repo}");
     let Some(target) = app.registry.mirror_target(&key) else { return false };
