@@ -55,6 +55,15 @@ export function App() {
   );
   const feedRef = useRef<EventSource | null>(null);
 
+  // Theme: light-first (the design's default), dark via [data-theme] on <html>. Persisted.
+  const [theme, setTheme] = useState<string>(
+    () => localStorage.getItem("hull_theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"),
+  );
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("hull_theme", theme);
+  }, [theme]);
+
   // Issues for the selected repo under the selected tenant (M2). Click a repo card to switch.
   const [issueRepo, setIssueRepo] = useState<string>("hull");
   const [issues, setIssues] = useState<Issue[]>([]);
@@ -177,6 +186,15 @@ export function App() {
       .catch(() => {});
   }, []);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
+  const kindOf = (id: string): string => actors.find((a) => a.id === id)?.kind ?? "";
+  const initials = (s: string) => (s.replace(/[^a-zA-Z0-9]/g, " ").trim().split(/\s+/).map((w) => w[0]).join("").slice(0, 2) || s.slice(0, 2)).toUpperCase();
+  // active_actors arrive as handles OR raw ids; resolve ids to handles so a 64-hex key never shows.
+  const actorName = (a: string) => (/^[0-9a-f]{16,}$/i.test(a) ? handleOf(a) : a);
+  const openIcon = (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="7" y1="17" x2="17" y2="7" /><polyline points="8 7 17 7 17 16" />
+    </svg>
+  );
   // You act only as your signed-in self. No token ⇒ no identity ⇒ writes are blocked (server 401s).
   const actingAs = me?.id ?? "";
   const canAct = !!me;
@@ -382,15 +400,15 @@ export function App() {
   };
   // A reusable thread block for a target (pr:N / issue:N).
   const Thread = ({ target }: { target: string }) => (
-    <div className="pr-thread">
+    <div className="thread">
       {comments.filter((c) => c.target === target).sort((a, b) => a.created_unix - b.created_unix).map((c) => (
         <div className="cmt" key={c.id}>
-          <b className={actors.find((a) => a.id === c.author)?.kind ?? ""}>{handleOf(c.author)}</b>
-          <span className="cmt-body">{c.body}</span>
-          <span className="cmt-ts" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
+          <b className={kindOf(c.author)}>{handleOf(c.author)}</b>
+          <span className="cbody">{c.body}</span>
+          <span className="cts" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
         </div>
       ))}
-      {comments.filter((c) => c.target === target).length === 0 && <div className="muted cmt-empty">no comments yet</div>}
+      {comments.filter((c) => c.target === target).length === 0 && <div className="empty">no comments yet</div>}
       <div className="cmt-form">
         <input
           placeholder={canAct ? "comment…" : "sign in to comment"}
@@ -568,643 +586,428 @@ export function App() {
   }
 
   return (
-    <div className="app">
-      <header className="top">
+    <div className="shell">
+      <header className="topbar">
         <button className="brand" onClick={() => setView("home")} title="home">
-          <span className="logo">⬡</span> Hull
+          <span className="mark" aria-hidden /> <span className="wordmark">hull</span>
         </button>
-        <div className="breadcrumb">
+        <div className="crumbs">
           {view === "repo" ? (
             <>
               <button className="link" onClick={() => setView("home")}>{tenant}</button>
               <span className="sep">/</span>
-              <b>{issueRepo}</b>
+              <span className="cur">{issueRepo}</span>
             </>
           ) : (
-            <span className="tag">situation room</span>
+            <span>situation room</span>
           )}
         </div>
-        <div className="spacer" />
-        <label className="tenant">
-          tenant&nbsp;
-          <input
-            value={tenant}
-            onChange={(e) => setTenant(e.target.value.trim())}
-            spellCheck={false}
-            aria-label="tenant"
-          />
-        </label>
-        <div className="signin">
-          {me ? (
-            <span className="signed-in">
-              signed in as{" "}
-              <button className={"whoami " + me.kind} onClick={() => setShowProfile((s) => !s)} title="your identity & accountability">
-                {me.handle} ▾
-              </button>
-              <button className="link" onClick={signOut}>sign out</button>
-              {showProfile && profile && (
-                <div className="profile-drop">
-                  <div className="profile-head">
-                    <b className={profile.kind}>{profile.handle}</b> <span className="muted">{profile.kind}</span>
-                    {profile.accountable && <span className="badge ok">accountable</span>}
-                  </div>
-                  <div className="profile-row">
-                    <span className="pk-label">actor id (public key)</span>
-                    <code className="pk" title="your Ed25519 public key — this IS your identity; it can't be rotated without becoming a different actor">{profile.id}</code>
-                  </div>
-                  {profile.kind === "agent" && profile.delegation.length > 0 && (
-                    <div className="profile-row">
-                      <span className="pk-label">accountability chain</span>
-                      <span className="chain">
-                        {profile.delegation.map((h, i) => (
-                          <span key={i} className="hop">
-                            <b className={h.kind}>{h.handle}</b>
-                            {i < profile.delegation.length - 1 && <span className="arrow"> → </span>}
-                          </span>
-                        ))}
-                      </span>
-                    </div>
-                  )}
-                  <div className="profile-row">
-                    <span className="pk-label">memberships</span>
-                    {profile.memberships.length > 0 ? (
-                      <span className="memberships">
-                        {profile.memberships.map((m, i) => (
-                          <span key={i} className="mem">{m.account}<span className="role">{m.role}</span></span>
-                        ))}
-                      </span>
-                    ) : (
-                      <span className="muted">none</span>
-                    )}
-                  </div>
-                  {profile.kind === "human" && (
-                    <div className="profile-actions">
-                      <button className="mint-agent" onClick={createAgent}>+ create an agent (chains to you)</button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </span>
-          ) : (
-            <>
-              <input
-                type="password"
-                placeholder="secret key to sign in"
-                value={secretInput}
-                onChange={(e) => setSecretInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && signIn()}
-              />
-              <button onClick={signIn}>Sign in</button>
-              <button className="link" onClick={registerAndSignIn}>new identity</button>
-              <button className="link" onClick={() => signInWith(DEMO_OWNER_SECRET)} title="log in as the published demo owner (real signature login)">demo</button>
-            </>
-          )}
+        <div className="grow" />
+        <div className="searchbox" title="tenant / organization">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
+          <input value={tenant} onChange={(e) => setTenant(e.target.value.trim())} spellCheck={false} aria-label="tenant" placeholder="tenant" />
         </div>
+        <button className="icon-btn" onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))} title={theme === "dark" ? "switch to light" : "switch to dark"} aria-label="toggle theme">
+          {theme === "dark" ? "☀" : "☾"}
+        </button>
         <div className="bell-wrap">
-          <button className="bell" onClick={toggleNotifs} title="notifications">
+          <button className="icon-btn" onClick={toggleNotifs} title="notifications">
             🔔{notifs.filter((n) => n.ts > seenTs).length > 0 && <span className="bell-count">{notifs.filter((n) => n.ts > seenTs).length}</span>}
           </button>
           {showNotifs && (
-            <div className="notif-drop">
-              <div className="notif-head">
-                inbox for <b>{handleOf(actingAs)}</b> <span className="muted">· via Notifier plugin</span>
-              </div>
+            <div className="pop">
+              <div className="pop-head">inbox for <b>{handleOf(actingAs)}</b> · via Notifier plugin</div>
               {notifs.length === 0 && <div className="empty">nothing yet</div>}
-              {notifs.slice(0, 15).map((n, i) => {
-                const icon =
-                  n.kind === "review_posted" ? "✍" :
-                  n.kind === "review_requested" ? "👀" :
-                  n.kind === "ci_passed" ? "✓" :
-                  n.kind === "ci_failed" ? "✗" :
-                  n.kind === "code_owner_referenced" ? "⬡" :
-                  n.kind === "mirror_pushed" ? "⇄" : "•";
-                return (
-                  <div className={"notif" + (n.ts > seenTs ? " unread" : "")} key={i}>
-                    <span className={"nk " + n.kind}>{icon} {n.kind.replace(/_/g, " ")}</span>
-                    {n.broadcast && <span className="nbcast">team</span>}
-                    <span className="ns">{n.summary}</span>
-                  </div>
-                );
-              })}
+              {notifs.slice(0, 15).map((n, i) => (
+                <div className={"notif" + (n.ts > seenTs ? " unread" : "")} key={i}>
+                  <span className="nk">{n.kind.replace(/_/g, " ")}</span>
+                  {n.broadcast && <span className="pill tag">team</span>}
+                  <span className="ns">{n.summary}</span>
+                </div>
+              ))}
             </div>
           )}
         </div>
-      </header>
-
-      {view === "home" && org && (
-        <div className="org-card">
-          <span className="org-name">{org.handle}</span>
-          <span className="muted">{org.kind}</span>
-          <span className="org-members">
-            {org.members.map((m, i) => (
-              <span className="mem" key={i}>
-                {m.handle}<span className="role">{m.role}</span>
-              </span>
-            ))}
-          </span>
-        </div>
-      )}
-      {view === "home" && (
-      <main className="grid">
-        <section>
-          <h2>Repositories <span className="muted">by live activity — click one to open it</span></h2>
-          <div className="repos">
-            {repos.length === 0 && (
-              <div className="empty">
-                no active repos for <b>{tenant}</b> — host one:{" "}
-                <code>git push http://localhost:8930/{tenant}/&lt;repo&gt; main</code>
+        {me ? (
+          <div className="bell-wrap">
+            <button className="avatar" onClick={() => setShowProfile((s) => !s)} title={`${me.handle} · your identity`}>{initials(me.handle)}</button>
+            {showProfile && profile && (
+              <div className="pop">
+                <div className="pop-head"><b className={profile.kind}>{profile.handle}</b> · {profile.kind}{profile.accountable && <> · <span className="pill pass">accountable</span></>}</div>
+                <div className="pop-row"><span className="pk-label">actor id</span><span className="pk" title="your Ed25519 public key — this IS your identity">{profile.id}</span></div>
+                {profile.kind === "agent" && profile.delegation.length > 0 && (
+                  <div className="pop-row"><span className="pk-label">accountability</span><span>{profile.delegation.map((h, i) => (<span key={i}><b className={h.kind}>{h.handle}</b>{i < profile.delegation.length - 1 && " → "}</span>))}</span></div>
+                )}
+                <div className="pop-row"><span className="pk-label">memberships</span>{profile.memberships.length > 0 ? <span style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>{profile.memberships.map((m, i) => (<span key={i} className="pill">{m.account} · {m.role}</span>))}</span> : <span className="muted">none</span>}</div>
+                <div className="pop-row"><span className="pk-label" /><span style={{ display: "flex", gap: 14 }}>{profile.kind === "human" && <button className="link" onClick={createAgent}>+ create agent</button>}<button className="link" onClick={signOut}>sign out</button></span></div>
               </div>
             )}
-            {repos.map((r) => (
-              <article
-                className={"repo" + (r.repo === issueRepo ? " selected" : "")}
-                key={r.repo}
-                onClick={() => selectRepo(r.repo)}
-                title="open this repo's issues"
-              >
-                <div className="repo-head">
-                  <span className="repo-name">{r.repo}</span>
-                  <span className="score" title="live activity score">{r.score.toFixed(0)}</span>
-                </div>
-                {r.active_actors.length > 0 && (
-                  <div className="actors">
-                    {r.active_actors.map((a) => (
-                      <span className={"chip " + (a.startsWith("agent") ? "agent" : "human")} key={a}>
-                        {a}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                {r.hot_files.length > 0 && (
-                  <ul className="files">
-                    {r.hot_files.map((f) => (
-                      <li key={f}><code>{f}</code></li>
-                    ))}
-                  </ul>
-                )}
-              </article>
-            ))}
           </div>
-        </section>
+        ) : (
+          <div className="signin">
+            <input type="password" placeholder="secret key" value={secretInput} onChange={(e) => setSecretInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signIn()} />
+            <button className="secondary" onClick={signIn}>Sign in</button>
+            <button className="link" onClick={registerAndSignIn}>new</button>
+            <button className="link" onClick={() => signInWith(DEMO_OWNER_SECRET)} title="log in as the published demo owner">demo</button>
+          </div>
+        )}
+      </header>
 
-        <section>
-          <h2>Live feed</h2>
-          <ul className="feed">
-            {events.length === 0 && <li className="empty">listening…</li>}
-            {events.map((e, i) => (
-              <li key={i} className={"ev ev-" + e.kind}>
-                {renderEvent(e)}
-              </li>
-            ))}
-          </ul>
-        </section>
-      </main>
+      {view === "home" && (
+        <div className="page-body">
+          <div className="body-head">
+            <span className="eyebrow">Situation room</span>
+            <div className="grow" />
+            {org && <span className="pill">{org.handle} · {org.kind}</span>}
+          </div>
+          <div className="split">
+            <div className="panel">
+              <div className="panel-head">
+                <span className="strong">Repositories</span>
+                <span className="muted">by live activity</span>
+                <div className="grow" />
+                <span className="muted">click to open</span>
+              </div>
+              {repos.length === 0 && (
+                <div className="empty">no active repos for {tenant} — push one to <code>http://localhost:8930/{tenant}/&lt;repo&gt;</code></div>
+              )}
+              <div className="rows">
+                {repos.map((r) => (
+                  <button className="row" key={r.repo} onClick={() => selectRepo(r.repo)} title="open this repo">
+                    <div className="main">
+                      <div className="line1">
+                        <span className="rtitle">{r.repo}</span>
+                        {r.active_actors.slice(0, 4).map((a) => (
+                          <span className={"pill " + (actorName(a).startsWith("agent") ? "agent" : "human")} key={a}>{actorName(a)}</span>
+                        ))}
+                      </div>
+                      <div className="meta">
+                        <span>activity {r.score.toFixed(0)}</span>
+                        {r.hot_files.slice(0, 3).map((f) => (<span key={f}>{f}</span>))}
+                      </div>
+                    </div>
+                    <span className="trailing swap">
+                      <span className="diffstat muted">{r.active_actors.length} active</span>
+                      <span className="openlink">{openIcon}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="side">
+              <div className="card" style={{ padding: 0, overflow: "hidden" }}>
+                <div className="card-title" style={{ padding: "12px 14px", borderBottom: "1px solid var(--rule2)", marginBottom: 0 }}>Live feed</div>
+                <div>
+                  {events.length === 0 && <div className="empty">listening…</div>}
+                  {events.slice(0, 24).map((e, i) => (
+                    <div key={i} style={{ padding: "9px 14px", borderTop: i ? "1px solid var(--rule2)" : "none", fontSize: 12.5, color: "var(--body)" }}>{renderEvent(e)}</div>
+                  ))}
+                </div>
+              </div>
+              {org && (
+                <div className="card">
+                  <div className="card-title">{org.handle} <span className="muted" style={{ fontWeight: 400 }}>· {org.members.length} members</span></div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {org.members.map((m, i) => (<span className="pill" key={i}>{m.handle} · {m.role}</span>))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
 
       {view === "repo" && (
-      <main className="repo-view">
-        {secrets.length > 0 && (
-          <div className="sec-banner">
-            <b>⚠ {secrets.length} secret{secrets.length > 1 ? "s" : ""} detected on push</b>
-            <ul>
-              {secrets.slice(0, 5).map((s, i) => (
-                <li key={i}>
-                  {s.title} — <code>{s.path}:{s.line}</code> <span className="muted">{s.redacted}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-        {mirror?.target && (
-          <div className="mirror-panel">
-            <span className="mirror-badge">⇄ mirrored</span>
-            <span>
-              linked to <code>{mirror.target}</code> · {mirror.outbound.length} change{mirror.outbound.length === 1 ? "" : "s"} pushed outbound
-            </span>
-            <span className="muted mirror-note">loop-safe: forge-originated changes are never pushed back; webhook redelivery is idempotent</span>
-          </div>
-        )}
-        {autonomy && (
-          <div className={"autonomy-panel tier-" + autonomy.tier}>
-            <span className="auto-badge">⚙ autonomy</span>
-            <span className="auto-tier">{autonomy.tier.toUpperCase()}</span>
-            <span className="muted">{TIERS[autonomy.tier]}</span>
-            <span className="muted auto-src">· from {autonomy.source}</span>
-            {isTenantOwner && (
-              <select className="auto-select" value={autonomy.tier} onChange={(e) => setTier(e.target.value)} title="set the repo's autonomy tier">
-                {["t0", "t1", "t2", "t3"].map((t) => (
-                  <option key={t} value={t}>{t.toUpperCase()}</option>
-                ))}
-              </select>
+        <>
+          <div className="repo-header">
+            <span className="repo-mark" aria-hidden />
+            <span className="repo-name">{tenant} / {issueRepo}</span>
+            {autonomy && (
+              <span className={"pill " + (autonomy.tier === "t3" || autonomy.tier === "t2" ? "warn" : "")} title={TIERS[autonomy.tier]}>autonomy {autonomy.tier.toUpperCase()}</span>
             )}
+            {mirror?.target && <span className="pill" title={`mirrored to ${mirror.target}`}>⇄ mirrored</span>}
+            <div className="grow" />
+            {!canAct && <span className="muted" style={{ fontSize: 12.5 }}>read-only · <button className="link" onClick={() => signInWith(DEMO_OWNER_SECRET)}>sign in</button></span>}
           </div>
-        )}
-        {ciConfig && (
-          <div className="ci-panel">
-            <span className="ci-badge">⚙ CI</span>
-            <span>
-              {ciConfig.url ? (
-                <>dispatches to <code>{ciConfig.url}</code> <span className="muted">({ciConfig.source}{ciConfig.has_secret ? ", secret set" : ", no secret"})</span></>
-              ) : (
-                <span className="muted">{ciConfig.source} — checks run on the built-in local runner</span>
-              )}
-            </span>
-            {isTenantOwner && (
-              <form className="ci-form" onSubmit={(e) => { e.preventDefault(); saveCiConfig(false); }}>
-                <input className="ci-url" placeholder="https://your-ci/hull" value={ciUrl} onChange={(e) => setCiUrl(e.target.value)} spellCheck={false} />
-                <input className="ci-secret" type="text" placeholder="shared secret (optional)" value={ciSecret} onChange={(e) => setCiSecret(e.target.value)} spellCheck={false} />
-                <button type="button" className="link" title="generate a random 32-byte secret" onClick={() => setCiSecret(bytesToHex(crypto.getRandomValues(new Uint8Array(32))))}>generate</button>
-                <button type="submit">Set</button>
-                {ciConfig.source === "repo" && <button type="button" className="link" onClick={() => saveCiConfig(true)}>clear</button>}
-                <a className="ci-spec-link" href="https://github.com/tankrap/hull/blob/main/CI-SPEC.md" target="_blank" rel="noreferrer">spec ↗</a>
-              </form>
-            )}
+          <div className="nav">
+            <button className={"nav-item" + (tab === "issues" ? " on" : "")} onClick={() => setTab("issues")}>
+              <span className="lbl">Issues <span className="nav-count">{issues.filter((i) => i.status.state === "open").length}</span></span>
+              <span className="bar" />
+            </button>
+            <button className={"nav-item" + (tab === "prs" ? " on" : "")} onClick={() => setTab("prs")}>
+              <span className="lbl">Pull requests <span className="nav-count">{prs.length}</span></span>
+              <span className="bar" />
+            </button>
           </div>
-        )}
-        <div className="tabs">
-          <button className={"tab" + (tab === "issues" ? " active" : "")} onClick={() => setTab("issues")}>
-            Issues <span className="muted">{issues.filter((i) => i.status.state === "open").length}</span>
-          </button>
-          <button className={"tab" + (tab === "prs" ? " active" : "")} onClick={() => setTab("prs")}>
-            Pull requests <span className="muted">{prs.length}</span>
-          </button>
-          <input
-            className="repo-search"
-            placeholder={`filter ${tab === "issues" ? "issues" : "pull requests"}…`}
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            spellCheck={false}
-          />
-          {!canAct && (
-            <span className="acting-note">
-              read-only — <button className="link" onClick={() => signInWith(DEMO_OWNER_SECRET)}>sign in</button> to act
-            </span>
-          )}
-        </div>
-
-        {tab === "issues" && (
-        <section className="issues">
-        <div className="view-toggle">
-          <button className={issueView === "list" ? "on" : ""} onClick={() => setIssueView("list")}>List</button>
-          <button className={issueView === "board" ? "on" : ""} onClick={() => setIssueView("board")}>Board</button>
-        </div>
-        <form className="issue-form" onSubmit={createIssue}>
-          <input
-            placeholder="Open an issue…"
-            value={form.title}
-            onChange={(e) => setForm({ ...form, title: e.target.value })}
-          />
-          <input
-            className="path"
-            placeholder="path (optional, e.g. crates/hull-server/src/quic.rs)"
-            value={form.path}
-            onChange={(e) => setForm({ ...form, path: e.target.value })}
-            spellCheck={false}
-          />
-          <input
-            className="line"
-            placeholder="line"
-            value={form.line}
-            onChange={(e) => setForm({ ...form, line: e.target.value })}
-          />
-          <select
-            className="assignee-pick"
-            value={form.assignee}
-            onChange={(e) => setForm({ ...form, assignee: e.target.value })}
-          >
-            <option value="">assign…</option>
-            {actors.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.handle}
-              </option>
-            ))}
-          </select>
-          <button type="submit">Open</button>
-        </form>
-        {issueView === "list" ? (
-        <ul className="issue-list">
-          {issues.length === 0 && <li className="empty">no issues yet — open one above</li>}
-          {[...issues]
-            .filter((it) => matchQ(`${it.title} ${it.body} #${it.number} ${it.labels.join(" ")}`))
-            .sort((a, b) => Number(a.status.state !== "open") - Number(b.status.state !== "open") || b.number - a.number)
-            .map((it) => (
-            <li key={it.number} className={"issue " + it.status.state}>
-              <div className="issue-row">
-                <span className={"state " + it.status.state} title={it.status.reason ?? ""}>
-                  {it.status.state === "open" ? "open" : it.status.reason ?? "closed"}
-                </span>
-                <span className="num">#{it.number}</span>
-                <button
-                  className="it-title"
-                  onClick={() => setOpenIssue(openIssue === it.number ? null : it.number)}
-                  title="open issue"
-                >
-                  {openIssue === it.number ? "▾ " : "▸ "}
-                  {it.title}
-                </button>
-                {it.code_refs.map((c, i) => (
-                  <button
-                    key={i}
-                    className="coderef"
-                    title={`content-addressed → keel blob ${c.blob} · click for provenance`}
-                    onClick={() => showWhy(`${it.number}:${c.path}`, c.path)}
-                  >
-                    <code>
-                      {c.path}:{c.line_start}
-                      {c.line_end ? `-${c.line_end}` : ""}
-                    </code>
-                    <span className="blob">⬡ {c.blob.slice(0, 10)}</span>
-                  </button>
-                ))}
-                {it.labels.map((l) => (
-                  <button key={l} className="row-label" title="filter by this label" onClick={() => setQ(l)}>{l}</button>
-                ))}
-                {it.assignees.map((id) => (
-                  <span key={id} className="assignee-chip" title="assignee">
-                    ◎ {handleOf(id)}
-                  </span>
-                ))}
-                {it.resolved_by && (
-                  <span className="resolved-chip" title="closed by a merged PR — resolving keel change">
-                    ⬡ resolved by {it.resolved_by.slice(0, 10)}
-                  </span>
-                )}
-                {!it.resolved_by && (it.linked_prs?.length ?? 0) > 0 && (
-                  <span className="linked-chip" title="a PR references this issue">
-                    ⇄ {it.linked_prs!.length} linked PR{it.linked_prs!.length > 1 ? "s" : ""}
-                  </span>
-                )}
-                <span className={"by " + (actors.find((a) => a.id === it.author)?.kind ?? "")}>
-                  {handleOf(it.author)}
-                </span>
-                {it.status.state === "open" ? (
-                  <button className="act close" onClick={() => transition(it.number, "close")}>
-                    Close
-                  </button>
-                ) : (
-                  <button className="act reopen" onClick={() => transition(it.number, "reopen")}>
-                    Reopen
-                  </button>
-                )}
-              </div>
-              {openIssue === it.number && (
-                <div className="issue-detail">
-                  <div className="meta">
-                    <span>opened by <b className={actors.find((a) => a.id === it.author)?.kind ?? ""}>{handleOf(it.author)}</b></span>
-                    {it.assignees.length > 0 && (
-                      <span>· assigned to {it.assignees.map((id) => handleOf(id)).join(", ")}</span>
-                    )}
-                    <span>· {it.status.state === "open" ? "open" : `closed (${it.status.reason ?? "closed"})`}</span>
-                  </div>
-                  {it.body && <p className="body">{it.body}</p>}
-                  {it.code_refs.length === 0 && <p className="muted">no code references</p>}
-                  {it.code_refs.length > 0 && (
-                    <p className="muted">code references (click a ⬡ anchor above for keel provenance)</p>
-                  )}
-                  <div className="issue-manage">
-                    <div className="mrow">
-                      <span className="pk-label">assignees</span>
-                      {it.assignees.map((id) => (
-                        <span key={id} className="chip">
-                          {handleOf(id)}
-                          {canAct && <button className="x" title="unassign" onClick={() => issueAction(it.number, "unassign", { assignee: id })}>×</button>}
-                        </span>
-                      ))}
-                      {canAct && me && !it.assignees.includes(me.id) && (
-                        <button className="link" onClick={() => issueAction(it.number, "assign", { assignee: me.id })}>assign me</button>
-                      )}
-                      {it.assignees.length === 0 && !canAct && <span className="muted">none</span>}
+          <div className="page-body">
+            <div className="split">
+              <div>
+                {tab === "issues" && (
+                  <div className="stack">
+                    <div className="body-head" style={{ marginBottom: 0 }}>
+                      <div className="seg">
+                        <button className={issueView === "list" ? "on" : ""} onClick={() => setIssueView("list")}>List</button>
+                        <button className={issueView === "board" ? "on" : ""} onClick={() => setIssueView("board")}>Board</button>
+                      </div>
+                      <div className="grow" />
+                      <input style={{ maxWidth: 200 }} placeholder="filter issues…" value={q} onChange={(e) => setQ(e.target.value)} spellCheck={false} />
                     </div>
-                    <div className="mrow">
-                      <span className="pk-label">labels</span>
-                      {it.labels.map((l) => (
-                        <span key={l} className="chip label">
-                          {l}
-                          {canAct && <button className="x" title="remove label" onClick={() => issueAction(it.number, "unlabel", { label: l })}>×</button>}
-                        </span>
-                      ))}
-                      {canAct && (
-                        <span className="label-add">
-                          <input
-                            placeholder="add label…"
-                            value={labelDraft[it.number] ?? ""}
-                            onChange={(e) => setLabelDraft((d) => ({ ...d, [it.number]: e.target.value }))}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" && (labelDraft[it.number] ?? "").trim()) {
-                                issueAction(it.number, "label", { label: labelDraft[it.number].trim() });
-                                setLabelDraft((d) => ({ ...d, [it.number]: "" }));
-                              }
-                            }}
-                          />
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="thread-wrap">
-                    <h5>Discussion</h5>
-                    <Thread target={`issue:${it.number}`} />
-                  </div>
-                </div>
-              )}
-              {it.code_refs.map((c) => {
-                const key = `${it.number}:${c.path}`;
-                return prov[key] ? (
-                  <ul className="prov" key={key}>
-                    <li className="prov-head">
-                      keel provenance · <code>{c.path}</code>
-                    </li>
-                    {prov[key].length === 0 && <li className="empty">no recorded history</li>}
-                    {prov[key].map((p, j) => (
-                      <li key={j}>
-                        <code className="ch">{p.change.slice(0, 10)}</code>
-                        <span className="intent">{p.intent}</span>
-                        <span className="by">{p.author}</span>
-                      </li>
-                    ))}
-                  </ul>
-                ) : null;
-              })}
-            </li>
-          ))}
-        </ul>
-        ) : (
-        <div className="board">
-          {[
-            { k: "open", label: "Open" },
-            { k: "completed", label: "Completed" },
-            { k: "not_planned", label: "Not planned" },
-            { k: "cancelled", label: "Cancelled" },
-            { k: "duplicate", label: "Duplicate" },
-          ].map((col) => {
-            const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k && matchQ(`${i.title} ${i.body} #${i.number} ${i.labels.join(" ")}`));
-            if (col.k !== "open" && inCol.length === 0) return null;
-            return (
-              <div className="col" key={col.k}>
-                <div className="col-head">
-                  {col.label} <span className="muted">{inCol.length}</span>
-                </div>
-                {inCol.map((it) => (
-                  <div
-                    className="card"
-                    key={it.number}
-                    onClick={() => {
-                      setIssueView("list");
-                      setOpenIssue(it.number);
-                    }}
-                  >
-                    <div className="card-num">#{it.number}</div>
-                    <div className="card-title">{it.title}</div>
-                    {it.assignees.length > 0 && (
-                      <div className="card-assignees">◎ {it.assignees.map((id) => handleOf(id)).join(", ")}</div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            );
-          })}
-        </div>
-        )}
-        </section>
-        )}
-
-        {tab === "prs" && (
-        <section className="issues prs">
-        <form className="issue-form" onSubmit={createPr}>
-          <input
-            placeholder="Open a PR from HEAD…"
-            value={prTitle}
-            onChange={(e) => setPrTitle(e.target.value)}
-          />
-          <button type="submit">Open PR</button>
-        </form>
-        <ul className="issue-list">
-          {prs.length === 0 && <li className="empty">no pull requests yet</li>}
-          {[...prs].filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
-            const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
-            return (
-            <li key={p.number} className="issue">
-              <div className="issue-row">
-                <span className={"verif " + (p.state === "merged" ? "merged" : p.state === "closed" ? "closed" : p.verification)}>
-                  {p.state === "merged" ? "merged" : p.state === "closed" ? "closed" : p.verification}
-                </span>
-                <span className="num">!{p.number}</span>
-                <button
-                  className="it-title"
-                  onClick={() => setOpenPr(openPr === p.number ? null : p.number)}
-                  title="open reviews"
-                >
-                  {openPr === p.number ? "▾ " : "▸ "}
-                  {p.title}
-                </button>
-                <span className="coderef" title={`proposes keel change ${p.changes[0]}`}>
-                  <span className="blob">⬡ {(p.changes[0] ?? "").slice(0, 10)}</span>
-                </span>
-                {prReviews.length > 0 && (
-                  <span className="review-count" title="reviews">{prReviews.length} review{prReviews.length > 1 ? "s" : ""}</span>
-                )}
-                {p.reviewers?.length > 0 && (
-                  <span className="owners-chip" title="code owners auto-requested">◎ {p.reviewers.map((id) => handleOf(id)).join(", ")}</span>
-                )}
-                <span className={"by " + (actors.find((a) => a.id === p.author)?.kind ?? "")}>
-                  {handleOf(p.author)}
-                </span>
-              </div>
-              {openPr === p.number && (
-                <div className="reviews">
-                  <div className="merge-bar">
-                    {p.state === "merged" ? (
-                      <span className="merged-note">✓ merged</span>
-                    ) : p.state === "closed" ? (
-                      <>
-                        <span className="closed-note">✕ closed without merging</span>
-                        {canAct && <button className="link" onClick={() => closePr(p.number, true)}>reopen</button>}
-                      </>
+                    <form className="form-row" onSubmit={createIssue}>
+                      <input placeholder="Open an issue…" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+                      <input style={{ flex: 2 }} placeholder="path (optional)" value={form.path} onChange={(e) => setForm({ ...form, path: e.target.value })} spellCheck={false} />
+                      <input className="field-narrow" placeholder="line" value={form.line} onChange={(e) => setForm({ ...form, line: e.target.value })} />
+                      <select value={form.assignee} onChange={(e) => setForm({ ...form, assignee: e.target.value })}>
+                        <option value="">assign…</option>
+                        {actors.map((a) => (<option key={a.id} value={a.id}>{a.handle}</option>))}
+                      </select>
+                      <button type="submit">Open</button>
+                    </form>
+                    {issueView === "list" ? (
+                      <div className="panel">
+                        <div className="panel-head"><span className="strong">{issues.filter((i) => i.status.state === "open").length} open</span><span className="muted">{issues.length} total</span></div>
+                        {issues.length === 0 && <div className="empty">no issues yet — open one above</div>}
+                        <div className="rows">
+                          {[...issues]
+                            .filter((it) => matchQ(`${it.title} ${it.body} #${it.number} ${it.labels.join(" ")}`))
+                            .sort((a, b) => Number(a.status.state !== "open") - Number(b.status.state !== "open") || b.number - a.number)
+                            .map((it) => (
+                              <div key={it.number}>
+                                <div className="row" onClick={() => setOpenIssue(openIssue === it.number ? null : it.number)}>
+                                  <div className="main">
+                                    <div className="line1">
+                                      <span className="rtitle">{it.title}</span>
+                                      <span className={"pill " + (it.status.state === "open" ? "open" : "closed")} title={it.status.reason ?? ""}>{it.status.state === "open" ? "open" : it.status.reason ?? "closed"}</span>
+                                      {it.labels.map((l) => (<span key={l} className="pill" style={{ cursor: "pointer" }} onClick={(e) => { e.stopPropagation(); setQ(l); }}>{l}</span>))}
+                                      {it.assignees.map((id) => (<span key={id} className="pill">◎ {handleOf(id)}</span>))}
+                                      {it.resolved_by && <span className="pill pass" title="closed by a merged PR">⬡ resolved</span>}
+                                      {!it.resolved_by && (it.linked_prs?.length ?? 0) > 0 && <span className="pill">⇄ {it.linked_prs!.length} PR{it.linked_prs!.length > 1 ? "s" : ""}</span>}
+                                    </div>
+                                    <div className="meta">
+                                      <span>#{it.number}</span>
+                                      <span className={kindOf(it.author)}>{handleOf(it.author)}</span>
+                                      {it.code_refs.map((c, i) => (
+                                        <span key={i} className="agent-text" style={{ cursor: "pointer" }} title={`keel blob ${c.blob} · provenance`} onClick={(e) => { e.stopPropagation(); showWhy(`${it.number}:${c.path}`, c.path); }}>⬡ {c.path}:{c.line_start}{c.line_end ? `-${c.line_end}` : ""}</span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                  <span className="trailing">
+                                    {it.status.state === "open"
+                                      ? <button className="btn-sec" style={{ height: 26 }} onClick={(e) => { e.stopPropagation(); transition(it.number, "close"); }}>Close</button>
+                                      : <button className="btn-sec" style={{ height: 26 }} onClick={(e) => { e.stopPropagation(); transition(it.number, "reopen"); }}>Reopen</button>}
+                                  </span>
+                                </div>
+                                {openIssue === it.number && (
+                                  <div style={{ padding: "0 14px 16px 14px", display: "grid", gap: 12 }}>
+                                    {it.body && <p style={{ color: "var(--body)", margin: 0 }}>{it.body}</p>}
+                                    <div className="mrow">
+                                      <span className="pk-label">assignees</span>
+                                      {it.assignees.map((id) => (<span key={id} className="pill">{handleOf(id)}{canAct && <button className="pill-x" title="unassign" onClick={() => issueAction(it.number, "unassign", { assignee: id })}>×</button>}</span>))}
+                                      {canAct && me && !it.assignees.includes(me.id) && (<button className="link" onClick={() => issueAction(it.number, "assign", { assignee: me.id })}>assign me</button>)}
+                                      {it.assignees.length === 0 && !canAct && <span className="muted">none</span>}
+                                    </div>
+                                    <div className="mrow">
+                                      <span className="pk-label">labels</span>
+                                      {it.labels.map((l) => (<span key={l} className="pill">{l}{canAct && <button className="pill-x" title="remove" onClick={() => issueAction(it.number, "unlabel", { label: l })}>×</button>}</span>))}
+                                      {canAct && (
+                                        <input style={{ height: 26, maxWidth: 130 }} placeholder="add label…" value={labelDraft[it.number] ?? ""} onChange={(e) => setLabelDraft((d) => ({ ...d, [it.number]: e.target.value }))}
+                                          onKeyDown={(e) => { if (e.key === "Enter" && (labelDraft[it.number] ?? "").trim()) { issueAction(it.number, "label", { label: labelDraft[it.number].trim() }); setLabelDraft((d) => ({ ...d, [it.number]: "" })); } }} />
+                                      )}
+                                    </div>
+                                    {it.code_refs.map((c) => {
+                                      const key = `${it.number}:${c.path}`;
+                                      return prov[key] ? (
+                                        <div className="card" key={key} style={{ padding: 12 }}>
+                                          <div className="pk-label" style={{ marginBottom: 6 }}>keel provenance · {c.path}</div>
+                                          {prov[key].length === 0 && <div className="muted">no recorded history</div>}
+                                          {prov[key].map((pp, j) => (<div key={j} className="stat-row"><span>⬡ {pp.change.slice(0, 10)} · {pp.intent}</span><span className="muted">{pp.author}</span></div>))}
+                                        </div>
+                                      ) : null;
+                                    })}
+                                    <div><div className="pk-label" style={{ marginBottom: 8 }}>Discussion</div><Thread target={`issue:${it.number}`} /></div>
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                        </div>
+                      </div>
                     ) : (
-                      <>
-                        <button className="merge-btn" onClick={() => mergePr(p.number)}>Merge</button>
-                        {canAct && <button className="link" onClick={() => closePr(p.number, false)}>close</button>}
-                        <span className="muted">
-                          gate: keel-verify green + an approving review from someone other than the author
-                        </span>
-                      </>
+                      <div className="board">
+                        {[
+                          { k: "open", label: "Open" },
+                          { k: "completed", label: "Completed" },
+                          { k: "not_planned", label: "Not planned" },
+                          { k: "cancelled", label: "Cancelled" },
+                          { k: "duplicate", label: "Duplicate" },
+                        ].map((col) => {
+                          const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k && matchQ(`${i.title} ${i.body} #${i.number} ${i.labels.join(" ")}`));
+                          if (col.k !== "open" && inCol.length === 0) return null;
+                          return (
+                            <div className="board-col" key={col.k}>
+                              <div className="board-col-head">{col.label} <span className="muted">{inCol.length}</span></div>
+                              {inCol.map((it) => (
+                                <div className="board-card" key={it.number} onClick={() => { setIssueView("list"); setOpenIssue(it.number); }}>
+                                  <div className="muted" style={{ fontSize: 11 }}>#{it.number}</div>
+                                  <div style={{ fontSize: 13, fontWeight: 500, marginTop: 4 }}>{it.title}</div>
+                                  {it.assignees.length > 0 && <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>◎ {it.assignees.map((id) => handleOf(id)).join(", ")}</div>}
+                                </div>
+                              ))}
+                            </div>
+                          );
+                        })}
+                      </div>
                     )}
                   </div>
-                  {prReviews.length === 0 && <p className="muted">no reviews yet</p>}
-                  {prReviews.map((r) => (
-                    <button className="review clickable" key={r.id} onClick={() => setOpenReview(r)} title="open review">
-                      <span className={"verdict " + r.verdict}>{r.verdict.replace("_", " ")}</span>
-                      <b className={actors.find((a) => a.id === r.reviewer)?.kind ?? ""}>{handleOf(r.reviewer)}</b>
-                      <span className="rv-summary">{r.summary || "open review →"}</span>
-                      {r.findings?.length > 0 && (
-                        <span className="find-count">{r.findings.length} finding{r.findings.length > 1 ? "s" : ""}</span>
-                      )}
-                    </button>
-                  ))}
-                  <div className="auto-review-bar">
-                    <button className="auto-review-btn" disabled={autoReviewing === p.number} onClick={() => autoReview(p.number)}>
-                      {autoReviewing === p.number ? "agent reviewing…" : "⬡ Agent auto-review"}
-                    </button>
-                    <span className="muted">runs checks + reconciles the change's claims, then posts an accountable agent review</span>
-                    {canAct && (
-                      <select className="req-reviewer" value="" onChange={(e) => { requestReviewer(p.number, e.target.value); e.target.value = ""; }}>
-                        <option value="">request a reviewer…</option>
-                        {actors.filter((a) => a.id !== p.author && !p.reviewers?.includes(a.id)).map((a) => (
-                          <option key={a.id} value={a.id}>{a.handle} ({a.kind})</option>
-                        ))}
-                      </select>
-                    )}
-                  </div>
-                  <div className="review-form">
-                    <select
-                      value={reviewForm.verdict}
-                      onChange={(e) => setReviewForm({ ...reviewForm, verdict: e.target.value })}
-                    >
-                      <option value="approve">approve</option>
-                      <option value="request_changes">request changes</option>
-                      <option value="reject">reject</option>
-                      <option value="comment">comment</option>
-                    </select>
-                    <input
-                      placeholder={`review as ${handleOf(actingAs)}…`}
-                      value={reviewForm.summary}
-                      onChange={(e) => setReviewForm({ ...reviewForm, summary: e.target.value })}
-                    />
-                    <button onClick={() => submitReview(p.number)}>Submit review</button>
-                    <div className="finding-row">
-                      <span className="muted">finding (optional):</span>
-                      <input
-                        className="fp"
-                        placeholder="path"
-                        value={reviewForm.findPath}
-                        onChange={(e) => setReviewForm({ ...reviewForm, findPath: e.target.value })}
-                        spellCheck={false}
-                      />
-                      <select value={reviewForm.findSev} onChange={(e) => setReviewForm({ ...reviewForm, findSev: e.target.value })}>
-                        <option value="info">info</option>
-                        <option value="warn">warn</option>
-                        <option value="blocker">blocker</option>
-                      </select>
-                      <input
-                        className="fn"
-                        placeholder="what's wrong"
-                        value={reviewForm.findNote}
-                        onChange={(e) => setReviewForm({ ...reviewForm, findNote: e.target.value })}
-                      />
+                )}
+
+                {tab === "prs" && (
+                  <div className="stack">
+                    <form className="form-row" onSubmit={createPr}>
+                      <input placeholder="Open a PR from HEAD…" value={prTitle} onChange={(e) => setPrTitle(e.target.value)} />
+                      <input style={{ maxWidth: 180 }} placeholder="filter…" value={q} onChange={(e) => setQ(e.target.value)} spellCheck={false} />
+                      <button type="submit">Open PR</button>
+                    </form>
+                    <div className="panel">
+                      <div className="panel-head"><span className="strong">{prs.filter((p) => p.state === "open").length} open</span><span className="muted">{prs.length} total</span></div>
+                      {prs.length === 0 && <div className="empty">no pull requests yet</div>}
+                      <div className="rows">
+                        {[...prs].filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
+                          const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
+                          const st = p.state === "merged" ? "merged" : p.state === "closed" ? "closed" : p.verification;
+                          return (
+                            <div key={p.number}>
+                              <div className="row" onClick={() => setOpenPr(openPr === p.number ? null : p.number)}>
+                                <div className="main">
+                                  <div className="line1">
+                                    <span className="rtitle">{p.title}</span>
+                                    <span className={"pill " + st}>{st}</span>
+                                    {prReviews.length > 0 && <span className="pill">{prReviews.length} review{prReviews.length > 1 ? "s" : ""}</span>}
+                                  </div>
+                                  <div className="meta">
+                                    <span>!{p.number}</span>
+                                    <span className="agent-text">⬡ {(p.changes[0] ?? "").slice(0, 10)}</span>
+                                    <span className={kindOf(p.author)}>{handleOf(p.author)}</span>
+                                    {p.reviewers?.length > 0 && <span>◎ {p.reviewers.map((id) => handleOf(id)).join(", ")}</span>}
+                                  </div>
+                                </div>
+                                <span className="trailing swap">
+                                  <span className="diffstat muted">{prReviews.length ? `${prReviews.length} rev` : "review"}</span>
+                                  <span className="openlink">{openIcon}</span>
+                                </span>
+                              </div>
+                              {openPr === p.number && (
+                                <div style={{ padding: "0 14px 16px 14px", display: "grid", gap: 12 }}>
+                                  <div className="mrow">
+                                    {p.state === "merged" ? <span className="pill pass">✓ merged</span>
+                                      : p.state === "closed" ? <><span className="pill closed">closed</span>{canAct && <button className="link" onClick={() => closePr(p.number, true)}>reopen</button>}</>
+                                        : <>
+                                          <button style={{ height: 28 }} onClick={() => mergePr(p.number)}>Merge</button>
+                                          {canAct && <button className="link" onClick={() => closePr(p.number, false)}>close</button>}
+                                          <span className="muted" style={{ fontSize: 12 }}>gate: keel-verify green + an approving review from someone other than the author</span>
+                                        </>}
+                                  </div>
+                                  {prReviews.length === 0 && <div className="muted">no reviews yet</div>}
+                                  {prReviews.map((r) => (
+                                    <button className="review-row" key={r.id} onClick={() => setOpenReview(r)} title="open review">
+                                      <span className={"pill " + r.verdict}>{r.verdict.replace("_", " ")}</span>
+                                      <b className={kindOf(r.reviewer)}>{handleOf(r.reviewer)}</b>
+                                      <span className="rv-summary">{r.summary || "open review →"}</span>
+                                      {r.findings?.length > 0 && <span className="pill">{r.findings.length} finding{r.findings.length > 1 ? "s" : ""}</span>}
+                                      <span className="openlink" style={{ position: "static", opacity: 1, transform: "none", marginLeft: "auto" }}>{openIcon}</span>
+                                    </button>
+                                  ))}
+                                  <div className="mrow">
+                                    <button className="btn-sec" disabled={autoReviewing === p.number} onClick={() => autoReview(p.number)}>
+                                      {autoReviewing === p.number ? "agent reviewing…" : "⬡ Agent auto-review"}
+                                    </button>
+                                    {canAct && (
+                                      <select value="" onChange={(e) => { requestReviewer(p.number, e.target.value); e.target.value = ""; }}>
+                                        <option value="">request a reviewer…</option>
+                                        {actors.filter((a) => a.id !== p.author && !p.reviewers?.includes(a.id)).map((a) => (<option key={a.id} value={a.id}>{a.handle} ({a.kind})</option>))}
+                                      </select>
+                                    )}
+                                  </div>
+                                  <div className="form-row">
+                                    <select value={reviewForm.verdict} onChange={(e) => setReviewForm({ ...reviewForm, verdict: e.target.value })}>
+                                      <option value="approve">approve</option>
+                                      <option value="request_changes">request changes</option>
+                                      <option value="reject">reject</option>
+                                      <option value="comment">comment</option>
+                                    </select>
+                                    <input placeholder={`review as ${handleOf(actingAs)}…`} value={reviewForm.summary} onChange={(e) => setReviewForm({ ...reviewForm, summary: e.target.value })} />
+                                    <button onClick={() => submitReview(p.number)}>Submit</button>
+                                  </div>
+                                  <div className="form-row">
+                                    <span className="pk-label">finding</span>
+                                    <input style={{ flex: 1 }} placeholder="path" value={reviewForm.findPath} onChange={(e) => setReviewForm({ ...reviewForm, findPath: e.target.value })} spellCheck={false} />
+                                    <select value={reviewForm.findSev} onChange={(e) => setReviewForm({ ...reviewForm, findSev: e.target.value })}>
+                                      <option value="info">info</option><option value="warn">warn</option><option value="blocker">blocker</option>
+                                    </select>
+                                    <input style={{ flex: 2 }} placeholder="what's wrong" value={reviewForm.findNote} onChange={(e) => setReviewForm({ ...reviewForm, findNote: e.target.value })} />
+                                  </div>
+                                  <div><div className="pk-label" style={{ marginBottom: 8 }}>Discussion · humans and agents, one accountable thread</div><Thread target={`pr:${p.number}`} /></div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
                     </div>
                   </div>
-                  <div className="thread-wrap">
-                    <h5>Discussion <span className="muted">humans and agents, one accountable thread</span></h5>
-                    <Thread target={`pr:${p.number}`} />
+                )}
+              </div>
+
+              <div className="side">
+                {secrets.length > 0 && (
+                  <div className="card" style={{ borderColor: "color-mix(in oklab, var(--fault) 30%, transparent)" }}>
+                    <div className="card-title" style={{ color: "var(--fault-text)" }}>⚠ {secrets.length} secret{secrets.length > 1 ? "s" : ""} on push</div>
+                    {secrets.slice(0, 5).map((s, i) => (<div key={i} className="stat-row" style={{ display: "block", marginTop: 6 }}>{s.title} — <span className="muted">{s.path}:{s.line}</span></div>))}
                   </div>
+                )}
+                <div className="card">
+                  <div className="card-title">Autonomy</div>
+                  {autonomy ? (
+                    <>
+                      <div className="stat-row"><span>tier</span><b>{autonomy.tier.toUpperCase()}</b></div>
+                      <div className="stat-row"><span>source</span><span className="muted">{autonomy.source}</span></div>
+                      <p className="muted" style={{ fontSize: 12, margin: "8px 0 0" }}>{TIERS[autonomy.tier]}</p>
+                      {isTenantOwner && (
+                        <select style={{ width: "100%", marginTop: 10 }} value={autonomy.tier} onChange={(e) => setTier(e.target.value)}>
+                          {["t0", "t1", "t2", "t3"].map((t) => (<option key={t} value={t}>{t.toUpperCase()} — {TIERS[t].split("—")[0].trim()}</option>))}
+                        </select>
+                      )}
+                    </>
+                  ) : <div className="muted">—</div>}
                 </div>
-              )}
-            </li>
-            );
-          })}
-        </ul>
-        </section>
-        )}
-      </main>
+                <div className="card">
+                  <div className="card-title">Drydock (CI)</div>
+                  {ciConfig?.url ? (
+                    <><div className="stat-row"><span>endpoint</span><span className="muted" style={{ maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis" }}>{ciConfig.url}</span></div><div className="stat-row"><span>source</span><span className="muted">{ciConfig.source}{ciConfig.has_secret ? " · secret" : ""}</span></div></>
+                  ) : <p className="muted" style={{ fontSize: 12, margin: 0 }}>{ciConfig?.source ?? "built-in"} — checks run on the built-in local runner.</p>}
+                  {isTenantOwner && (
+                    <form style={{ display: "grid", gap: 6, marginTop: 10 }} onSubmit={(e) => { e.preventDefault(); saveCiConfig(false); }}>
+                      <input placeholder="https://your-ci/hull" value={ciUrl} onChange={(e) => setCiUrl(e.target.value)} spellCheck={false} />
+                      <input type="text" placeholder="shared secret (optional)" value={ciSecret} onChange={(e) => setCiSecret(e.target.value)} spellCheck={false} />
+                      <div className="mrow">
+                        <button type="submit" style={{ height: 28 }}>Set</button>
+                        <button type="button" className="link" onClick={() => setCiSecret(bytesToHex(crypto.getRandomValues(new Uint8Array(32))))}>generate</button>
+                        {ciConfig?.source === "repo" && <button type="button" className="link" onClick={() => saveCiConfig(true)}>clear</button>}
+                        <a className="link" href="https://github.com/tankrap/hull/blob/main/CI-SPEC.md" target="_blank" rel="noreferrer">spec ↗</a>
+                      </div>
+                    </form>
+                  )}
+                </div>
+                {mirror?.target && (
+                  <div className="card">
+                    <div className="card-title">Mirror</div>
+                    <div className="stat-row"><span>target</span><span className="muted">{mirror.target}</span></div>
+                    <div className="stat-row"><span>pushed</span><b>{mirror.outbound.length}</b></div>
+                    <p className="muted" style={{ fontSize: 11.5, margin: "8px 0 0" }}>loop-safe: forge-originated changes are never pushed back.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </>
       )}
     </div>
   );
@@ -1394,18 +1197,19 @@ function ReviewPage({
   };
 
   return (
-    <div className="app review-page">
-      <header className="top">
-        <button className="back" onClick={onBack}>
-          ← situation room
-        </button>
-        <div className="tag">review package · synthesized understanding, not a diff</div>
+    <div className="shell review-page">
+      <header className="topbar">
+        <button className="brand" onClick={onBack} title="back to situation room"><span className="mark" aria-hidden /> <span className="wordmark">hull</span></button>
+        <div className="crumbs"><button className="link" onClick={onBack}>← situation room</button></div>
+        <div className="grow" />
+        <span className="muted" style={{ fontSize: 12.5 }}>review package</span>
       </header>
-      <main className="review-main">
+      <div className="page-body">
         <div className="rp-head">
-          <span className={"verdict " + review.verdict}>{review.verdict.replace("_", " ")}</span>
-          <h1>{pr ? `PR !${pr.number} · ${pr.title}` : review.target}</h1>
+          <span className={"pill " + review.verdict}>{review.verdict.replace("_", " ")}</span>
+          <span className="rp-title">{pr ? `PR !${pr.number} · ${pr.title}` : review.target}</span>
         </div>
+        <div className="stack">{/* review cards */}
         {(() => {
           // F5: degraded-state badges — surface where the review is thinner than ideal.
           const needs = shownLedger?.claims.filter((c) => c.status === "needs_judgment").length ?? 0;
@@ -1743,7 +1547,8 @@ function ReviewPage({
             </div>
           </section>
         )}
-      </main>
+        </div>
+      </div>
     </div>
   );
 }
