@@ -292,6 +292,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/comments", get(comments_list).post(create_comment))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
+        .route("/api/repos/:tenant/:repo/change/:id/semantic", get(change_semantic))
         .route("/api/repos/:tenant/:repo/change/:id/ledger", get(change_ledger))
         .route("/api/repos/:tenant/:repo/change/:id/claims/:claim/resolve", post(resolve_claim))
         .route("/api/repos/:tenant/:repo/tree/:tree/tar", get(tree_archive))
@@ -897,6 +898,13 @@ async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(Strin
 /// semantic-operations summary — the review's diff viewer.
 async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
     Json(json!({ "files": app.repos.diff(&tenant, &repo, &id) }))
+}
+
+/// The **content-addressed semantic summary** of a change (`GET …/change/:id/semantic`, B1): files
+/// purely moved (proven by an unchanged blob id, not guessed by similarity) vs really added/deleted/
+/// modified, and whether the whole change is a behavior-preserving `pure_move`.
+async fn change_semantic(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
+    Json(json!({ "semantic": app.repos.semantic_summary(&tenant, &repo, &id) }))
 }
 
 /// **keel-native content-addressed source fetch** (`GET …/tree/:tree/tar`): the change's keel tree,

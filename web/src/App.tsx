@@ -1285,6 +1285,8 @@ function ReviewPage({
   type Ledger = { change: string; claims: Claim[] };
   const [change, setChange] = useState<ChangeInfo | null>(null);
   const [diff, setDiff] = useState<FileDiff[]>([]);
+  type Semantic = { moves: { from: string; to: string; blob: string }[]; added: string[]; deleted: string[]; modified: string[]; pure_move: boolean };
+  const [semantic, setSemantic] = useState<Semantic | null>(null);
   const [ledger, setLedger] = useState<Ledger | null>(null);
   const [openFile, setOpenFile] = useState<string | null>(null);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
@@ -1303,6 +1305,10 @@ function ReviewPage({
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/diff`)
       .then((r) => r.json())
       .then((d) => setDiff(d.files ?? []))
+      .catch(() => {});
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/semantic`)
+      .then((r) => r.json())
+      .then((d) => setSemantic(d.semantic ?? null))
       .catch(() => {});
   }, [changeId, tenant, repo]);
   // If this review carries an immutable ledger snapshot (an agent reconciliation review), show that
@@ -1639,8 +1645,16 @@ function ReviewPage({
         <section className="rp-card">
           <h3>
             Changes <span className="muted">({diff.length} files) · what changed, as operations</span>
+            {semantic?.pure_move && <span className="badge ok" title="every file was relocated with byte-identical content (proven by content address) — behavior-preserving"> ⇄ pure move</span>}
           </h3>
-          {diff.length === 0 && <p className="muted">no textual changes (or binary)</p>}
+          {semantic && semantic.moves.length > 0 && (
+            <ul className="rp-files" style={{ marginBottom: 10 }}>
+              {semantic.moves.map((m, i) => (
+                <li key={i}><span className="op add">renamed</span> <code>{m.from}</code> <span className="muted">→</span> <code>{m.to}</code> <span className="muted" title="same content-address — an exact move, not a git similarity guess">⬡ {m.blob.slice(0, 10)}</span></li>
+              ))}
+            </ul>
+          )}
+          {diff.length === 0 && !semantic?.moves.length && <p className="muted">no textual changes (or binary)</p>}
           {diff.length > 0 &&
             (() => {
               const allOps = [...new Set(diff.flatMap((f) => f.ops))];

@@ -270,6 +270,28 @@ pub struct FileDiff {
 const MAX_DIFF_FILES: usize = 40;
 const MAX_BLOB_FOR_DIFF: usize = 256 * 1024; // skip huge/binary blobs
 
+/// A file relocated with byte-identical content — a **pure move**, detected exactly by content
+/// address (the blob id is unchanged), not guessed by similarity like git.
+#[derive(serde::Serialize)]
+pub struct Move {
+    pub from: String,
+    pub to: String,
+    /// The shared blob content-address that proves the two paths are the same bytes.
+    pub blob: String,
+}
+
+/// A content-addressed classification of a change: which files were purely moved vs really changed.
+/// `pure_move` (every change is a move, no content touched) marks a mechanical, behavior-preserving
+/// change — the low-risk case a reviewer (or an auto-approve policy) can treat differently.
+#[derive(serde::Serialize)]
+pub struct SemanticSummary {
+    pub moves: Vec<Move>,
+    pub added: Vec<String>,
+    pub deleted: Vec<String>,
+    pub modified: Vec<String>,
+    pub pure_move: bool,
+}
+
 /// The leading identifier after a keyword (`fn foo` → `foo`).
 fn ident_after(s: &str) -> String {
     s.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect()
@@ -595,6 +617,55 @@ impl RepoHost {
         // Keep it reachable (unreferenced changes can be GC'd).
         let _ = store.set_ref(&format!("hull/fix/{}", id.to_hex()), &id);
         Some(id.to_hex())
+    }
+
+    /// Content-addressed semantic summary of a change (B1): which files were **purely moved** (same
+    /// blob id, new path) vs genuinely added/deleted/modified. Because keel addresses blobs by
+    /// content, a move is detected **exactly** — a removed path's blob id reappearing at an added
+    /// path is provably the same bytes — where git can only guess by similarity. A change whose every
+    /// file-level change is a move is `pure_move`: mechanical and behavior-preserving.
+    pub fn semantic_summary(&self, tenant: &str, repo: &str, hex: &str) -> SemanticSummary {
+        let empty = || SemanticSummary { moves: vec![], added: vec![], deleted: vec![], modified: vec![], pure_move: false };
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return empty() };
+        let Some(cid) = ObjectId::from_hex(hex) else { return empty() };
+        let change = match store.get(&cid).ok().flatten() {
+            Some(Object::Change(c)) => c,
+            _ => return empty(),
+        };
+        let mut head = HashMap::new();
+        flatten_tree(&store, change.tree, "", &mut head, 0);
+        let mut parent = HashMap::new();
+        if let Some(p) = change.parents.first() {
+            if let Some(Object::Change(pc)) = store.get(p).ok().flatten() {
+                flatten_tree(&store, pc.tree, "", &mut parent, 0);
+            }
+        }
+        // Partition by path: added (new only), deleted (parent only), modified (both, blob differs).
+        let mut added: Vec<(String, ObjectId)> = head.iter().filter(|(p, _)| !parent.contains_key(*p)).map(|(p, id)| (p.clone(), *id)).collect();
+        let mut deleted: Vec<(String, ObjectId)> = parent.iter().filter(|(p, _)| !head.contains_key(*p)).map(|(p, id)| (p.clone(), *id)).collect();
+        let mut modified: Vec<String> = head.iter().filter(|(p, id)| parent.get(*p).is_some_and(|pid| pid != *id)).map(|(p, _)| p.clone()).collect();
+        added.sort();
+        deleted.sort();
+        modified.sort();
+        // Pair identical blobs across deleted↔added: same content-address ⇒ a pure move. Greedy per
+        // blob so duplicated content still pairs one-to-one.
+        let mut moves = Vec::new();
+        let mut used_del = vec![false; deleted.len()];
+        let mut leftover_added = Vec::new();
+        for (to, aid) in added.into_iter() {
+            if let Some(k) = deleted.iter().enumerate().find(|(i, (_, did))| !used_del[*i] && *did == aid).map(|(i, _)| i) {
+                used_del[k] = true;
+                moves.push(Move { from: deleted[k].0.clone(), to, blob: aid.to_hex() });
+            } else {
+                leftover_added.push(to);
+            }
+        }
+        let leftover_deleted: Vec<String> = deleted.iter().enumerate().filter(|(i, _)| !used_del[*i]).map(|(_, (p, _))| p.clone()).collect();
+        moves.sort_by(|a, b| a.to.cmp(&b.to));
+        leftover_added.sort();
+        // Pure move: at least one move, and nothing else actually changed content.
+        let pure_move = !moves.is_empty() && leftover_added.is_empty() && leftover_deleted.is_empty() && modified.is_empty();
+        SemanticSummary { moves, added: leftover_added, deleted: leftover_deleted, modified, pure_move }
     }
 
     /// The observable facts of a change — touched files, semantic operations, verification, and
@@ -934,6 +1005,40 @@ mod tests {
             verification: keel_store::Verification::Unverified,
         };
         store.put(&Object::Change(change)).unwrap()
+    }
+
+    #[test]
+    fn pure_move_is_detected_by_content_address() {
+        let tmp = std::env::temp_dir().join(format!("hull-move-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("t/r/.keel/store")).unwrap();
+        let host = RepoHost::new(&tmp);
+        let (parent_hex, moved_hex, mixed_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            // parent: a file + an unrelated file
+            let p_tree = tree_from(&store, &tmp, "p", &[("src/old.rs", "fn f() {}\n"), ("README", "hi\n")]);
+            let parent = commit(&store, vec![], p_tree);
+            // pure move: old.rs → new.rs, byte-identical; README untouched
+            let m_tree = tree_from(&store, &tmp, "m", &[("src/new.rs", "fn f() {}\n"), ("README", "hi\n")]);
+            let moved = commit(&store, vec![parent], m_tree);
+            // mixed: same move, but README also edited → not a pure move
+            let x_tree = tree_from(&store, &tmp, "x", &[("src/new.rs", "fn f() {}\n"), ("README", "changed\n")]);
+            let mixed = commit(&store, vec![parent], x_tree);
+            (parent.to_hex(), moved.to_hex(), mixed.to_hex())
+        };
+        let _ = parent_hex;
+
+        let s = host.semantic_summary("t", "r", &moved_hex);
+        assert!(s.pure_move, "a content-identical relocation is a pure move");
+        assert_eq!(s.moves.len(), 1);
+        assert_eq!((s.moves[0].from.as_str(), s.moves[0].to.as_str()), ("src/old.rs", "src/new.rs"));
+        assert!(s.added.is_empty() && s.deleted.is_empty() && s.modified.is_empty(), "nothing else changed");
+
+        let m = host.semantic_summary("t", "r", &mixed_hex);
+        assert!(!m.pure_move, "a move alongside a content edit is NOT a pure move");
+        assert_eq!(m.moves.len(), 1); // the move is still detected
+        assert_eq!(m.modified, vec!["README".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
