@@ -25,13 +25,13 @@ const run = async () => {
     await shot(page, `home-${theme}`);
     // sign in as demo (best-effort)
     try { await page.getByText("demo", { exact: true }).first().click({ timeout: 2000 }); await page.waitForTimeout(800); } catch {}
-    // open a repo (first flat row in the Repositories panel)
-    try { await page.locator(".rows .row").first().click({ timeout: 3000 }); await page.waitForTimeout(1200); await shot(page, `repo-${theme}`); } catch { console.log("no repo to open"); }
+    // open a repo card
+    try { await page.locator(".repo").first().click({ timeout: 3000 }); await page.waitForTimeout(1200); await shot(page, `repo-${theme}`); } catch { console.log("no repo to open"); }
     // PRs tab
     try { await page.getByText(/pull requests/i).first().click({ timeout: 2000 }); await page.waitForTimeout(1000); await shot(page, `prs-${theme}`); } catch {}
     // expand first PR then open its review
-    try { await page.locator(".panel .rows .row").first().click({ timeout: 2000 }); await page.waitForTimeout(600);
-          await page.locator(".review-row").first().click({ timeout: 2500 }); await page.waitForTimeout(1600); await shot(page, `review-${theme}`); } catch {}
+    try { await page.locator(".it-title").first().click({ timeout: 2000 }); await page.waitForTimeout(600);
+          await page.locator(".review").first().click({ timeout: 2500 }); await page.waitForTimeout(1600); await shot(page, `review-${theme}`); } catch {}
     await ctx.close();
   }
   await browser.close();
