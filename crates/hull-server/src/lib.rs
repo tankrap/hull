@@ -265,6 +265,7 @@ fn make_router(app: App) -> Router {
         .route("/api/feed", get(feed))
         .route("/api/actors", get(actors_list).post(register_actor))
         .route("/api/actors/:id/revoke", post(revoke_actor))
+        .route("/api/actors/:id/renew", post(renew_delegation))
         .route("/api/actors/:id/nostr", post(set_nostr_key))
         .route("/api/accounts", get(accounts_list))
         .route("/api/accounts/:id/members", post(add_member))
@@ -519,10 +520,14 @@ async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, 
             let scope = body.get("scope").and_then(Value::as_str).unwrap_or("*");
             let child_pub = body.get("child_pub").and_then(Value::as_str).unwrap_or("").trim();
             let sig_hex = body.get("delegation_sig").and_then(Value::as_str).unwrap_or("").trim();
+            // A standing agent may be minted with a short TTL (`expires_unix`) — "never an eternal
+            // token"; the client signs the same expiry into the hop. 0 = no expiry.
+            let expires_unix = body.get("expires_unix").and_then(Value::as_u64).unwrap_or(0);
+            let lifetime = if expires_unix > 0 { Lifetime::Ephemeral { expires_unix } } else { Lifetime::Static };
             if !child_pub.is_empty() && !sig_hex.is_empty() {
                 // Client-signed: verify the parent's signature by assembling + verifying the chain.
                 let Ok(sig) = hex::decode(sig_hex) else { return (StatusCode::BAD_REQUEST, "delegation_sig must be hex").into_response() };
-                match identity::delegate(&handle, &parent, child_pub, scope, Lifetime::Static, sig) {
+                match identity::delegate(&handle, &parent, child_pub, scope, lifetime, sig) {
                     Some(actor) => {
                         app.store.put_actor(actor.clone());
                         return (StatusCode::CREATED, Json(json!({ "actor": actor }))).into_response();
@@ -533,7 +538,7 @@ async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, 
             // Fallback: only the demo owner's key is known server-side, so Hull can sign for it.
             let demo_id = identity::human_from_secret("demo", DEMO_OWNER_SECRET).map(|m| m.actor.id).unwrap_or_default();
             if parent.id == demo_id {
-                match identity::mint_agent(&handle, &parent, DEMO_OWNER_SECRET, scope, Lifetime::Static) {
+                match identity::mint_agent(&handle, &parent, DEMO_OWNER_SECRET, scope, lifetime) {
                     Some(m) => m,
                     None => return (StatusCode::UNPROCESSABLE_ENTITY, "could not mint — parent is not accountable").into_response(),
                 }
@@ -567,6 +572,53 @@ async fn revoke_actor(State(app): State<App>, headers: axum::http::HeaderMap, Pa
     target.revoked = true;
     app.store.put_actor(target);
     Json(json!({ "revoked": id, "by": caller.handle })).into_response()
+}
+
+/// Renew a standing agent's short-TTL delegation (`POST /api/actors/:id/renew` `{expires_unix,
+/// delegation_sig}`). "Never an eternal token": a standing agent holds a short-lived delegation that
+/// its **delegating parent** (a machine credential that itself chains to the human) re-issues before
+/// it lapses. Only that immediate parent may renew — it signs a fresh hop over the same scope with a
+/// new expiry; Hull swaps in the new leaf hop and re-verifies. Revocation of any ancestor still kills
+/// it, and the parent can simply stop renewing to let it expire.
+async fn renew_delegation(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
+    use hull_core::{ActorKind, Delegation, DelegationHop};
+    let caller = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(mut target) = app.store.actor(&id) else {
+        return (StatusCode::NOT_FOUND, "no such actor").into_response();
+    };
+    let Some(chain) = target.delegation.as_ref().map(|d| d.chain.clone()) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "actor has no delegation to renew").into_response();
+    };
+    if chain.len() < 2 {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "delegation has no delegating parent").into_response();
+    }
+    // Only the leaf's immediate parent may renew it (the machine credential that issued it).
+    if chain[chain.len() - 2].principal != caller.id {
+        return (StatusCode::FORBIDDEN, "only the delegating parent may renew this agent").into_response();
+    }
+    let scope = chain[chain.len() - 1].scope.clone(); // renewal keeps the same (already-attenuated) scope
+    let expires_unix = body.get("expires_unix").and_then(Value::as_u64).unwrap_or(0);
+    let sig_hex = body.get("delegation_sig").and_then(Value::as_str).unwrap_or("").trim();
+    let Ok(sig) = hex::decode(sig_hex) else { return (StatusCode::BAD_REQUEST, "delegation_sig must be hex").into_response() };
+    // The parent must have signed the fresh hop (over its own id → this leaf, the same scope, new TTL).
+    let msg = identity::hop_message(&caller.id, &id, ActorKind::Agent, &scope, expires_unix);
+    if !identity::verify_bytes(&caller.id, &msg, &sig) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "renewal signature does not verify").into_response();
+    }
+    let mut new_chain = chain;
+    let last = new_chain.len() - 1;
+    new_chain[last] = DelegationHop { principal: id.clone(), kind: ActorKind::Agent, scope, expires_unix, signature: sig };
+    let deleg = Delegation { chain: new_chain };
+    if deleg.verify(&id, 0, &|_| false).is_err() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "renewed delegation does not verify").into_response();
+    }
+    target.lifetime = if expires_unix > 0 { Lifetime::Ephemeral { expires_unix } } else { Lifetime::Static };
+    target.delegation = Some(deleg);
+    app.store.put_actor(target);
+    Json(json!({ "renewed": id, "expires_unix": expires_unix })).into_response()
 }
 
 /// Opt an actor into nostr notifications (`POST /api/actors/:id/nostr` `{pubkey}`). Self-only: you
