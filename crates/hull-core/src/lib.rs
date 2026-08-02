@@ -51,6 +51,10 @@ pub struct Actor {
     /// secp256k1 nostr pubkey for notification fan-out (code-owner pings), if the actor opted in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nostr_pubkey: Option<String>,
+    /// Revoked actors cannot authenticate or author, and — because their id sits in every descendant's
+    /// delegation chain — revoking one **propagates** to its whole subtree via [`Delegation::verify`].
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,13 +98,21 @@ pub struct DelegationHop {
     pub kind: ActorKind,
     /// Attenuated scope for this hop — a subset of the parent's (scope + TTL + ref-glob).
     pub scope: String,
-    /// Ed25519 signature by the PARENT principal over this hop (empty until the crypto layer, M1).
+    /// Unix expiry for this hop's grant; `0` = no expiry (a standing delegation). A hop may not
+    /// outlive its parent — the verifier enforces monotonic (non-increasing) TTL down the chain.
+    #[serde(default)]
+    pub expires_unix: u64,
+    /// Ed25519 signature by the PARENT principal over this hop's canonical bytes
+    /// ([`identity::hop_message`]). Empty on the root hop (a human is self-rooted) and on any
+    /// structurally-minted (pre-crypto) hop; the [`Delegation::verify`] crypto gate rejects the
+    /// latter at every authoring boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signature: Vec<u8>,
 }
 
 impl Delegation {
-    /// The human principal at the root, or `None` if the chain doesn't start at a human.
+    /// The human principal at the root, or `None` if the chain doesn't start at a human. This is the
+    /// **structural** check (kind only); [`Delegation::verify`] is the cryptographic gate.
     pub fn human_root(&self) -> Option<&ActorId> {
         match self.chain.first() {
             Some(h) if h.kind == ActorKind::Human => Some(&h.principal),
@@ -111,7 +123,7 @@ impl Delegation {
 
 /// Static (registered, long-lived) or ephemeral (session-scoped, auto-expiring). The delegation
 /// chain on [`Actor`] carries who delegated it; lifetime carries only how long it lives.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Lifetime {
     Static,
@@ -426,13 +438,13 @@ mod tests {
     use super::*;
 
     fn human(id: &str) -> Actor {
-        Actor { id: id.into(), kind: ActorKind::Human, lifetime: Lifetime::Static, handle: id.into(), delegation: None, nostr_pubkey: None }
+        Actor { id: id.into(), kind: ActorKind::Human, lifetime: Lifetime::Static, handle: id.into(), delegation: None, nostr_pubkey: None , revoked: false }
     }
     fn agent(id: &str, delegation: Option<Delegation>) -> Actor {
-        Actor { id: id.into(), kind: ActorKind::Agent, lifetime: Lifetime::Ephemeral { expires_unix: 0 }, handle: id.into(), delegation, nostr_pubkey: None }
+        Actor { id: id.into(), kind: ActorKind::Agent, lifetime: Lifetime::Ephemeral { expires_unix: 0 }, handle: id.into(), delegation, nostr_pubkey: None , revoked: false }
     }
     fn hop(id: &str, kind: ActorKind) -> DelegationHop {
-        DelegationHop { principal: id.into(), kind, scope: "*".into(), signature: vec![] }
+        DelegationHop { principal: id.into(), kind, scope: "*".into(), expires_unix: 0, signature: vec![] }
     }
 
     #[test]

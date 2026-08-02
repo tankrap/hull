@@ -171,6 +171,38 @@ fn seed_if_empty(store: &dyn Store) {
     }
     ensure_demo_owner(store);
     backfill_members(store);
+    backfill_accountability(store);
+}
+
+/// Migration for the crypto-delegation milestone (NEW-1166): any agent whose delegation doesn't
+/// cryptographically verify — including legacy agents minted before hops were signed, or with no
+/// delegation at all — is re-rooted at the demo human with a **signed** hop. Without this, enforcing
+/// [`Delegation::verify`] at the authoring gate would lock out agents seeded by an earlier build.
+/// Idempotent: already-verifiable agents are skipped. Only the demo human can be signed for here (its
+/// key is known); a real deployment re-delegates through the owning human instead.
+fn backfill_accountability(store: &dyn Store) {
+    use hull_core::{ActorKind, Delegation, DelegationHop};
+    let Some(demo) = identity::human_from_secret("demo", DEMO_OWNER_SECRET) else { return };
+    let demo_id = demo.actor.id;
+    let no_rev = |_: &str| false;
+    for mut a in store.actors() {
+        if a.kind != ActorKind::Agent {
+            continue;
+        }
+        let verified = a.delegation.as_ref().map(|d| d.verify(&a.id, 0, &no_rev).is_ok()).unwrap_or(false);
+        if verified {
+            continue;
+        }
+        let Some(sig) = identity::sign_hop(DEMO_OWNER_SECRET, &demo_id, &a.id, ActorKind::Agent, "*", 0) else { continue };
+        a.delegation = Some(Delegation {
+            chain: vec![
+                DelegationHop { principal: demo_id.clone(), kind: ActorKind::Human, scope: "*".into(), expires_unix: 0, signature: vec![] },
+                DelegationHop { principal: a.id.clone(), kind: ActorKind::Agent, scope: "*".into(), expires_unix: 0, signature: sig },
+            ],
+        });
+        eprintln!("hull: backfilled a signed delegation for agent {} (rooted at demo)", a.handle);
+        store.put_actor(a);
+    }
 }
 
 /// A published demo credential: a fixed Ed25519 secret so a local/demo instance has a **known** human
@@ -225,6 +257,7 @@ fn make_router(app: App) -> Router {
         .route("/api/home", get(home))
         .route("/api/feed", get(feed))
         .route("/api/actors", get(actors_list).post(register_actor))
+        .route("/api/actors/:id/revoke", post(revoke_actor))
         .route("/api/accounts", get(accounts_list))
         .route("/api/accounts/:id/members", post(add_member))
         .route("/api/auth/challenge", get(auth_challenge))
@@ -442,7 +475,9 @@ async fn actors_list(State(app): State<App>) -> Json<Value> {
                 "id": a.id,
                 "handle": a.handle,
                 "kind": a.kind,
-                "accountable": a.is_accountable(),
+                // Reflect the real gate: cryptographic verification + revocation, not just structure.
+                "accountable": accountable(&app, &a).is_ok(),
+                "revoked": a.revoked,
                 "human_root": a.human_principal(),
             })
         })
@@ -463,24 +498,67 @@ async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, 
         // Creating a *new* human identity is open self-serve onboarding — you're a new person, not
         // claiming to be an existing one.
         "human" => identity::mint_human(&handle),
-        // An agent is delegated by its parent — and the parent is the **authenticated caller**, never
-        // a body field. You can only mint an agent that chains to *you*, so a delegation can't be
-        // forged in someone else's name.
+        // An agent is delegated by its parent — the **authenticated caller**, never a body field, so a
+        // delegation can't be forged in someone else's name. The delegation hop is signed by the
+        // parent's Ed25519 key (NEW-1166): preferably client-side (the caller generates the child key
+        // and signs `child_pub`, so Hull never sees the agent's secret), with a demo-owner fallback
+        // where Hull holds the key.
         "agent" => {
             let parent = match require_actor(&app, &headers, "") {
                 Ok(a) => a,
                 Err(resp) => return resp,
             };
             let scope = body.get("scope").and_then(Value::as_str).unwrap_or("*");
-            match identity::mint_agent(&handle, &parent, scope, Lifetime::Ephemeral { expires_unix: 0 }) {
-                Some(m) => m,
-                None => return (StatusCode::UNPROCESSABLE_ENTITY, "you are not accountable — an agent must chain to a human").into_response(),
+            let child_pub = body.get("child_pub").and_then(Value::as_str).unwrap_or("").trim();
+            let sig_hex = body.get("delegation_sig").and_then(Value::as_str).unwrap_or("").trim();
+            if !child_pub.is_empty() && !sig_hex.is_empty() {
+                // Client-signed: verify the parent's signature by assembling + verifying the chain.
+                let Ok(sig) = hex::decode(sig_hex) else { return (StatusCode::BAD_REQUEST, "delegation_sig must be hex").into_response() };
+                match identity::delegate(&handle, &parent, child_pub, scope, Lifetime::Static, sig) {
+                    Some(actor) => {
+                        app.store.put_actor(actor.clone());
+                        return (StatusCode::CREATED, Json(json!({ "actor": actor }))).into_response();
+                    }
+                    None => return (StatusCode::UNPROCESSABLE_ENTITY, "delegation did not verify — bad signature, widened scope, or unaccountable parent").into_response(),
+                }
+            }
+            // Fallback: only the demo owner's key is known server-side, so Hull can sign for it.
+            let demo_id = identity::human_from_secret("demo", DEMO_OWNER_SECRET).map(|m| m.actor.id).unwrap_or_default();
+            if parent.id == demo_id {
+                match identity::mint_agent(&handle, &parent, DEMO_OWNER_SECRET, scope, Lifetime::Static) {
+                    Some(m) => m,
+                    None => return (StatusCode::UNPROCESSABLE_ENTITY, "could not mint — parent is not accountable").into_response(),
+                }
+            } else {
+                return (StatusCode::UNPROCESSABLE_ENTITY, "sign the delegation client-side: send { child_pub, delegation_sig } (Hull never holds an agent's secret)").into_response();
             }
         }
         _ => return (StatusCode::BAD_REQUEST, "kind must be 'human' or 'agent'").into_response(),
     };
     app.store.put_actor(minted.actor.clone());
     (StatusCode::CREATED, Json(json!({ "actor": minted.actor, "secret_key": minted.secret_key }))).into_response()
+}
+
+/// Revoke an actor (`POST /api/actors/:id/revoke`). Only an **ancestor** may revoke — the caller must
+/// be the target itself or appear as a principal in the target's delegation chain (its human root or
+/// an intermediate agent). Revocation propagates: because the revoked id sits in every descendant's
+/// chain, [`accountable`] then rejects the whole subtree. Blast radius = the subtree.
+async fn revoke_actor(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>) -> Response {
+    let caller = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(mut target) = app.store.actor(&id) else {
+        return (StatusCode::NOT_FOUND, "no such actor").into_response();
+    };
+    let ancestor = target.id == caller.id
+        || target.delegation.as_ref().map(|d| d.chain.iter().any(|h| h.principal == caller.id)).unwrap_or(false);
+    if !ancestor {
+        return (StatusCode::FORBIDDEN, "you may only revoke an actor in your own delegation subtree").into_response();
+    }
+    target.revoked = true;
+    app.store.put_actor(target);
+    Json(json!({ "revoked": id, "by": caller.handle })).into_response()
 }
 
 // ── auth: prove you hold an actor's Ed25519 key, get a session token ────────────────────────────
@@ -501,8 +579,10 @@ async fn auth_login(State(app): State<App>, Json(body): Json<Value>) -> Response
     let actor = body.get("actor").and_then(Value::as_str).unwrap_or("").to_string();
     let nonce = body.get("nonce").and_then(Value::as_str).unwrap_or("").to_string();
     let signature = body.get("signature").and_then(Value::as_str).unwrap_or("");
-    if app.store.actor(&actor).is_none() {
-        return (StatusCode::UNAUTHORIZED, "unknown actor").into_response();
+    match app.store.actor(&actor) {
+        None => return (StatusCode::UNAUTHORIZED, "unknown actor").into_response(),
+        Some(a) if a.revoked => return (StatusCode::UNAUTHORIZED, "this actor has been revoked").into_response(),
+        Some(_) => {}
     }
     {
         // consume the nonce (one-time)
@@ -608,9 +688,29 @@ fn authed_actor(app: &App, headers: &axum::http::HeaderMap) -> Option<Actor> {
 /// don't churn.
 fn require_actor(app: &App, headers: &axum::http::HeaderMap, _actor_id: &str) -> Result<Actor, Response> {
     match authed_actor(app, headers) {
-        Some(a) if a.is_accountable() => Ok(a),
-        Some(_) => Err((StatusCode::FORBIDDEN, "authenticated actor is not accountable").into_response()),
+        Some(a) => match accountable(app, &a) {
+            Ok(()) => Ok(a),
+            Err(why) => Err((StatusCode::FORBIDDEN, why).into_response()),
+        },
         None => Err((StatusCode::UNAUTHORIZED, "sign in required — no valid session token").into_response()),
+    }
+}
+
+/// The **cryptographic** accountability gate (NEW-1166), run at every authoring boundary. A human is
+/// its own root (must not be revoked); an agent's delegation must fully verify — every hop signed by
+/// its parent, scope only narrowing, within the depth cap and TTL, and no principal in the chain
+/// revoked. Revocation of any ancestor propagates here automatically. `Ok(())` means "may author".
+fn accountable(app: &App, a: &Actor) -> Result<(), String> {
+    if a.revoked {
+        return Err("this actor has been revoked".into());
+    }
+    match a.kind {
+        hull_core::ActorKind::Human => Ok(()),
+        hull_core::ActorKind::Agent => {
+            let deleg = a.delegation.as_ref().ok_or("agent carries no delegation — unaccountable")?;
+            let is_revoked = |id: &str| app.store.actor(id).map(|x| x.revoked).unwrap_or(false);
+            deleg.verify(&a.id, now(), &is_revoked).map(|_| ()).map_err(|e| format!("agent delegation does not verify: {e}"))
+        }
     }
 }
 
@@ -2015,12 +2115,13 @@ async fn fix_finding(
 }
 
 /// Pick an agent actor that may independently review a PR by `author` — the reviewer for the on-open
-/// agent flow. `None` if no agent other than the author is registered.
+/// agent flow. `None` if no **accountable** agent other than the author is registered: an agent whose
+/// delegation doesn't cryptographically verify (NEW-1166) must not author, so it's never selected.
 fn independent_agent_reviewer(app: &App, author: &str) -> Option<hull_core::Actor> {
     app.store
         .actors()
         .into_iter()
-        .find(|a| a.kind == hull_core::ActorKind::Agent && a.id != author)
+        .find(|a| a.kind == hull_core::ActorKind::Agent && a.id != author && accountable(app, a).is_ok())
 }
 
 /// List pull requests for a hosted repo (`GET /api/repos/:tenant/:repo/prs`). Each PR's verification
@@ -2337,12 +2438,15 @@ fn seed(store: &dyn Store) {
             default_branch: "main".into(),
         });
     }
-    // A human root + an agent it delegated — both real Ed25519 identities, both org members.
-    let human = identity::mint_human("justin").actor;
+    // A human root + an agent it delegated — both real Ed25519 identities, both org members. The
+    // human signs the agent's delegation hop (it holds the key at mint), so the chain is
+    // cryptographically verifiable, not merely asserted.
+    let human_minted = identity::mint_human("justin");
+    let human = human_minted.actor.clone();
     store.put_actor(human.clone());
     let mut members = vec![Membership { actor: human.id.clone(), role: Role::Owner }];
     if let Some(agent) =
-        identity::mint_agent("agent:reviewer", &human, "issues:*", Lifetime::Static)
+        identity::mint_agent("agent:reviewer", &human, &human_minted.secret_key, "*", Lifetime::Static)
     {
         members.push(Membership { actor: agent.actor.id.clone(), role: Role::Write });
         // agent:reviewer owns the server crate — it'll be auto-requested on PRs touching it.

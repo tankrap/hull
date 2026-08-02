@@ -28,6 +28,7 @@ keel-git = { git = "https://github.com/tankrap/keel", rev = "6827a3443de3c9be2e6
 keel-store = { git = "https://github.com/tankrap/keel", rev = "6827a3443de3c9be2e66887c8038310e32dddc37", package = "keel-store" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+hex = "0.4"
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
