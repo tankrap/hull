@@ -1310,6 +1310,24 @@ function ReviewPage({
     else alert(await res.text());
   };
 
+  // "Fix with AI": ask the fixer to propose a patch for a finding; it posts to the PR thread.
+  const [fixing, setFixing] = useState<number | null>(null);
+  const fixWithAI = async (idx: number, f: Finding) => {
+    if (!canAct || !pr) return alert("Sign in to act.");
+    setFixing(idx);
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/prs/${pr.number}/fix`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ path: f.path, note: f.note, severity: f.severity }),
+      });
+      if (res.ok) { const d = await res.json(); alert("Proposed fix posted to the PR discussion:\n\n" + (d.fix?.explanation ?? "")); loadThread(); }
+      else alert(await res.text());
+    } finally {
+      setFixing(null);
+    }
+  };
+
   const verify = async (green: boolean) => {
     if (!changeId) return;
     if (!canAct) return alert("Sign in to act.");
@@ -1545,6 +1563,11 @@ function ReviewPage({
                     <span className={"sev " + f.severity}>{f.severity}</span>
                     {f.path && <code>{f.path}{f.line ? `:${f.line}` : ""}</code>}
                     <span className="fnote">{f.note}</span>
+                    {f.severity !== "info" && pr && f.path && (
+                      <button className="fix-ai" disabled={!canAct || fixing === i} onClick={() => fixWithAI(i, f)}>
+                        {fixing === i ? "fixing…" : "✨ Fix with AI"}
+                      </button>
+                    )}
                   </li>
                 ))}
               </ul>

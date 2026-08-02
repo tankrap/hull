@@ -497,3 +497,7 @@ h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .degraded{font-size:11px;font-weight:600;padding:3px 10px;border-radius:999px;border:1px solid #9a670055;background:#9a670012;color:#9a6700;cursor:help}
 .degraded.unverified{color:#cf222e;border-color:#cf222e44;background:#cf222e0a}
 .degraded.no-plan{color:var(--muted);border-color:var(--line);background:var(--surface)}
+
+/* Fix with AI button */
+.fix-ai{margin-left:auto;font-size:11px;font-weight:600;padding:3px 10px;border-radius:6px;border:1px solid #8250df55;background:#8250df12;color:#8250df;cursor:pointer;white-space:nowrap}
+.fix-ai:disabled{opacity:.5;cursor:progress}

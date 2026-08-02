@@ -253,6 +253,37 @@ pub fn default_local_ci(req: &CiRequest) -> CiOutcome {
     }
 }
 
+// ── Fixer (review → fix loop) ────────────────────────────────────────────────────────────────────
+
+/// Propose a fix for a review finding. Given the finding (file + note) and the keel-native source, a
+/// model produces a concrete patch. Like [`Reviewer`], the core has no default (fixing needs a
+/// model); the hosted plugin drives one. The result is *proposed* — Hull posts it for a human, or at
+/// T3 the agent acts on it — never silently rewriting code without the merge gate + CI catching a
+/// bad fix.
+pub trait Fixer: Send + Sync {
+    fn fix(&self, req: &FixRequest) -> FixResult;
+}
+
+#[derive(Debug, Clone)]
+pub struct FixRequest {
+    pub repo: String,
+    pub change: String,
+    /// keel-native content-addressed source (the tree tar) — the fixer fetches the file to patch.
+    pub source_url: String,
+    pub path: String,
+    pub note: String,
+    pub severity: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FixResult {
+    pub ok: bool,
+    /// A patch / edited snippet a human (or an apply step) can use.
+    pub patch: String,
+    /// One-line explanation of the fix.
+    pub explanation: String,
+}
+
 // ── Reviewer (Epic D / D1) ──────────────────────────────────────────────────────────────────────
 
 /// Produce a review package for a change (Epic D). The core default [`default_review`] is the
@@ -395,6 +426,7 @@ pub struct Registry {
     ci_runner: Option<Arc<dyn CiRunner>>,
     mirror: Option<Arc<dyn Mirror>>,
     reviewer: Option<Arc<dyn Reviewer>>,
+    fixer: Option<Arc<dyn Fixer>>,
     config_providers: Vec<Arc<dyn ConfigProvider>>,
 }
 
@@ -437,6 +469,10 @@ impl Registry {
     /// Install a reviewer (the hosted AI reviewer overrides the OSS reconciliation default).
     pub fn set_reviewer(&mut self, r: Arc<dyn Reviewer>) {
         self.reviewer = Some(r);
+    }
+    /// Install a fixer (the hosted AI fixer; the core has none).
+    pub fn set_fixer(&mut self, f: Arc<dyn Fixer>) {
+        self.fixer = Some(f);
     }
     /// Add a config/secret provider. Tried in registration order; a hosted plugin adds Infisical/Vault.
     pub fn add_config_provider(&mut self, c: Arc<dyn ConfigProvider>) {
@@ -482,6 +518,11 @@ impl Registry {
     /// Resolve a config value / secret by key, trying each provider in order. Never logs the value.
     pub fn config(&self, key: &str) -> Option<String> {
         self.config_providers.iter().find_map(|p| p.get(key))
+    }
+
+    /// Propose a fix for a finding, if a fixer is installed (`None` in the OSS core).
+    pub fn fix(&self, req: &FixRequest) -> Option<FixResult> {
+        self.fixer.as_ref().map(|f| f.fix(req))
     }
 
     /// Produce a review package: the installed reviewer (hosted AI) if any, else the OSS

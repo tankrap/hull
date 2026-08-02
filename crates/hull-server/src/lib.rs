@@ -241,6 +241,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/prs/:number/close", post(close_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/auto-review", post(auto_review))
         .route("/api/repos/:tenant/:repo/prs/:number/reviewers", post(request_reviewer))
+        .route("/api/repos/:tenant/:repo/prs/:number/fix", post(fix_finding))
         .route("/api/repos/:tenant/:repo/mirror", get(mirror_status))
         .route("/api/repos/:tenant/:repo/mirror/inbound", post(mirror_inbound))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
@@ -1843,6 +1844,15 @@ async fn perform_auto_review(
         }
     }
 
+    // AI auto-fix (T3): a review that raises blockers gets fixes proposed automatically — the agent
+    // handles its own findings, not just flags them. (Proposed as PR comments; applying them as a new
+    // keel change is the next increment.)
+    if tier >= hull_core::AutonomyTier::T3 && review.verdict == Verdict::RequestChanges {
+        for f in review.findings.iter().filter(|f| f.severity == "blocker" && !f.path.is_empty()) {
+            let _ = post_fix(app, tenant, repo, number, reviewer, &f.path, &f.note, &f.severity).await;
+        }
+    }
+
     // AI merge (T3): if the agent approved and the change is mergeable (green, non-protected), the
     // agent merges it autonomously — the top of the autonomy ladder. The merge gate still runs, so a
     // protected path or a non-green change is refused even here (D11).
@@ -1860,6 +1870,75 @@ async fn perform_auto_review(
         }
     }
     Ok(review)
+}
+
+/// Ask the AI fixer to propose a fix for a finding, and post it as a comment on the PR (authored by
+/// `agent`). Returns the fixer's result, or `None` if no fixer is configured. Fetches the change's
+/// keel-native source for the fixer to patch.
+#[allow(clippy::too_many_arguments)]
+async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull_core::Actor, path: &str, note: &str, severity: &str) -> Option<hull_plugin::FixResult> {
+    let key = format!("{tenant}/{repo}");
+    let pr = app.store.prs(&key).into_iter().find(|p| p.number == number)?;
+    let change = pr.changes.first().cloned()?;
+    let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
+    let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
+    let req = hull_plugin::FixRequest {
+        repo: key.clone(),
+        change,
+        source_url,
+        path: path.to_string(),
+        note: note.to_string(),
+        severity: severity.to_string(),
+    };
+    let registry = app.registry.clone();
+    let res = tokio::task::spawn_blocking(move || registry.fix(&req)).await.ok()??;
+    if res.ok {
+        let count = app.store.comments(&key).len();
+        app.store.put_comment(Comment {
+            id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
+            repo: key.clone(),
+            target: format!("pr:{number}"),
+            author: agent.id.clone(),
+            body: format!("🔧 **Proposed fix** for `{path}` — {}\n\n```diff\n{}\n```", res.explanation, res.patch),
+            created_unix: now(),
+        });
+        app.registry.notify(&NotifyEvent {
+            kind: "fix_proposed".into(),
+            to: vec![pr.author.clone()],
+            summary: format!("{} proposed a fix for {path} on PR !{number}", agent.handle),
+            change: pr.changes.first().cloned(),
+        });
+    }
+    Some(res)
+}
+
+/// Request an AI fix for a finding (`POST …/prs/:number/fix` with `{path, note, severity}`). Any
+/// signed-in actor may ask; the fix is proposed by an agent as a PR comment. 501 if no fixer is
+/// configured (OSS core has none — it's a hosted capability).
+async fn fix_finding(
+    State(app): State<App>,
+    Path((tenant, repo, number)): Path<(String, String, u64)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = require_actor(&app, &headers, "") {
+        return resp;
+    }
+    let key = format!("{tenant}/{repo}");
+    let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+        return (StatusCode::NOT_FOUND, "no such PR").into_response();
+    };
+    let Some(agent) = independent_agent_reviewer(&app, &pr.author) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "no agent available to fix").into_response();
+    };
+    let path = body.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+    let note = body.get("note").and_then(Value::as_str).unwrap_or("").to_string();
+    let severity = body.get("severity").and_then(Value::as_str).unwrap_or("warn").to_string();
+    match post_fix(&app, &tenant, &repo, number, &agent, &path, &note, &severity).await {
+        Some(res) if res.ok => (StatusCode::CREATED, Json(json!({ "fix": res }))).into_response(),
+        Some(res) => (StatusCode::UNPROCESSABLE_ENTITY, if res.explanation.is_empty() { "the fixer could not produce a fix".into() } else { res.explanation }).into_response(),
+        None => (StatusCode::NOT_IMPLEMENTED, "no AI fixer configured on this instance").into_response(),
+    }
 }
 
 /// Pick an agent actor that may independently review a PR by `author` — the reviewer for the on-open
