@@ -28,6 +28,32 @@ pub struct Outbound {
     pub ts: u64,
 }
 
+/// One recorded inbound import from the forge, with its **accountability mapping** (NEW-1176). A git
+/// commit carries a git identity (name/email + optional login), not a hull Ed25519 actor. We resolve
+/// that identity to a hull actor when the person has linked their GitHub login, else record it as an
+/// **external, un-natively-signed** author — never passed off as accountable hull authorship.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Inbound {
+    pub repo: String,
+    pub change: String,
+    pub external_id: String,
+    /// The git author string (`Name <email>`), preserved verbatim as provenance.
+    pub git_author: String,
+    /// The committer's forge login, if the webhook provided it.
+    pub github_login: String,
+    /// The hull actor this maps to (a linked, accountable actor), or `None` = external/unmapped.
+    pub attributed_actor: Option<String>,
+    pub ts: u64,
+}
+
+impl Inbound {
+    /// True iff this import resolved to a linked hull actor (so it carries hull accountability);
+    /// false = an external git identity with no hull actor behind it.
+    pub fn accountable(&self) -> bool {
+        self.attributed_actor.is_some()
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Ledger {
     /// change id → origin (`hull` | `github`). First writer wins.
@@ -35,6 +61,11 @@ struct Ledger {
     /// idempotency keys already handled.
     processed: HashSet<String>,
     outbound: Vec<Outbound>,
+    /// forge login → hull actor id (self-linked). The mirror's accountability map.
+    #[serde(default)]
+    links: HashMap<String, String>,
+    #[serde(default)]
+    inbound: Vec<Inbound>,
 }
 
 /// The persisted mirror ledger.
@@ -106,6 +137,43 @@ impl MirrorLedger {
         v.reverse();
         v
     }
+
+    /// Link a forge login to a hull actor (self-service). `""` clears the link. This is the mapping
+    /// that lets imported git commits carry hull accountability instead of being anonymous externals.
+    pub fn link_github(&self, login: &str, actor_id: &str) {
+        let mut l = self.inner.lock().unwrap();
+        if actor_id.is_empty() {
+            l.links.remove(login);
+        } else {
+            l.links.insert(login.to_string(), actor_id.to_string());
+        }
+        self.persist(&l);
+    }
+
+    /// The hull actor a forge login maps to, if linked.
+    pub fn resolve_github(&self, login: &str) -> Option<String> {
+        self.inner.lock().unwrap().links.get(login).cloned()
+    }
+
+    /// The forge login linked to a hull actor (reverse lookup, for display).
+    pub fn github_for(&self, actor_id: &str) -> Option<String> {
+        self.inner.lock().unwrap().links.iter().find(|(_, v)| v.as_str() == actor_id).map(|(k, _)| k.clone())
+    }
+
+    /// Record an inbound import + its accountability mapping.
+    pub fn record_inbound(&self, i: Inbound) {
+        let mut l = self.inner.lock().unwrap();
+        l.inbound.push(i);
+        self.persist(&l);
+    }
+
+    /// Inbound imports recorded for a repo (newest first).
+    pub fn inbound_for(&self, repo: &str) -> Vec<Inbound> {
+        let l = self.inner.lock().unwrap();
+        let mut v: Vec<Inbound> = l.inbound.iter().filter(|i| i.repo == repo).cloned().collect();
+        v.reverse();
+        v
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +220,20 @@ mod tests {
         let l = ledger();
         assert!(l.mark_processed("in:evt-1"), "first delivery is fresh");
         assert!(!l.mark_processed("in:evt-1"), "redelivery is a no-op");
+    }
+
+    #[test]
+    fn github_link_maps_imports_to_an_accountable_actor() {
+        let l = ledger();
+        l.link_github("octocat", "actor_abc");
+        assert_eq!(l.resolve_github("octocat").as_deref(), Some("actor_abc"));
+        assert_eq!(l.github_for("actor_abc").as_deref(), Some("octocat"));
+        // a mapped import carries hull accountability; an unmapped one is external.
+        let mapped = Inbound { repo: "t/r".into(), change: "c1".into(), external_id: "e1".into(), git_author: "Mona <mo@x>".into(), github_login: "octocat".into(), attributed_actor: l.resolve_github("octocat"), ts: 0 };
+        let external = Inbound { repo: "t/r".into(), change: "c2".into(), external_id: "e2".into(), git_author: "Rando <r@x>".into(), github_login: "rando".into(), attributed_actor: l.resolve_github("rando"), ts: 0 };
+        assert!(mapped.accountable());
+        assert!(!external.accountable());
+        l.link_github("octocat", ""); // clearing unlinks
+        assert!(l.resolve_github("octocat").is_none());
     }
 }

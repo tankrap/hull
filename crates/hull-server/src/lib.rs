@@ -267,6 +267,7 @@ fn make_router(app: App) -> Router {
         .route("/api/actors/:id/revoke", post(revoke_actor))
         .route("/api/actors/:id/renew", post(renew_delegation))
         .route("/api/actors/:id/nostr", post(set_nostr_key))
+        .route("/api/actors/:id/github", post(link_github))
         .route("/api/accounts", get(accounts_list))
         .route("/api/accounts/:id/members", post(add_member))
         .route("/api/auth/challenge", get(auth_challenge))
@@ -488,6 +489,7 @@ async fn actors_list(State(app): State<App>) -> Json<Value> {
                 "accountable": accountable(&app, &a).is_ok(),
                 "revoked": a.revoked,
                 "human_root": a.human_principal(),
+                "github": app.mirror.github_for(&a.id),
             })
         })
         .collect();
@@ -619,6 +621,29 @@ async fn renew_delegation(State(app): State<App>, headers: axum::http::HeaderMap
     target.delegation = Some(deleg);
     app.store.put_actor(target);
     Json(json!({ "renewed": id, "expires_unix": expires_unix })).into_response()
+}
+
+/// Link your forge (GitHub) login to your hull actor (`POST /api/actors/:id/github` `{login}`).
+/// Self-only. This is the accountability map across the mirror (NEW-1176): git commits you author on
+/// GitHub, imported into Hull, then resolve to **you** (an accountable hull actor) instead of an
+/// anonymous external identity. `login: ""` clears the link.
+async fn link_github(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
+    let caller = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if caller.id != id {
+        return (StatusCode::FORBIDDEN, "you may only link your own GitHub login").into_response();
+    }
+    let login = body.get("login").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if login.is_empty() {
+        if let Some(existing) = app.mirror.github_for(&id) {
+            app.mirror.link_github(&existing, ""); // clear the caller's current link
+        }
+        return Json(json!({ "id": id, "linked": false })).into_response();
+    }
+    app.mirror.link_github(&login, &id);
+    Json(json!({ "id": id, "github_login": login, "linked": true })).into_response()
 }
 
 /// Opt an actor into nostr notifications (`POST /api/actors/:id/nostr` `{pubkey}`). Self-only: you
@@ -1627,9 +1652,15 @@ fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
 /// to (if any) and the outbound pushes recorded, for the UI's mirror panel.
 async fn mirror_status(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
     let key = format!("{tenant}/{repo}");
+    let inbound = app.mirror.inbound_for(&key);
     Json(json!({
         "target": app.registry.mirror_target(&key),
         "outbound": app.mirror.outbound_for(&key),
+        // Imported changes with their accountability mapping (NEW-1176).
+        "inbound": inbound.iter().map(|i| json!({
+            "change": i.change, "git_author": i.git_author, "github_login": i.github_login,
+            "attributed_actor": i.attributed_actor, "accountable": i.accountable(), "ts": i.ts,
+        })).collect::<Vec<_>>(),
     }))
 }
 
@@ -1661,12 +1692,36 @@ async fn mirror_inbound(
     }
     // Loop prevention: mark this change as forge-originated so it is never pushed back out.
     app.mirror.set_origin(&change, "github");
-    let author = body.get("author").and_then(Value::as_str).unwrap_or("mirror").to_string();
+
+    // Accountability mapping across the mirror (NEW-1176). A git commit carries a git identity, not a
+    // hull key. Resolve the committer's forge login to a linked hull actor when we can; otherwise the
+    // import is an **external, un-natively-signed** author — recorded honestly, never presented as
+    // accountable hull authorship (an imported change stays out of the auto-merge path just like any
+    // unverified one).
+    let git_author = body.get("author").and_then(Value::as_str).unwrap_or("mirror").to_string();
+    let github_login = body.get("github_login").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let attributed = if github_login.is_empty() { None } else { app.mirror.resolve_github(&github_login) };
+    let attributed_handle = attributed.as_ref().and_then(|id| app.store.actor(id).map(|a| a.handle));
+    let key = format!("{tenant}/{repo}");
+    app.mirror.record_inbound(mirror::Inbound {
+        repo: key.clone(),
+        change: change.clone(),
+        external_id,
+        git_author: git_author.clone(),
+        github_login: github_login.clone(),
+        attributed_actor: attributed.clone(),
+        ts: now(),
+    });
+    // Surface the mapped (accountable) actor in the activity stream when known; else the git identity.
+    let actor_label = attributed_handle.clone().unwrap_or_else(|| format!("{git_author} (external)"));
     app.hub.publish(
         &tenant,
-        ActivityEvent::Push { actor: author, repo: repo.clone(), change: change.clone(), ts: now() },
+        ActivityEvent::Push { actor: actor_label, repo: repo.clone(), change: change.clone(), ts: now() },
     );
-    (StatusCode::CREATED, Json(json!({ "processed": true, "duplicate": false, "change": change, "origin": "github" }))).into_response()
+    (StatusCode::CREATED, Json(json!({
+        "processed": true, "duplicate": false, "change": change, "origin": "github",
+        "attributed_actor": attributed, "attributed_handle": attributed_handle, "accountable": attributed.is_some(),
+    }))).into_response()
 }
 
 /// List reviews for a hosted repo (`GET /api/repos/:tenant/:repo/reviews`); the client filters by
