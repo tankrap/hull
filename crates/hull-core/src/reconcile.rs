@@ -18,6 +18,11 @@ use serde::{Deserialize, Serialize};
 pub struct ClaimLedger {
     pub change: String,
     pub claims: Vec<Claim>,
+    /// C5 — **phantom work**: semantic operations the change actually made that **no claim accounts
+    /// for**. The narrative didn't mention them, so a reviewer must — the agent did more (or other)
+    /// than it said. Reconciliation checks claims→evidence; this is the reverse, evidence→claims.
+    #[serde(default)]
+    pub unclaimed: Vec<String>,
 }
 
 impl ClaimLedger {
@@ -36,6 +41,11 @@ impl ClaimLedger {
     /// Count self-attested (green but the change tests itself) — a caution, not a verification.
     pub fn self_attested(&self) -> usize {
         self.claims.iter().filter(|c| c.status == ClaimStatus::SelfAttested).count()
+    }
+    /// Count of phantom-work operations — changes the narrative never claimed (C5). A reviewer must
+    /// account for these: the change did more than it said.
+    pub fn phantom(&self) -> usize {
+        self.unclaimed.len()
     }
 }
 
@@ -169,7 +179,15 @@ pub fn reconcile(change: &str, intent: &str, lesson: &str, facts: &ChangeFacts) 
         }
         claims.push(judge(&text, ClaimSource::Lesson, facts));
     }
-    ClaimLedger { change: change.to_string(), claims }
+    // C5 — phantom work: any semantic op the change made that no claim's evidence cites. An op is
+    // "claimed" when some claim matched it (its exact string appears as a `diff` evidence detail).
+    let unclaimed: Vec<String> = facts
+        .ops
+        .iter()
+        .filter(|op| !claims.iter().flat_map(|c| &c.evidence).any(|e| e.kind == "diff" && e.detail == **op))
+        .cloned()
+        .collect();
+    ClaimLedger { change: change.to_string(), claims, unclaimed }
 }
 
 /// Break a narrative into clause-level assertions. Splits on sentence and clause boundaries, drops
@@ -516,6 +534,22 @@ mod tests {
         // "the page" is a sentence shard, not an assertion — it should not appear at all.
         let l = reconcile("c1", "reworked navigation. the page. added fn foo", "", &facts());
         assert!(!l.claims.iter().any(|c| c.text.eq_ignore_ascii_case("the page")));
+    }
+
+    #[test]
+    fn phantom_work_is_flagged_when_the_narrative_omits_an_op() {
+        // The intent claims add_member, but the change ALSO added accounts_list — unclaimed.
+        let l = reconcile("c1", "add the add_member handler", "", &facts());
+        assert!(l.claims.iter().any(|c| c.text.contains("add_member")));
+        assert_eq!(l.unclaimed, vec!["added fn accounts_list".to_string()], "the unmentioned op is phantom work");
+        assert_eq!(l.phantom(), 1);
+    }
+
+    #[test]
+    fn nothing_is_phantom_when_every_op_is_claimed() {
+        let l = reconcile("c1", "add add_member and accounts_list handlers", "", &facts());
+        assert!(l.unclaimed.is_empty(), "both ops are named in the intent");
+        assert_eq!(l.phantom(), 0);
     }
 
     #[test]

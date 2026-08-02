@@ -27,7 +27,7 @@ type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable:
 type PR = { number: number; title: string; author: string; changes: string[]; verification: string; state: string; reviewers: string[] };
 type Finding = { path: string; line?: number; severity: string; note: string };
 type ClaimEv = { kind: string; detail: string; supports: boolean };
-type LedgerSnap = { change: string; claims: { id: string; text: string; source: string; status: string; evidence: ClaimEv[] }[] };
+type LedgerSnap = { change: string; claims: { id: string; text: string; source: string; status: string; evidence: ClaimEv[] }[]; unclaimed?: string[] };
 type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string; findings: Finding[]; ledger?: LedgerSnap; artifact_id?: string };
 type CodeRef = { repo: string; blob: string; path: string; line_start: number; line_end?: number };
 type Issue = {
@@ -1282,7 +1282,7 @@ function ReviewPage({
   type FileDiff = { path: string; status: string; ops: string[]; hunks: { old_start: number; new_start: number; lines: DiffLine[] }[] };
   type Evidence = { kind: string; detail: string; supports: boolean };
   type Claim = { id: string; text: string; source: string; status: string; evidence: Evidence[] };
-  type Ledger = { change: string; claims: Claim[] };
+  type Ledger = { change: string; claims: Claim[]; unclaimed?: string[] };
   const [change, setChange] = useState<ChangeInfo | null>(null);
   const [diff, setDiff] = useState<FileDiff[]>([]);
   type Semantic = { moves: { from: string; to: string; blob: string }[]; added: string[]; deleted: string[]; modified: string[]; whitespace_only: string[]; behavioral: string[]; pure_move: boolean; mechanical: boolean };
@@ -1458,6 +1458,8 @@ function ReviewPage({
           if (change && change.verification !== "green") badges.push({ cls: "unverified", label: `checks ${change.verification}`, title: "checks are not green — the mechanical evidence is incomplete" });
           if (needs > 0) badges.push({ cls: "partial", label: `${needs} unresolved claim${needs > 1 ? "s" : ""}`, title: "claims the engine couldn't verify — a human must judge them (partial review)" });
           if (selfAtt > 0) badges.push({ cls: "self", label: "self-attested tests", title: "green, but the change tests itself — not independently verified" });
+          const phantom = shownLedger?.unclaimed?.length ?? 0;
+          if (phantom > 0) badges.push({ cls: "partial", label: `${phantom} unclaimed change${phantom > 1 ? "s" : ""}`, title: "the change did work the narrative never mentions — phantom work a reviewer must account for" });
           return badges.length > 0 ? (
             <div className="degraded-badges">
               {badges.map((b, i) => (
@@ -1529,6 +1531,17 @@ function ReviewPage({
               </div>
               {contradicted > 0 && (
                 <p className="recon-warn">⚠ {contradicted} claim{contradicted > 1 ? "s" : ""} the change's own facts contradict — do not merge without resolving.</p>
+              )}
+              {(ledger.unclaimed?.length ?? 0) > 0 && (
+                <div className="claim needs_judgment" style={{ marginBottom: 10 }}>
+                  <div className="claim-head">
+                    <span className="cstat needs_judgment" title="phantom work">?</span>
+                    <span className="claim-text"><b>Unclaimed changes ({ledger.unclaimed!.length})</b> — the change did work its narrative never mentions; a reviewer must account for it.</span>
+                  </div>
+                  <ul className="claim-ev">
+                    {ledger.unclaimed!.map((op, i) => (<li key={i} className="bad"><span className="ev-kind">phantom</span> {op}</li>))}
+                  </ul>
+                </div>
               )}
               {(() => {
                 // F1: unverified/contradicted are primary; verified rows collapse by default.
