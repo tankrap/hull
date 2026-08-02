@@ -87,6 +87,9 @@ export function App() {
 
   // Auth: sign in by proving possession of an actor's Ed25519 key → session token.
   const [token, setToken] = useState<string>(() => localStorage.getItem("hull_token") ?? "");
+  // Your Ed25519 secret, held in memory for the session only (never localStorage) so you can sign
+  // agent delegations locally. Set on sign-in, cleared on sign-out.
+  const sessionSecret = useRef<string>("");
   const [me, setMe] = useState<{ id: string; handle: string; kind: string } | null>(null);
   const [secretInput, setSecretInput] = useState("");
   const authHeaders = (): Record<string, string> => (token ? { authorization: `Bearer ${token}` } : {});
@@ -152,6 +155,9 @@ export function App() {
       const { token: t } = await res.json();
       localStorage.setItem("hull_token", t);
       setToken(t);
+      // Keep the key in memory (not localStorage) for the session, so you can sign delegations
+      // (createAgent) without Hull ever holding it. Cleared on sign-out.
+      sessionSecret.current = secret;
       setSecretInput("");
     } catch (e) {
       alert("bad secret key");
@@ -161,20 +167,34 @@ export function App() {
     localStorage.removeItem("hull_token");
     setToken("");
     setMe(null);
+    sessionSecret.current = "";
   };
-  // Mint an agent that cryptographically chains to you (the authenticated caller is the parent).
+  // Mint an agent that cryptographically chains to you. The delegation hop is signed **client-side**
+  // with your key (kept in memory for the session, never persisted), so Hull never sees the agent's
+  // secret — it only stores a signed delegation it can verify. Matches the server's canonical
+  // hop_message (identity::hop_message) exactly.
   const createAgent = async () => {
+    if (!sessionSecret.current || !me) {
+      alert("Sign in again (paste your secret key) to delegate an agent — Hull needs your key in memory to sign the delegation, and it isn't stored.");
+      return;
+    }
     const handle = prompt("handle for your agent (it will chain to you)", "agent:mine") ?? "";
     if (!handle.trim()) return;
+    const scope = "*";
+    // 1. generate the agent's keypair locally — its secret never leaves the browser
+    const childSk = ed.utils.randomSecretKey();
+    const childPub = bytesToHex(await ed.getPublicKeyAsync(childSk));
+    // 2. sign the canonical delegation hop with YOUR key (the parent)
+    const msg = new TextEncoder().encode(`hull-delegation:v1\nparent=${me.id}\nchild=${childPub}\nkind=agent\nscope=${scope}\nexpires=0`);
+    const sig = bytesToHex(await ed.signAsync(msg, hexToBytes(sessionSecret.current)));
     const res = await fetch("/api/actors", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ handle: handle.trim(), kind: "agent" }),
+      body: JSON.stringify({ handle: handle.trim(), kind: "agent", child_pub: childPub, scope, delegation_sig: sig }),
     });
     if (!res.ok) return alert(await res.text());
-    const { secret_key } = await res.json();
     fetch("/api/actors").then((r) => r.json()).then((d) => setActors(d.actors ?? []));
-    alert(`Agent created, delegated by you.\n\nIts secret key (save it — the agent signs in with this):\n\n${secret_key}`);
+    alert(`Agent created, cryptographically delegated by you (Hull never saw this key).\n\nIts secret key — save it, the agent signs in with this:\n\n${bytesToHex(childSk)}`);
   };
 
   // Registered actors (for display / handle resolution only — you cannot *act* as any of them).
