@@ -16,6 +16,7 @@ pub mod reviewcache;
 pub mod ingress;
 pub mod keeld;
 pub mod mirror;
+pub mod nostr;
 pub mod plugins;
 pub mod quic;
 pub mod repos;
@@ -137,6 +138,12 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
     // this plus the log notifier plus any hosted plugin notifier.
     let notifications: Arc<Mutex<Vec<Notification>>> = Arc::new(Mutex::new(Vec::new()));
     registry.add_notifier(Arc::new(RecordingNotifier(notifications.clone())));
+    // Decentralized fan-out: if a nostr publisher key + relays are configured, code-owner pings are
+    // also published as signed nostr events to opted-in actors. Off by default (OSS stays log-only).
+    if let Some(n) = nostr::NostrNotifier::from_env(store.clone()) {
+        eprintln!("nostr: code-owner notifications enabled → {} relay(s)", n.relays().len());
+        registry.add_notifier(Arc::new(n));
+    }
     App {
         store,
         hub,
@@ -258,6 +265,7 @@ fn make_router(app: App) -> Router {
         .route("/api/feed", get(feed))
         .route("/api/actors", get(actors_list).post(register_actor))
         .route("/api/actors/:id/revoke", post(revoke_actor))
+        .route("/api/actors/:id/nostr", post(set_nostr_key))
         .route("/api/accounts", get(accounts_list))
         .route("/api/accounts/:id/members", post(add_member))
         .route("/api/auth/challenge", get(auth_challenge))
@@ -559,6 +567,29 @@ async fn revoke_actor(State(app): State<App>, headers: axum::http::HeaderMap, Pa
     target.revoked = true;
     app.store.put_actor(target);
     Json(json!({ "revoked": id, "by": caller.handle })).into_response()
+}
+
+/// Opt an actor into nostr notifications (`POST /api/actors/:id/nostr` `{pubkey}`). Self-only: you
+/// set your **own** nostr pubkey (32-byte x-only hex). Code you own then pings you over nostr.
+async fn set_nostr_key(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
+    let caller = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if caller.id != id {
+        return (StatusCode::FORBIDDEN, "you may only set your own nostr key").into_response();
+    }
+    let pubkey = body.get("pubkey").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    // A nostr x-only pubkey is 32 bytes → 64 hex chars. Empty clears the opt-in.
+    if !pubkey.is_empty() && (pubkey.len() != 64 || hex::decode(&pubkey).is_err()) {
+        return (StatusCode::BAD_REQUEST, "pubkey must be a 32-byte hex nostr key (or empty to clear)").into_response();
+    }
+    let Some(mut actor) = app.store.actor(&id) else {
+        return (StatusCode::NOT_FOUND, "no such actor").into_response();
+    };
+    actor.nostr_pubkey = (!pubkey.is_empty()).then_some(pubkey);
+    app.store.put_actor(actor);
+    Json(json!({ "id": id, "nostr": true })).into_response()
 }
 
 // ── auth: prove you hold an actor's Ed25519 key, get a session token ────────────────────────────
