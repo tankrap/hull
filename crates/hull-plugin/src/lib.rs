@@ -275,13 +275,23 @@ pub struct FixRequest {
     pub severity: String,
 }
 
+/// One edit as a **search/replace** on a file — `search` is the exact existing code, `replace` is
+/// the corrected code. This applies deterministically (find the verbatim `search`, swap it), so a
+/// model fix can be materialized as a real keel change without guessing diff line numbers.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FixEdit {
+    pub path: String,
+    pub search: String,
+    pub replace: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FixResult {
     pub ok: bool,
-    /// A patch / edited snippet a human (or an apply step) can use.
-    pub patch: String,
     /// One-line explanation of the fix.
     pub explanation: String,
+    /// The edits to apply (empty if `ok` is false).
+    pub edits: Vec<FixEdit>,
 }
 
 // ── Reviewer (Epic D / D1) ──────────────────────────────────────────────────────────────────────

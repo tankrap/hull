@@ -1321,7 +1321,7 @@ function ReviewPage({
         headers: { "content-type": "application/json", ...authHeaders() },
         body: JSON.stringify({ path: f.path, note: f.note, severity: f.severity }),
       });
-      if (res.ok) { const d = await res.json(); alert("Proposed fix posted to the PR discussion:\n\n" + (d.fix?.explanation ?? "")); loadThread(); }
+      if (res.ok) { const d = await res.json(); alert("AI fix applied as a new change (re-verified):\n\n" + (d.fix?.explanation ?? "")); loadThread(); loadChange(); }
       else alert(await res.text());
     } finally {
       setFixing(null);

@@ -1648,7 +1648,7 @@ async fn auto_review(
     let Some(agent) = independent_agent_reviewer(&app, &pr.author) else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "no independent agent reviewer is registered").into_response();
     };
-    match perform_auto_review(&app, &tenant, &repo, number, &agent).await {
+    match perform_auto_review(&app, &tenant, &repo, number, &agent, 0).await {
         Ok(review) => (StatusCode::CREATED, Json(json!({ "review": review }))).into_response(),
         Err((code, msg)) => (code, msg).into_response(),
     }
@@ -1657,12 +1657,16 @@ async fn auto_review(
 /// The reviewer runtime: run a PR's checks, reconcile its change, and post an accountable agent
 /// review. Shared by the explicit endpoint and the on-open agent flow. Enforces the gate (agent,
 /// independent of author) itself, so every caller is safe.
+/// Max review→fix→re-review cycles at T3, so the autonomous loop always terminates.
+const MAX_FIX_DEPTH: u8 = 2;
+
 async fn perform_auto_review(
     app: &App,
     tenant: &str,
     repo: &str,
     number: u64,
     reviewer: &hull_core::Actor,
+    depth: u8,
 ) -> Result<Review, (StatusCode, String)> {
     let key = format!("{tenant}/{repo}");
     if reviewer.kind != hull_core::ActorKind::Agent {
@@ -1844,12 +1848,23 @@ async fn perform_auto_review(
         }
     }
 
-    // AI auto-fix (T3): a review that raises blockers gets fixes proposed automatically — the agent
-    // handles its own findings, not just flags them. (Proposed as PR comments; applying them as a new
-    // keel change is the next increment.)
-    if tier >= hull_core::AutonomyTier::T3 && review.verdict == Verdict::RequestChanges {
-        for f in review.findings.iter().filter(|f| f.severity == "blocker" && !f.path.is_empty()) {
-            let _ = post_fix(app, tenant, repo, number, reviewer, &f.path, &f.note, &f.severity).await;
+    // AI auto-fix (T3): the agent handles its own findings — it applies a fix for every non-info
+    // finding as a new keel change, then RE-REVIEWS the fixed change. Bounded by MAX_FIX_DEPTH so the
+    // loop terminates; if the re-review is clean the auto-merge below fires. A fix that doesn't apply
+    // (or the fixer declines) leaves the PR flagged for a human.
+    if tier >= hull_core::AutonomyTier::T3
+        && depth < MAX_FIX_DEPTH
+        && review.findings.iter().any(|f| f.severity != "info" && !f.path.is_empty())
+    {
+        let mut applied = false;
+        for f in review.findings.iter().filter(|f| f.severity != "info" && !f.path.is_empty()) {
+            if let Some(res) = post_fix(app, tenant, repo, number, reviewer, &f.path, &f.note, &f.severity).await {
+                applied |= res.ok;
+            }
+        }
+        if applied {
+            // The PR now points at the fixed change — re-review it (one step deeper).
+            return Box::pin(perform_auto_review(app, tenant, repo, number, reviewer, depth + 1)).await;
         }
     }
 
@@ -1890,24 +1905,51 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
         note: note.to_string(),
         severity: severity.to_string(),
     };
+    let change = req.change.clone();
     let registry = app.registry.clone();
     let res = tokio::task::spawn_blocking(move || registry.fix(&req)).await.ok()??;
-    if res.ok {
-        let count = app.store.comments(&key).len();
-        app.store.put_comment(Comment {
-            id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
-            repo: key.clone(),
-            target: format!("pr:{number}"),
-            author: agent.id.clone(),
-            body: format!("🔧 **Proposed fix** for `{path}` — {}\n\n```diff\n{}\n```", res.explanation, res.patch),
-            created_unix: now(),
-        });
-        app.registry.notify(&NotifyEvent {
-            kind: "fix_proposed".into(),
-            to: vec![pr.author.clone()],
-            summary: format!("{} proposed a fix for {path} on PR !{number}", agent.handle),
-            change: pr.changes.first().cloned(),
-        });
+    if res.ok && !res.edits.is_empty() {
+        let intent = format!("fix: {}", res.explanation);
+        let edits: Vec<(String, String, String)> = res.edits.iter().map(|e| (e.path.clone(), e.search.clone(), e.replace.clone())).collect();
+        // Materialize the fix as a NEW keel change parented on the PR's change.
+        match app.repos.apply_fix(tenant, repo, &change, &edits, &intent, &agent.handle, now()) {
+            Some(fix_change) => {
+                // Point the PR at the fixed change and run its checks.
+                if let Some(mut pr2) = app.store.prs(&key).into_iter().find(|p| p.number == number) {
+                    pr2.changes = vec![fix_change.clone()];
+                    app.store.replace_pr(pr2);
+                }
+                let _ = resolve_check(app, tenant, repo, &fix_change, false).await;
+                let diff = res.edits.iter().map(|e| format!("--- {}\n- {}\n+ {}", e.path, e.search.lines().next().unwrap_or(""), e.replace.lines().next().unwrap_or(""))).collect::<Vec<_>>().join("\n");
+                let count = app.store.comments(&key).len();
+                app.store.put_comment(Comment {
+                    id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
+                    repo: key.clone(),
+                    target: format!("pr:{number}"),
+                    author: agent.id.clone(),
+                    body: format!("🔧 **Applied fix** as change ⬡{} — {}\n\n```diff\n{diff}\n```", &fix_change[..12], res.explanation),
+                    created_unix: now(),
+                });
+                app.registry.notify(&NotifyEvent {
+                    kind: "fix_applied".into(),
+                    to: vec![pr.author.clone()],
+                    summary: format!("{} applied a fix to PR !{number} (new change {})", agent.handle, &fix_change[..12]),
+                    change: Some(fix_change),
+                });
+            }
+            None => {
+                // The fix didn't apply cleanly — record it as a proposal instead of a silent drop.
+                let count = app.store.comments(&key).len();
+                app.store.put_comment(Comment {
+                    id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
+                    repo: key.clone(),
+                    target: format!("pr:{number}"),
+                    author: agent.id.clone(),
+                    body: format!("🔧 **Proposed fix** for `{path}` (couldn't apply cleanly — the code moved): {}", res.explanation),
+                    created_unix: now(),
+                });
+            }
+        }
     }
     Some(res)
 }
@@ -2068,7 +2110,7 @@ async fn create_pr(
         if let Some(agent) = independent_agent_reviewer(&app, &pr.author) {
             let (app2, t2, r2, n2) = (app.clone(), tenant.clone(), repo.clone(), number);
             tokio::spawn(async move {
-                let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent).await;
+                let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent, 0).await;
             });
         }
     }

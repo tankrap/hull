@@ -533,6 +533,70 @@ impl RepoHost {
         keel_store::snapshot::checkout(&store, tid, dir).is_ok()
     }
 
+    /// Apply search/replace `edits` to a change's tree and commit the result as a **new keel change**
+    /// parented on it — how an AI fix becomes real code. Returns the new change id, or `None` if any
+    /// edit's `search` isn't found verbatim (the fix doesn't apply cleanly — we never write a partial
+    /// or guessed patch). A ref keeps the new change reachable so GC can't sweep it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_fix(
+        &self,
+        tenant: &str,
+        repo: &str,
+        change_hex: &str,
+        edits: &[(String, String, String)],
+        intent: &str,
+        author: &str,
+        timestamp: u64,
+    ) -> Option<String> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let cid = ObjectId::from_hex(change_hex)?;
+        let tree = match store.get(&cid).ok()?? {
+            Object::Change(c) => c.tree,
+            _ => return None,
+        };
+        let dir = std::env::temp_dir().join(format!("hull-fix-{}-{}", &change_hex[..change_hex.len().min(12)], std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        if keel_store::snapshot::checkout(&store, tree, &dir).is_err() {
+            return None;
+        }
+        // Apply each edit; abort (clean up, return None) if any search string isn't present.
+        for (path, search, replace) in edits {
+            let fp = dir.join(path);
+            let Ok(content) = std::fs::read_to_string(&fp) else {
+                let _ = std::fs::remove_dir_all(&dir);
+                return None;
+            };
+            if !content.contains(search.as_str()) {
+                let _ = std::fs::remove_dir_all(&dir);
+                return None;
+            }
+            let updated = content.replacen(search.as_str(), replace.as_str(), 1);
+            if std::fs::write(&fp, updated).is_err() {
+                let _ = std::fs::remove_dir_all(&dir);
+                return None;
+            }
+        }
+        let new_tree = keel_store::snapshot::snapshot_uncached(&store, &dir).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        let new_tree = new_tree?;
+        if new_tree == tree {
+            return None; // no-op edit
+        }
+        let change = keel_store::Change {
+            parents: vec![cid],
+            tree: new_tree,
+            session: None,
+            intent: intent.to_string(),
+            author: author.to_string(),
+            timestamp,
+            verification: keel_store::Verification::Unverified,
+        };
+        let id = store.put(&Object::Change(change)).ok()?;
+        // Keep it reachable (unreferenced changes can be GC'd).
+        let _ = store.set_ref(&format!("hull/fix/{}", id.to_hex()), &id);
+        Some(id.to_hex())
+    }
+
     /// The observable facts of a change — touched files, semantic operations, verification, and
     /// secret findings — the ground truth a [`reconcile`](hull_core::reconcile) run judges claims
     /// against.
