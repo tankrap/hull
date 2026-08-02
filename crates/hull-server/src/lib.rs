@@ -1548,13 +1548,16 @@ async fn perform_merge(
     let change = pr.changes.first().cloned().unwrap_or_default();
     let files: Vec<String> = app.repos.change_info(tenant, repo, &change).map(|i| i.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
     let protected = autonomy::touches_protected(&files, &eff.protected_paths);
-    let contradicted = {
+    let (contradicted, phantom) = {
         let lesson = app.store.session_record(&key, &change).map(|s| s.lesson).unwrap_or_default();
         let intent = app.repos.change_info(tenant, repo, &change).map(|i| i.intent).unwrap_or_default();
         let facts = facts_with_independence(app, tenant, repo, &change).await;
-        hull_core::reconcile::reconcile(&change, &intent, &lesson, &facts).contradicted() > 0
+        let ledger = hull_core::reconcile::reconcile(&change, &intent, &lesson, &facts);
+        (ledger.contradicted() > 0, ledger.phantom() > 0)
     };
-    let low_risk = !protected && !contradicted; // green is already required above
+    // A change that did work its narrative never claimed (C5 phantom work) is NOT low-risk: it
+    // includes unreviewed operations, so an agent's approve must not auto-merge it — a human looks.
+    let low_risk = !protected && !contradicted && !phantom; // green is already required above
     let agent_approve_counts = match eff.tier {
         hull_core::AutonomyTier::T0 | hull_core::AutonomyTier::T1 => false,
         hull_core::AutonomyTier::T2 => low_risk,
