@@ -159,18 +159,62 @@ const Avatar = ({ id, handle, kind, size = 22 }: { id?: string; handle?: string;
 
 // An issue label rendered as a neutral tag (like the rest of the UI) with a small colour dot for
 // identity — hue deterministically derived from the label text.
-const Label = ({ name, color }: { name: string; color?: string }) => {
-  let h = 2166136261;
-  for (let i = 0; i < name.length; i++) { h ^= name.charCodeAt(i); h = Math.imul(h, 16777619); }
-  const dot = color || `hsl(${(h >>> 0) % 360} 55% 50%)`;
+// Perceived luminance of a #rrggbb colour → pick black or white text so a label always reads clearly.
+const hexLum = (hex: string): number => {
+  const m = /^#?([0-9a-fA-F]{6})$/.exec(hex || "");
+  if (!m) return 0.5;
+  const n = parseInt(m[1], 16);
+  return (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+};
+const contrastText = (hex: string) => (hexLum(hex) > 0.6 ? "#111827" : "#ffffff");
+const randomHexColor = () => "#" + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, "0");
+const Label = ({ name, color, icon }: { name: string; color?: string; icon?: string }) => {
+  const c = color || "#8b949e";
   return (
-    <span className="inline-flex items-center gap-1 text-[12px] font-medium px-1.5 py-[2px] rounded-badge bg-rule2 text-dim">
-      <span className="w-1.5 h-1.5 rounded-full flex-none" style={{ background: dot }} />{name}
+    <span className="inline-flex items-center gap-1 text-[12px] font-semibold px-1.5 py-[2px] rounded-badge" style={{ background: c, color: contrastText(c) }}>
+      {icon ? <span className="leading-none">{icon}</span> : null}{name}
     </span>
   );
 };
-// A small preset palette for configuring labels (name → hex).
+// Presets + emoji icons for configuring labels; custom hex + a random roll are also offered.
 const LABEL_COLORS = ["#d73a4a", "#e99695", "#fbca04", "#0e8a16", "#006b75", "#1d76db", "#0052cc", "#5319e7", "#b60205", "#c5def5", "#bfdadc", "#8b949e"];
+const LABEL_ICONS = ["🐛", "✨", "📝", "🔥", "⚠️", "🚀", "🧹", "🔒", "💡", "📦", "🎨", "⚡", "❓", "🚧"];
+type RepoLabel = { name: string; color: string; icon?: string };
+// Shared label editor — used by BOTH repo settings and org defaults. Pick an emoji icon, a preset OR
+// custom OR random colour, name it, preview it live, add/remove.
+function LabelEditor({ labels, onChange }: { labels: RepoLabel[]; onChange: (l: RepoLabel[]) => void }) {
+  const [draft, setDraft] = useState<RepoLabel>({ name: "", color: LABEL_COLORS[0], icon: "" });
+  const add = () => { const n = draft.name.trim(); if (!n || labels.some((x) => x.name === n)) return; onChange([...labels, { name: n, color: draft.color, icon: draft.icon }]); setDraft({ name: "", color: LABEL_COLORS[0], icon: "" }); };
+  const chip = "w-7 h-7 rounded-ctl border grid place-items-center text-[14px] transition-colors";
+  return (
+    <div className="grid gap-3">
+      <div className="flex flex-wrap gap-1.5">
+        {labels.map((l) => (
+          <span key={l.name} className="inline-flex items-center gap-1"><Label name={l.name} color={l.color} icon={l.icon} /><button className="text-muted hover:text-fault-text cursor-pointer" title="remove" onClick={() => onChange(labels.filter((x) => x.name !== l.name))}>×</button></span>
+        ))}
+        {labels.length === 0 && <span className="text-[12.5px] text-muted">none yet</span>}
+      </div>
+      <div className="grid gap-2.5 border border-rule2 rounded-ctl p-3 bg-paper/40 max-w-[560px]">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className="text-[11.5px] text-muted w-10 flex-none">Icon</span>
+          <button type="button" title="no icon" onClick={() => setDraft((d) => ({ ...d, icon: "" }))} className={`${chip} text-[10px] ${draft.icon === "" ? "border-body text-ink" : "border-rule text-muted hover:border-dim"}`}>—</button>
+          {LABEL_ICONS.map((ic) => <button key={ic} type="button" onClick={() => setDraft((d) => ({ ...d, icon: ic }))} className={`${chip} ${draft.icon === ic ? "border-body bg-surface" : "border-rule hover:border-dim"}`}>{ic}</button>)}
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className="text-[11.5px] text-muted w-10 flex-none">Color</span>
+          {LABEL_COLORS.map((c) => <button key={c} type="button" onClick={() => setDraft((d) => ({ ...d, color: c }))} className={`w-6 h-6 rounded-full transition-transform ${draft.color.toLowerCase() === c ? "ring-2 ring-offset-1 ring-body scale-110" : "hover:scale-110"}`} style={{ background: c }} />)}
+          <label className="w-7 h-7 rounded-ctl border border-rule overflow-hidden cursor-pointer relative" title="custom color" style={{ background: draft.color }}><input type="color" value={draft.color} onChange={(e) => setDraft((d) => ({ ...d, color: e.target.value }))} className="absolute inset-0 opacity-0 cursor-pointer" /></label>
+          <button type="button" onClick={() => setDraft((d) => ({ ...d, color: randomHexColor() }))} className="h-7 px-2 rounded-ctl border border-rule text-[12px] text-dim hover:text-ink hover:border-dim inline-flex items-center gap-1">🎲 random</button>
+        </div>
+        <div className="flex items-center gap-2 flex-wrap">
+          <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[180px]" placeholder="label name" value={draft.name} onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
+          {draft.name.trim() && <Label name={draft.name.trim()} color={draft.color} icon={draft.icon} />}
+          <Button size="sm" className="ml-auto" disabled={!draft.name.trim()} onClick={add}>Add label</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ── small token-only layout atoms (not controls — controls come from ./ui) ──────────
 const Card = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
@@ -899,8 +943,9 @@ export function App() {
   };
   useEffect(() => { if (authPage === "account") loadAccount(); }, [authPage, token]);
   // Profile page: bio + a year of contributions (mine + my agents'), for the heatmap.
-  type ProfileStats = { handle: string; bio: string; total: number; human_count: number; days: { day: number; count: number }[]; agents: { handle: string; count: number }[] };
+  type ProfileStats = { handle: string; bio: string; total: number; human_count: number; days: HeatDay[]; agents: { handle: string; count: number }[] };
   const [profileStats, setProfileStats] = useState<ProfileStats | null>(null);
+  const [profileRepoQ, setProfileRepoQ] = useState("");
   const [bioDraft, setBioDraft] = useState<string | null>(null); // non-null = editing
   const loadProfile = () => { if (token) fetch("/api/profile", { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then(setProfileStats).catch(() => {}); };
   useEffect(() => { if (authPage === "profile") loadProfile(); /* eslint-disable-next-line */ }, [authPage, token]);
@@ -1046,11 +1091,9 @@ export function App() {
     }
   };
   // repo settings
-  type RepoLabel = { name: string; color: string };
-  type RepoSettings = { private: boolean; unlisted?: boolean; visibility?: "public" | "private" | "unlisted"; require_review_to_land: boolean; default_reviewers: { actor: string; handle: string }[]; team_access: { team: string; role: string }[]; labels?: RepoLabel[] };
+  type RepoSettings = { private: boolean; unlisted?: boolean; visibility?: "public" | "private" | "unlisted"; require_review_to_land: boolean; author_independence?: boolean; default_reviewers: { actor: string; handle: string }[]; team_access: { team: string; role: string }[]; labels?: RepoLabel[] };
   const [repoSettings, setRepoSettings] = useState<RepoSettings | null>(null);
   const [ownerRules, setOwnerRules] = useState<{ glob: string; owners: string[] }[]>([]);
-  const [newLabel, setNewLabel] = useState<RepoLabel>({ name: "", color: LABEL_COLORS[0] });
   // The repo's configured labels (readable by any member) — drives issue label colors + the pickers.
   const [repoLabels, setRepoLabels] = useState<RepoLabel[]>([]);
   const labelColor = (name: string) => repoLabels.find((l) => l.name === name)?.color;
@@ -1060,7 +1103,7 @@ export function App() {
     if (orgAccountFor(tenant)) loadTeams(orgAccountFor(tenant)!.id);
   };
   const orgAccountFor = (handle: string) => accounts.find((a) => a.handle === handle);
-  const saveRepoSettings = async (patch: Partial<{ private: boolean; visibility: "public" | "private" | "unlisted"; require_review_to_land: boolean; default_reviewers: string[]; team_access: { team: string; role: string }[]; labels: RepoLabel[] }>) => {
+  const saveRepoSettings = async (patch: Partial<{ private: boolean; visibility: "public" | "private" | "unlisted"; require_review_to_land: boolean; author_independence: boolean; default_reviewers: string[]; team_access: { team: string; role: string }[]; labels: RepoLabel[] }>) => {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
     if (!res.ok) return uiAlert(await res.text());
     setRepoSettings(await res.json());
@@ -1164,7 +1207,6 @@ export function App() {
   const orgAccount = accounts.find((a) => a.handle === (orgHandle ?? " "));
   // Org-level DEFAULT repo settings — inherited by every repo created afterward.
   const [orgDefaults, setOrgDefaults] = useState<RepoSettings | null>(null);
-  const [orgLabelDraft, setOrgLabelDraft] = useState<RepoLabel>({ name: "", color: LABEL_COLORS[0] });
   const loadOrgDefaults = (acctId: string) => fetch(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setOrgDefaults(d)).catch(() => {});
   const saveOrgDefaults = async (acctId: string, patch: Partial<{ visibility: string; require_review_to_land: boolean; labels: RepoLabel[] }>) => {
     const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
@@ -1582,70 +1624,71 @@ export function App() {
 
     // account settings
     if (authPage === "profile") {
+      const ranked = [...repos].sort((a, b) => b.score - a.score);
+      const q = profileRepoQ.trim().toLowerCase();
+      const shownRepos = q ? ranked.filter((r) => `${r.tenant}/${r.repo}`.toLowerCase().includes(q)) : ranked.slice(0, 6);
       return shell(me ? me.handle : "Profile", (
         <div className="grid gap-6">
+          {/* Full-bleed banner behind the page — breaks out of the container to the viewport edges. */}
+          <div className="relative left-1/2 right-1/2 -mx-[50vw] w-screen -mt-12 -z-0 h-[220px] bg-gradient-to-br from-steel-wash via-paper to-brass-wash pointer-events-none" aria-hidden />
           {me && (
-            <Card>
-              {/* Banner (future) — a placeholder header the account will later be able to customize. */}
-              <div className="h-[104px] bg-gradient-to-r from-steel-wash via-paper to-brass-wash relative" title="Profile banner — coming soon">
-                <span className="absolute right-3 top-2.5 text-[11px] font-semibold uppercase tracking-[0.06em] text-muted/70">banner · soon</span>
+            <div className="-mt-[150px] relative">
+              <div className="flex items-end gap-4">
+                <span className="rounded-full ring-4 ring-surface bg-surface shadow-modal"><Avatar id={me.id} handle={me.handle} kind={me.kind} size={104} /></span>
+                <div className="flex-1 min-w-0 pb-1">
+                  <div className="text-[24px] font-semibold leading-tight">{me.handle}</div>
+                  <div className="text-[13px] text-muted">{me.kind}{profile?.accountable ? " · accountable" : ""} · member of {myAccounts.length} org{myAccounts.length === 1 ? "" : "s"}</div>
+                </div>
+                <button onClick={() => navigate("/settings")} className="text-[13px] text-steel-text hover:underline flex-none pb-1">Account settings →</button>
               </div>
-              <div className="px-5 pb-4">
-                <div className="flex items-end gap-3 -mt-8">
-                  <span className="rounded-full ring-4 ring-surface bg-surface"><Avatar id={me.id} handle={me.handle} kind={me.kind} size={72} /></span>
-                  <div className="flex-1 min-w-0 pb-1">
-                    <div className="text-[19px] font-semibold leading-tight">{me.handle}</div>
-                    <div className="text-[12.5px] text-muted">{me.kind}{profile?.accountable ? " · accountable" : ""} · member of {myAccounts.length} org{myAccounts.length === 1 ? "" : "s"}</div>
+              <div className="mt-3 max-w-[560px]">
+                {bioDraft !== null ? (
+                  <div className="grid gap-2">
+                    <textarea autoFocus value={bioDraft} onChange={(e) => setBioDraft(e.target.value.slice(0, 280))} rows={2} placeholder="Tell people what you work on…" className="w-full box-border px-2.5 py-2 rounded-ctl border border-ctl bg-surface font-sans text-[14px] text-ink outline-none focus:border-body resize-y" />
+                    <div className="flex items-center gap-2"><Button size="sm" onClick={() => saveBio(bioDraft)}>Save</Button><LinkButton onClick={() => setBioDraft(null)}>cancel</LinkButton><span className="text-[12px] text-faint ml-auto">{bioDraft.length}/280</span></div>
                   </div>
-                  <button onClick={() => navigate("/settings")} className="text-[12.5px] text-steel-text hover:underline flex-none pb-1">Account settings →</button>
-                </div>
-                {/* Bio */}
-                <div className="mt-3 max-w-[560px]">
-                  {bioDraft !== null ? (
-                    <div className="grid gap-2">
-                      <textarea autoFocus value={bioDraft} onChange={(e) => setBioDraft(e.target.value.slice(0, 280))} rows={2} placeholder="Tell people what you work on…" className="w-full box-border px-2.5 py-2 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body resize-y" />
-                      <div className="flex items-center gap-2"><Button size="sm" onClick={() => saveBio(bioDraft)}>Save</Button><LinkButton onClick={() => setBioDraft(null)}>cancel</LinkButton><span className="text-[11.5px] text-faint ml-auto">{bioDraft.length}/280</span></div>
-                    </div>
-                  ) : (profileStats?.bio || "").trim() ? (
-                    <p className="text-[13.5px] text-body leading-[1.55]">{profileStats!.bio} <button onClick={() => setBioDraft(profileStats!.bio)} className="text-[12px] text-steel-text hover:underline">edit</button></p>
-                  ) : (
-                    <button onClick={() => setBioDraft("")} className="text-[13px] text-muted hover:text-steel-text">+ Add a bio</button>
-                  )}
-                </div>
+                ) : (profileStats?.bio || "").trim() ? (
+                  <p className="text-[14px] text-body leading-[1.55]">{profileStats!.bio} <button onClick={() => setBioDraft(profileStats!.bio)} className="text-[12.5px] text-steel-text hover:underline">edit</button></p>
+                ) : (
+                  <button onClick={() => setBioDraft("")} className="text-[14px] text-muted hover:text-steel-text">+ Add a bio</button>
+                )}
               </div>
-            </Card>
+            </div>
           )}
 
           {/* Contributions */}
           <Card>
-            <SectionHeader label={`${profileStats?.total ?? 0} contribution${(profileStats?.total ?? 0) === 1 ? "" : "s"} in the last year`} right={<span className="text-[12.5px] text-muted">you + your agents</span>} />
+            <SectionHeader label={`${profileStats?.total ?? 0} contribution${(profileStats?.total ?? 0) === 1 ? "" : "s"} in the last year`} />
             <div className="px-5 py-4">
               <ContributionHeatmap days={profileStats?.days ?? []} />
               <div className="mt-4 grid gap-1.5 pt-3 border-t border-rule3">
-                <div className="flex items-center gap-2 text-[13px]">
+                <div className="flex items-center gap-2 text-[14px]">
                   <Avatar id={me?.id} handle={me?.handle} kind="human" size={18} />
                   <span className="font-medium">{me?.handle}</span>
                   <span className="text-muted">directly</span>
                   <span className="ml-auto tabular-nums text-body">{profileStats?.human_count ?? 0}</span>
                 </div>
                 {(profileStats?.agents ?? []).map((a) => (
-                  <div key={a.handle} className="flex items-center gap-2 text-[13px] pl-5">
+                  <div key={a.handle} className="flex items-center gap-2 text-[14px] pl-5">
                     <span className="text-faint">↳</span>
                     <Avatar handle={a.handle} kind="agent" size={16} />
                     <span className="text-steel-text">{a.handle}</span>
                     <span className="ml-auto tabular-nums text-muted">{a.count}</span>
                   </div>
                 ))}
-                {(profileStats?.agents ?? []).length === 0 && <div className="text-[12px] text-faint pl-5">no agents accountable to you have contributed yet</div>}
+                {(profileStats?.agents ?? []).length === 0 && <div className="text-[12.5px] text-faint pl-5">no agents accountable to you have contributed yet</div>}
               </div>
             </div>
           </Card>
 
           <div>
-            <Eyebrow label="All repositories" right={`${repos.length}`} />
+            <div className="flex items-end justify-between gap-4 mb-2">
+              <Eyebrow label="Repositories" right={q ? `${shownRepos.length} of ${repos.length}` : `${Math.min(6, repos.length)} of ${repos.length}`} />
+              <div className="w-[220px] pb-1"><SearchInput placeholder="Find a repository" shortcut="" value={profileRepoQ} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setProfileRepoQ(e.target.value)} /></div>
+            </div>
             {repos.length === 0 && <div className="py-8 text-[13px] text-muted">No repositories yet.</div>}
             <div>
-              {repos.map((r) => (
+              {shownRepos.map((r) => (
                 <button key={`${r.tenant}/${r.repo}`} onClick={() => navigate(`/${encodeURIComponent(r.tenant)}/${encodeURIComponent(r.repo)}`)} className="group w-full text-left block border-b border-rule2">
                   <div className="flex items-center gap-3 py-3 -mx-3 px-3 rounded-ctl group-hover:bg-surface transition-colors">
                     <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-muted flex-none"><path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8ZM5 12.25a.25.25 0 0 1 .25-.25h3.5a.25.25 0 0 1 .25.25v3.25a.25.25 0 0 1-.4.2l-1.45-1.087a.25.25 0 0 0-.3 0L5.4 15.7a.25.25 0 0 1-.4-.2Z" /></svg>
@@ -1654,6 +1697,8 @@ export function App() {
                   </div>
                 </button>
               ))}
+              {q && shownRepos.length === 0 && <div className="py-6 text-[13px] text-muted">No repositories match “{profileRepoQ}”.</div>}
+              {!q && repos.length > 6 && <div className="pt-3 text-[12.5px] text-muted">Showing your 6 most active — search to find the rest.</div>}
             </div>
           </div>
         </div>
@@ -2263,17 +2308,7 @@ export function App() {
                         </div>
                         <div className="grid gap-2 pt-1 border-t border-rule3">
                           <div className="text-[14px] font-medium">Default labels</div>
-                          <div className="flex flex-wrap gap-1.5">
-                            {(orgDefaults?.labels ?? []).map((l) => (
-                              <span key={l.name} className="inline-flex items-center gap-1"><Label name={l.name} color={l.color} /><button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveOrgDefaults(acct.id, { labels: (orgDefaults?.labels ?? []).filter((x) => x.name !== l.name) })}>×</button></span>
-                            ))}
-                            {(orgDefaults?.labels ?? []).length === 0 && <span className="text-[12.5px] text-muted">none</span>}
-                          </div>
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <div className="inline-flex items-center gap-1">{LABEL_COLORS.map((c) => <button key={c} type="button" onClick={() => setOrgLabelDraft((n) => ({ ...n, color: c }))} className={`w-5 h-5 rounded-full transition-transform ${orgLabelDraft.color === c ? "ring-2 ring-offset-1 ring-body scale-110" : "hover:scale-110"}`} style={{ background: c }} />)}</div>
-                            <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[180px]" placeholder="label name" value={orgLabelDraft.name} onChange={(e) => setOrgLabelDraft((n) => ({ ...n, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter" && orgLabelDraft.name.trim() && !(orgDefaults?.labels ?? []).some((x) => x.name === orgLabelDraft.name.trim())) { saveOrgDefaults(acct.id, { labels: [...(orgDefaults?.labels ?? []), { name: orgLabelDraft.name.trim(), color: orgLabelDraft.color }] }); setOrgLabelDraft({ name: "", color: LABEL_COLORS[0] }); } }} />
-                            <Button size="sm" disabled={!orgLabelDraft.name.trim()} onClick={() => { if (orgLabelDraft.name.trim() && !(orgDefaults?.labels ?? []).some((x) => x.name === orgLabelDraft.name.trim())) { saveOrgDefaults(acct.id, { labels: [...(orgDefaults?.labels ?? []), { name: orgLabelDraft.name.trim(), color: orgLabelDraft.color }] }); setOrgLabelDraft({ name: "", color: LABEL_COLORS[0] }); } }}>Add</Button>
-                          </div>
+                          <LabelEditor labels={orgDefaults?.labels ?? []} onChange={(l) => saveOrgDefaults(acct.id, { labels: l })} />
                         </div>
                       </div>
                     </Card>
@@ -2543,8 +2578,12 @@ export function App() {
                       options={[{ value: "public", label: "Public" }, { value: "unlisted", label: "Unlisted" }, { value: "private", label: "Private" }]} />
                   </div>
                   <div className="flex items-center justify-between gap-4">
-                    <div><div className="text-[13.5px] font-medium">Require a review to merge</div><div className="text-[12.5px] text-muted">On top of the built-in author-independence gate.</div></div>
+                    <div><div className="text-[13.5px] font-medium">Require a review to merge</div><div className="text-[12.5px] text-muted">An approving review is needed to land.</div></div>
                     <Switch on={!!s?.require_review_to_land} onChange={(on: boolean) => isTenantOwner && saveRepoSettings({ require_review_to_land: on })} />
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <div><div className="text-[13.5px] font-medium">Author-independence gate</div><div className="text-[12.5px] text-muted">An approval must come from someone other than the author (no self-merge). Turn off for a solo repo.</div></div>
+                    <Switch on={s?.author_independence ?? true} onChange={(on: boolean) => isTenantOwner && saveRepoSettings({ author_independence: on })} />
                   </div>
                 </div>
               </Card>
@@ -2604,29 +2643,10 @@ export function App() {
               </Card>
               <Card>
                 <SectionHeader label="Labels" right={<span className="text-[12.5px] text-muted">the only labels issues can use</span>} />
-                <div className="px-5 py-4 grid gap-3">
-                  <div className="flex flex-wrap gap-1.5">
-                    {(s?.labels ?? []).map((l) => (
-                      <span key={l.name} className="inline-flex items-center gap-1">
-                        <Label name={l.name} color={l.color} />
-                        {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" title="remove" onClick={() => saveRepoSettings({ labels: (s?.labels ?? []).filter((x) => x.name !== l.name) })}>×</button>}
-                      </span>
-                    ))}
-                    {(s?.labels ?? []).length === 0 && <span className="text-[12.5px] text-muted">none yet — add labels so issues aren't free-form</span>}
-                  </div>
-                  {isTenantOwner && (
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <div className="inline-flex items-center gap-1">
-                        {LABEL_COLORS.map((c) => (
-                          <button key={c} type="button" title={c} onClick={() => setNewLabel((n) => ({ ...n, color: c }))} className={`w-5 h-5 rounded-full transition-transform ${newLabel.color === c ? "ring-2 ring-offset-1 ring-body scale-110" : "hover:scale-110"}`} style={{ background: c }} />
-                        ))}
-                      </div>
-                      <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[190px]" placeholder="label name (e.g. bug)" value={newLabel.name}
-                        onChange={(e) => setNewLabel((n) => ({ ...n, name: e.target.value }))}
-                        onKeyDown={(e) => { if (e.key === "Enter" && newLabel.name.trim() && s && !(s.labels ?? []).some((x) => x.name === newLabel.name.trim())) { saveRepoSettings({ labels: [...(s.labels ?? []), { name: newLabel.name.trim(), color: newLabel.color }] }); setNewLabel({ name: "", color: LABEL_COLORS[0] }); } }} />
-                      <Button size="sm" disabled={!newLabel.name.trim()} onClick={() => { if (newLabel.name.trim() && s && !(s.labels ?? []).some((x) => x.name === newLabel.name.trim())) { saveRepoSettings({ labels: [...(s.labels ?? []), { name: newLabel.name.trim(), color: newLabel.color }] }); setNewLabel({ name: "", color: LABEL_COLORS[0] }); } }}>Add label</Button>
-                    </div>
-                  )}
+                <div className="px-5 py-4">
+                  {isTenantOwner
+                    ? <LabelEditor labels={s?.labels ?? []} onChange={(l) => saveRepoSettings({ labels: l })} />
+                    : <div className="flex flex-wrap gap-1.5">{(s?.labels ?? []).map((l) => <Label key={l.name} name={l.name} color={l.color} icon={l.icon} />)}{(s?.labels ?? []).length === 0 && <span className="text-[12.5px] text-muted">none</span>}</div>}
                 </div>
               </Card>
               <Card>
@@ -2673,37 +2693,45 @@ export function App() {
     </div>
   );
 }
-// A GitHub-style contribution heatmap: ~53 weeks × 7 days, coloured by daily contribution count.
-// `days` are (day-since-epoch, count) pairs; cells outside the trailing year render empty.
-function ContributionHeatmap({ days }: { days: { day: number; count: number }[] }) {
-  const byDay = new Map(days.map((d) => [d.day, d.count]));
+// A GitHub-style contribution heatmap: ~53 weeks × 7 days. Each cell is split into TWO triangles —
+// top-left = your own contributions, bottom-right = your agents' — each shaded by its own intensity.
+// Columns flex to fill the width, so there's never a scrollbar.
+type HeatDay = { day: number; human: number; agent: number };
+const HEAT_YOU = ["#ebedf0", "#9be9a8", "#40c463", "#30a14e", "#216e39"]; // green
+const HEAT_AGENT = ["#dfe3ea", "#a9c9f5", "#5a9bd4", "#2f6fb0", "#1b4d80"]; // blue
+function ContributionHeatmap({ days }: { days: HeatDay[] }) {
+  const byDay = new Map(days.map((d) => [d.day, d]));
   const today = Math.floor(Date.now() / 86_400_000);
   const start = today - 371;
   const dow = (e: number) => ((e % 7) + 4) % 7; // epoch day 0 = Thursday; 0=Sun … 6=Sat
   const gridStart = start - dow(start);
-  const max = Math.max(1, ...days.map((d) => d.count));
-  const level = (c: number) => (c <= 0 ? 0 : c <= max * 0.25 ? 1 : c <= max * 0.5 ? 2 : c <= max * 0.75 ? 3 : 4);
-  const shade = ["bg-rule2/70", "bg-clear/30", "bg-clear/55", "bg-clear/80", "bg-clear"];
+  const maxH = Math.max(1, ...days.map((d) => d.human));
+  const maxA = Math.max(1, ...days.map((d) => d.agent));
+  const lvl = (c: number, m: number) => (c <= 0 ? 0 : c <= m * 0.25 ? 1 : c <= m * 0.5 ? 2 : c <= m * 0.75 ? 3 : 4);
   const weeks: number[][] = [];
   for (let w = 0; gridStart + w * 7 <= today; w++) {
     const col: number[] = [];
-    for (let d = 0; d < 7; d++) { const e = gridStart + w * 7 + d; col.push(e >= start && e <= today ? (byDay.get(e) ?? 0) : -1); }
+    for (let d = 0; d < 7; d++) { const e = gridStart + w * 7 + d; col.push(e >= start && e <= today ? e : -1); }
     weeks.push(col);
   }
   const fmt = (e: number) => new Date(e * 86_400_000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   return (
     <div className="grid gap-2">
-      <div className="flex gap-[3px] overflow-x-auto pb-1">
+      <div className="flex gap-[2px] w-full">
         {weeks.map((col, i) => (
-          <div key={i} className="grid gap-[3px] content-start">
-            {col.map((c, j) => c < 0
-              ? <span key={j} className="w-[11px] h-[11px]" />
-              : <span key={j} title={`${c} contribution${c === 1 ? "" : "s"} · ${fmt(gridStart + i * 7 + j)}`} className={`w-[11px] h-[11px] rounded-[2px] ${shade[level(c)]}`} />)}
+          <div key={i} className="grid gap-[2px] flex-1 min-w-0 content-start">
+            {col.map((e, j) => {
+              if (e < 0) return <span key={j} className="aspect-square" />;
+              const d = byDay.get(e); const h = d?.human ?? 0; const a = d?.agent ?? 0;
+              const bg = h === 0 && a === 0 ? "#ebedf0" : `linear-gradient(to bottom right, ${HEAT_YOU[lvl(h, maxH)]} 0 50%, ${HEAT_AGENT[lvl(a, maxA)]} 50% 100%)`;
+              return <span key={j} title={`${h + a} contribution${h + a === 1 ? "" : "s"} — ${h} you, ${a} agents · ${fmt(e)}`} className="aspect-square rounded-[2px]" style={{ background: bg }} />;
+            })}
           </div>
         ))}
       </div>
-      <div className="flex items-center gap-1.5 text-[11.5px] text-muted self-end">
-        Less {shade.map((s, i) => <span key={i} className={`w-[11px] h-[11px] rounded-[2px] ${s}`} />)} More
+      <div className="flex items-center gap-4 text-[11.5px] text-muted self-end">
+        <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />you</span>
+        <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_AGENT[3] }} />agents</span>
       </div>
     </div>
   );

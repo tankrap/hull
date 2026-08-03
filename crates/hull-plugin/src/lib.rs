@@ -183,8 +183,12 @@ pub struct MirrorResult {
 pub struct LogMirror;
 
 impl Mirror for LogMirror {
-    fn target(&self, _repo: &str) -> Option<String> {
-        std::env::var("HULL_MIRROR_TARGET").ok().filter(|s| !s.is_empty())
+    fn target(&self, repo: &str) -> Option<String> {
+        // `HULL_MIRROR_TARGET` (e.g. "github:tenant/repo") configures ONE repo's mirror — only that
+        // repo reports a target, not every repo in the instance.
+        let t = std::env::var("HULL_MIRROR_TARGET").ok().filter(|s| !s.is_empty())?;
+        let repo_part = t.split_once(':').map(|(_, r)| r).unwrap_or(&t);
+        (repo_part == repo).then_some(t)
     }
     fn push(&self, req: &MirrorPush) -> MirrorResult {
         let target = std::env::var("HULL_MIRROR_TARGET").unwrap_or_default();

@@ -511,7 +511,9 @@ async fn profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Resp
     }
     // The git author header is "Name <email> unixtime tz"; take the name part as the handle.
     let handle_of = |author: &str| -> String { author.split_once(" <").map(|(n, _)| n.trim().to_string()).unwrap_or_else(|| author.trim().to_string()) };
-    let mut days: HashMap<u64, u64> = HashMap::new();
+    // Per day, split human (my own commits) vs agent (my agents') so each heatmap cell can render two
+    // triangles.
+    let mut days: HashMap<u64, (u64, u64)> = HashMap::new();
     let mut by_handle: HashMap<String, u64> = HashMap::new();
     let mut total = 0u64;
     for acct in member_accounts(&app, &me.id) {
@@ -521,14 +523,15 @@ async fn profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Resp
             for (author, ts) in app.repos.history(&acct.handle, &repo.name, &roots, since) {
                 let h = handle_of(&author);
                 if mine.contains(&h) {
-                    *days.entry(ts / 86_400).or_default() += 1;
+                    let e = days.entry(ts / 86_400).or_default();
+                    if agent_handles.contains(&h) { e.1 += 1; } else { e.0 += 1; }
                     *by_handle.entry(h).or_default() += 1;
                     total += 1;
                 }
             }
         }
     }
-    let days_v: Vec<Value> = days.into_iter().map(|(d, c)| json!({ "day": d, "count": c })).collect();
+    let days_v: Vec<Value> = days.into_iter().map(|(d, (human, agent))| json!({ "day": d, "human": human, "agent": agent, "count": human + agent })).collect();
     let mut agents_v: Vec<Value> = by_handle
         .iter()
         .filter(|(h, _)| agent_handles.contains(*h))
@@ -872,12 +875,13 @@ fn settings_value(app: &App, s: &reposettings::RepoSettings) -> Value {
         .map(|id| json!({ "actor": id, "handle": app.store.actor(id).map(|a| a.handle).unwrap_or_default() }))
         .collect();
     let teams: Vec<Value> = s.team_access.iter().map(|t| json!({ "team": t.team, "role": t.role })).collect();
-    let labels: Vec<Value> = s.labels.iter().map(|l| json!({ "name": l.name, "color": l.color })).collect();
+    let labels: Vec<Value> = s.labels.iter().map(|l| json!({ "name": l.name, "color": l.color, "icon": l.icon })).collect();
     json!({
         "private": s.private,
         "unlisted": s.unlisted,
         "visibility": if s.private { "private" } else if s.unlisted { "unlisted" } else { "public" },
         "require_review_to_land": s.require_review_to_land,
+        "author_independence": !s.allow_self_approve,
         "default_reviewers": reviewers,
         "team_access": teams,
         "labels": labels,
@@ -891,7 +895,7 @@ async fn repo_labels(State(app): State<App>, Path((tenant, repo)): Path<(String,
         return resp;
     }
     let s = app.repo_settings.get(&format!("{tenant}/{repo}"));
-    let labels: Vec<Value> = s.labels.iter().map(|l| json!({ "name": l.name, "color": l.color })).collect();
+    let labels: Vec<Value> = s.labels.iter().map(|l| json!({ "name": l.name, "color": l.color, "icon": l.icon })).collect();
     Json(json!({ "labels": labels })).into_response()
 }
 
@@ -940,6 +944,9 @@ fn apply_settings_patch(app: &App, s: &mut reposettings::RepoSettings, body: &Va
     if let Some(r) = body.get("require_review_to_land").and_then(Value::as_bool) {
         s.require_review_to_land = r;
     }
+    if let Some(ai) = body.get("author_independence").and_then(Value::as_bool) {
+        s.allow_self_approve = !ai;
+    }
     if let Some(arr) = body.get("default_reviewers").and_then(Value::as_array) {
         s.default_reviewers = arr.iter().filter_map(|v| v.as_str()).filter(|id| app.store.actor(id).is_some()).map(str::to_string).collect();
     }
@@ -960,7 +967,8 @@ fn apply_settings_patch(app: &App, s: &mut reposettings::RepoSettings, body: &Va
                 let name = v.get("name").and_then(Value::as_str)?.trim().to_string();
                 if name.is_empty() { return None; }
                 let color = v.get("color").and_then(Value::as_str).unwrap_or("#8b949e").to_string();
-                Some(reposettings::Label { name, color })
+                let icon = v.get("icon").and_then(Value::as_str).unwrap_or("").chars().take(4).collect();
+                Some(reposettings::Label { name, color, icon })
             })
             .collect();
     }
@@ -2607,12 +2615,14 @@ async fn perform_merge(
     if !green && !override_ok {
         return Err((StatusCode::CONFLICT, "cannot merge: change is not keel-verify green".into()));
     }
-    // Independent approving reviews (approver != PR author), split by actor kind.
+    // Independent approving reviews (approver != PR author unless the repo allows self-approval),
+    // split by actor kind.
+    let allow_self = app.repo_settings.get(&key).allow_self_approve;
     let approvals: Vec<ActorId> = app
         .store
         .reviews(&key)
         .into_iter()
-        .filter(|r| r.target == format!("pr:{number}") && r.verdict == Verdict::Approve && r.reviewer != pr.author)
+        .filter(|r| r.target == format!("pr:{number}") && r.verdict == Verdict::Approve && (allow_self || r.reviewer != pr.author))
         .map(|r| r.reviewer)
         .collect();
     let human_approval = approvals.iter().any(|a| app.store.actor(a).map(|x| x.kind == hull_core::ActorKind::Human).unwrap_or(false));
