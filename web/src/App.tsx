@@ -1098,7 +1098,7 @@ export function App() {
                 <b className={kindOf(c.author) === "agent" ? "text-steel-text" : ""}>{handleOf(c.author)}</b>
                 <span className="text-faint tabular-nums" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
               </div>
-              <Markdown text={c.body} className="px-3 py-2 text-[13.5px] text-body" />
+              <Markdown text={c.body} linkBase={`/${encodeURIComponent(tenant)}/${issueRepo}`} className="px-3 py-2 text-[13.5px] text-body" />
             </div>
           </div>
         ))}
@@ -1701,7 +1701,7 @@ export function App() {
             </p>
             <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-x-12 gap-y-9">
               <section className="min-w-0 grid gap-6">
-                {it.body ? <Markdown text={it.body} className="text-[14px] text-body" /> : <p className="text-[13px] text-muted">no description</p>}
+                {it.body ? <Markdown text={it.body} linkBase={`/${encodeURIComponent(tenant)}/${issueRepo}`} className="text-[14px] text-body" /> : <p className="text-[13px] text-muted">no description</p>}
                 {it.code_refs.length > 0 && (
                   <div className="grid gap-2">
                     <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">Code references</span>
@@ -2531,11 +2531,19 @@ function ReviewPage({
   const composerDisabled = composerBusy || (composerMode === "comment" && !draft.trim());
   // Inline findings: which are collapsed (hidden inline, reopenable from a gutter marker).
   // Findings start collapsed (shown as a gutter marker) so they don't crowd the diff; click to open.
-  const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => {
-    const s = new Set<string>();
-    reviews.forEach((r, ri) => (r.findings ?? []).forEach((_, fi) => s.add(`${ri}:${fi}`)));
-    return s;
-  });
+  // Reviews load async, so collapse each finding once when first seen (without undoing manual expands).
+  const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => new Set());
+  const seenFindingsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    setCollapsedFindings((prev) => {
+      const n = new Set(prev);
+      reviews.forEach((r, ri) => (r.findings ?? []).forEach((_, fi) => {
+        const k = `${ri}:${fi}`;
+        if (!seenFindingsRef.current.has(k)) { seenFindingsRef.current.add(k); n.add(k); }
+      }));
+      return n;
+    });
+  }, [reviews]);
   const toggleFinding = (key: string) => setCollapsedFindings((s) => { const n = new Set(s); n.has(key) ? n.delete(key) : n.add(key); return n; });
   // Line-level review comments: select a diff line, press C (or click the gutter ✎) to comment on it.
   const [selLine, setSelLine] = useState<{ path: string; line: number } | null>(null);
@@ -2636,7 +2644,7 @@ function ReviewPage({
           );
         })()}
 
-        <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-8 gap-y-6 mt-3">
+        <div className="grid gap-6 mt-3">
           <div className="min-w-0 grid gap-6">
         {/* changes — the flagship semantic-diff surface (Grouped ⇄ Line-by-line toggle built in) */}
         {(() => {
@@ -2710,7 +2718,7 @@ function ReviewPage({
                   <span className="text-faint tabular-nums" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
                   <span className="text-[11px] text-faint">on line {c.line}</span>
                 </div>
-                <Markdown text={c.body} className="text-[13.5px] text-body mt-0.5" />
+                <Markdown text={c.body} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} className="text-[13.5px] text-body mt-0.5" />
               </div>
             </div>
           );
@@ -3046,7 +3054,7 @@ function ReviewPage({
                         <b className={kindOf(e.c.author) === "agent" ? "text-steel-text" : ""}>{handleOf(e.c.author)}</b>
                         <span className="text-faint tabular-nums" title={new Date(e.c.created_unix * 1000).toLocaleString()}>{timeAgo(e.c.created_unix)}</span>
                       </div>
-                      <Markdown text={e.c.body} className="px-3 py-2 text-[13.5px] text-body" />
+                      <Markdown text={e.c.body} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} className="px-3 py-2 text-[13.5px] text-body" />
                     </div>
                   </div>
                 ));
@@ -3083,11 +3091,9 @@ function ReviewPage({
           </Card>
         )}
 
-        {/* decision — placed last, so a reviewer lands only after reading the diff, reconciliation,
-            findings, and conversation above. */}
-        {landGate}
           </div>
-          <aside className="grid gap-6 content-start">
+          {/* details — moved below the full-width diff so the diff gets the whole page width */}
+          <div className="grid md:grid-cols-3 gap-6 content-start">
         {/* proposed change — the file list + provenance; the "why" lives in the brief above */}
         <Card>
           <SectionHeader label="Files" right={<span className="text-[12.5px] text-muted tabular-nums">{change ? `${change.files.length} · +${addN} −${delN}` : ""}</span>} />
@@ -3153,8 +3159,10 @@ function ReviewPage({
             )}
           </div>
         </Card>
+          </div>
 
-          </aside>
+        {/* decision — placed last, after everything has been reviewed */}
+        {landGate}
         </div>
 
       </div>

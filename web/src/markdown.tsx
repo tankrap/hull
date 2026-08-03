@@ -3,9 +3,13 @@ import React from "react";
 // Minimal, XSS-safe markdown → React (no dangerouslySetInnerHTML on user content). Covers headings,
 // bullet lists, blockquotes, fenced + inline code, bold/italic, and links — enough for comments,
 // descriptions, and review summaries.
+// When a repo base like "/acme/web" is given, `!11` links to that voyage and `#7` to that issue —
+// so descriptions and comments cross-reference other work with a click.
+let LINK_BASE: string | null = null;
 function inline(text: string, kp: string): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
-  const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|_[^_]+_|\[[^\]]+\]\([^)]+\)|https?:\/\/[^\s)]+)/g;
+  const ref = LINK_BASE ? "|(?<![\\w])[!#]\\d+" : "";
+  const re = new RegExp(`(\`[^\`]+\`|\\*\\*[^*]+\\*\\*|\\*[^*]+\\*|_[^_]+_|\\[[^\\]]+\\]\\([^)]+\\)|https?:\\/\\/[^\\s)]+${ref})`, "g");
   let last = 0, m: RegExpExecArray | null, i = 0;
   while ((m = re.exec(text))) {
     if (m.index > last) nodes.push(text.slice(last, m.index));
@@ -16,6 +20,7 @@ function inline(text: string, kp: string): React.ReactNode[] {
     else if (tok.startsWith("*")) nodes.push(<i key={key}>{tok.slice(1, -1)}</i>);
     else if (tok.startsWith("_")) nodes.push(<i key={key}>{tok.slice(1, -1)}</i>);
     else if (tok.startsWith("[")) { const mm = /\[([^\]]+)\]\(([^)]+)\)/.exec(tok); if (mm && /^https?:\/\//.test(mm[2])) nodes.push(<a key={key} href={mm[2]} target="_blank" rel="noreferrer" className="text-steel-text">{mm[1]}</a>); else nodes.push(tok); }
+    else if (LINK_BASE && (tok[0] === "!" || tok[0] === "#")) { const n = tok.slice(1); const href = `${LINK_BASE}/${tok[0] === "!" ? "voyages" : "issues"}/${n}`; nodes.push(<a key={key} href={href} className="text-steel-text font-medium">{tok}</a>); }
     else nodes.push(<a key={key} href={tok} target="_blank" rel="noreferrer" className="text-steel-text break-all">{tok}</a>);
     last = m.index + tok.length;
   }
@@ -23,7 +28,8 @@ function inline(text: string, kp: string): React.ReactNode[] {
   return nodes;
 }
 
-export function Markdown({ text, className = "" }: { text: string; className?: string }) {
+export function Markdown({ text, className = "", linkBase = null }: { text: string; className?: string; linkBase?: string | null }) {
+  LINK_BASE = linkBase;
   const lines = (text ?? "").split("\n");
   const blocks: React.ReactNode[] = [];
   let i = 0, k = 0;
