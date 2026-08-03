@@ -10,6 +10,7 @@ import { SemanticDiff, CodePanel, LocationBar, OldTok, NewTok } from "./ui/Seman
 import { createPasskey, getPasskey } from "./webauthn";
 import { hlToHtml, wordDiff, type Seg } from "./highlight";
 import { Markdown } from "./markdown";
+import { RichText } from "./ui/RichText";
 
 // Syntax-highlighted code fragment (hljs HTML). Used across the diff viewer.
 const Hl = ({ text, path }: { text: string; path: string }) => <span dangerouslySetInnerHTML={{ __html: hlToHtml(text, path) }} />;
@@ -325,7 +326,7 @@ function NewIssueModal({ repos, defaultRepo, actors, onClose, onCreate }: { repo
       <div className="grid gap-4">
         <Field label="Repository"><Picker block value={repo} onChange={setRepo} options={repos.map((r) => ({ value: `${r.tenant}/${r.repo}`, label: `${r.tenant}/${r.repo}` }))} placeholder="Choose a repository…" /></Field>
         <Field label="Title"><input autoFocus className={modalInput} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Something an agent (or human) should fix" /></Field>
-        <Field label="Description" hint="markdown"><textarea rows={5} className={`${modalInput} h-auto py-2 resize-y leading-[1.5]`} value={body} onChange={(e) => setBody(e.target.value)} placeholder="What's wrong, where, and how you'd know it's fixed. Agents read this first." /></Field>
+        <Field label="Description"><RichText value={body} onChange={setBody} rows={5} placeholder="What's wrong, where, and how you'd know it's fixed. Agents read this first." /></Field>
         <Field label="Labels" hint="comma-separated"><input className={modalInput} value={labels} onChange={(e) => setLabels(e.target.value)} placeholder="bug, area:auth" spellCheck={false} /></Field>
         <Field label="Assignees">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -2806,10 +2807,7 @@ function ReviewPage({
           const composerNote = () => (
             <div className="px-4 py-3 bg-steel-wash/50 grid gap-2">
               <div className="text-[11.5px] text-muted">Commenting on <b className="text-body">{commenting!.path.split("/").pop()}:{commenting!.line}</b></div>
-              <textarea autoFocus rows={2} value={lineDraft} onChange={(e) => setLineDraft(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) postLineComment(); if (e.key === "Escape") { setCommenting(null); setSelLine(null); } }}
-                placeholder="Leave a comment on this line…  (⌘↵ to submit)"
-                className="w-full box-border px-2.5 py-2 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body resize-y placeholder:text-faint" />
+              <RichText value={lineDraft} onChange={setLineDraft} rows={2} autoFocus minimal onSubmit={postLineComment} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} placeholder="Leave a comment on this line…  (⌘↵ to submit)" />
               <div className="flex gap-2">
                 <Button size="sm" disabled={!lineDraft.trim()} onClick={postLineComment}>Comment</Button>
                 <Button size="sm" variant="secondary" onClick={() => { setCommenting(null); setSelLine(null); }}>Cancel</Button>
@@ -3157,8 +3155,10 @@ function ReviewPage({
                   </div>
                 ));
               })()}
-              <div className="flex gap-2 mt-1 items-start">
-                <input className="flex-1 box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder={canAct ? "Leave a comment…" : "sign in to comment"} disabled={!canAct} value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !composerDisabled) runMode(composerMode); }} />
+              <div className="mt-1 grid gap-2">
+                {canAct ? <RichText value={draft} onChange={setDraft} rows={3} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} onSubmit={() => !composerDisabled && runMode(composerMode)} placeholder="Leave a comment…" />
+                  : <div className="border border-ctl rounded-ctl px-2.5 py-2 text-[13px] text-faint">sign in to comment</div>}
+                <div className="flex justify-end">
                 {canAct ? (
                   <div className="flex-none inline-flex h-ctl">
                     <Button size="md" disabled={composerDisabled} onClick={() => runMode(composerMode)} className="!rounded-r-none inline-flex items-center gap-1.5">{MODES.find((m) => m.id === composerMode)!.icon}{MODES.find((m) => m.id === composerMode)!.label}</Button>
@@ -3184,6 +3184,7 @@ function ReviewPage({
                     </Popover>
                   </div>
                 ) : <Button size="md" disabled>Comment</Button>}
+                </div>
               </div>
             </div>
           </Card>
