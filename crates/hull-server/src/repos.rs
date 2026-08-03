@@ -158,6 +158,17 @@ impl RepoHost {
         self.open.lock().unwrap().insert(key, store.clone());
         Ok(Some(store))
     }
+
+    /// Provision an empty repo (dir + keel store) so it can be cloned and pushed to. Returns `true`
+    /// if newly created, `false` if it already existed. Errors on an invalid name.
+    pub fn create_repo(&self, tenant: &str, repo: &str) -> io::Result<bool> {
+        if !safe_segment(tenant) || !safe_segment(repo) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid repo name"));
+        }
+        let existed = self.root.join(tenant).join(repo).join(".keel/store").exists();
+        self.store(tenant, repo, true)?;
+        Ok(!existed)
+    }
 }
 
 /// A resolved content-addressed anchor: the keel blob id a path currently maps to at HEAD, plus the
@@ -174,6 +185,21 @@ impl RepoHost {
     pub fn head_change(&self, tenant: &str, repo: &str) -> Option<String> {
         let store = self.store(tenant, repo, false).ok()??;
         store.get_ref("main").ok()?.map(|id| id.to_hex())
+    }
+
+    /// Resolve a pushed git commit (full 40-hex SHA-1) to the keel change it was bridged into — the
+    /// glue that lets a voyage be opened from a pushed branch's HEAD, not just `main`.
+    /// The `gchange` aux namespace (git-commit-oid(20) → keel change id(32)) is written by the bridge
+    /// for every pushed commit, so a branch's changes are resolvable even before it's merged.
+    pub fn change_for_commit(&self, tenant: &str, repo: &str, sha_hex: &str) -> Option<String> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let s = sha_hex.trim();
+        if s.len() != 40 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let oid: Vec<u8> = (0..40).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect();
+        let cid = store.aux_get("gchange", &oid).ok()??;
+        Some(cid.iter().map(|b| format!("{b:02x}")).collect())
     }
 
     /// Resolve `path` in a hosted repo to the keel blob it points at in HEAD's tree. This is what

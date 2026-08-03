@@ -3239,12 +3239,16 @@ async fn create_pr(
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title is required").into_response();
     }
-    let changes: Vec<String> = match body.get("changes").and_then(Value::as_array) {
-        Some(arr) => arr.iter().filter_map(Value::as_str).map(str::to_string).collect(),
-        None => app.repos.head_change(&tenant, &repo).into_iter().collect(),
+    let changes: Vec<String> = if let Some(commit) = body.get("commit").and_then(Value::as_str) {
+        // Open a voyage from a pushed branch's HEAD commit (resolved to its bridged keel change).
+        app.repos.change_for_commit(&tenant, &repo, commit).into_iter().collect()
+    } else if let Some(arr) = body.get("changes").and_then(Value::as_array) {
+        arr.iter().filter_map(Value::as_str).map(str::to_string).collect()
+    } else {
+        app.repos.head_change(&tenant, &repo).into_iter().collect()
     };
     if changes.is_empty() {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "no changes to propose (empty repo?)").into_response();
+        return (StatusCode::UNPROCESSABLE_ENTITY, "no changes to propose (unknown commit or empty repo?)").into_response();
     }
     let number = app.store.prs(&key).iter().map(|p| p.number).max().unwrap_or(0) + 1;
     // Code owners: resolve the owners of any file this change touches — they become requested
