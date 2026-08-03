@@ -1838,6 +1838,18 @@ async fn run_check_handler(
             if matches!(o.status, hull_plugin::CiStatus::Green | hull_plugin::CiStatus::Red) {
                 notify_ci(&app, &tenant, &repo, &id, status, &o.summary);
             }
+            // Auto-triage a failed check: an independent agent reviews the failing change and posts
+            // findings, so a red result isn't a dead end. Runs in the background; the memoized red
+            // verdict makes the agent's own check run instant.
+            if matches!(o.status, hull_plugin::CiStatus::Red) {
+                let key = format!("{tenant}/{repo}");
+                if let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.changes.iter().any(|c| c.starts_with(&id) || id.starts_with(c.as_str()))) {
+                    if let Some(agent) = independent_agent_reviewer(&app, &pr.author) {
+                        let (app2, t2, r2, n2) = (app.clone(), tenant.clone(), repo.clone(), pr.number);
+                        tokio::spawn(async move { let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent, 0).await; });
+                    }
+                }
+            }
             Json(json!({ "status": status, "summary": o.summary, "memoized": o.memoized })).into_response()
         }
         CiResolution::Dispatched { url } => {
