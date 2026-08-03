@@ -65,21 +65,22 @@ type RouteState = {
   orgHandle: string | null;
   tenant: string;
   issueRepo: string;
-  tab: "issues" | "prs";
+  tab: RepoTab;
   openIssue: number | null;
   openPr: number | null;
-  repoSettingsOpen: boolean;
 };
+type RepoTab = "issues" | "prs" | "files" | "settings";
 function parseRoute(path: string): RouteState {
   const seg = path.split("?")[0].split("/").filter(Boolean).map(decodeURIComponent);
-  const r: RouteState = { view: "home", authPage: null, orgHandle: null, tenant: "", issueRepo: "", tab: "issues", openIssue: null, openPr: null, repoSettingsOpen: false };
+  const r: RouteState = { view: "home", authPage: null, orgHandle: null, tenant: "", issueRepo: "", tab: "issues", openIssue: null, openPr: null };
   if (seg[0] === "login" || seg[0] === "signup") { r.authPage = seg[0]; return r; }
   if (seg[0] === "settings") { r.authPage = "account"; return r; }
   if (seg[0] === "orgs" && seg[1]) { r.orgHandle = seg[1]; return r; }
   const [t, rp, s, n] = seg;
   if (t && rp) {
     r.view = "repo"; r.tenant = t; r.issueRepo = rp;
-    if (s === "settings") r.repoSettingsOpen = true;
+    if (s === "settings") r.tab = "settings";
+    else if (s === "files" || s === "tree" || s === "code") r.tab = "files";
     else if (s === "issues" && n) { r.openIssue = Number(n); r.tab = "issues"; }
     else if (s === "voyages" && n) { r.openPr = Number(n); r.tab = "prs"; }
     else if (s === "voyages") r.tab = "prs";
@@ -831,7 +832,6 @@ export function App() {
 
   // ── org management (members + teams) + repo settings ──────────────────────
   const [orgHandle, setOrgHandle] = useState<string | null>(() => parseRoute(location.pathname).orgHandle);
-  const [repoSettingsOpen, setRepoSettingsOpen] = useState(() => parseRoute(location.pathname).repoSettingsOpen);
   type TeamT = { id: string; name: string; members: { actor: string; handle: string; role: string }[] };
   const [teams, setTeams] = useState<TeamT[]>([]);
   const [memberPick, setMemberPick] = useState({ actor: "", role: "write" });
@@ -947,7 +947,6 @@ export function App() {
     if (orgAccountFor(tenant)) loadTeams(orgAccountFor(tenant)!.id);
   };
   const orgAccountFor = (handle: string) => accounts.find((a) => a.handle === handle);
-  useEffect(() => { if (repoSettingsOpen) loadRepoSettings(); }, [repoSettingsOpen, tenant, issueRepo]);
   const saveRepoSettings = async (patch: Partial<{ private: boolean; require_review_to_land: boolean; default_reviewers: string[]; team_access: { team: string; role: string }[] }>) => {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
     if (!res.ok) return uiAlert(await res.text());
@@ -993,7 +992,8 @@ export function App() {
 
   // Two views: Home (situation room) and a focused Repo view with Issues / PRs tabs.
   const [view, setView] = useState<"home" | "repo">(() => parseRoute(location.pathname).view);
-  const [tab, setTab] = useState<"issues" | "prs">(() => parseRoute(location.pathname).tab);
+  const [tab, setTab] = useState<RepoTab>(() => parseRoute(location.pathname).tab);
+  useEffect(() => { if (tab === "settings") loadRepoSettings(); }, [tab, tenant, issueRepo]);
   const [issueView, setIssueView] = useState<"list" | "board">("list");
   type StateFilter = "open" | "closed" | "all";
   const [issueFilter, setIssueFilter] = useState<StateFilter>("open");
@@ -1150,7 +1150,6 @@ export function App() {
     const r = parseRoute(path);
     setAuthPage(r.authPage);
     setOrgHandle(r.orgHandle);
-    setRepoSettingsOpen(r.repoSettingsOpen);
     setView(r.view);
     setTab(r.tab);
     setOpenIssue(r.openIssue);
@@ -2088,163 +2087,31 @@ export function App() {
         );
       })()}
 
-      {/* ── REPO · settings ───────────────────────────────────────────────── */}
-      {view === "repo" && repoSettingsOpen && !isTenantOwner && (
-        <div className="max-w-[720px] mx-auto px-6 sm:px-8 py-16">
-          <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer mb-5" onClick={() => navigate(repoBase())}>
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
-            {issueRepo}
-          </button>
-          <Card><div className="px-6 py-8 grid gap-2"><h2 className="text-[16px] font-semibold">Not authorized</h2><p className="text-[13.5px] text-muted">Repository settings are visible only to owners and admins of <b className="text-body">{tenant}</b>. {!me && <>You are not signed in.</>}</p></div></Card>
-        </div>
-      )}
-      {view === "repo" && repoSettingsOpen && isTenantOwner && (() => {
-        const s = repoSettings;
-        const reviewerCandidates = actors;
-        return (
-          <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-8">
-            <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer mb-5" onClick={() => navigate(repoBase())}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
-              {issueRepo}
-            </button>
-            <h1 className="text-[24px] font-semibold tracking-tight mb-1.5">Repository settings</h1>
-            <p className="text-[13px] text-muted mb-7">{tenant} / {issueRepo}{!isTenantOwner && <span> · read-only (owner/admin required to change)</span>}</p>
-            <div className="grid gap-5 max-w-[760px]">
-              <Card>
-                <SectionHeader label="General" />
-                <div className="px-5 py-4 grid gap-4">
-                  <div className="flex items-center justify-between gap-4">
-                    <div><div className="text-[13.5px] font-medium">Private</div><div className="text-[12.5px] text-muted">Hidden from non-members.</div></div>
-                    <Switch on={!!s?.private} onChange={(on: boolean) => isTenantOwner && saveRepoSettings({ private: on })} />
-                  </div>
-                  <div className="flex items-center justify-between gap-4">
-                    <div><div className="text-[13.5px] font-medium">Require a review to merge</div><div className="text-[12.5px] text-muted">On top of the built-in author-independence gate.</div></div>
-                    <Switch on={!!s?.require_review_to_land} onChange={(on: boolean) => isTenantOwner && saveRepoSettings({ require_review_to_land: on })} />
-                  </div>
-                </div>
-              </Card>
-              <Card>
-                <SectionHeader label="Default reviewers" right={<span className="text-[12.5px] text-muted">auto-requested on new pull requests</span>} />
-                <div className="px-5 py-4 grid gap-3">
-                  <div className="flex flex-wrap gap-1.5">
-                    {(s?.default_reviewers ?? []).map((r) => (
-                      <span key={r.actor} className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-chip bg-paper border border-rule">
-                        {r.handle || r.actor.slice(0, 8)}
-                        {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveRepoSettings({ default_reviewers: (s!.default_reviewers.filter((x) => x.actor !== r.actor)).map((x) => x.actor) })}>×</button>}
-                      </span>
-                    ))}
-                    {(s?.default_reviewers ?? []).length === 0 && <span className="text-[12.5px] text-muted">none</span>}
-                  </div>
-                  {isTenantOwner && (
-                    <div className="max-w-[280px]"><Picker block value="" placeholder="Add a reviewer…" onChange={(v) => { if (v && s) saveRepoSettings({ default_reviewers: [...new Set([...s.default_reviewers.map((x) => x.actor), v])] }); }}
-                      options={reviewerCandidates.filter((a) => !(s?.default_reviewers ?? []).some((x) => x.actor === a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} /></div>
-                  )}
-                </div>
-              </Card>
-              <Card>
-                <SectionHeader label="Team access" />
-                <div className="px-5 py-4 grid gap-3">
-                  {(s?.team_access ?? []).map((ta, i) => {
-                    const tm = teams.find((t) => t.id === ta.team);
-                    return (
-                      <div key={i} className="flex items-center gap-3">
-                        <span className="flex-1 text-[13.5px]">{tm?.name ?? ta.team}</span>
-                        <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge bg-rule2 text-dim">{ta.role}</span>
-                        {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveRepoSettings({ team_access: (s!.team_access.filter((_, j) => j !== i)) })}>×</button>}
-                      </div>
-                    );
-                  })}
-                  {(s?.team_access ?? []).length === 0 && <span className="text-[12.5px] text-muted">no teams have explicit access</span>}
-                  {isTenantOwner && teams.length > 0 && (
-                    <div className="max-w-[280px]"><Picker block value="" placeholder="Grant a team access…" onChange={(v) => { if (v && s) saveRepoSettings({ team_access: [...s.team_access, { team: v, role: "write" }] }); }}
-                      options={teams.filter((t) => !(s?.team_access ?? []).some((x) => x.team === t.id)).map((t) => ({ value: t.id, label: t.name }))} /></div>
-                  )}
-                  {teams.length === 0 && <span className="text-[12px] text-faint">create teams in the org page to grant team access</span>}
-                </div>
-              </Card>
-              <Card>
-                <SectionHeader label="Automation" right={<span className="text-[12.5px] text-muted">autonomy tier</span>} />
-                <div className="px-5 py-4 grid gap-3">
-                  {autonomy && (
-                    <>
-                      <div className="flex items-center gap-2">
-                        <StatusBadge kind={autonomy.tier === "t0" ? "queued" : "agent"}>{autonomy.tier.toUpperCase()}</StatusBadge>
-                        <span className="text-[12.5px] text-muted">{TIERS[autonomy.tier]}</span>
-                      </div>
-                      {isTenantOwner && <div className="max-w-[160px]"><Select options={["t0", "t1", "t2", "t3"].map((t) => t.toUpperCase())} value={autonomy.tier.toUpperCase()} onChange={(v: string) => setTier(v.toLowerCase())} /></div>}
-                    </>
-                  )}
-                </div>
-              </Card>
-              {ciConfig && (
-                <Card>
-                  <SectionHeader label="Checks" right={<span className="text-[12.5px] text-muted">how checks run</span>} />
-                  <div className="px-5 py-4 grid gap-3">
-                    <p className="text-[13px] text-body leading-[1.5]">
-                      {ciConfig.url ? <>Dispatched to <code className="text-[12px]">{ciConfig.url}</code></> : "Run on the built-in local runner."}
-                      <span className="text-faint"> · {ciConfig.source}{ciConfig.has_secret ? " · secret set" : ""}</span>
-                    </p>
-                    {isTenantOwner && (
-                      <div className="grid gap-2 max-w-[420px]">
-                        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="https://your-ci/hull (blank = local runner)" value={ciUrl} onChange={(e) => setCiUrl(e.target.value)} spellCheck={false} />
-                        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="shared secret (optional)" value={ciSecret} onChange={(e) => setCiSecret(e.target.value)} spellCheck={false} />
-                        <div className="flex gap-2">
-                          <Button size="sm" variant="secondary" onClick={() => setCiSecret(bytesToHex(crypto.getRandomValues(new Uint8Array(32))))}>Generate secret</Button>
-                          <Button size="sm" onClick={() => saveCiConfig(false)}>Save</Button>
-                          {ciConfig.source === "repo" && <Button size="sm" variant="ghost" onClick={() => saveCiConfig(true)}>Clear</Button>}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </Card>
-              )}
-              {mirror?.target && (
-                <Card>
-                  <SectionHeader label="Mirror" right={<span className="text-[12.5px] text-muted">outbound delivery</span>} />
-                  <div className="px-5 py-4 grid gap-1.5 text-[13px]">
-                    <Stat k="mirror" v={<code className="text-[12px]">{mirror.target}</code>} />
-                    <Stat k="pushed outbound" v={`${mirror.outbound.length}`} />
-                    <p className="text-[11.5px] text-faint leading-[1.5] pt-1">Loop-safe: forge-originated changes are never pushed back.</p>
-                  </div>
-                </Card>
-              )}
-              <Card>
-                <SectionHeader label="Code owners" right={<span className="text-[12.5px] text-muted">path → owners · also .hull/CODEOWNERS</span>} />
-                <div className="px-5 py-4 grid gap-2">
-                  {ownerRules.length === 0 && <span className="text-[12.5px] text-muted">no code-owner rules</span>}
-                  {ownerRules.map((r, i) => (
-                    <div key={i} className="flex items-center gap-3 text-[13px]">
-                      <code className="text-body">{r.glob}</code>
-                      <span className="text-muted flex-1">{r.owners.map((o) => handleOf(o)).join(", ")}</span>
-                    </div>
-                  ))}
-                </div>
-              </Card>
-            </div>
-          </div>
-        );
-      })()}
-
       {/* ── REPO · list (issues / voyages) ────────────────────────────────── */}
-      {view === "repo" && !repoSettingsOpen && !currentIssue && !currentPr && (
+      {view === "repo" && !currentIssue && !currentPr && (
         <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mb-6">
             <h1 className="text-[25px] font-semibold tracking-tight"><button className="text-muted font-normal hover:text-ink transition-colors" onClick={() => navigate(`/orgs/${encodeURIComponent(tenant)}`)}>{tenant}</button><span className="text-faint font-normal mx-1.5">/</span>{issueRepo}</h1>
             {autonomy && <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge bg-rule2 text-dim" title={TIERS[autonomy.tier]}>{autonomy.tier.toUpperCase()}</span>}
             {secrets.length > 0 && <StatusBadge kind="failed">{secrets.length} secret{secrets.length > 1 ? "s" : ""}</StatusBadge>}
             <div className="ml-auto flex items-center gap-3">
-              {isTenantOwner && <LinkButton onClick={() => navigate(`${repoBase()}/settings`)}>Settings</LinkButton>}
               {!canAct && <span className="text-[12.5px] text-muted">read-only</span>}
             </div>
           </div>
 
           <div className="flex items-end justify-between gap-4 border-b border-rule2 mb-7">
-            <HTabs items={[`Issues ${openIssues}`, `Pull requests ${prs.length}`]} value={tab === "issues" ? 0 : 1} onChange={(i: number) => navigate(i === 0 ? repoBase() : `${repoBase()}/voyages`)} />
-            <div className="w-[240px] pb-1.5 hidden sm:block">
-              <SearchInput placeholder={tab === "issues" ? "Filter issues" : "Filter pull requests"} shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} />
-            </div>
+            <HTabs
+              items={[`Issues ${openIssues}`, `Pull requests ${prs.length}`, "Files", ...(isTenantOwner ? ["Settings"] : [])]}
+              value={tab === "issues" ? 0 : tab === "prs" ? 1 : tab === "files" ? 2 : 3}
+              onChange={(i: number) => navigate([repoBase(), `${repoBase()}/voyages`, `${repoBase()}/files`, `${repoBase()}/settings`][i])} />
+            {(tab === "issues" || tab === "prs") && (
+              <div className="w-[240px] pb-1.5 hidden sm:block">
+                <SearchInput placeholder={tab === "issues" ? "Filter issues" : "Filter pull requests"} shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} />
+              </div>
+            )}
           </div>
 
+          {(tab === "issues" || tab === "prs") && (
           <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-12 gap-y-9">
             <section className="min-w-0">
               {tab === "issues" && (
@@ -2389,7 +2256,265 @@ export function App() {
 
             {repoSidebar}
           </div>
+          )}
+
+          {tab === "files" && (
+            <RepoFiles tenant={tenant} repo={issueRepo} authHeaders={authHeaders} />
+          )}
+
+          {tab === "settings" && !isTenantOwner && (
+            <Card><div className="px-6 py-8 grid gap-2"><h2 className="text-[16px] font-semibold">Not authorized</h2><p className="text-[13.5px] text-muted">Repository settings are visible only to owners and admins of <b className="text-body">{tenant}</b>. {!me && <>You are not signed in.</>}</p></div></Card>
+          )}
+          {tab === "settings" && isTenantOwner && (() => {
+            const s = repoSettings;
+            const reviewerCandidates = actors;
+            return (
+            <div className="grid gap-5 max-w-[760px]">
+              <Card>
+                <SectionHeader label="General" />
+                <div className="px-5 py-4 grid gap-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div><div className="text-[13.5px] font-medium">Private</div><div className="text-[12.5px] text-muted">Hidden from non-members.</div></div>
+                    <Switch on={!!s?.private} onChange={(on: boolean) => isTenantOwner && saveRepoSettings({ private: on })} />
+                  </div>
+                  <div className="flex items-center justify-between gap-4">
+                    <div><div className="text-[13.5px] font-medium">Require a review to merge</div><div className="text-[12.5px] text-muted">On top of the built-in author-independence gate.</div></div>
+                    <Switch on={!!s?.require_review_to_land} onChange={(on: boolean) => isTenantOwner && saveRepoSettings({ require_review_to_land: on })} />
+                  </div>
+                </div>
+              </Card>
+              <Card>
+                <SectionHeader label="Default reviewers" right={<span className="text-[12.5px] text-muted">auto-requested on new pull requests</span>} />
+                <div className="px-5 py-4 grid gap-3">
+                  <div className="flex flex-wrap gap-1.5">
+                    {(s?.default_reviewers ?? []).map((r) => (
+                      <span key={r.actor} className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-chip bg-paper border border-rule">
+                        {r.handle || r.actor.slice(0, 8)}
+                        {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveRepoSettings({ default_reviewers: (s!.default_reviewers.filter((x) => x.actor !== r.actor)).map((x) => x.actor) })}>×</button>}
+                      </span>
+                    ))}
+                    {(s?.default_reviewers ?? []).length === 0 && <span className="text-[12.5px] text-muted">none</span>}
+                  </div>
+                  {isTenantOwner && (
+                    <div className="max-w-[280px]"><Picker block value="" placeholder="Add a reviewer…" onChange={(v) => { if (v && s) saveRepoSettings({ default_reviewers: [...new Set([...s.default_reviewers.map((x) => x.actor), v])] }); }}
+                      options={reviewerCandidates.filter((a) => !(s?.default_reviewers ?? []).some((x) => x.actor === a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} /></div>
+                  )}
+                </div>
+              </Card>
+              <Card>
+                <SectionHeader label="Team access" />
+                <div className="px-5 py-4 grid gap-3">
+                  {(s?.team_access ?? []).map((ta, i) => {
+                    const tm = teams.find((t) => t.id === ta.team);
+                    return (
+                      <div key={i} className="flex items-center gap-3">
+                        <span className="flex-1 text-[13.5px]">{tm?.name ?? ta.team}</span>
+                        <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge bg-rule2 text-dim">{ta.role}</span>
+                        {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveRepoSettings({ team_access: (s!.team_access.filter((_, j) => j !== i)) })}>×</button>}
+                      </div>
+                    );
+                  })}
+                  {(s?.team_access ?? []).length === 0 && <span className="text-[12.5px] text-muted">no teams have explicit access</span>}
+                  {isTenantOwner && teams.length > 0 && (
+                    <div className="max-w-[280px]"><Picker block value="" placeholder="Grant a team access…" onChange={(v) => { if (v && s) saveRepoSettings({ team_access: [...s.team_access, { team: v, role: "write" }] }); }}
+                      options={teams.filter((t) => !(s?.team_access ?? []).some((x) => x.team === t.id)).map((t) => ({ value: t.id, label: t.name }))} /></div>
+                  )}
+                  {teams.length === 0 && <span className="text-[12px] text-faint">create teams in the org page to grant team access</span>}
+                </div>
+              </Card>
+              <Card>
+                <SectionHeader label="Automation" right={<span className="text-[12.5px] text-muted">autonomy tier</span>} />
+                <div className="px-5 py-4 grid gap-3">
+                  {autonomy && (
+                    <>
+                      <div className="flex items-center gap-2">
+                        <StatusBadge kind={autonomy.tier === "t0" ? "queued" : "agent"}>{autonomy.tier.toUpperCase()}</StatusBadge>
+                        <span className="text-[12.5px] text-muted">{TIERS[autonomy.tier]}</span>
+                      </div>
+                      {isTenantOwner && <div className="max-w-[160px]"><Select options={["t0", "t1", "t2", "t3"].map((t) => t.toUpperCase())} value={autonomy.tier.toUpperCase()} onChange={(v: string) => setTier(v.toLowerCase())} /></div>}
+                    </>
+                  )}
+                </div>
+              </Card>
+              {ciConfig && (
+                <Card>
+                  <SectionHeader label="Checks" right={<span className="text-[12.5px] text-muted">how checks run</span>} />
+                  <div className="px-5 py-4 grid gap-3">
+                    <p className="text-[13px] text-body leading-[1.5]">
+                      {ciConfig.url ? <>Dispatched to <code className="text-[12px]">{ciConfig.url}</code></> : "Run on the built-in local runner."}
+                      <span className="text-faint"> · {ciConfig.source}{ciConfig.has_secret ? " · secret set" : ""}</span>
+                    </p>
+                    {isTenantOwner && (
+                      <div className="grid gap-2 max-w-[420px]">
+                        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="https://your-ci/hull (blank = local runner)" value={ciUrl} onChange={(e) => setCiUrl(e.target.value)} spellCheck={false} />
+                        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="shared secret (optional)" value={ciSecret} onChange={(e) => setCiSecret(e.target.value)} spellCheck={false} />
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="secondary" onClick={() => setCiSecret(bytesToHex(crypto.getRandomValues(new Uint8Array(32))))}>Generate secret</Button>
+                          <Button size="sm" onClick={() => saveCiConfig(false)}>Save</Button>
+                          {ciConfig.source === "repo" && <Button size="sm" variant="ghost" onClick={() => saveCiConfig(true)}>Clear</Button>}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </Card>
+              )}
+              {mirror?.target && (
+                <Card>
+                  <SectionHeader label="Mirror" right={<span className="text-[12.5px] text-muted">outbound delivery</span>} />
+                  <div className="px-5 py-4 grid gap-1.5 text-[13px]">
+                    <Stat k="mirror" v={<code className="text-[12px]">{mirror.target}</code>} />
+                    <Stat k="pushed outbound" v={`${mirror.outbound.length}`} />
+                    <p className="text-[11.5px] text-faint leading-[1.5] pt-1">Loop-safe: forge-originated changes are never pushed back.</p>
+                  </div>
+                </Card>
+              )}
+              <Card>
+                <SectionHeader label="Code owners" right={<span className="text-[12.5px] text-muted">path → owners · also .hull/CODEOWNERS</span>} />
+                <div className="px-5 py-4 grid gap-2">
+                  {ownerRules.length === 0 && <span className="text-[12.5px] text-muted">no code-owner rules</span>}
+                  {ownerRules.map((r, i) => (
+                    <div key={i} className="flex items-center gap-3 text-[13px]">
+                      <code className="text-body">{r.glob}</code>
+                      <span className="text-muted flex-1">{r.owners.map((o) => handleOf(o)).join(", ")}</span>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            </div>
+            );
+          })()}
         </div>
+      )}
+    </div>
+  );
+}
+// ── Files tab: a branch-aware file browser with fuzzy/full-text search ──────────────────────────
+type TreeItem = { name: string; path: string; dir: boolean; size: number };
+type SearchHit = { path: string; line: number; text: string; kind: "path" | "content" };
+function RepoFiles({ tenant, repo, authHeaders }: { tenant: string; repo: string; authHeaders: () => Record<string, string> }) {
+  const base = `/api/repos/${encodeURIComponent(tenant)}/${repo}`;
+  const [branches, setBranches] = useState<string[]>([]);
+  const [branch, setBranch] = useState("main");
+  const [path, setPath] = useState("");
+  const [entries, setEntries] = useState<TreeItem[] | null>(null);
+  const [file, setFile] = useState<{ path: string; text: string; binary: boolean; size: number } | null>(null);
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<SearchHit[] | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    fetch(`${base}/branches`, { headers: authHeaders() }).then((r) => r.json()).then((d) => {
+      const bs: string[] = d.branches ?? [];
+      setBranches(bs);
+      setBranch((b) => (bs.length && !bs.includes(b) ? bs[0] : b));
+    }).catch(() => {});
+  }, [tenant, repo]);
+
+  const loadDir = (p: string) => {
+    setLoading(true); setFile(null);
+    fetch(`${base}/tree?ref=${encodeURIComponent(branch)}&path=${encodeURIComponent(p)}`, { headers: authHeaders() })
+      .then((r) => r.json()).then((d) => { setEntries(d.entries ?? []); setPath(p); }).catch(() => setEntries([])).finally(() => setLoading(false));
+  };
+  const openFile = (p: string) => {
+    setLoading(true); setResults(null); setQuery("");
+    fetch(`${base}/blob?ref=${encodeURIComponent(branch)}&path=${encodeURIComponent(p)}`, { headers: authHeaders() })
+      .then((r) => r.json()).then((d) => setFile({ path: p, text: d.text ?? "", binary: !!d.binary, size: d.size ?? 0 })).finally(() => setLoading(false));
+  };
+  // Reset to the branch root whenever the branch changes.
+  useEffect(() => { setResults(null); setQuery(""); loadDir(""); /* eslint-disable-next-line */ }, [branch]);
+  // Debounced fuzzy/full-text search.
+  useEffect(() => {
+    if (!query.trim()) { setResults(null); return; }
+    const t = setTimeout(() => {
+      fetch(`${base}/search?ref=${encodeURIComponent(branch)}&q=${encodeURIComponent(query)}`, { headers: authHeaders() })
+        .then((r) => r.json()).then((d) => setResults(d.hits ?? [])).catch(() => setResults([]));
+    }, 250);
+    return () => clearTimeout(t);
+  }, [query, branch]);
+
+  const Folder = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="text-steel-text flex-none"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg>;
+  const FileIcon = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="text-muted flex-none"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /></svg>;
+  const fmtSize = (n: number) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
+  const crumbs = path ? path.split("/") : [];
+  const LINE_CAP = 1500;
+  const lines = file ? file.text.replace(/\n$/, "").split("\n") : [];
+
+  return (
+    <div className="grid gap-4">
+      <div className="flex items-center gap-3 flex-wrap">
+        <Picker value={branch} onChange={setBranch} options={branches.map((b) => ({ value: b, label: b }))} placeholder="branch" width={220} size="sm" />
+        <div className="flex-1 min-w-[220px] max-w-[440px] ml-auto">
+          <SearchInput placeholder="Search files & content…" shortcut="" value={query} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQuery(e.target.value)} />
+        </div>
+      </div>
+
+      {results !== null ? (
+        <Card>
+          <SectionHeader label="Search" right={<span className="text-[12.5px] text-muted">{results.length} hit{results.length === 1 ? "" : "s"} · {branch}</span>} />
+          <div className="max-h-[560px] overflow-y-auto">
+            {results.length === 0 && <div className="px-5 py-6 text-[13px] text-muted">No matches for “{query}”.</div>}
+            {results.map((h, i) => (
+              <button key={i} onClick={() => openFile(h.path)} className="w-full text-left px-5 py-2 border-b border-rule3 hover:bg-paper/60 flex items-start gap-3">
+                <span className="text-[11px] font-bold uppercase tracking-[0.05em] mt-0.5 flex-none w-[52px] text-right">{h.kind === "path" ? <span className="text-steel-text">name</span> : <span className="text-faint tabular-nums">L{h.line}</span>}</span>
+                <span className="min-w-0">
+                  <span className="block text-[12.5px] text-body font-medium truncate">{h.path}</span>
+                  {h.kind === "content" && <span className="block text-[12px] text-muted truncate"><Hl text={h.text} path={h.path} /></span>}
+                </span>
+              </button>
+            ))}
+          </div>
+        </Card>
+      ) : file ? (
+        <Card>
+          <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
+            <div className="flex items-center gap-1.5 text-[13px] min-w-0">
+              <button onClick={() => { setFile(null); loadDir(path); }} className="text-dim hover:text-ink inline-flex items-center gap-1 flex-none"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg></button>
+              <FileIcon /><span className="font-medium truncate">{file.path}</span>
+            </div>
+            <span className="text-[12px] text-faint flex-none tabular-nums">{fmtSize(file.size)}</span>
+          </div>
+          {file.binary ? (
+            <div className="px-5 py-8 text-[13px] text-muted">Binary file · {fmtSize(file.size)} — not shown.</div>
+          ) : (
+            <div className="text-[12.5px] leading-[1.6] overflow-x-auto">
+              {lines.slice(0, LINE_CAP).map((ln, i) => (
+                <div key={i} className="grid grid-cols-[52px_1fr] hover:bg-paper/50">
+                  <span className="pr-3 py-0.5 text-right text-faint bg-paper/40 border-r border-rule3 select-none tabular-nums text-[11px]">{i + 1}</span>
+                  <span className="px-3 py-0.5 whitespace-pre-wrap break-words"><Hl text={ln} path={file.path} /></span>
+                </div>
+              ))}
+              {lines.length > LINE_CAP && <div className="px-5 py-3 text-[12.5px] text-muted border-t border-rule2">{lines.length - LINE_CAP} more lines not shown ({fmtSize(file.size)} file).</div>}
+            </div>
+          )}
+        </Card>
+      ) : (
+        <Card>
+          <div className="flex items-center gap-1 px-5 py-2.5 border-b border-rule2 text-[13px] flex-wrap">
+            <button onClick={() => loadDir("")} className="font-medium text-steel-text hover:underline">{repo}</button>
+            {crumbs.map((c, i) => (
+              <span key={i} className="flex items-center gap-1">
+                <span className="text-faint">/</span>
+                <button onClick={() => loadDir(crumbs.slice(0, i + 1).join("/"))} className="text-body hover:text-ink hover:underline">{c}</button>
+              </span>
+            ))}
+          </div>
+          <div className="max-h-[560px] overflow-y-auto">
+            {loading && !entries && <div className="px-5 py-6 text-[13px] text-muted">Loading…</div>}
+            {entries && entries.length === 0 && <div className="px-5 py-6 text-[13px] text-muted">Empty directory.</div>}
+            {path && (
+              <button onClick={() => loadDir(crumbs.slice(0, -1).join("/"))} className="w-full text-left px-5 py-1.5 border-b border-rule3 hover:bg-paper/60 flex items-center gap-2.5 text-[13px] text-muted">
+                <span className="w-4 text-center">↑</span> ..
+              </button>
+            )}
+            {(entries ?? []).map((e) => (
+              <button key={e.path} onClick={() => (e.dir ? loadDir(e.path) : openFile(e.path))} className="w-full text-left px-5 py-1.5 border-b border-rule3 hover:bg-paper/60 flex items-center gap-2.5 text-[13px]">
+                {e.dir ? <Folder /> : <FileIcon />}
+                <span className={`flex-1 truncate ${e.dir ? "font-medium" : "text-body"}`}>{e.name}</span>
+                {!e.dir && <span className="text-[11.5px] text-faint tabular-nums flex-none">{fmtSize(e.size)}</span>}
+              </button>
+            ))}
+          </div>
+        </Card>
       )}
     </div>
   );

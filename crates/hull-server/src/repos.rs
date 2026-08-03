@@ -233,6 +233,158 @@ impl RepoHost {
     }
 }
 
+/// One entry in a directory listing for the file browser.
+#[derive(serde::Serialize)]
+pub struct TreeItem {
+    pub name: String,
+    pub path: String,
+    pub dir: bool,
+    pub size: u64,
+}
+
+/// A search hit: a filename match (`kind:"path"`, line 0) or a content-line match (`kind:"content"`).
+#[derive(serde::Serialize)]
+pub struct SearchHit {
+    pub path: String,
+    pub line: u32,
+    pub text: String,
+    pub kind: &'static str,
+}
+
+impl RepoHost {
+    /// Branch names that resolve to a keel change, `main` first then alphabetical. The keel store
+    /// keys refs by bare branch name (`main`, `feat/x`), so this is just the ref table filtered.
+    pub fn branches(&self, tenant: &str, repo: &str) -> Vec<String> {
+        let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return vec![] };
+        let mut names: Vec<String> = store
+            .list_refs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, id)| matches!(store.get(id), Ok(Some(Object::Change(_)))))
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        names.dedup();
+        if let Some(pos) = names.iter().position(|n| n == "main") {
+            let m = names.remove(pos);
+            names.insert(0, m);
+        }
+        names
+    }
+
+    /// The root tree of a branch head (`None` if the repo/ref is missing or not a change).
+    fn root_tree(&self, store: &Store, ref_name: &str) -> Option<ObjectId> {
+        let head = store.get_ref(ref_name).ok()??;
+        match store.get(&head).ok()?? {
+            Object::Change(c) => Some(c.tree),
+            _ => None,
+        }
+    }
+
+    /// List a directory (`path`, "" = root) at a branch. Directories first, then files, both by name.
+    /// `None` if the repo/ref/path is missing or the path isn't a directory.
+    pub fn list_tree(&self, tenant: &str, repo: &str, ref_name: &str, path: &str) -> Option<Vec<TreeItem>> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let root = self.root_tree(&store, ref_name)?;
+        let base = path.trim_matches('/');
+        let tree_id = if base.is_empty() { root } else { resolve_path_in_tree(&store, root, base)? };
+        let entries = match store.get(&tree_id).ok()?? {
+            Object::Tree(t) => t.entries,
+            _ => return None,
+        };
+        let mut out: Vec<TreeItem> = entries
+            .into_iter()
+            .map(|e| {
+                let (dir, size) = match store.get(&e.id) {
+                    Ok(Some(Object::Tree(_))) => (true, 0),
+                    Ok(Some(Object::Blob(b))) => (false, b.len() as u64),
+                    _ => (e.mode == 0o040000, 0),
+                };
+                let full = if base.is_empty() { e.name.clone() } else { format!("{base}/{}", e.name) };
+                TreeItem { name: e.name, path: full, dir, size }
+            })
+            .collect();
+        out.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
+        Some(out)
+    }
+
+    /// Read a file's bytes at a specific branch (`None` if repo/ref/path missing or not a blob).
+    pub fn read_file_at(&self, tenant: &str, repo: &str, ref_name: &str, path: &str) -> Option<Vec<u8>> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let root = self.root_tree(&store, ref_name)?;
+        let blob = resolve_path_in_tree(&store, root, path)?;
+        match store.get(&blob).ok()?? {
+            Object::Blob(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Fuzzy filename + full-text content search across a branch's tree. Filename hits first, then
+    /// content-line hits; capped so a huge repo can't run away. (Semantic/vector search is a
+    /// follow-up — this is the fuzzy/full-text tier.)
+    pub fn search(&self, tenant: &str, repo: &str, ref_name: &str, query: &str) -> Vec<SearchHit> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return vec![];
+        }
+        let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return vec![] };
+        let Some(root) = self.root_tree(&store, ref_name) else { return vec![] };
+        // Walk the whole tree, collecting (path, blob id).
+        let mut files: Vec<(String, ObjectId)> = Vec::new();
+        let mut stack = vec![(String::new(), root)];
+        while let Some((prefix, tid)) = stack.pop() {
+            if files.len() > 50_000 {
+                break;
+            }
+            let entries = match store.get(&tid) {
+                Ok(Some(Object::Tree(t))) => t.entries,
+                _ => continue,
+            };
+            for e in entries {
+                let full = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+                match store.get(&e.id) {
+                    Ok(Some(Object::Tree(_))) => stack.push((full, e.id)),
+                    Ok(Some(Object::Blob(_))) => files.push((full, e.id)),
+                    _ => {}
+                }
+            }
+        }
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for (path, _) in &files {
+            if path.to_lowercase().contains(&q) {
+                hits.push(SearchHit { path: path.clone(), line: 0, text: String::new(), kind: "path" });
+            }
+        }
+        for (path, id) in &files {
+            if hits.len() > 300 {
+                break;
+            }
+            let bytes = match store.get(id) {
+                Ok(Some(Object::Blob(b))) => b,
+                _ => continue,
+            };
+            if bytes.len() > 512 * 1024 || bytes.iter().take(8000).any(|&b| b == 0) {
+                continue; // skip huge or binary files
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            for (i, line) in text.lines().enumerate() {
+                if line.to_lowercase().contains(&q) {
+                    hits.push(SearchHit {
+                        path: path.clone(),
+                        line: (i + 1) as u32,
+                        text: line.trim().chars().take(200).collect(),
+                        kind: "content",
+                    });
+                    if hits.len() > 300 {
+                        break;
+                    }
+                }
+            }
+        }
+        hits
+    }
+}
+
 /// One change that touched a path — the keel-native provenance behind a code-ref.
 #[derive(serde::Serialize)]
 pub struct Provenance {

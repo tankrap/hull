@@ -318,6 +318,10 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
         .route("/api/repos/:tenant/:repo/issues/:number", axum::routing::patch(update_issue))
         .route("/api/repos/:tenant/:repo/why", get(why))
+        .route("/api/repos/:tenant/:repo/branches", get(repo_branches))
+        .route("/api/repos/:tenant/:repo/tree", get(repo_tree))
+        .route("/api/repos/:tenant/:repo/blob", get(repo_blob))
+        .route("/api/repos/:tenant/:repo/search", get(repo_search))
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/merge", post(merge_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/close", post(close_pr))
@@ -1572,6 +1576,53 @@ async fn why(
     let path = q.get("path").map(String::as_str).unwrap_or("");
     let prov = app.repos.why(&tenant, &repo, path, 10);
     Json(json!({ "path": path, "provenance": prov }))
+}
+
+/// Branch names for a repo (`GET /api/repos/:tenant/:repo/branches`).
+async fn repo_branches(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+    Json(json!({ "branches": app.repos.branches(&tenant, &repo) }))
+}
+
+/// A directory listing at a branch (`GET /api/repos/:tenant/:repo/tree?ref=<branch>&path=<dir>`).
+async fn repo_tree(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
+    let path = q.get("path").map(String::as_str).unwrap_or("");
+    Json(json!({ "ref": ref_name, "path": path, "entries": app.repos.list_tree(&tenant, &repo, ref_name, path) }))
+}
+
+/// A file's contents at a branch (`GET /api/repos/:tenant/:repo/blob?ref=<branch>&path=<file>`).
+/// Returns text when decodable, plus a `binary` flag and byte size so the UI can render sensibly.
+async fn repo_blob(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
+    let path = q.get("path").map(String::as_str).unwrap_or("");
+    match app.repos.read_file_at(&tenant, &repo, ref_name, path) {
+        Some(bytes) => {
+            let binary = bytes.iter().take(8000).any(|&b| b == 0);
+            let size = bytes.len();
+            let text = if binary { String::new() } else { String::from_utf8_lossy(&bytes).into_owned() };
+            Json(json!({ "path": path, "ref": ref_name, "size": size, "binary": binary, "text": text }))
+        }
+        None => Json(json!({ "path": path, "ref": ref_name, "missing": true })),
+    }
+}
+
+/// Fuzzy filename + full-text content search (`GET /api/repos/:tenant/:repo/search?q=<query>&ref=<branch>`).
+async fn repo_search(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
+    let query = q.get("q").map(String::as_str).unwrap_or("");
+    Json(json!({ "q": query, "ref": ref_name, "hits": app.repos.search(&tenant, &repo, ref_name, query) }))
 }
 
 /// A repo's code-owner rules (`GET /api/repos/:tenant/:repo/owners`).
