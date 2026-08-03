@@ -1606,6 +1606,20 @@ async fn set_owners(
 }
 
 /// Resolve the code owners whose globs match any of `files`, deduped.
+/// Extract `@handle` mentions from free text (handles allow `_ - :`, e.g. `@agent:reviewer`).
+fn parse_mentions(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        if let Some(rest) = word.strip_prefix('@') {
+            let h: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ':').collect();
+            if !h.is_empty() && !out.contains(&h) {
+                out.push(h);
+            }
+        }
+    }
+    out
+}
+
 fn owners_for(app: &App, repo_key: &str, files: &[String]) -> Vec<String> {
     let mut set: Vec<String> = Vec::new();
     for rule in app.store.owners(repo_key) {
@@ -1613,6 +1627,32 @@ fn owners_for(app: &App, repo_key: &str, files: &[String]) -> Vec<String> {
             for o in rule.owners {
                 if !set.contains(&o) {
                     set.push(o);
+                }
+            }
+        }
+    }
+    // In-repo `.hull/CODEOWNERS` (GitHub-style: `<pattern> @handle …`), so owners live with the code,
+    // not only in the UI. Handles resolve to accountable actors; unknown handles are ignored.
+    if let Some((tenant, repo)) = repo_key.split_once('/') {
+        if let Some(bytes) = app.repos.read_file(tenant, repo, ".hull/CODEOWNERS") {
+            let text = String::from_utf8_lossy(&bytes);
+            let actors = app.store.actors();
+            for line in text.lines() {
+                let line = line.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                let Some(glob) = parts.next() else { continue };
+                if files.iter().any(|f| hull_core::store::glob_match(glob, f)) {
+                    for owner in parts {
+                        let handle = owner.trim_start_matches('@');
+                        if let Some(a) = actors.iter().find(|a| a.handle == handle) {
+                            if !set.contains(&a.id) {
+                                set.push(a.id.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2695,6 +2735,41 @@ async fn create_comment(
     if !to.is_empty() {
         app.registry.notify(&NotifyEvent { kind: "comment_posted".into(), to, summary, change });
     }
+    // @mentions in a comment add the mentioned actor as a reviewer (on a PR) or assignee (on an issue).
+    let mentioned = parse_mentions(&comment.body);
+    if !mentioned.is_empty() {
+        let actors = app.store.actors();
+        let ids: Vec<String> = mentioned.iter().filter_map(|h| actors.iter().find(|a| &a.handle == h).map(|a| a.id.clone())).collect();
+        if let Some(num) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
+            if let Some(mut pr) = app.store.prs(&key).into_iter().find(|p| p.number == num) {
+                let mut added = vec![];
+                for id in &ids {
+                    if id != &pr.author && !pr.reviewers.contains(id) {
+                        pr.reviewers.push(id.clone());
+                        added.push(id.clone());
+                    }
+                }
+                if !added.is_empty() {
+                    app.store.replace_pr(pr.clone());
+                    app.registry.notify(&NotifyEvent { kind: "review_requested".into(), to: added, summary: format!("{} mentioned you as a reviewer on PR !{num}", author.handle), change: pr.changes.first().cloned() });
+                }
+            }
+        } else if let Some(num) = target.strip_prefix("issue:").and_then(|s| s.parse::<u64>().ok()) {
+            if let Some(mut issue) = app.store.issues(&key).into_iter().find(|i| i.number == num) {
+                let mut added = vec![];
+                for id in &ids {
+                    if !issue.assignees.contains(id) {
+                        issue.assignees.push(id.clone());
+                        added.push(id.clone());
+                    }
+                }
+                if !added.is_empty() {
+                    app.store.replace_issue(issue.clone());
+                    app.registry.notify(&NotifyEvent { kind: "issue_assigned".into(), to: added, summary: format!("{} mentioned you on issue #{num}", author.handle), change: None });
+                }
+            }
+        }
+    }
     (StatusCode::CREATED, Json(json!({ "comment": comment }))).into_response()
 }
 
@@ -3364,7 +3439,7 @@ async fn create_issue(
         }
     }
     // Assignees must themselves be registered accountable actors (unknown ids are dropped).
-    let assignees: Vec<String> = body
+    let mut assignees: Vec<String> = body
         .get("assignees")
         .and_then(Value::as_array)
         .map(|arr| {
@@ -3375,6 +3450,16 @@ async fn create_issue(
                 .collect()
         })
         .unwrap_or_default();
+    // @mentions in the title or body also assign the mentioned actor.
+    let mention_text = format!("{} {}", title, body.get("body").and_then(Value::as_str).unwrap_or(""));
+    let actors = app.store.actors();
+    for h in parse_mentions(&mention_text) {
+        if let Some(a) = actors.iter().find(|a| a.handle == h && a.is_accountable()) {
+            if !assignees.contains(&a.id) {
+                assignees.push(a.id.clone());
+            }
+        }
+    }
     let number = app.store.issues(&key).iter().map(|i| i.number).max().unwrap_or(0) + 1;
     let author = actor.id.clone();
     let issue = Issue {

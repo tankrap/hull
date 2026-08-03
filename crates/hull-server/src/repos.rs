@@ -215,6 +215,22 @@ impl RepoHost {
         let blob = resolve_path_in_tree(&store, tree, path)?;
         Some(BlobAnchor { blob: blob.to_hex(), change: head.to_hex() })
     }
+
+    /// Read a file's bytes from the repo's HEAD tree by path (content-addressed). Used to read the
+    /// in-repo `.hull/CODEOWNERS`. `None` if the repo or path doesn't exist.
+    pub fn read_file(&self, tenant: &str, repo: &str, path: &str) -> Option<Vec<u8>> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let head = store.get_ref("main").ok()??;
+        let tree = match store.get(&head).ok()?? {
+            Object::Change(c) => c.tree,
+            _ => return None,
+        };
+        let blob = resolve_path_in_tree(&store, tree, path)?;
+        match store.get(&blob).ok()?? {
+            Object::Blob(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
 }
 
 /// One change that touched a path — the keel-native provenance behind a code-ref.

@@ -2187,7 +2187,7 @@ export function App() {
                 </Card>
               )}
               <Card>
-                <SectionHeader label="Code owners" right={<span className="text-[12.5px] text-muted">path → owners</span>} />
+                <SectionHeader label="Code owners" right={<span className="text-[12.5px] text-muted">path → owners · also .hull/CODEOWNERS</span>} />
                 <div className="px-5 py-4 grid gap-2">
                   {ownerRules.length === 0 && <span className="text-[12.5px] text-muted">no code-owner rules</span>}
                   {ownerRules.map((r, i) => (

@@ -9,7 +9,7 @@ let LINK_BASE: string | null = null;
 function inline(text: string, kp: string): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
   const ref = LINK_BASE ? "|(?<![\\w])[!#]\\d+" : "";
-  const re = new RegExp(`(\`[^\`]+\`|\\*\\*[^*]+\\*\\*|\\*[^*]+\\*|_[^_]+_|\\[[^\\]]+\\]\\([^)]+\\)|https?:\\/\\/[^\\s)]+${ref})`, "g");
+  const re = new RegExp(`(\`[^\`]+\`|\\*\\*[^*]+\\*\\*|\\*[^*]+\\*|_[^_]+_|\\[[^\\]]+\\]\\([^)]+\\)|https?:\\/\\/[^\\s)]+|(?<![\\w])@[A-Za-z0-9][\\w:-]*${ref})`, "g");
   let last = 0, m: RegExpExecArray | null, i = 0;
   while ((m = re.exec(text))) {
     if (m.index > last) nodes.push(text.slice(last, m.index));
@@ -20,6 +20,7 @@ function inline(text: string, kp: string): React.ReactNode[] {
     else if (tok.startsWith("*")) nodes.push(<i key={key}>{tok.slice(1, -1)}</i>);
     else if (tok.startsWith("_")) nodes.push(<i key={key}>{tok.slice(1, -1)}</i>);
     else if (tok.startsWith("[")) { const mm = /\[([^\]]+)\]\(([^)]+)\)/.exec(tok); if (mm && /^https?:\/\//.test(mm[2])) nodes.push(<a key={key} href={mm[2]} target="_blank" rel="noreferrer" className="text-steel-text">{mm[1]}</a>); else nodes.push(tok); }
+    else if (tok[0] === "@") { nodes.push(<span key={key} className="font-semibold text-steel-text">{tok}</span>); }
     else if (LINK_BASE && (tok[0] === "!" || tok[0] === "#")) { const n = tok.slice(1); const href = `${LINK_BASE}/${tok[0] === "!" ? "voyages" : "issues"}/${n}`; nodes.push(<a key={key} href={href} className="text-steel-text font-medium">{tok}</a>); }
     else nodes.push(<a key={key} href={tok} target="_blank" rel="noreferrer" className="text-steel-text break-all">{tok}</a>);
     last = m.index + tok.length;
