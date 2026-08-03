@@ -33,6 +33,17 @@ pub struct RepoSettings {
     /// Require an approving review to land (on top of the built-in author-independence gate).
     #[serde(default)]
     pub require_review_to_land: bool,
+    /// The repo's configured issue labels — the ONLY labels issues can carry (not free-form).
+    #[serde(default)]
+    pub labels: Vec<Label>,
+}
+
+/// A configurable issue label: a name + a color (hex, e.g. `#d73a4a`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Label {
+    pub name: String,
+    #[serde(default)]
+    pub color: String,
 }
 
 pub struct RepoSettingsStore {

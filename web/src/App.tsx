@@ -159,16 +159,18 @@ const Avatar = ({ id, handle, kind, size = 22 }: { id?: string; handle?: string;
 
 // An issue label rendered as a neutral tag (like the rest of the UI) with a small colour dot for
 // identity — hue deterministically derived from the label text.
-const Label = ({ name }: { name: string }) => {
+const Label = ({ name, color }: { name: string; color?: string }) => {
   let h = 2166136261;
   for (let i = 0; i < name.length; i++) { h ^= name.charCodeAt(i); h = Math.imul(h, 16777619); }
-  const hue = (h >>> 0) % 360;
+  const dot = color || `hsl(${(h >>> 0) % 360} 55% 50%)`;
   return (
-    <span className="inline-flex items-center gap-1 text-[11.5px] font-medium px-1.5 py-[2px] rounded-badge bg-rule2 text-dim">
-      <span className="w-1.5 h-1.5 rounded-full flex-none" style={{ background: `hsl(${hue} 55% 50%)` }} />{name}
+    <span className="inline-flex items-center gap-1 text-[12px] font-medium px-1.5 py-[2px] rounded-badge bg-rule2 text-dim">
+      <span className="w-1.5 h-1.5 rounded-full flex-none" style={{ background: dot }} />{name}
     </span>
   );
 };
+// A small preset palette for configuring labels (name → hex).
+const LABEL_COLORS = ["#d73a4a", "#e99695", "#fbca04", "#0e8a16", "#006b75", "#1d76db", "#0052cc", "#5319e7", "#b60205", "#c5def5", "#bfdadc", "#8b949e"];
 
 // ── small token-only layout atoms (not controls — controls come from ./ui) ──────────
 const Card = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
@@ -395,11 +397,18 @@ function NewIssueModal({ repos, defaultRepo, actors, onClose, onCreate }: { repo
   const [repo, setRepo] = useState(defaultRepo || (repos[0] ? `${repos[0].tenant}/${repos[0].repo}` : ""));
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
-  const [labels, setLabels] = useState("");
+  const [labels, setLabels] = useState<string[]>([]);
+  const [repoLabels, setRepoLabels] = useState<{ name: string; color: string }[]>([]);
   const [assignees, setAssignees] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  // Labels are the repo's configured set (not free-form) — refetch when the repo changes.
+  useEffect(() => {
+    setLabels([]); setRepoLabels([]);
+    const [t, r] = repo.split("/");
+    if (t && r) fetch(`/api/repos/${encodeURIComponent(t)}/${r}/labels`).then((res) => (res.ok ? res.json() : { labels: [] })).then((d) => setRepoLabels(d.labels ?? [])).catch(() => {});
+  }, [repo]);
   const ok = !!repo && !!title.trim();
-  const submit = async () => { if (!ok || busy) return; setBusy(true); const done = await onCreate({ repo, title: title.trim(), body: body.trim(), labels: labels.split(",").map((s) => s.trim()).filter(Boolean), assignees }); setBusy(false); if (done) onClose(); };
+  const submit = async () => { if (!ok || busy) return; setBusy(true); const done = await onCreate({ repo, title: title.trim(), body: body.trim(), labels, assignees }); setBusy(false); if (done) onClose(); };
   const sorted = [...actors].sort((a, b) => Number(b.kind === "agent") - Number(a.kind === "agent"));
   return (
     <ModalShell title="New issue" onClose={onClose} width={540}>
@@ -407,7 +416,24 @@ function NewIssueModal({ repos, defaultRepo, actors, onClose, onCreate }: { repo
         <Field label="Repository"><Picker block value={repo} onChange={setRepo} options={repos.map((r) => ({ value: `${r.tenant}/${r.repo}`, label: `${r.tenant}/${r.repo}` }))} placeholder="Choose a repository…" /></Field>
         <Field label="Title"><input autoFocus className={modalInput} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Something an agent (or human) should fix" /></Field>
         <Field label="Description"><RichText value={body} onChange={setBody} rows={5} mentions={actors.map((a) => ({ handle: a.handle, kind: a.kind }))} placeholder="What's wrong, where, and how you'd know it's fixed. Agents read this first." /></Field>
-        <Field label="Labels" hint="comma-separated"><input className={modalInput} value={labels} onChange={(e) => setLabels(e.target.value)} placeholder="bug, area:auth" spellCheck={false} /></Field>
+        <Field label="Labels" hint="configured by the repo">
+          {repoLabels.length === 0 ? (
+            <div className="text-[12.5px] text-muted">This repo has no labels yet. A repo admin adds them in Settings → Labels.</div>
+          ) : (
+            <div className="flex flex-wrap gap-1.5">
+              {repoLabels.map((l) => {
+                const on = labels.includes(l.name);
+                return (
+                  <button key={l.name} type="button" onClick={() => setLabels((s) => (on ? s.filter((x) => x !== l.name) : [...s, l.name]))}
+                    className={`inline-flex items-center gap-1 text-[12px] font-medium px-1.5 py-[3px] rounded-badge border transition-colors ${on ? "border-body bg-rule2 text-ink" : "border-rule text-dim hover:border-dim"}`}>
+                    <span className="w-1.5 h-1.5 rounded-full flex-none" style={{ background: l.color || "#8b949e" }} />{l.name}
+                    {on && <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </Field>
         <Field label="Assignees">
           <div className="flex flex-wrap items-center gap-1.5">
             {assignees.map((id) => { const a = actors.find((x) => x.id === id); return (
@@ -1020,16 +1046,21 @@ export function App() {
     }
   };
   // repo settings
-  type RepoSettings = { private: boolean; unlisted?: boolean; visibility?: "public" | "private" | "unlisted"; require_review_to_land: boolean; default_reviewers: { actor: string; handle: string }[]; team_access: { team: string; role: string }[] };
+  type RepoLabel = { name: string; color: string };
+  type RepoSettings = { private: boolean; unlisted?: boolean; visibility?: "public" | "private" | "unlisted"; require_review_to_land: boolean; default_reviewers: { actor: string; handle: string }[]; team_access: { team: string; role: string }[]; labels?: RepoLabel[] };
   const [repoSettings, setRepoSettings] = useState<RepoSettings | null>(null);
   const [ownerRules, setOwnerRules] = useState<{ glob: string; owners: string[] }[]>([]);
+  const [newLabel, setNewLabel] = useState<RepoLabel>({ name: "", color: LABEL_COLORS[0] });
+  // The repo's configured labels (readable by any member) — drives issue label colors + the pickers.
+  const [repoLabels, setRepoLabels] = useState<RepoLabel[]>([]);
+  const labelColor = (name: string) => repoLabels.find((l) => l.name === name)?.color;
   const loadRepoSettings = () => {
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setRepoSettings(d)).catch(() => {});
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/owners`, { headers: authHeaders() }).then((r) => r.json()).then((d) => setOwnerRules(d.owners ?? [])).catch(() => {});
     if (orgAccountFor(tenant)) loadTeams(orgAccountFor(tenant)!.id);
   };
   const orgAccountFor = (handle: string) => accounts.find((a) => a.handle === handle);
-  const saveRepoSettings = async (patch: Partial<{ private: boolean; visibility: "public" | "private" | "unlisted"; require_review_to_land: boolean; default_reviewers: string[]; team_access: { team: string; role: string }[] }>) => {
+  const saveRepoSettings = async (patch: Partial<{ private: boolean; visibility: "public" | "private" | "unlisted"; require_review_to_land: boolean; default_reviewers: string[]; team_access: { team: string; role: string }[]; labels: RepoLabel[] }>) => {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
     if (!res.ok) return uiAlert(await res.text());
     setRepoSettings(await res.json());
@@ -1104,6 +1135,7 @@ export function App() {
       .catch(() => {});
   useEffect(() => {
     loadIssues();
+    if (tenant && issueRepo) fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/labels`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : { labels: [] })).then((d) => setRepoLabels(d.labels ?? [])).catch(() => {});
   }, [tenant, issueRepo]);
 
   const issueAction = async (number: number, action: string, extra: Record<string, unknown> = {}) => {
@@ -1116,7 +1148,6 @@ export function App() {
     if (res.ok) loadIssues();
     else uiAlert(await res.text());
   };
-  const [labelDraft, setLabelDraft] = useState<Record<number, string>>({});
   // Issue comment composer mode per target (Comment / Close with comment / Close as not planned / Reopen).
   const [issueMode, setIssueMode] = useState<Record<string, string>>({});
   const runIssueMode = async (target: string, num: number, mode: string) => {
@@ -2048,7 +2079,12 @@ export function App() {
 
               <aside className="grid gap-5 content-start">
                 <Module title="Details">
-                  <Stat k="state" v={it.status.state === "open" ? "open" : it.status.reason ?? "closed"} />
+                  <Stat k="status" v={
+                    <span className={`inline-flex items-center gap-1 text-[12px] font-medium px-1.5 py-[2px] rounded-badge ${it.status.state === "open" ? "bg-clear-wash text-clear-text" : it.status.reason === "completed" || !it.status.reason ? "bg-steel-wash text-steel-text" : "bg-rule2 text-dim"}`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${it.status.state === "open" ? "bg-clear" : it.status.reason === "completed" || !it.status.reason ? "bg-steel" : "bg-muted"}`} />
+                      {it.status.state === "open" ? "open" : it.status.reason ?? "closed"}
+                    </span>
+                  } />
                   <Stat k="author" v={handleOf(it.author)} />
                   <div className="grid gap-1.5 pt-1">
                     <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">assignees</span>
@@ -2068,15 +2104,18 @@ export function App() {
                     <div className="flex flex-wrap gap-1.5">
                       {it.labels.map((l) => (
                         <span key={l} className="inline-flex items-center gap-1">
-                          <Label name={l} />
+                          <Label name={l} color={labelColor(l)} />
                           {canAct && <button className="text-muted hover:text-fault-text cursor-pointer text-xs" title="remove" onClick={() => issueAction(it.number, "unlabel", { label: l })}>×</button>}
                         </span>
                       ))}
                       {it.labels.length === 0 && <span className="text-[12.5px] text-muted">none</span>}
                     </div>
-                    {canAct && (
-                      <input className="box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-xs text-ink outline-none focus:border-body placeholder:text-faint" placeholder="add label…" value={labelDraft[it.number] ?? ""} onChange={(e) => setLabelDraft((d) => ({ ...d, [it.number]: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter" && (labelDraft[it.number] ?? "").trim()) { issueAction(it.number, "label", { label: labelDraft[it.number].trim() }); setLabelDraft((d) => ({ ...d, [it.number]: "" })); } }} />
-                    )}
+                    {canAct && (repoLabels.filter((l) => !it.labels.includes(l.name)).length > 0 ? (
+                      <div className="max-w-[220px]"><Picker block size="sm" value="" placeholder="Add a label…" onChange={(v) => v && issueAction(it.number, "label", { label: v })}
+                        options={repoLabels.filter((l) => !it.labels.includes(l.name)).map((l) => ({ value: l.name, label: l.name }))} /></div>
+                    ) : repoLabels.length === 0 ? (
+                      <span className="text-[11.5px] text-faint">no labels configured — a repo admin can add them in Settings</span>
+                    ) : null)}
                   </div>
                   {it.resolved_by && <Stat k="resolved by" v={<code className="text-[12px] text-steel-text">⬡ {it.resolved_by.slice(0, 8)}</code>} />}
                 </Module>
@@ -2522,6 +2561,33 @@ export function App() {
                       options={teams.filter((t) => !(s?.team_access ?? []).some((x) => x.team === t.id)).map((t) => ({ value: t.id, label: t.name }))} /></div>
                   )}
                   {teams.length === 0 && <span className="text-[12px] text-faint">create teams in the org page to grant team access</span>}
+                </div>
+              </Card>
+              <Card>
+                <SectionHeader label="Labels" right={<span className="text-[12.5px] text-muted">the only labels issues can use</span>} />
+                <div className="px-5 py-4 grid gap-3">
+                  <div className="flex flex-wrap gap-1.5">
+                    {(s?.labels ?? []).map((l) => (
+                      <span key={l.name} className="inline-flex items-center gap-1">
+                        <Label name={l.name} color={l.color} />
+                        {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" title="remove" onClick={() => saveRepoSettings({ labels: (s?.labels ?? []).filter((x) => x.name !== l.name) })}>×</button>}
+                      </span>
+                    ))}
+                    {(s?.labels ?? []).length === 0 && <span className="text-[12.5px] text-muted">none yet — add labels so issues aren't free-form</span>}
+                  </div>
+                  {isTenantOwner && (
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <div className="inline-flex items-center gap-1">
+                        {LABEL_COLORS.map((c) => (
+                          <button key={c} type="button" title={c} onClick={() => setNewLabel((n) => ({ ...n, color: c }))} className={`w-5 h-5 rounded-full transition-transform ${newLabel.color === c ? "ring-2 ring-offset-1 ring-body scale-110" : "hover:scale-110"}`} style={{ background: c }} />
+                        ))}
+                      </div>
+                      <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[190px]" placeholder="label name (e.g. bug)" value={newLabel.name}
+                        onChange={(e) => setNewLabel((n) => ({ ...n, name: e.target.value }))}
+                        onKeyDown={(e) => { if (e.key === "Enter" && newLabel.name.trim() && s && !(s.labels ?? []).some((x) => x.name === newLabel.name.trim())) { saveRepoSettings({ labels: [...(s.labels ?? []), { name: newLabel.name.trim(), color: newLabel.color }] }); setNewLabel({ name: "", color: LABEL_COLORS[0] }); } }} />
+                      <Button size="sm" disabled={!newLabel.name.trim()} onClick={() => { if (newLabel.name.trim() && s && !(s.labels ?? []).some((x) => x.name === newLabel.name.trim())) { saveRepoSettings({ labels: [...(s.labels ?? []), { name: newLabel.name.trim(), color: newLabel.color }] }); setNewLabel({ name: "", color: LABEL_COLORS[0] }); } }}>Add label</Button>
+                    </div>
+                  )}
                 </div>
               </Card>
               <Card>

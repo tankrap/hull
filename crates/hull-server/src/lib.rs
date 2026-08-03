@@ -357,6 +357,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/security", get(repo_security))
         .route("/api/repos/:tenant/:repo/owners", get(owners_list).post(set_owners))
         .route("/api/repos/:tenant/:repo/settings", get(get_repo_settings).put(set_repo_settings))
+        .route("/api/repos/:tenant/:repo/labels", get(repo_labels))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
@@ -867,6 +868,7 @@ fn repo_settings_value(app: &App, tenant: &str, repo: &str) -> Value {
         .map(|id| json!({ "actor": id, "handle": app.store.actor(id).map(|a| a.handle).unwrap_or_default() }))
         .collect();
     let teams: Vec<Value> = s.team_access.iter().map(|t| json!({ "team": t.team, "role": t.role })).collect();
+    let labels: Vec<Value> = s.labels.iter().map(|l| json!({ "name": l.name, "color": l.color })).collect();
     json!({
         "private": s.private,
         "unlisted": s.unlisted,
@@ -874,7 +876,19 @@ fn repo_settings_value(app: &App, tenant: &str, repo: &str) -> Value {
         "require_review_to_land": s.require_review_to_land,
         "default_reviewers": reviewers,
         "team_access": teams,
+        "labels": labels,
     })
+}
+
+/// `GET /api/repos/:tenant/:repo/labels` — the repo's configured issue labels (name + color). Readable
+/// by anyone who can read the repo, so the new-issue form can offer them.
+async fn repo_labels(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(resp) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return resp;
+    }
+    let s = app.repo_settings.get(&format!("{tenant}/{repo}"));
+    let labels: Vec<Value> = s.labels.iter().map(|l| json!({ "name": l.name, "color": l.color })).collect();
+    Json(json!({ "labels": labels })).into_response()
 }
 
 /// `GET /api/repos/:tenant/:repo/settings` — repo settings. **Owner/admin only** (settings expose
@@ -925,6 +939,17 @@ async fn set_repo_settings(State(app): State<App>, Path((tenant, repo)): Path<(S
                 let team = v.get("team").and_then(Value::as_str)?.to_string();
                 let role = v.get("role").and_then(Value::as_str).unwrap_or("read").to_string();
                 Some(reposettings::TeamAccess { team, role })
+            })
+            .collect();
+    }
+    if let Some(arr) = body.get("labels").and_then(Value::as_array) {
+        s.labels = arr
+            .iter()
+            .filter_map(|v| {
+                let name = v.get("name").and_then(Value::as_str)?.trim().to_string();
+                if name.is_empty() { return None; }
+                let color = v.get("color").and_then(Value::as_str).unwrap_or("#8b949e").to_string();
+                Some(reposettings::Label { name, color })
             })
             .collect();
     }
