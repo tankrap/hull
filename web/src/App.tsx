@@ -1136,11 +1136,10 @@ export function App() {
           const mode = modes.find((m) => m.id === (issueMode[target] ?? "comment")) ?? modes[0];
           const disabled = !canAct || (mode.id === "comment" && !draft);
           return (
-            <div className="flex gap-2 mt-1 items-start">
-              <input ref={commentBoxRef} className="flex-1 box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none transition-colors duration-150 focus:border-body placeholder:text-faint"
-                placeholder={canAct ? "Leave a comment…" : "sign in to comment"} disabled={!canAct} value={commentDraft[target] ?? ""}
-                onChange={(e) => setCommentDraft((d) => ({ ...d, [target]: e.target.value }))}
-                onKeyDown={(e) => { if (e.key === "Enter" && !disabled) runIssueMode(target, num, mode.id); }} />
+            <div className="mt-1 grid gap-2" ref={commentBoxRef}>
+              {canAct ? <RichText value={commentDraft[target] ?? ""} onChange={(v) => setCommentDraft((d) => ({ ...d, [target]: v }))} rows={3} linkBase={`/${encodeURIComponent(tenant)}/${issueRepo}`} onSubmit={() => !disabled && runIssueMode(target, num, mode.id)} placeholder="Leave a comment…" />
+                : <div className="border border-ctl rounded-ctl px-2.5 py-2 text-[13px] text-faint">sign in to comment</div>}
+              <div className="flex justify-end">
               {canAct ? (
                 <div className="flex-none inline-flex h-ctl">
                   <Button size="md" disabled={disabled} onClick={() => runIssueMode(target, num, mode.id)} className="!rounded-r-none whitespace-nowrap">{mode.label}{mode.sub ? ` — ${mode.sub}` : ""}</Button>
@@ -1162,6 +1161,7 @@ export function App() {
                   </Popover>
                 </div>
               ) : <Button size="md" disabled>Comment</Button>}
+              </div>
             </div>
           );
         })()}
@@ -1256,7 +1256,7 @@ export function App() {
 
   // ── full-screen auth / account pages ──────────────────────────────────────
   // keyboard shortcuts: g→h/i/p navigation, c to comment, ? for help, / for the palette
-  const commentBoxRef = useRef<HTMLInputElement | null>(null);
+  const commentBoxRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     let lastG = 0;
     const onKey = (e: KeyboardEvent) => {
@@ -1275,7 +1275,7 @@ export function App() {
         else if (e.key === "s" && view === "repo" && isTenantOwner) { e.preventDefault(); navigate(`${repoBase()}/settings`); }
         return;
       }
-      if (e.key === "c" && commentBoxRef.current) { e.preventDefault(); commentBoxRef.current.focus(); }
+      if (e.key === "c" && commentBoxRef.current) { const t = commentBoxRef.current.querySelector("textarea"); if (t) { e.preventDefault(); t.focus(); } }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -1939,8 +1939,9 @@ export function App() {
         return (
           <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
             <div className="flex items-center gap-3 flex-wrap mb-1.5">
+              <Avatar id={acct.id} handle={acct.handle} kind="organization" size={32} />
               <h1 className="text-[25px] font-semibold tracking-tight">{acct.handle}</h1>
-              <span className="text-[11.5px] font-semibold px-2 py-[3px] rounded-full border border-rule text-dim">{acct.kind}</span>
+              <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge bg-rule2 text-dim">{acct.kind}</span>
             </div>
             <p className="text-[13px] text-muted mb-6">{acct.members.length} member{acct.members.length === 1 ? "" : "s"} · {teams.length} team{teams.length === 1 ? "" : "s"} · {acct.repos.length} repo{acct.repos.length === 1 ? "" : "s"}</p>
             <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-12 gap-y-9">
@@ -1968,22 +1969,19 @@ export function App() {
                         <Avatar id={m.actor} handle={m.handle} kind={kindOf(m.actor)} size={30} />
                         <div className="flex-1 min-w-0">
                           <div className="text-[14px] font-medium">{m.handle || m.actor.slice(0, 10)}</div>
-                          <div className="text-[12px] text-muted tabular-nums">{m.actor.slice(0, 16)}…</div>
+                          <div className="text-[12px] text-muted">{kindOf(m.actor) === "agent" ? "agent" : "human"}</div>
                         </div>
-                        <span className="text-[11.5px] font-semibold px-2 py-[3px] rounded-full border border-rule text-dim">{m.role}</span>
-                        {amAdmin && <Button size="sm" variant="destructive" onClick={() => removeOrgMember(acct.id, m.actor)}>Remove</Button>}
+                        <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge bg-rule2 text-dim">{m.role}</span>
+                        {amAdmin && me?.id !== m.actor && <Button size="sm" variant="destructive" onClick={() => removeOrgMember(acct.id, m.actor)}>Remove</Button>}
                       </div>
                     ))}
                     {amAdmin && (
-                      <div className="px-5 py-3 flex gap-2 items-center bg-paper">
-                        <select className="flex-1 box-border h-ctl px-2 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body" value={memberPick.actor} onChange={(e) => setMemberPick({ ...memberPick, actor: e.target.value })}>
-                          <option value="">add a member…</option>
-                          {candidates.map((a) => <option key={a.id} value={a.id}>{a.handle} ({a.kind})</option>)}
-                        </select>
-                        <select className="box-border h-ctl px-2 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body" value={memberPick.role} onChange={(e) => setMemberPick({ ...memberPick, role: e.target.value })}>
-                          {["read", "write", "admin", "owner"].map((r) => <option key={r} value={r}>{r}</option>)}
-                        </select>
-                        <Button size="sm" onClick={() => { if (memberPick.actor) { addOrgMember(acct.id, { actor: memberPick.actor }, memberPick.role); setMemberPick({ actor: "", role: "write" }); } }}>Add</Button>
+                      <div className="px-5 py-3 flex gap-2 items-center bg-paper flex-wrap">
+                        <div className="flex-1 min-w-[200px]"><Picker block value={memberPick.actor} placeholder="Add a member…" onChange={(v) => setMemberPick({ ...memberPick, actor: v })}
+                          options={candidates.map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} /></div>
+                        <Picker width={140} value={memberPick.role} onChange={(v) => setMemberPick({ ...memberPick, role: v })}
+                          options={["read", "write", "admin", "owner"].map((r) => ({ value: r, label: r }))} />
+                        <Button size="sm" disabled={!memberPick.actor} onClick={() => { if (memberPick.actor) { addOrgMember(acct.id, { actor: memberPick.actor }, memberPick.role); setMemberPick({ actor: "", role: "write" }); } }}>Add</Button>
                       </div>
                     )}
                   </Card>
@@ -2000,17 +1998,16 @@ export function App() {
                         </div>
                         {t.members.map((m) => (
                           <div key={m.actor} className="px-5 py-2.5 border-b border-rule2 last:border-0 flex items-center gap-3">
+                            <Avatar id={m.actor} handle={m.handle} kind={kindOf(m.actor)} size={20} />
                             <span className="flex-1 text-[13.5px]">{m.handle || m.actor.slice(0, 10)}</span>
-                            <span className="text-[11.5px] text-muted">{m.role}</span>
+                            <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[2px] rounded-badge bg-rule2 text-dim">{m.role}</span>
                             {amAdmin && <button className="text-muted hover:text-fault-text cursor-pointer text-sm" title="remove" onClick={() => teamRemoveMember(acct.id, t.id, m.actor)}>×</button>}
                           </div>
                         ))}
                         {amAdmin && (
                           <div className="px-5 py-2.5 bg-paper">
-                            <select className="w-full box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-xs text-ink outline-none focus:border-body" value="" onChange={(e) => { if (e.target.value) { teamAddMember(acct.id, t.id, { actor: e.target.value }, "write"); e.target.value = ""; } }}>
-                              <option value="">add to team…</option>
-                              {acct.members.filter((m) => !t.members.some((x) => x.actor === m.actor)).map((m) => <option key={m.actor} value={m.actor}>{m.handle}</option>)}
-                            </select>
+                            <Picker size="sm" block value="" placeholder="Add to team…" onChange={(v) => { if (v) teamAddMember(acct.id, t.id, { actor: v }, "write"); }}
+                              options={acct.members.filter((m) => !t.members.some((x) => x.actor === m.actor)).map((m) => ({ value: m.actor, label: m.handle || m.actor.slice(0, 10) }))} />
                           </div>
                         )}
                       </Card>
@@ -2099,10 +2096,8 @@ export function App() {
                     {(s?.default_reviewers ?? []).length === 0 && <span className="text-[12.5px] text-muted">none</span>}
                   </div>
                   {isTenantOwner && (
-                    <select className="max-w-[280px] box-border h-ctl px-2 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body" value="" onChange={(e) => { if (e.target.value && s) { const ids = [...new Set([...s.default_reviewers.map((x) => x.actor), e.target.value])]; saveRepoSettings({ default_reviewers: ids }); e.target.value = ""; } }}>
-                      <option value="">add a reviewer…</option>
-                      {reviewerCandidates.filter((a) => !(s?.default_reviewers ?? []).some((x) => x.actor === a.id)).map((a) => <option key={a.id} value={a.id}>{a.handle} ({a.kind})</option>)}
-                    </select>
+                    <div className="max-w-[280px]"><Picker block value="" placeholder="Add a reviewer…" onChange={(v) => { if (v && s) saveRepoSettings({ default_reviewers: [...new Set([...s.default_reviewers.map((x) => x.actor), v])] }); }}
+                      options={reviewerCandidates.filter((a) => !(s?.default_reviewers ?? []).some((x) => x.actor === a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} /></div>
                   )}
                 </div>
               </Card>
@@ -2114,17 +2109,15 @@ export function App() {
                     return (
                       <div key={i} className="flex items-center gap-3">
                         <span className="flex-1 text-[13.5px]">{tm?.name ?? ta.team}</span>
-                        <span className="text-[11.5px] font-semibold px-2 py-[3px] rounded-full border border-rule text-dim">{ta.role}</span>
+                        <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge bg-rule2 text-dim">{ta.role}</span>
                         {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveRepoSettings({ team_access: (s!.team_access.filter((_, j) => j !== i)) })}>×</button>}
                       </div>
                     );
                   })}
                   {(s?.team_access ?? []).length === 0 && <span className="text-[12.5px] text-muted">no teams have explicit access</span>}
                   {isTenantOwner && teams.length > 0 && (
-                    <select className="max-w-[280px] box-border h-ctl px-2 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body" value="" onChange={(e) => { if (e.target.value && s) { saveRepoSettings({ team_access: [...s.team_access, { team: e.target.value, role: "write" }] }); e.target.value = ""; } }}>
-                      <option value="">grant a team access…</option>
-                      {teams.filter((t) => !(s?.team_access ?? []).some((x) => x.team === t.id)).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-                    </select>
+                    <div className="max-w-[280px]"><Picker block value="" placeholder="Grant a team access…" onChange={(v) => { if (v && s) saveRepoSettings({ team_access: [...s.team_access, { team: v, role: "write" }] }); }}
+                      options={teams.filter((t) => !(s?.team_access ?? []).some((x) => x.team === t.id)).map((t) => ({ value: t.id, label: t.name }))} /></div>
                   )}
                   {teams.length === 0 && <span className="text-[12px] text-faint">create teams in the org page to grant team access</span>}
                 </div>
