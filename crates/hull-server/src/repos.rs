@@ -269,6 +269,128 @@ impl RepoHost {
     }
 }
 
+/// A node (file) + edges (imports) for the codebase graph.
+#[derive(serde::Serialize)]
+pub struct GraphNode {
+    pub path: String,
+    pub dir: String,
+    pub lang: String,
+    pub size: u64,
+    pub deg: usize,
+}
+#[derive(serde::Serialize)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+}
+
+impl RepoHost {
+    /// Build a codebase import graph at a branch: nodes are source files, edges are resolved in-repo
+    /// imports (TS/JS relative `import`/`require`, Rust `mod`). Self-contained (no resolver sidecars).
+    pub fn code_graph(&self, tenant: &str, repo: &str, ref_name: &str) -> (Vec<GraphNode>, Vec<GraphEdge>) {
+        let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return (vec![], vec![]) };
+        let Some(root) = self.root_tree(&store, ref_name) else { return (vec![], vec![]) };
+        // Collect all source files (path -> text).
+        let mut files: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut stack = vec![(String::new(), root)];
+        let lang_of = |p: &str| -> Option<&'static str> {
+            if p.ends_with(".tsx") || p.ends_with(".ts") { Some("ts") }
+            else if p.ends_with(".jsx") || p.ends_with(".js") || p.ends_with(".mjs") { Some("js") }
+            else if p.ends_with(".rs") { Some("rust") }
+            else if p.ends_with(".py") { Some("python") }
+            else if p.ends_with(".go") { Some("go") }
+            else { None }
+        };
+        while let Some((prefix, tid)) = stack.pop() {
+            if files.len() > 6000 { break; }
+            let entries = match store.get(&tid) { Ok(Some(Object::Tree(t))) => t.entries, _ => continue };
+            for e in entries {
+                let full = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+                match store.get(&e.id) {
+                    Ok(Some(Object::Tree(_))) => stack.push((full, e.id)),
+                    Ok(Some(Object::Blob(b))) if lang_of(&full).is_some() && b.len() < 400_000 => {
+                        files.insert(full, String::from_utf8_lossy(&b).into_owned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let paths: std::collections::HashSet<String> = files.keys().cloned().collect();
+        // Resolve a relative TS/JS import spec from `dir` to an existing repo file.
+        let resolve_rel = |dir: &str, spec: &str| -> Option<String> {
+            let mut parts: Vec<String> = if dir.is_empty() { vec![] } else { dir.split('/').map(str::to_string).collect() };
+            for seg in spec.split('/') {
+                match seg {
+                    "." | "" => {}
+                    ".." => { parts.pop(); }
+                    s => parts.push(s.to_string()),
+                }
+            }
+            let base = parts.join("/");
+            for ext in ["", ".ts", ".tsx", ".js", ".jsx", ".mjs"] {
+                let cand = format!("{base}{ext}");
+                if paths.contains(&cand) { return Some(cand); }
+            }
+            for idx in ["/index.ts", "/index.tsx", "/index.js", "/index.jsx"] {
+                let cand = format!("{base}{idx}");
+                if paths.contains(&cand) { return Some(cand); }
+            }
+            None
+        };
+        let mut edges: Vec<GraphEdge> = Vec::new();
+        let mut deg: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut seen_edge: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for (path, text) in &files {
+            let dir = path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+            let lang = lang_of(path).unwrap_or("");
+            for line in text.lines() {
+                let t = line.trim();
+                let mut targets: Vec<String> = Vec::new();
+                if lang == "ts" || lang == "js" {
+                    // from "X" / require("X") / import "X"
+                    for marker in ["from \"", "from '", "require(\"", "require('", "import \"", "import '"] {
+                        if let Some(i) = t.find(marker) {
+                            let rest = &t[i + marker.len()..];
+                            let end = rest.find(['"', '\'']).unwrap_or(rest.len());
+                            let spec = &rest[..end];
+                            if spec.starts_with('.') { if let Some(r) = resolve_rel(&dir, spec) { targets.push(r); } }
+                        }
+                    }
+                } else if lang == "rust" {
+                    // mod x;  → sibling x.rs or x/mod.rs
+                    if let Some(rest) = t.strip_prefix("mod ").or_else(|| t.strip_prefix("pub mod ")) {
+                        if let Some(name) = rest.split(&[';', ' '][..]).next().filter(|s| !s.is_empty()) {
+                            for cand in [format!("{dir}/{name}.rs"), format!("{dir}/{name}/mod.rs")] {
+                                let c = cand.trim_start_matches('/').to_string();
+                                if paths.contains(&c) { targets.push(c); }
+                            }
+                        }
+                    }
+                }
+                for to in targets {
+                    if &to != path && seen_edge.insert((path.clone(), to.clone())) {
+                        *deg.entry(path.clone()).or_default() += 1;
+                        *deg.entry(to.clone()).or_default() += 1;
+                        edges.push(GraphEdge { from: path.clone(), to });
+                    }
+                }
+            }
+        }
+        let mut nodes: Vec<GraphNode> = files
+            .iter()
+            .map(|(p, txt)| GraphNode {
+                path: p.clone(),
+                dir: p.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default(),
+                lang: lang_of(p).unwrap_or("").to_string(),
+                size: txt.len() as u64,
+                deg: deg.get(p).copied().unwrap_or(0),
+            })
+            .collect();
+        nodes.sort_by(|a, b| a.path.cmp(&b.path));
+        (nodes, edges)
+    }
+}
+
 /// One entry in a directory listing for the file browser.
 #[derive(serde::Serialize)]
 pub struct TreeItem {

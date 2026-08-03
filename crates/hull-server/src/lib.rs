@@ -331,6 +331,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/tree", get(repo_tree))
         .route("/api/repos/:tenant/:repo/blob", get(repo_blob))
         .route("/api/repos/:tenant/:repo/search", get(repo_search))
+        .route("/api/repos/:tenant/:repo/graph", get(repo_graph))
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/merge", post(merge_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/close", post(close_pr))
@@ -1849,6 +1850,22 @@ async fn repo_blob(
         }
         None => Json(json!({ "path": path, "ref": ref_name, "missing": true })),
     }
+}
+
+/// The codebase import graph at a branch (`GET /api/repos/:tenant/:repo/graph?ref=<branch>`) —
+/// nodes are source files, edges are resolved in-repo imports.
+async fn repo_graph(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(resp) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return resp;
+    }
+    let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
+    let (nodes, edges) = app.repos.code_graph(&tenant, &repo, ref_name);
+    Json(json!({ "ref": ref_name, "nodes": nodes, "edges": edges })).into_response()
 }
 
 /// Fuzzy filename + full-text content search (`GET /api/repos/:tenant/:repo/search?q=<query>&ref=<branch>`).
