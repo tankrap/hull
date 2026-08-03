@@ -1162,7 +1162,15 @@ export function App() {
   type Account = { id: string; handle: string; kind: string; repos: string[]; members: { actor: string; handle: string; role: string }[] };
   const [accounts, setAccounts] = useState<Account[]>([]);
   const orgAccount = accounts.find((a) => a.handle === (orgHandle ?? " "));
-  useEffect(() => { if (orgAccount) { loadTeams(orgAccount.id); loadGh(orgAccount.id); setImportList(null); } }, [orgAccount?.id]);
+  // Org-level DEFAULT repo settings — inherited by every repo created afterward.
+  const [orgDefaults, setOrgDefaults] = useState<RepoSettings | null>(null);
+  const [orgLabelDraft, setOrgLabelDraft] = useState<RepoLabel>({ name: "", color: LABEL_COLORS[0] });
+  const loadOrgDefaults = (acctId: string) => fetch(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setOrgDefaults(d)).catch(() => {});
+  const saveOrgDefaults = async (acctId: string, patch: Partial<{ visibility: string; require_review_to_land: boolean; labels: RepoLabel[] }>) => {
+    const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
+    if (res.ok) setOrgDefaults(await res.json()); else uiAlert(await res.text());
+  };
+  useEffect(() => { if (orgAccount) { loadTeams(orgAccount.id); loadGh(orgAccount.id); loadOrgDefaults(orgAccount.id); setImportList(null); } }, [orgAccount?.id]);
   useEffect(() => {
     if (!token) { setAccounts([]); return; }
     fetch("/api/accounts", { headers: authHeaders() }).then((r) => (r.ok ? r.json() : { accounts: [] })).then((d) => setAccounts(d.accounts ?? [])).catch(() => {});
@@ -2240,6 +2248,37 @@ export function App() {
             <p className="text-[13px] text-muted mb-6">{acct.members.length} member{acct.members.length === 1 ? "" : "s"} · {teams.length} team{teams.length === 1 ? "" : "s"} · {acct.repos.length} repo{acct.repos.length === 1 ? "" : "s"}</p>
             <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-12 gap-y-9">
               <section className="min-w-0 grid gap-8">
+                {amAdmin && (
+                  <div>
+                    <Eyebrow label="Default repository settings" right="inherited by new repos" />
+                    <Card>
+                      <div className="px-5 py-4 grid gap-4">
+                        <div className="flex items-center justify-between gap-4">
+                          <div><div className="text-[14px] font-medium">Default visibility</div><div className="text-[12.5px] text-muted">New repos in {acct.handle} start with this.</div></div>
+                          <Picker width={200} value={orgDefaults?.visibility ?? "public"} onChange={(v) => saveOrgDefaults(acct.id, { visibility: v })} options={[{ value: "public", label: "Public" }, { value: "unlisted", label: "Unlisted" }, { value: "private", label: "Private" }]} />
+                        </div>
+                        <div className="flex items-center justify-between gap-4">
+                          <div><div className="text-[14px] font-medium">Require a review to merge</div><div className="text-[12.5px] text-muted">Default merge gate for new repos.</div></div>
+                          <Switch on={!!orgDefaults?.require_review_to_land} onChange={(on: boolean) => saveOrgDefaults(acct.id, { require_review_to_land: on })} />
+                        </div>
+                        <div className="grid gap-2 pt-1 border-t border-rule3">
+                          <div className="text-[14px] font-medium">Default labels</div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {(orgDefaults?.labels ?? []).map((l) => (
+                              <span key={l.name} className="inline-flex items-center gap-1"><Label name={l.name} color={l.color} /><button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveOrgDefaults(acct.id, { labels: (orgDefaults?.labels ?? []).filter((x) => x.name !== l.name) })}>×</button></span>
+                            ))}
+                            {(orgDefaults?.labels ?? []).length === 0 && <span className="text-[12.5px] text-muted">none</span>}
+                          </div>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <div className="inline-flex items-center gap-1">{LABEL_COLORS.map((c) => <button key={c} type="button" onClick={() => setOrgLabelDraft((n) => ({ ...n, color: c }))} className={`w-5 h-5 rounded-full transition-transform ${orgLabelDraft.color === c ? "ring-2 ring-offset-1 ring-body scale-110" : "hover:scale-110"}`} style={{ background: c }} />)}</div>
+                            <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[180px]" placeholder="label name" value={orgLabelDraft.name} onChange={(e) => setOrgLabelDraft((n) => ({ ...n, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter" && orgLabelDraft.name.trim() && !(orgDefaults?.labels ?? []).some((x) => x.name === orgLabelDraft.name.trim())) { saveOrgDefaults(acct.id, { labels: [...(orgDefaults?.labels ?? []), { name: orgLabelDraft.name.trim(), color: orgLabelDraft.color }] }); setOrgLabelDraft({ name: "", color: LABEL_COLORS[0] }); } }} />
+                            <Button size="sm" disabled={!orgLabelDraft.name.trim()} onClick={() => { if (orgLabelDraft.name.trim() && !(orgDefaults?.labels ?? []).some((x) => x.name === orgLabelDraft.name.trim())) { saveOrgDefaults(acct.id, { labels: [...(orgDefaults?.labels ?? []), { name: orgLabelDraft.name.trim(), color: orgLabelDraft.color }] }); setOrgLabelDraft({ name: "", color: LABEL_COLORS[0] }); } }}>Add</Button>
+                          </div>
+                        </div>
+                      </div>
+                    </Card>
+                  </div>
+                )}
                 <div>
                   <Eyebrow label="Members" />
                   <Card>

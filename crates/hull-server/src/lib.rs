@@ -317,6 +317,7 @@ fn make_router(app: App) -> Router {
         .route("/api/me", get(me_profile))
         .route("/api/notifications", get(notifications_list))
         .route("/api/repos", get(repos_list).post(create_repo_handler))
+        .route("/api/accounts/:id/repo-defaults", get(repo_defaults_get).put(repo_defaults_set))
         .route("/api/accounts/:id/github", get(github_status).delete(github_disconnect))
         .route("/api/accounts/:id/github/connect", post(github_connect))
         .route("/api/accounts/:id/github/connect-url", post(github_connect_url))
@@ -860,8 +861,11 @@ async fn team_remove_member(State(app): State<App>, Path((id, team, actor)): Pat
 
 /// Build the settings JSON (no auth — callers gate).
 fn repo_settings_value(app: &App, tenant: &str, repo: &str) -> Value {
-    let key = format!("{tenant}/{repo}");
-    let s = app.repo_settings.get(&key);
+    settings_value(app, &app.repo_settings.get(&format!("{tenant}/{repo}")))
+}
+
+/// Serialize a RepoSettings to the JSON the UI reads (shared by repo settings + org defaults).
+fn settings_value(app: &App, s: &reposettings::RepoSettings) -> Value {
     let reviewers: Vec<Value> = s
         .default_reviewers
         .iter()
@@ -915,6 +919,13 @@ async fn set_repo_settings(State(app): State<App>, Path((tenant, repo)): Path<(S
     }
     let key = format!("{tenant}/{repo}");
     let mut s = app.repo_settings.get(&key);
+    apply_settings_patch(&app, &mut s, &body);
+    app.repo_settings.set(&key, s);
+    Json(repo_settings_value(&app, &tenant, &repo)).into_response()
+}
+
+/// Apply a settings JSON patch (shared by repo settings + org defaults).
+fn apply_settings_patch(app: &App, s: &mut reposettings::RepoSettings, body: &Value) {
     // Accept either a `visibility` enum ("public"|"private"|"unlisted") or the legacy `private` bool.
     if let Some(vis) = body.get("visibility").and_then(Value::as_str) {
         s.private = vis == "private";
@@ -953,8 +964,6 @@ async fn set_repo_settings(State(app): State<App>, Path((tenant, repo)): Path<(S
             })
             .collect();
     }
-    app.repo_settings.set(&key, s);
-    Json(repo_settings_value(&app, &tenant, &repo)).into_response()
 }
 
 /// Resolve an account by id or handle and require the caller be its owner/admin.
@@ -992,7 +1001,38 @@ async fn create_repo_handler(State(app): State<App>, headers: axum::http::Header
     }
     let repo = Repo { id: format!("repo_{tenant}_{name}"), owner: acct.id.clone(), name: name.clone(), default_branch: "main".into() };
     app.store.put_repo(repo.clone());
+    // Inherit the org's default repo settings, if it has configured any.
+    let defaults = app.repo_settings.get(&repo_defaults_key(&acct.id));
+    app.repo_settings.set(&format!("{tenant}/{name}"), defaults);
     (StatusCode::CREATED, Json(json!({ "repo": repo, "tenant": tenant, "name": name }))).into_response()
+}
+
+/// The RepoSettingsStore key holding an account's default repo settings (inherited by new repos).
+fn repo_defaults_key(acct_id: &str) -> String {
+    format!("@defaults/{acct_id}")
+}
+
+/// `GET /api/accounts/:id/repo-defaults` — the org's default repo settings (owner/admin only).
+async fn repo_defaults_get(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    Json(settings_value(&app, &app.repo_settings.get(&repo_defaults_key(&acct.id)))).into_response()
+}
+
+/// `PUT /api/accounts/:id/repo-defaults` — set the org's default repo settings (owner/admin only).
+/// These are copied into every repo created afterward.
+async fn repo_defaults_set(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let key = repo_defaults_key(&acct.id);
+    let mut s = app.repo_settings.get(&key);
+    apply_settings_patch(&app, &mut s, &body);
+    app.repo_settings.set(&key, s.clone());
+    Json(settings_value(&app, &s)).into_response()
 }
 
 /// `GET /api/accounts/:id/github` — the account's GitHub connection status (admin only). Never
