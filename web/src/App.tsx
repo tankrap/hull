@@ -232,11 +232,11 @@ function Popover({ trigger, children, align = "left", width = 300, direction = "
 
 // Styled select (replaces native <select>). options: {value,label}[]. When value is "" it shows the
 // placeholder — used both for bound selects and "pick to act" menus.
-function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", block = false, direction = "down", className = "" }: { value: string; onChange: (v: string) => void; options: { value: string; label: string }[]; placeholder?: string; width?: number; size?: "sm" | "md"; block?: boolean; direction?: "down" | "up"; className?: string }) {
+function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", block = false, direction = "down", className = "", searchable: searchableProp }: { value: string; onChange: (v: string) => void; options: { value: string; label: string }[]; placeholder?: string; width?: number; size?: "sm" | "md"; block?: boolean; direction?: "down" | "up"; className?: string; searchable?: boolean }) {
   const cur = options.find((o) => o.value === value);
   const h = size === "sm" ? "h-ctl-sm text-xs" : "h-ctl text-[13px]";
   const [q, setQ] = useState("");
-  const searchable = options.length >= 8;
+  const searchable = searchableProp ?? options.length >= 8;
   const ql = q.trim().toLowerCase();
   const filtered = ql ? options.filter((o) => o.label.toLowerCase().includes(ql)) : options;
   return (
@@ -251,10 +251,10 @@ function Picker({ value, onChange, options, placeholder = "Select…", width = 2
           <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…" className="w-full box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" />
         </div>
       )}
-      <div className="py-1 max-h-[240px] overflow-auto">
+      <div className="py-1 max-h-[280px] overflow-y-auto overflow-x-hidden">
         {filtered.length === 0 && <div className="px-3 py-1.5 text-[12.5px] text-muted">{ql ? "no matches" : "none available"}</div>}
         {filtered.map((o) => (
-          <button key={o.value} type="button" onClick={() => onChange(o.value)} className={`w-full text-left px-3 py-1.5 text-[13px] hover:bg-paper ${o.value === value ? "bg-paper font-medium text-ink" : "text-body"}`}>{o.label}</button>
+          <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-3 py-1.5 text-[13px] truncate hover:bg-paper ${o.value === value ? "bg-paper font-medium text-ink" : "text-body"}`}>{o.label}</button>
         ))}
       </div>
     </Popover>
@@ -1527,19 +1527,19 @@ export function App() {
           <span className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-[5px] py-0.5 bg-paper flex-none">⌘K</span>
         </button>
       </div>
-      <div className="flex items-center gap-2.5 shrink-0">
-        <div className="flex items-center gap-1.5 text-muted" title={theme === "dark" ? "switch to light" : "switch to dark"}>
+      <div className="flex items-center gap-2 shrink-0">
+        <button onClick={() => setTheme(theme === "dark" ? "light" : "dark")} title={theme === "dark" ? "Switch to light" : "Switch to dark"} aria-label="toggle theme"
+          className="h-ctl w-ctl grid place-items-center rounded-ctl border border-ctl bg-surface text-dim hover:text-ink hover:border-dim transition-colors">
           {theme === "dark" ? (
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></svg>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></svg>
           ) : (
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" /></svg>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" /></svg>
           )}
-          <Switch on={theme === "dark"} onChange={(on: boolean) => setTheme(on ? "dark" : "light")} />
-        </div>
+        </button>
         {me && (
           <Popover align="right" width={230} trigger={(open) => (
-            <span className={`h-ctl w-ctl grid place-items-center rounded-ctl border bg-surface cursor-pointer transition-colors ${open ? "border-body" : "border-ctl hover:border-dim"}`} title="Create new…" aria-label="create">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-dim"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+            <span className={`h-ctl w-ctl grid place-items-center rounded-ctl border bg-surface cursor-pointer transition-colors text-dim hover:text-ink ${open ? "border-body" : "border-ctl hover:border-dim"}`} title="Create new…" aria-label="create">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
             </span>
           )}>
             <div className="py-1">
@@ -1557,16 +1557,17 @@ export function App() {
           </Popover>
         )}
         <button
-          className="relative h-ctl w-ctl grid place-items-center rounded-ctl border border-ctl bg-surface hover:border-[oklch(0.6_0.015_250)] cursor-pointer"
+          className="relative h-ctl w-ctl grid place-items-center rounded-ctl border border-ctl bg-surface text-dim hover:text-ink hover:border-dim transition-colors cursor-pointer"
           onClick={openNotifs}
           title="notifications"
           aria-label="notifications"
         >
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-dim">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.73 21a2 2 0 0 1-3.46 0" />
           </svg>
           {unread > 0 && <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 grid place-items-center rounded-full bg-fault text-white text-[10px] font-bold tabular-nums">{unread}</span>}
         </button>
+        <span className="w-px h-6 bg-rule2 mx-0.5" aria-hidden />
         {me ? (
           <div className="relative">
             <button
@@ -1934,7 +1935,6 @@ export function App() {
                 <Button size="sm" disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}>Merge</Button>
                 {!canLand && <span className="text-[12.5px] text-muted">{isTenantOwner ? "Or override as an owner:" : "Every check must pass before merging."}</span>}
                 {!canLand && isTenantOwner && <Button size="sm" variant="secondary" className="ml-auto !text-fault-text" onClick={() => mergePr(p.number, true)}>Merge without checks</Button>}
-                {canAct && <LinkButton className="ml-auto" onClick={() => closePr(p.number, false)}>Close</LinkButton>}
               </div>
             </Card>
           </div>
@@ -2442,7 +2442,7 @@ function RepoFiles({ tenant, repo, authHeaders }: { tenant: string; repo: string
   return (
     <div className="grid gap-4">
       <div className="flex items-center gap-3 flex-wrap">
-        <Picker value={branch} onChange={setBranch} options={branches.map((b) => ({ value: b, label: b }))} placeholder="branch" width={220} size="sm" />
+        <div className="min-w-[240px]"><Picker value={branch} onChange={setBranch} options={branches.map((b) => ({ value: b, label: b }))} placeholder="branch" width={340} size="sm" block searchable /></div>
         <div className="flex-1 min-w-[220px] max-w-[440px] ml-auto">
           <SearchInput placeholder="Search files & content…" shortcut="" value={query} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQuery(e.target.value)} />
         </div>
@@ -2785,6 +2785,14 @@ function ReviewPage({
       else uiAlert(await res.text());
     } finally { setComposerBusy(false); }
   };
+  const closeOrReopenPr = async (reopen: boolean) => {
+    if (!canAct || !pr) return uiAlert("Sign in to act.");
+    if (!reopen && !(await uiConfirm({ title: "Close this pull request?", body: "It won't be merged. You can reopen it later from the pull requests list.", danger: true, confirmLabel: "Close pull request" }))) return;
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/prs/${pr.number}/close`, {
+      method: "POST", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify({ reopen }),
+    });
+    if (res.ok) { onReviewsChanged?.(); if (!reopen) onBack(); } else uiAlert(await res.text());
+  };
   type ComposerMode = "comment" | "approve" | "request_changes" | "reject";
   const [composerMode, setComposerMode] = useState<ComposerMode>("comment");
   const composerHasDraft = draft.trim().length > 0;
@@ -2901,7 +2909,24 @@ function ReviewPage({
               ))}
               {canAct && (
                 <div className="px-4 py-2.5 flex items-center gap-2 bg-paper">
-                  <Button size="sm" disabled={checking} onClick={() => runChecks(false)}>{checking ? "Running…" : "Run checks"}</Button>
+                  <Popover align="left" width={260} trigger={(open) => (
+                    <span className={`inline-flex items-center gap-1.5 h-ctl-sm px-2.5 rounded-ctl-sm border bg-surface text-[12.5px] font-medium cursor-pointer transition-colors ${checking ? "opacity-60" : ""} ${open ? "border-body text-ink" : "border-ctl text-dim hover:text-ink hover:border-dim"}`}>
+                      {checking ? "Running…" : "Rerun failed pipelines"}
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`text-muted transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
+                    </span>
+                  )}>
+                    <div className="py-1">
+                      {[
+                        { label: "Rerun failed pipelines", hint: "reuses cached results that are still valid", run: () => runChecks(false) },
+                        { label: "Force rerun (ignore cache)", hint: "re-execute every check from scratch", run: () => runChecks(true) },
+                      ].map((o) => (
+                        <button key={o.label} type="button" disabled={checking} onClick={o.run} className="w-full text-left px-3 py-2 hover:bg-paper disabled:opacity-50">
+                          <span className="block text-[13px] font-medium text-body leading-tight">{o.label}</span>
+                          <span className="block text-[11.5px] text-muted leading-tight mt-0.5">{o.hint}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </Popover>
                   {checkResult && <span className="text-[12px] text-muted">{checkResult.status}{checkResult.memoized ? " · memoized" : ""}</span>}
                 </div>
               )}
@@ -3090,6 +3115,16 @@ function ReviewPage({
               let last = segs.length - 1; while (last >= 0 && !segs[last].changed) last--;
               return segs.slice(first, last + 1).map((s) => s.text).join("").trim();
             };
+            // A "What changed here" row is noise if its content is only punctuation/brackets (e.g. "};",
+            // "})", ",") or a comment — those aren't behaviourally interesting, so keep them out of the
+            // summary. A transform is dropped only when BOTH sides are noise.
+            const noise = (s: string) => {
+              const t = s.trim();
+              if (!t) return true;
+              if (/^[\s{}()[\];,.:<>+\-|&?*]+$/.test(t)) return true;
+              if (/^(\/\/|\/\*|\*\/|\*|#|--|<!--)/.test(t)) return true;
+              return false;
+            };
             // Cheap always-on pass: extract the "What changed here" summary WITHOUT building any React
             // elements. The heavy row/syntax-highlight build happens only for an OPEN diff (below), so a
             // huge collapsed file costs nothing per render — it no longer swamps the page.
@@ -3118,7 +3153,14 @@ function ReviewPage({
                 } else { n++; k++; }
               }
             }
-            const hunkNodes = isOpen ? f.hunks.map((h, hi) => {
+            // Which new-line numbers a hunk covers — so a "What changed here" click can open ONLY the
+            // hunk holding that line instead of unfurling the whole file.
+            const hunkHasLine = (h: FileDiff["hunks"][number], line: number) => {
+              let n = h.new_start;
+              for (const l of h.lines) { if (l.tag !== "del") { if (n === line) return true; n++; } }
+              return false;
+            };
+            const renderHunk = (h: FileDiff["hunks"][number], hi: number) => {
               let o = h.old_start, n = h.new_start;
               const L = h.lines;
               const out: Row[] = [];
@@ -3149,10 +3191,29 @@ function ReviewPage({
                     onCommentLine={(ln: number) => openLineComment(f.path, ln)} />
                 </div>
               );
-            }) : null;
-            // Dedupe the transforms so a repeated edit isn't listed twice.
+            };
+            const focusLine = diffFocus[f.path];
+            const indexed = f.hunks.map((h, hi) => ({ h, hi }));
+            // A what-changed click focuses one line → show just that hunk; otherwise show the whole file.
+            const focusedHunks = focusLine != null && !forceOpen ? indexed.filter(({ h }) => hunkHasLine(h, focusLine)) : [];
+            const shownHunks = focusedHunks.length > 0 ? focusedHunks : indexed;
+            const hiddenHunks = indexed.length - shownHunks.length;
+            const hunkNodes = isOpen ? (
+              <>
+                {hiddenHunks > 0 && (
+                  <button onClick={() => setDiffFocus((s) => { const c = { ...s }; delete c[f.path]; return c; })}
+                    className="w-full mb-2 py-2 rounded-ctl border border-dashed border-rule text-[12.5px] font-medium text-steel-text hover:bg-steel-wash/50 hover:border-ctl transition-colors flex items-center justify-center gap-1.5">
+                    Showing 1 of {indexed.length} sections · show the whole file
+                  </button>
+                )}
+                {shownHunks.map(({ h, hi }) => renderHunk(h, hi))}
+              </>
+            ) : null;
+            // Drop punctuation/comment-only noise, then dedupe so a repeated edit isn't listed twice.
             const seen = new Set<string>();
-            const uniq = transforms.filter((t) => { const k = t.old + "→" + t.next; if (seen.has(k)) return false; seen.add(k); return true; });
+            const uniq = transforms
+              .filter((t) => !(noise(t.old) && noise(t.next)))
+              .filter((t) => { const k = t.old + "→" + t.next; if (seen.has(k)) return false; seen.add(k); return true; });
             return (
               <>
                 {uniq.length > 0 && (() => {
@@ -3429,11 +3490,17 @@ function ReviewPage({
                   : <div className="border border-ctl rounded-ctl px-2.5 py-2 text-[13px] text-faint">sign in to comment</div>}
                 <div className="flex justify-end">
                 {canAct ? (
-                  <div className="flex-none inline-flex h-ctl">
-                    <Button size="md" disabled={composerDisabled} onClick={() => runMode(composerMode)} className="!rounded-r-none inline-flex items-center gap-1.5">{MODES.find((m) => m.id === composerMode)!.icon}{MODES.find((m) => m.id === composerMode)!.label}</Button>
-                    <Popover align="right" width={244} direction="up" trigger={(open) => (
-                      <span className={`inline-flex items-center h-ctl px-1.5 rounded-ctl rounded-l-none border-l border-l-white/25 bg-ink text-surface ${open ? "opacity-90" : ""}`}>
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={open ? "rotate-180 transition-transform" : "transition-transform"}><polyline points="6 9 12 15 18 9" /></svg>
+                  // Cohesive split button: both halves share one dark/muted skin so a disabled submit
+                  // never leaves a stray bright chevron. The chevron stays clickable when the submit is
+                  // disabled — that's how you pick a verdict (no draft needed) or close the PR.
+                  <div className={`flex-none inline-flex h-ctl rounded-ctl overflow-hidden border ${composerDisabled ? "border-ctl" : "border-ink"}`}>
+                    <button type="button" disabled={composerDisabled} onClick={() => runMode(composerMode)}
+                      className={`inline-flex items-center gap-1.5 px-3.5 text-[13px] font-semibold transition-colors ${composerDisabled ? "bg-paper text-faint cursor-not-allowed" : "bg-ink text-surface hover:brightness-110"}`}>
+                      {MODES.find((m) => m.id === composerMode)!.icon}{MODES.find((m) => m.id === composerMode)!.label}
+                    </button>
+                    <Popover align="right" width={256} direction="up" trigger={(open) => (
+                      <span className={`inline-flex items-center h-full px-1.5 border-l cursor-pointer transition-[filter,background-color] ${composerDisabled ? "bg-paper text-muted border-ctl hover:text-ink" : "bg-ink text-surface border-l-white/25 hover:brightness-110"} ${open ? "brightness-110" : ""}`}>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
                       </span>
                     )}>
                       <div className="py-1">
@@ -3449,6 +3516,22 @@ function ReviewPage({
                             {m.id === composerMode && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text mt-0.5 flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
                           </button>
                         ))}
+                        {pr && (
+                          <>
+                            <div className="my-1 border-t border-rule2" />
+                            {pr.state === "open" ? (
+                              <button type="button" onClick={() => closeOrReopenPr(false)} className="w-full text-left px-3 py-2 flex items-start gap-2.5 hover:bg-fault-wash">
+                                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-fault-text mt-[1px] flex-none"><circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" /></svg>
+                                <span className="min-w-0 flex-1"><span className="block text-[13px] font-medium text-fault-text leading-tight">Close pull request</span><span className="block text-[11.5px] text-muted leading-tight mt-0.5">Close without merging</span></span>
+                              </button>
+                            ) : (
+                              <button type="button" onClick={() => closeOrReopenPr(true)} className="w-full text-left px-3 py-2 flex items-start gap-2.5 hover:bg-paper">
+                                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-dim mt-[1px] flex-none"><path d="M3 12a9 9 0 1 0 9-9 9 9 0 0 0-6.36 2.64L3 8" /><polyline points="3 3 3 8 8 8" /></svg>
+                                <span className="min-w-0 flex-1"><span className="block text-[13px] font-medium text-body leading-tight">Reopen pull request</span><span className="block text-[11.5px] text-muted leading-tight mt-0.5">Put it back in review</span></span>
+                              </button>
+                            )}
+                          </>
+                        )}
                       </div>
                     </Popover>
                   </div>

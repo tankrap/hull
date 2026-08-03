@@ -18,6 +18,17 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
   const [sel, setSel] = useState(0);
   const [view, setView] = useState('sem');
   const [full, setFull] = useState(false);
+  const [railW, setRailW] = useState(236);
+  // Drag the divider to resize the file/findings rail.
+  const startResize = (e) => {
+    e.preventDefault();
+    const startX = e.clientX, startW = railW;
+    const onMove = (ev) => setRailW(Math.max(170, Math.min(520, startW + ev.clientX - startX)));
+    const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); document.body.style.userSelect = ''; };
+    document.body.style.userSelect = 'none';
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
   const [reviewed, setReviewed] = useState(() => loadReviewed(storageKey, ops.length) ?? ops.map(() => false));
   const [accepted, setAccepted] = useState(ops.map((o) => (o.proposals || []).map(() => false)));
   const done = reviewed.filter(Boolean).length;
@@ -47,9 +58,9 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
   };
 
   const body = view === 'sem' ? (
-    <div className={cx('grid', full ? 'grid-cols-[260px_1fr] flex-1 min-h-0' : 'grid-cols-[236px_1fr]')}>
+    <div className={cx('grid', full && 'flex-1 min-h-0')} style={{ gridTemplateColumns: `${railW}px 7px 1fr` }}>
       {/* rail */}
-      <div className={cx('border-r border-rule2 bg-paper px-2 py-2.5 grid gap-0.5 content-start', full && 'overflow-auto')}>
+      <div className={cx('border-r border-rule2 bg-paper px-2 py-2.5 grid gap-0.5 content-start overflow-x-hidden', full && 'overflow-y-auto')}>
         {ops.map((op, i) => (
           <button key={i} onClick={() => setSel(i)}
             className={cx('flex items-center gap-2 min-w-0 px-2.5 py-2 rounded-ctl text-left transition-colors duration-150 border',
@@ -65,6 +76,10 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
             <OpBadge kind={op.kind} />
           </button>
         ))}
+      </div>
+      {/* resize handle */}
+      <div onMouseDown={startResize} title="Drag to resize" className="group cursor-col-resize flex items-center justify-center hover:bg-steel-wash/60 transition-colors">
+        <span className="w-px h-8 bg-rule2 group-hover:bg-steel" />
       </div>
       {/* detail */}
       <div className={cx('flex flex-col min-w-0', full ? 'overflow-auto' : '')}>
