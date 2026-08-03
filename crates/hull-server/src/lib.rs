@@ -3381,7 +3381,7 @@ async fn create_issue(
         body: body.get("body").and_then(Value::as_str).unwrap_or("").to_string(),
         author: author.clone(),
         assignees,
-        labels: vec![],
+        labels: body.get("labels").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default(),
         projects: vec![],
         status: IssueStatus::Open,
         code_refs,

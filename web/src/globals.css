@@ -66,8 +66,8 @@ body { @apply font-sans text-ink bg-paper antialiased; text-wrap: pretty; }
 /* Diff line flash (jump target from "What changed here"). */
 @keyframes flash-line { 0%, 40% { background-color: var(--brass-wash); box-shadow: inset 3px 0 0 var(--brass); } 100% { background-color: transparent; box-shadow: none; } }
 .flash-line { animation: flash-line 1.3s ease-out; }
-a { @apply text-steel-text border-b border-steel/30 no-underline; }
-a:hover { @apply border-steel/60; }
+a { @apply text-steel-text no-underline; }
+a:hover { @apply underline; text-underline-offset: 2px; text-decoration-thickness: 1px; }
 
 /* ── syntax highlighting (highlight.js token classes) — GitHub-style, theme-aware ── */
 .hljs-comment,.hljs-quote{color:#6e7781;font-style:italic}

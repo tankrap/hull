@@ -150,13 +150,16 @@ const Avatar = ({ id, handle, kind, size = 22 }: { id?: string; handle?: string;
   );
 };
 
-// A colored issue label (GitHub-style), hue deterministically derived from the label text.
+// An issue label rendered as a neutral tag (like the rest of the UI) with a small colour dot for
+// identity — hue deterministically derived from the label text.
 const Label = ({ name }: { name: string }) => {
   let h = 2166136261;
   for (let i = 0; i < name.length; i++) { h ^= name.charCodeAt(i); h = Math.imul(h, 16777619); }
   const hue = (h >>> 0) % 360;
   return (
-    <span className="inline-flex items-center text-[11.5px] font-medium px-2 py-[2px] rounded-full" style={{ background: `hsl(${hue} 70% 95%)`, color: `hsl(${hue} 48% 34%)`, border: `1px solid hsl(${hue} 55% 84%)` }}>{name}</span>
+    <span className="inline-flex items-center gap-1 text-[11.5px] font-medium px-1.5 py-[2px] rounded-badge bg-rule2 text-dim">
+      <span className="w-1.5 h-1.5 rounded-full flex-none" style={{ background: `hsl(${hue} 55% 50%)` }} />{name}
+    </span>
   );
 };
 
@@ -197,7 +200,7 @@ const Stat = ({ k, v }: { k: React.ReactNode; v: React.ReactNode }) => (
 
 // A click-to-open popover anchored under its trigger. Closes on outside-click or Escape. Used for the
 // header "checks" summary, so the landing gate is reachable from the top of the page.
-function Popover({ trigger, children, align = "left", width = 300, direction = "down", onToggle }: { trigger: (open: boolean) => React.ReactNode; children: React.ReactNode; align?: "left" | "right"; width?: number; direction?: "down" | "up"; onToggle?: (open: boolean) => void }) {
+function Popover({ trigger, children, align = "left", width = 300, direction = "down", block = false, onToggle }: { trigger: (open: boolean) => React.ReactNode; children: React.ReactNode; align?: "left" | "right"; width?: number; direction?: "down" | "up"; block?: boolean; onToggle?: (open: boolean) => void }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLSpanElement>(null);
   const set = (v: boolean) => { setOpen(v); onToggle?.(v); };
@@ -210,11 +213,11 @@ function Popover({ trigger, children, align = "left", width = 300, direction = "
     return () => { document.removeEventListener("mousedown", onDoc); document.removeEventListener("keydown", onEsc); };
   }, [open]);
   return (
-    <span ref={ref} className="relative inline-flex">
-      <button type="button" onClick={() => set(!open)} className="inline-flex">{trigger(open)}</button>
+    <span ref={ref} className={`relative inline-flex ${block ? "w-full" : ""}`}>
+      <button type="button" onClick={() => set(!open)} className={`inline-flex ${block ? "w-full" : ""}`}>{trigger(open)}</button>
       {open && (
-        <div style={{ width }} onClick={() => set(false)}
-          className={`absolute z-40 ${direction === "up" ? "bottom-full mb-2" : "top-full mt-2"} ${align === "right" ? "right-0" : "left-0"} bg-surface border border-rule rounded-card shadow-menu overflow-hidden animate-[bd-in_120ms_ease-out]`}>
+        <div style={block ? undefined : { width }} onClick={() => set(false)}
+          className={`absolute z-40 ${block ? "inset-x-0" : ""} ${direction === "up" ? "bottom-full mb-2" : "top-full mt-2"} ${align === "right" ? "right-0" : "left-0"} bg-surface border border-rule rounded-card shadow-menu overflow-hidden animate-[bd-in_120ms_ease-out]`}>
           {children}
         </div>
       )}
@@ -224,12 +227,12 @@ function Popover({ trigger, children, align = "left", width = 300, direction = "
 
 // Styled select (replaces native <select>). options: {value,label}[]. When value is "" it shows the
 // placeholder — used both for bound selects and "pick to act" menus.
-function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", className = "" }: { value: string; onChange: (v: string) => void; options: { value: string; label: string }[]; placeholder?: string; width?: number; size?: "sm" | "md"; className?: string }) {
+function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", block = false, className = "" }: { value: string; onChange: (v: string) => void; options: { value: string; label: string }[]; placeholder?: string; width?: number; size?: "sm" | "md"; block?: boolean; className?: string }) {
   const cur = options.find((o) => o.value === value);
   const h = size === "sm" ? "h-ctl-sm text-xs" : "h-ctl text-[13px]";
   return (
-    <Popover align="left" width={width} trigger={(open) => (
-      <span className={`inline-flex items-center justify-between gap-2 ${h} px-2.5 rounded-ctl border bg-surface transition-colors ${open ? "border-body" : "border-ctl hover:border-dim"} ${className}`}>
+    <Popover align="left" width={width} block={block} trigger={(open) => (
+      <span className={`inline-flex items-center justify-between gap-2 ${h} px-2.5 rounded-ctl border bg-surface transition-colors ${block ? "w-full" : ""} ${open ? "border-body" : "border-ctl hover:border-dim"} ${className}`}>
         <span className={`truncate ${cur ? "text-ink" : "text-faint"}`}>{cur?.label ?? placeholder}</span>
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`text-muted flex-none transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
       </span>
@@ -241,6 +244,102 @@ function Picker({ value, onChange, options, placeholder = "Select…", width = 2
         ))}
       </div>
     </Popover>
+  );
+}
+
+// Centered modal shell (backdrop + card + header). Closes on backdrop click / ✕ / Escape.
+function ModalShell({ title, onClose, children, width = 480 }: { title: string; onClose: () => void; children: React.ReactNode; width?: number }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <>
+      <div className="fixed inset-0 z-40 bg-ink/40 animate-bd-in" onClick={onClose} />
+      <div style={{ width }} className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-[93vw] max-h-[88vh] overflow-auto bg-surface rounded-card shadow-modal animate-ov-in">
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-rule2 sticky top-0 bg-surface">
+          <h2 className="text-[15px] font-semibold">{title}</h2>
+          <button onClick={onClose} className="w-6 h-6 grid place-items-center rounded-ctl text-muted hover:text-ink hover:bg-paper" aria-label="close">✕</button>
+        </div>
+        <div className="px-5 py-4">{children}</div>
+      </div>
+    </>
+  );
+}
+// A labelled field wrapper for modals.
+const Field = ({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) => (
+  <div className="grid gap-1.5">
+    <label className="text-[12.5px] font-semibold text-body">{label}{hint && <span className="text-faint font-normal"> · {hint}</span>}</label>
+    {children}
+  </div>
+);
+const modalInput = "w-full box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint";
+
+// New repository modal: owner, name, default branch, private (item 7).
+function NewRepoModal({ accounts, onClose, onCreate }: { accounts: string[]; onClose: () => void; onCreate: (p: { account: string; name: string; isPrivate: boolean; branch: string }) => Promise<boolean> }) {
+  const [account, setAccount] = useState(accounts[0] ?? "");
+  const [name, setName] = useState("");
+  const [isPrivate, setIsPrivate] = useState(false);
+  const [branch, setBranch] = useState("main");
+  const [busy, setBusy] = useState(false);
+  const ok = !!account && !!name.trim();
+  const submit = async () => { if (!ok || busy) return; setBusy(true); const done = await onCreate({ account, name: name.trim(), isPrivate, branch: branch.trim() || "main" }); setBusy(false); if (done) onClose(); };
+  return (
+    <ModalShell title="New repository" onClose={onClose} width={460}>
+      <div className="grid gap-4">
+        <Field label="Owner"><Picker block value={account} onChange={setAccount} options={accounts.map((a) => ({ value: a, label: a }))} placeholder="Choose an owner…" /></Field>
+        <Field label="Repository name"><input autoFocus className={modalInput} value={name} onChange={(e) => setName(sanitizeHandle(e.target.value))} onKeyDown={(e) => e.key === "Enter" && submit()} placeholder="my-service" spellCheck={false} /></Field>
+        <Field label="Default branch"><input className={modalInput} value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="main" spellCheck={false} /></Field>
+        <div className="flex items-center justify-between gap-4 py-0.5">
+          <div><div className="text-[13px] font-medium">Private</div><div className="text-[12px] text-muted">Only members of {account || "the owner"} can see it.</div></div>
+          <Switch on={isPrivate} onChange={setIsPrivate} />
+        </div>
+        <div className="flex justify-end gap-2 pt-1">
+          <Button variant="secondary" size="sm" onClick={onClose}>Cancel</Button>
+          <Button size="sm" disabled={!ok || busy} onClick={submit}>{busy ? "Creating…" : "Create repository"}</Button>
+        </div>
+      </div>
+    </ModalShell>
+  );
+}
+
+// New issue modal: repo, title, description, labels, assignees (item 11). agentActors listed first.
+function NewIssueModal({ repos, defaultRepo, actors, onClose, onCreate }: { repos: { tenant: string; repo: string }[]; defaultRepo: string; actors: Actor[]; onClose: () => void; onCreate: (p: { repo: string; title: string; body: string; labels: string[]; assignees: string[] }) => Promise<boolean> }) {
+  const [repo, setRepo] = useState(defaultRepo || (repos[0] ? `${repos[0].tenant}/${repos[0].repo}` : ""));
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [labels, setLabels] = useState("");
+  const [assignees, setAssignees] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const ok = !!repo && !!title.trim();
+  const submit = async () => { if (!ok || busy) return; setBusy(true); const done = await onCreate({ repo, title: title.trim(), body: body.trim(), labels: labels.split(",").map((s) => s.trim()).filter(Boolean), assignees }); setBusy(false); if (done) onClose(); };
+  const sorted = [...actors].sort((a, b) => Number(b.kind === "agent") - Number(a.kind === "agent"));
+  return (
+    <ModalShell title="New issue" onClose={onClose} width={540}>
+      <div className="grid gap-4">
+        <Field label="Repository"><Picker block value={repo} onChange={setRepo} options={repos.map((r) => ({ value: `${r.tenant}/${r.repo}`, label: `${r.tenant}/${r.repo}` }))} placeholder="Choose a repository…" /></Field>
+        <Field label="Title"><input autoFocus className={modalInput} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Something an agent (or human) should fix" /></Field>
+        <Field label="Description" hint="markdown"><textarea rows={5} className={`${modalInput} h-auto py-2 resize-y leading-[1.5]`} value={body} onChange={(e) => setBody(e.target.value)} placeholder="What's wrong, where, and how you'd know it's fixed. Agents read this first." /></Field>
+        <Field label="Labels" hint="comma-separated"><input className={modalInput} value={labels} onChange={(e) => setLabels(e.target.value)} placeholder="bug, area:auth" spellCheck={false} /></Field>
+        <Field label="Assignees">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {assignees.map((id) => { const a = actors.find((x) => x.id === id); return (
+              <span key={id} className="inline-flex items-center gap-1 text-[12px] px-1.5 py-1 rounded-badge bg-rule2 text-dim">
+                <Avatar id={id} handle={a?.handle ?? id} kind={a?.kind} size={14} />{a?.handle ?? id.slice(0, 7)}
+                <button className="hover:text-fault-text" onClick={() => setAssignees((s) => s.filter((x) => x !== id))}>✕</button>
+              </span>
+            ); })}
+            <Picker size="sm" width={240} value="" placeholder="Add assignee…" onChange={(v) => setAssignees((s) => s.includes(v) ? s : [...s, v])}
+              options={sorted.filter((a) => !assignees.includes(a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} />
+          </div>
+        </Field>
+        <div className="flex justify-end gap-2 pt-1">
+          <Button variant="secondary" size="sm" onClick={onClose}>Cancel</Button>
+          <Button size="sm" disabled={!ok || busy} onClick={submit}>{busy ? "Creating…" : "Create issue"}</Button>
+        </div>
+      </div>
+    </ModalShell>
   );
 }
 
@@ -666,19 +765,26 @@ export function App() {
     await reloadAccounts();
     navigate(`/orgs/${encodeURIComponent(handle.trim())}`);
   };
-  const createRepoFlow = async (account?: string) => {
-    let acct = account;
-    if (!acct) {
-      if (myAccounts.length === 0) return uiAlert("Create an organization first.");
-      acct = myAccounts.length === 1 ? myAccounts[0] : ((await uiPrompt({ title: "Which organization?", label: `org (${myAccounts.join(", ")})`, initial: myAccounts[0] })) ?? "");
-    }
-    if (!acct?.trim()) return;
-    const name = (await uiPrompt({ title: "New repository", label: `name under ${acct}`, sanitize: sanitizeHandle, confirmLabel: "Create" })) ?? "";
-    if (!name.trim()) return;
-    const res = await fetch("/api/repos", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ account: acct, name: name.trim() }) });
-    if (!res.ok) return uiAlert(await res.text());
+  // The "+" navbar menu opens these modals (New repo / New issue); New org still uses the prompt.
+  const [newRepoOpen, setNewRepoOpen] = useState(false);
+  const [newIssueOpen, setNewIssueOpen] = useState(false);
+  const doCreateRepo = async (p: { account: string; name: string; isPrivate: boolean; branch: string }): Promise<boolean> => {
+    if (!canAct) { uiAlert("Sign in to act."); return false; }
+    const res = await fetch("/api/repos", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ account: p.account, name: sanitizeHandle(p.name), default_branch: p.branch }) });
+    if (!res.ok) { uiAlert(await res.text()); return false; }
     const d = await res.json();
+    if (p.isPrivate) await fetch(`/api/repos/${encodeURIComponent(d.tenant)}/${encodeURIComponent(d.name)}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ private: true }) });
     navigate(`/${encodeURIComponent(d.tenant)}/${encodeURIComponent(d.name)}`);
+    return true;
+  };
+  const doCreateIssue = async (p: { repo: string; title: string; body: string; labels: string[]; assignees: string[] }): Promise<boolean> => {
+    if (!canAct) { uiAlert("Sign in to act."); return false; }
+    const slash = p.repo.indexOf("/");
+    const t = p.repo.slice(0, slash), r = p.repo.slice(slash + 1);
+    const res = await fetch(`/api/repos/${encodeURIComponent(t)}/${encodeURIComponent(r)}/issues`, { method: "POST", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify({ title: p.title, author: actingAs, body: p.body, labels: p.labels, assignees: p.assignees }) });
+    if (!res.ok) { uiAlert(await res.text()); return false; }
+    navigate(`/${encodeURIComponent(t)}/${encodeURIComponent(r)}`);
+    return true;
   };
   // GitHub connection is per-account (org). Import lives under an org you administer + have connected.
   type GhStatus = { connected: boolean; login?: string; provider?: string };
@@ -729,7 +835,7 @@ export function App() {
   const [ownerRules, setOwnerRules] = useState<{ glob: string; owners: string[] }[]>([]);
   const loadRepoSettings = () => {
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setRepoSettings(d)).catch(() => {});
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/owners`).then((r) => r.json()).then((d) => setOwnerRules(d.owners ?? [])).catch(() => {});
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/owners`, { headers: authHeaders() }).then((r) => r.json()).then((d) => setOwnerRules(d.owners ?? [])).catch(() => {});
     if (orgAccountFor(tenant)) loadTeams(orgAccountFor(tenant)!.id);
   };
   const orgAccountFor = (handle: string) => accounts.find((a) => a.handle === handle);
@@ -798,9 +904,8 @@ export function App() {
     ).then((r) => r.json());
     setProv((p) => ({ ...p, [key]: d.provenance ?? [] }));
   };
-  const [form, setForm] = useState({ title: "", path: "", line: "", assignee: "" });
   const loadIssues = () =>
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setIssues(d.issues ?? []))
       .catch(() => {});
@@ -834,7 +939,7 @@ export function App() {
   // Server-side secret-scan findings for the selected repo.
   const [secrets, setSecrets] = useState<{ path: string; line: number; title: string; redacted: string }[]>([]);
   useEffect(() => {
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/security`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/security`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setSecrets(d.secrets ?? []))
       .catch(() => {});
@@ -842,9 +947,8 @@ export function App() {
 
   // Pull requests for the selected repo.
   const [prs, setPrs] = useState<PR[]>([]);
-  const [prTitle, setPrTitle] = useState("");
   const loadPrs = () =>
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setPrs(d.prs ?? []))
       .catch(() => {});
@@ -857,7 +961,7 @@ export function App() {
   type Mirror = { target: string | null; outbound: { change: string; target: string; external_ref: string; ts: number }[] };
   const [mirror, setMirror] = useState<Mirror | null>(null);
   useEffect(() => {
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/mirror`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/mirror`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setMirror(d))
       .catch(() => {});
@@ -869,7 +973,7 @@ export function App() {
   const [ciUrl, setCiUrl] = useState("");
   const [ciSecret, setCiSecret] = useState("");
   const loadCiConfig = () =>
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/ci-config`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/ci-config`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => { setCiConfig(d); setCiUrl(d.url ?? ""); })
       .catch(() => {});
@@ -890,7 +994,7 @@ export function App() {
   type Autonomy = { tier: string; source: string; protected_paths: string[] };
   const [autonomy, setAutonomy] = useState<Autonomy | null>(null);
   const loadAutonomy = () =>
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/autonomy`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/autonomy`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setAutonomy(d))
       .catch(() => {});
@@ -950,7 +1054,7 @@ export function App() {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
   const loadReviews = () =>
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setReviews(d.reviews ?? []))
       .catch(() => {});
@@ -963,7 +1067,7 @@ export function App() {
   const [comments, setComments] = useState<Comment[]>([]);
   const [commentDraft, setCommentDraft] = useState<Record<string, string>>({});
   const loadComments = () =>
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/comments`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/comments`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setComments(d.comments ?? []))
       .catch(() => {});
@@ -1067,46 +1171,6 @@ export function App() {
     else uiAlert(await res.text());
   };
 
-  const createPr = async () => {
-    if (!canAct) return uiAlert("Sign in to act.");
-    if (!prTitle.trim()) return;
-    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs`, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ title: prTitle.trim(), author: actingAs }),
-    });
-    if (res.ok) {
-      setPrTitle("");
-      loadPrs();
-    } else {
-      uiAlert(await res.text());
-    }
-  };
-
-  const createIssue = async () => {
-    if (!canAct) return uiAlert("Sign in to act.");
-    if (!form.title.trim()) return;
-    const code_ref = form.path.trim()
-      ? { path: form.path.trim(), line_start: Number(form.line) || 1 }
-      : null;
-    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...authHeaders() },
-      body: JSON.stringify({
-        title: form.title.trim(),
-        author: actingAs,
-        code_ref,
-        assignees: form.assignee ? [form.assignee] : [],
-      }),
-    });
-    if (res.ok) {
-      setForm({ title: "", path: "", line: "", assignee: "" });
-      loadIssues();
-    } else {
-      uiAlert(await res.text());
-    }
-  };
-
   // Personalized home: the signed-in user's repos across every org they belong to, ranked by
   // activity. Not tied to a single tenant. `myAccounts` also scopes the live feed.
   const [myAccounts, setMyAccounts] = useState<string[]>([]);
@@ -1198,9 +1262,15 @@ export function App() {
   }
   if (me) {
     cmdItems.push({ id: "act-neworg", group: "Actions", label: "New organization", run: createOrg });
-    cmdItems.push({ id: "act-newrepo", group: "Actions", label: "New repository", run: () => createRepoFlow() });
+    cmdItems.push({ id: "act-newrepo", group: "Actions", label: "New repository", run: () => setNewRepoOpen(true) });
   }
   const cmdNode = <CommandPalette open={cmdOpen} items={cmdItems} onClose={() => setCmdOpen(false)} />;
+  const createModalsNode = (
+    <>
+      {newRepoOpen && <NewRepoModal accounts={myAccounts} onClose={() => setNewRepoOpen(false)} onCreate={doCreateRepo} />}
+      {newIssueOpen && <NewIssueModal repos={repos.map((r) => ({ tenant: r.tenant, repo: r.repo }))} defaultRepo={view === "repo" ? `${tenant}/${issueRepo}` : ""} actors={actors} onClose={() => setNewIssueOpen(false)} onCreate={doCreateIssue} />}
+    </>
+  );
 
   if (authPage) {
     const shell = (title: string, children: React.ReactNode, wide = false) => (
@@ -1208,6 +1278,8 @@ export function App() {
         {uiModalNode}
         {cmdNode}
         {shortcutsNode}
+        {createModalsNode}
+
         <header className="h-14 border-b border-rule2 bg-surface flex items-center px-6">
           <button className="flex items-center gap-2.5 cursor-pointer" onClick={() => navigate("/")}>
             <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
@@ -1372,6 +1444,26 @@ export function App() {
           )}
           <Switch on={theme === "dark"} onChange={(on: boolean) => setTheme(on ? "dark" : "light")} />
         </div>
+        {me && (
+          <Popover align="right" width={230} trigger={(open) => (
+            <span className={`h-ctl w-ctl grid place-items-center rounded-ctl border bg-surface cursor-pointer transition-colors ${open ? "border-body" : "border-ctl hover:border-dim"}`} title="Create new…" aria-label="create">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-dim"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+            </span>
+          )}>
+            <div className="py-1">
+              {[
+                { label: "New issue", hint: view === "repo" ? `in ${issueRepo}` : "pick a repository", run: () => setNewIssueOpen(true), icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="16" /><line x1="8" y1="12" x2="16" y2="12" /></svg> },
+                { label: "New repository", hint: "", run: () => setNewRepoOpen(true), icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg> },
+                { label: "New organization", hint: "", run: createOrg, icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 21h18M5 21V7l8-4v18M19 21V11l-6-4" /></svg> },
+              ].map((it) => (
+                <button key={it.label} type="button" onClick={it.run} className="w-full text-left px-3 py-2 flex items-center gap-2.5 hover:bg-paper">
+                  <span className="text-muted flex-none">{it.icon}</span>
+                  <span className="min-w-0"><span className="block text-[13px] font-medium text-body leading-tight">{it.label}</span>{it.hint && <span className="block text-[11.5px] text-muted leading-tight">{it.hint}</span>}</span>
+                </button>
+              ))}
+            </div>
+          </Popover>
+        )}
         <button
           className="relative h-ctl w-ctl grid place-items-center rounded-ctl border border-ctl bg-surface hover:border-[oklch(0.6_0.015_250)] cursor-pointer"
           onClick={openNotifs}
@@ -1500,6 +1592,8 @@ export function App() {
       {uiModalNode}
       {cmdNode}
       {shortcutsNode}
+      {createModalsNode}
+
       {topBar}
       {notifDrawer}
 
@@ -1522,10 +1616,6 @@ export function App() {
               <p className="text-[13.5px] text-muted mt-2.5">
                 {repos.length} {repos.length === 1 ? "repo" : "repos"} across {myAccounts.length} {myAccounts.length === 1 ? "org" : "orgs"} · ranked by what's active
               </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button size="sm" variant="secondary" onClick={() => createRepoFlow()}>New repo</Button>
-              <Button size="sm" variant="secondary" onClick={createOrg}>New org</Button>
             </div>
           </div>
 
@@ -1860,7 +1950,7 @@ export function App() {
                   {acct.repos.map((rp: string) => (
                     <button key={rp} className="text-left text-[13.5px] text-body hover:text-steel-text cursor-pointer" onClick={() => navigate(`/${encodeURIComponent(acct.handle)}/${encodeURIComponent(rp)}`)}>{rp} →</button>
                   ))}
-                  {amAdmin && <div className="pt-1"><LinkButton onClick={() => createRepoFlow(acct.handle)}>+ new repo</LinkButton></div>}
+                  {amAdmin && <div className="pt-1"><LinkButton onClick={() => setNewRepoOpen(true)}>+ new repo</LinkButton></div>}
                 </Module>
                 {amAdmin && (
                   <Module title="GitHub" tone={ghStatus?.connected ? "var(--clear)" : ""}>
@@ -2031,16 +2121,15 @@ export function App() {
       {/* ── REPO · list (issues / voyages) ────────────────────────────────── */}
       {view === "repo" && !repoSettingsOpen && !currentIssue && !currentPr && (
         <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mb-1.5">
-            <h1 className="text-[25px] font-semibold tracking-tight">{issueRepo}</h1>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mb-6">
+            <h1 className="text-[25px] font-semibold tracking-tight"><button className="text-muted font-normal hover:text-ink transition-colors" onClick={() => navigate(`/orgs/${encodeURIComponent(tenant)}`)}>{tenant}</button><span className="text-faint font-normal mx-1.5">/</span>{issueRepo}</h1>
             {autonomy && <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge bg-rule2 text-dim" title={TIERS[autonomy.tier]}>{autonomy.tier.toUpperCase()}</span>}
             {secrets.length > 0 && <StatusBadge kind="failed">{secrets.length} secret{secrets.length > 1 ? "s" : ""}</StatusBadge>}
             <div className="ml-auto flex items-center gap-3">
               {isTenantOwner && <LinkButton onClick={() => navigate(`${repoBase()}/settings`)}>Settings</LinkButton>}
-              {!canAct && <span className="text-[12.5px] text-muted">read-only, <LinkButton onClick={() => signInWith(DEMO_OWNER_SECRET)}>sign in</LinkButton> to act</span>}
+              {!canAct && <span className="text-[12.5px] text-muted">read-only</span>}
             </div>
           </div>
-          <p className="text-[13px] text-muted mb-6">under <b className="text-body font-medium">{tenant}</b></p>
 
           <div className="flex items-end justify-between gap-4 border-b border-rule2 mb-7">
             <HTabs items={[`Issues ${openIssues}`, `Voyages ${prs.length}`]} value={tab === "issues" ? 0 : 1} onChange={(i: number) => navigate(i === 0 ? repoBase() : `${repoBase()}/voyages`)} />
@@ -2053,23 +2142,16 @@ export function App() {
             <section className="min-w-0">
               {tab === "issues" && (
                 <>
-                  <div className="flex items-center justify-between gap-3 mb-5">
+                  <div className="flex items-center justify-between gap-3 mb-6">
                     <span className="text-[13px] text-muted"><b className="text-body font-medium tabular-nums">{openIssues} open</b>{issues.length - openIssues > 0 ? ` · ${issues.length - openIssues} closed` : ""}</span>
-                    <Segmented items={["List", "Board"]} value={issueView === "list" ? 0 : 1} onChange={(i: number) => setIssueView(i === 0 ? "list" : "board")} />
-                  </div>
-                  <div className="flex flex-wrap gap-2 mb-7">
-                    <input className="flex-1 min-w-[200px] box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="open an issue" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} onKeyDown={(e) => e.key === "Enter" && createIssue()} />
-                    <input className="w-[190px] box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="path (optional)" value={form.path} onChange={(e) => setForm({ ...form, path: e.target.value })} spellCheck={false} />
-                    <input className="w-[56px] box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="line" value={form.line} onChange={(e) => setForm({ ...form, line: e.target.value })} />
-                    <select className="box-border h-ctl px-2 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body" value={form.assignee} onChange={(e) => setForm({ ...form, assignee: e.target.value })}>
-                      <option value="">assign…</option>
-                      {actors.map((a) => <option key={a.id} value={a.id}>{a.handle}</option>)}
-                    </select>
-                    <Button size="sm" onClick={createIssue}>Open</Button>
+                    <div className="flex items-center gap-2.5">
+                      <Segmented items={["List", "Board"]} value={issueView === "list" ? 0 : 1} onChange={(i: number) => setIssueView(i === 0 ? "list" : "board")} />
+                      {canAct && <Button size="sm" variant="ghost" className="inline-flex items-center gap-1.5" onClick={() => setNewIssueOpen(true)}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>New issue</Button>}
+                    </div>
                   </div>
                   {issueView === "list" ? (
                     <div>
-                      {issues.length === 0 && <div className="py-8 text-[13px] text-muted">no issues yet, open one above</div>}
+                      {issues.length === 0 && <div className="py-8 text-[13px] text-muted">no issues yet — open one with the New issue button</div>}
                       {[...issues]
                         .filter((it) => matchQ(`${it.title} ${it.body} #${it.number} ${it.labels.join(" ")}`))
                         .sort((a, b) => Number(a.status.state !== "open") - Number(b.status.state !== "open") || b.number - a.number)
@@ -2134,12 +2216,8 @@ export function App() {
 
               {tab === "prs" && (
                 <>
-                  <div className="flex flex-wrap gap-2 mb-7">
-                    <input className="flex-1 min-w-[220px] box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="open a voyage from HEAD" value={prTitle} onChange={(e) => setPrTitle(e.target.value)} onKeyDown={(e) => e.key === "Enter" && createPr()} />
-                    <Button size="sm" onClick={createPr}>Open voyage</Button>
-                  </div>
                   <div>
-                    {prs.length === 0 && <div className="py-8 text-[13px] text-muted">no voyages yet</div>}
+                    {prs.length === 0 && <div className="py-8 text-[13px] text-muted">no voyages yet — agents open these when they push a change for review</div>}
                     {[...prs].filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
                       const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
                       return (
@@ -2253,7 +2331,7 @@ function ReviewPage({
   const changeId = pr?.changes[0];
   const loadChange = () => {
     if (!changeId) return;
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setChange(d.change))
       .catch(() => {});
@@ -2261,11 +2339,11 @@ function ReviewPage({
   useEffect(loadChange, [changeId, tenant, repo]);
   useEffect(() => {
     if (!changeId) return;
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/diff`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/diff`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setDiff(d.files ?? []))
       .catch(() => {});
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/semantic`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/semantic`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setSemantic(d.semantic ?? null))
       .catch(() => {});
@@ -2275,7 +2353,7 @@ function ReviewPage({
   const snapshot = active.ledger ?? null;
   const loadLedger = () => {
     if (snapshot || !changeId) return;
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/ledger`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/ledger`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setLedger(d.ledger))
       .catch(() => {});
@@ -2290,7 +2368,7 @@ function ReviewPage({
   const [resolutions, setResolutions] = useState<Record<string, Res>>({});
   const loadResolutions = () => {
     if (!changeId) return;
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/ledger`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/ledger`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => {
         const m: Record<string, Res> = {};
@@ -2410,7 +2488,7 @@ function ReviewPage({
   const [thread, setThread] = useState<Cmt[]>([]);
   const [draft, setDraft] = useState("");
   const loadThread = () =>
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/comments`)
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/comments`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setThread((d.comments ?? []).filter((c: Cmt) => pr && c.target === `pr:${pr.number}`)))
       .catch(() => {});
@@ -2452,7 +2530,12 @@ function ReviewPage({
   const runMode = (m: ComposerMode) => { if (m === "comment") postThreadComment(); else postReview(m); };
   const composerDisabled = composerBusy || (composerMode === "comment" && !draft.trim());
   // Inline findings: which are collapsed (hidden inline, reopenable from a gutter marker).
-  const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => new Set());
+  // Findings start collapsed (shown as a gutter marker) so they don't crowd the diff; click to open.
+  const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => {
+    const s = new Set<string>();
+    reviews.forEach((r, ri) => (r.findings ?? []).forEach((_, fi) => s.add(`${ri}:${fi}`)));
+    return s;
+  });
   const toggleFinding = (key: string) => setCollapsedFindings((s) => { const n = new Set(s); n.has(key) ? n.delete(key) : n.add(key); return n; });
   // Line-level review comments: select a diff line, press C (or click the gutter ✎) to comment on it.
   const [selLine, setSelLine] = useState<{ path: string; line: number } | null>(null);
@@ -2732,22 +2815,32 @@ function ReviewPage({
                     ))}
                   </div>
                 )}
-                {uniq.length > 0 && (
-                  <div className="mb-3 rounded-ctl border border-rule2 overflow-hidden">
-                    <div className="px-3.5 py-2 bg-paper border-b border-rule2 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">What changed here</div>
-                    <div className="px-3.5 py-3 grid gap-2">
-                      {uniq.slice(0, 8).map((t, i) => (
-                        <div key={i} className="flex items-center gap-2 flex-wrap text-[13px]">
-                          <button onClick={() => flashLine(`L-${f.path}-${t.ln}`)} title={`Jump to line ${t.ln}`}
-                            className="inline-flex items-center h-[18px] px-1.5 rounded-[3px] bg-rule2 text-dim text-[11px] font-semibold tabular-nums hover:bg-steel-wash hover:text-steel-text transition-colors flex-none">L{t.ln}</button>
-                          {t.old ? <OldTok>{t.old}</OldTok> : <span className="text-muted italic text-[12.5px]">nothing</span>}
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-faint flex-none"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg>
-                          {t.next ? <NewTok>{t.next}</NewTok> : <span className="text-muted italic text-[12.5px]">removed</span>}
-                        </div>
-                      ))}
+                {uniq.length > 0 && (() => {
+                  const clip = (s: string) => (s.length > 48 ? s.slice(0, 47).trimEnd() + "…" : s);
+                  const SHOWN = 12;
+                  return (
+                    <div className="mb-3 rounded-ctl border border-rule2 overflow-hidden">
+                      <div className="px-3.5 py-2 bg-paper border-b border-rule2 flex items-center justify-between">
+                        <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">What changed here</span>
+                        <span className="text-[11px] text-faint tabular-nums">{uniq.length} edit{uniq.length > 1 ? "s" : ""} · click a line to jump</span>
+                      </div>
+                      <div className="px-3.5 py-2.5 grid gap-2.5">
+                        {uniq.slice(0, SHOWN).map((t, i) => (
+                          <div key={i} className="grid grid-cols-[auto_1fr] items-start gap-x-2.5 gap-y-1 text-[13px]">
+                            <button onClick={() => flashLine(`L-${f.path}-${t.ln}`)} title={`Jump to line ${t.ln}`}
+                              className="inline-flex items-center h-[19px] px-1.5 mt-px rounded-[3px] bg-rule2 text-dim text-[11px] font-semibold tabular-nums hover:bg-steel-wash hover:text-steel-text transition-colors flex-none">L{t.ln}</button>
+                            <div className="flex items-center gap-2 flex-wrap min-w-0 leading-relaxed">
+                              {t.old ? <OldTok>{clip(t.old)}</OldTok> : <span className="text-muted italic text-[12.5px]">added</span>}
+                              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-faint flex-none"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg>
+                              {t.next ? <NewTok>{clip(t.next)}</NewTok> : <span className="text-muted italic text-[12.5px]">removed</span>}
+                            </div>
+                          </div>
+                        ))}
+                        {uniq.length > SHOWN && <div className="text-[12px] text-muted pl-[42px]">+{uniq.length - SHOWN} more edit{uniq.length - SHOWN > 1 ? "s" : ""} in the diff below</div>}
+                      </div>
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
                 {hunkNodes}
               </>
             );
