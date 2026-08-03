@@ -217,7 +217,15 @@ function Popover({ trigger, children, align = "left", width = 300, direction = "
   useLayoutEffect(() => { if (open) measure(); /* eslint-disable-next-line */ }, [open]);
   useEffect(() => {
     if (!open) return;
-    const onDoc = (e: MouseEvent) => { const t = e.target as Node; if (!wrapRef.current?.contains(t) && !panelRef.current?.contains(t)) set(false); };
+    // Close on an outside click — but NOT when the click lands inside ANY popover panel (panels are
+    // portaled to <body>, so a nested menu's panel is a DOM sibling that would otherwise read as
+    // "outside" and wrongly close its parent). Menu items still close via the panel's own onClick.
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      if (wrapRef.current?.contains(t)) return;
+      if (t.closest?.("[data-popover-panel]")) return;
+      set(false);
+    };
     const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") set(false); };
     const reflow = () => measure();
     document.addEventListener("mousedown", onDoc);
@@ -236,9 +244,11 @@ function Popover({ trigger, children, align = "left", width = 300, direction = "
   }
   return (
     <span ref={wrapRef} className={`relative inline-flex ${block ? "w-full" : ""}`}>
-      <button type="button" onClick={() => set(!open)} className={`inline-flex ${block ? "w-full" : ""}`}>{trigger(open)}</button>
+      {/* stopPropagation so a Popover nested inside another Popover's panel doesn't bubble its trigger
+          click up to the outer panel's close-on-click handler (which would shut everything). */}
+      <button type="button" onClick={(e) => { e.stopPropagation(); set(!open); }} className={`inline-flex ${block ? "w-full" : ""}`}>{trigger(open)}</button>
       {open && rect && createPortal(
-        <div ref={panelRef} style={style} onClick={() => set(false)}
+        <div ref={panelRef} style={style} data-popover-panel onClick={() => set(false)}
           className="bg-surface border border-rule rounded-card shadow-menu overflow-y-auto overflow-x-hidden animate-[bd-in_120ms_ease-out]">
           {children}
         </div>,
@@ -276,6 +286,27 @@ function Picker({ value, onChange, options, placeholder = "Select…", width = 2
         ))}
       </div>
     </Popover>
+  );
+}
+
+// A cohesive split button: a primary action + a dropdown, sharing ONE dark/muted skin so a disabled
+// submit never leaves a stray bright chevron. The chevron stays clickable while the submit is disabled
+// (to pick a verdict / mode / secondary action). Shared by every composer — issues AND pull requests.
+function SplitButton({ label, icon, disabled, onSubmit, menu, menuWidth = 252 }: { label: React.ReactNode; icon?: React.ReactNode; disabled?: boolean; onSubmit: () => void; menu: React.ReactNode; menuWidth?: number }) {
+  return (
+    <div className={`flex-none inline-flex h-ctl rounded-ctl overflow-hidden border ${disabled ? "border-ctl" : "border-ink"}`}>
+      <button type="button" disabled={disabled} onClick={onSubmit}
+        className={`inline-flex items-center gap-1.5 px-3.5 text-[13px] font-semibold whitespace-nowrap transition-colors ${disabled ? "bg-paper text-faint cursor-not-allowed" : "bg-ink text-surface hover:brightness-110"}`}>
+        {icon}{label}
+      </button>
+      <Popover align="right" width={menuWidth} direction="up" trigger={(open) => (
+        <span className={`inline-flex items-center h-full px-1.5 border-l cursor-pointer transition-[filter,background-color] ${disabled ? "bg-paper text-muted border-ctl hover:text-ink" : "bg-ink text-surface border-l-white/25 hover:brightness-110"} ${open ? "brightness-110" : ""}`}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
+        </span>
+      )}>
+        {menu}
+      </Popover>
+    </div>
   );
 }
 
@@ -485,13 +516,9 @@ function IssueThread({ target, comments, issues, commentDraft, setCommentDraft, 
           : <div className="border border-ctl rounded-ctl px-2.5 py-2 text-[13px] text-faint">sign in to comment</div>}
         <div className="flex justify-end">
           {canAct ? (
-            <div className="flex-none inline-flex h-ctl">
-              <Button size="md" disabled={disabled} onClick={() => runIssueMode(target, num, mode.id)} className="!rounded-r-none whitespace-nowrap inline-flex items-center gap-1.5">{mode.icon}{mode.label}{mode.sub ? ` — ${mode.sub}` : ""}</Button>
-              <Popover align="right" width={250} direction="up" trigger={(open) => (
-                <span className={`inline-flex items-center h-ctl px-1.5 rounded-ctl rounded-l-none border-l border-l-white/25 bg-ink text-surface ${open ? "opacity-90" : ""}`}>
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={open ? "rotate-180 transition-transform" : "transition-transform"}><polyline points="6 9 12 15 18 9" /></svg>
-                </span>
-              )}>
+            <SplitButton disabled={disabled} onSubmit={() => runIssueMode(target, num, mode.id)}
+              icon={mode.icon} label={`${mode.label}${mode.sub ? ` — ${mode.sub}` : ""}`}
+              menu={
                 <div className="py-1">
                   {modes.map((m) => (
                     <button key={m.id} type="button" onClick={() => setIssueMode((s) => ({ ...s, [target]: m.id }))}
@@ -502,8 +529,7 @@ function IssueThread({ target, comments, issues, commentDraft, setCommentDraft, 
                     </button>
                   ))}
                 </div>
-              </Popover>
-            </div>
+              } />
           ) : <Button size="md" disabled>Comment</Button>}
         </div>
       </div>
@@ -942,7 +968,6 @@ export function App() {
   // GitHub connection is per-account (org). Import lives under an org you administer + have connected.
   type GhStatus = { connected: boolean; login?: string; provider?: string };
   const [ghStatus, setGhStatus] = useState<GhStatus | null>(null);
-  const [ghInstalls, setGhInstalls] = useState<{ id: string; login: string }[] | null>(null);
   const [importList, setImportList] = useState<string[] | null>(null);
   const [importBusy, setImportBusy] = useState("");
   const loadGh = (acctId: string) => {
@@ -951,17 +976,13 @@ export function App() {
       .then(setGhStatus)
       .catch(() => setGhStatus({ connected: false }));
   };
-  // Discover the GitHub App's installations so the admin PICKS their org — no pasting an id.
-  const loadGhInstalls = async (acctId: string) => {
-    setGhInstalls(null);
-    const d = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/github/installations`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : { installations: [] })).catch(() => ({ installations: [] }));
-    setGhInstalls(d.installations ?? []);
-  };
-  const connectGh = async (acctId: string, installation: string) => {
-    const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/github/connect`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ installation }) });
+  // Connect = redirect the admin to GitHub's install page, where THEY pick their org + the repos to
+  // grant. We never list the App's installations, so you can't see or connect an org you don't admin.
+  const connectGh = async (acctId: string) => {
+    const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/github/connect-url`, { method: "POST", headers: authHeaders() });
     if (!res.ok) return uiAlert(await res.text());
-    setGhInstalls(null);
-    loadGh(acctId);
+    const { url } = await res.json();
+    window.location.href = url; // GitHub → /api/github/setup → back here, connected
   };
   const disconnectGh = async (acctId: string) => {
     if (!(await uiConfirm({ title: "Disconnect GitHub", body: "Disconnect GitHub from this org?", danger: true, confirmLabel: "Disconnect" }))) return;
@@ -1399,7 +1420,7 @@ export function App() {
               ) : (
                 <>
                   <Field label="Organization" hint="you must be an admin">
-                    <Picker block value={importAcct} onChange={(v) => { setImportAcct(v); setImportList(null); setGhInstalls(null); loadGh(v); }} options={adminAccounts.map((a) => ({ value: a.id, label: a.handle }))} placeholder="Pick an organization…" />
+                    <Picker block value={importAcct} onChange={(v) => { setImportAcct(v); setImportList(null); loadGh(v); }} options={adminAccounts.map((a) => ({ value: a.id, label: a.handle }))} placeholder="Pick an organization…" />
                   </Field>
                   {importAcct && (ghStatus?.connected ? (
                     <>
@@ -1421,23 +1442,11 @@ export function App() {
                     </>
                   ) : (
                     <div className="grid gap-2">
-                      <p className="text-[12.5px] text-muted leading-[1.5]">Connect this org to the hull GitHub App to import its repositories. Only an admin can see or import them.</p>
-                      {ghInstalls === null ? (
-                        <div><Button size="sm" onClick={() => loadGhInstalls(importAcct)}>Connect GitHub</Button></div>
-                      ) : ghInstalls.length === 0 ? (
-                        <div className="text-[12.5px] text-muted leading-[1.5]">No GitHub App installations were found. Install the hull app on your GitHub organization, then <LinkButton onClick={() => loadGhInstalls(importAcct)}>refresh</LinkButton>.</div>
-                      ) : (
-                        <div className="border border-rule2 rounded-ctl overflow-hidden">
-                          <div className="px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-muted bg-paper border-b border-rule2">Pick your GitHub organization</div>
-                          {ghInstalls.map((inst) => (
-                            <div key={inst.id} className="flex items-center gap-3 px-3 py-2 border-b border-rule3 last:border-0 text-[13px]">
-                              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" className="text-dim flex-none"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.71.08-.71 1.17.08 1.79 1.2 1.79 1.2 1.04 1.79 2.73 1.27 3.4.97.1-.76.4-1.27.74-1.56-2.56-.29-5.26-1.28-5.26-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.7 5.4-5.28 5.69.42.36.79 1.07.79 2.16v3.2c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z" /></svg>
-                              <span className="flex-1 truncate font-medium">{inst.login || `installation ${inst.id}`}</span>
-                              <Button size="sm" onClick={() => connectGh(importAcct, inst.id)}>Connect</Button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
+                      <p className="text-[12.5px] text-muted leading-[1.5]">Connect this org to GitHub. You'll be taken to GitHub to sign in, choose <b className="text-body">{adminAccounts.find((a) => a.id === importAcct)?.handle}</b>'s GitHub organization, and pick exactly which repositories to grant — you only ever connect an org you administer.</p>
+                      <div><Button size="sm" className="inline-flex items-center gap-2" onClick={() => connectGh(importAcct)}>
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.71.08-.71 1.17.08 1.79 1.2 1.79 1.2 1.04 1.79 2.73 1.27 3.4.97.1-.76.4-1.27.74-1.56-2.56-.29-5.26-1.28-5.26-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.7 5.4-5.28 5.69.42.36.79 1.07.79 2.16v3.2c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z" /></svg>
+                        Continue to GitHub
+                      </Button></div>
                     </div>
                   ))}
                 </>
@@ -1904,6 +1913,12 @@ export function App() {
                   </button>
                 ))}
               </div>
+              {repos.length > 0 && (
+                <button onClick={() => navigate("/me")} className="mt-3 inline-flex items-center gap-1.5 text-[13px] font-medium text-steel-text hover:underline">
+                  All {repos.length} {repos.length === 1 ? "repository" : "repositories"} on your profile
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg>
+                </button>
+              )}
               </div>
             </section>
 
@@ -1915,12 +1930,6 @@ export function App() {
                     <span>{h}</span><span className="text-faint">→</span>
                   </button>
                 ))}
-              </Module>
-              <Module title="Profile">
-                <button className="text-left text-[13.5px] text-body hover:text-steel-text cursor-pointer flex items-center justify-between w-full" onClick={() => navigate("/me")}>
-                  <span>All {repos.length} {repos.length === 1 ? "repository" : "repositories"}</span><span className="text-faint">→</span>
-                </button>
-                <p className="text-[12px] text-muted mt-1 leading-[1.5]">Every repo you can access, across orgs.</p>
               </Module>
             </aside>
           </div>
@@ -3606,19 +3615,9 @@ function ReviewPage({
                   : <div className="border border-ctl rounded-ctl px-2.5 py-2 text-[13px] text-faint">sign in to comment</div>}
                 <div className="flex justify-end">
                 {canAct ? (
-                  // Cohesive split button: both halves share one dark/muted skin so a disabled submit
-                  // never leaves a stray bright chevron. The chevron stays clickable when the submit is
-                  // disabled — that's how you pick a verdict (no draft needed) or close the PR.
-                  <div className={`flex-none inline-flex h-ctl rounded-ctl overflow-hidden border ${composerDisabled ? "border-ctl" : "border-ink"}`}>
-                    <button type="button" disabled={composerDisabled} onClick={() => runMode(composerMode)}
-                      className={`inline-flex items-center gap-1.5 px-3.5 text-[13px] font-semibold transition-colors ${composerDisabled ? "bg-paper text-faint cursor-not-allowed" : "bg-ink text-surface hover:brightness-110"}`}>
-                      {MODES.find((m) => m.id === composerMode)!.icon}{MODES.find((m) => m.id === composerMode)!.label}
-                    </button>
-                    <Popover align="right" width={256} direction="up" trigger={(open) => (
-                      <span className={`inline-flex items-center h-full px-1.5 border-l cursor-pointer transition-[filter,background-color] ${composerDisabled ? "bg-paper text-muted border-ctl hover:text-ink" : "bg-ink text-surface border-l-white/25 hover:brightness-110"} ${open ? "brightness-110" : ""}`}>
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
-                      </span>
-                    )}>
+                  <SplitButton disabled={composerDisabled} onSubmit={() => runMode(composerMode)} menuWidth={256}
+                    icon={MODES.find((m) => m.id === composerMode)!.icon} label={MODES.find((m) => m.id === composerMode)!.label}
+                    menu={
                       <div className="py-1">
                         {/* Selecting only changes what kind of reply this is — it doesn't submit. */}
                         {MODES.map((m) => (
@@ -3649,8 +3648,7 @@ function ReviewPage({
                           </>
                         )}
                       </div>
-                    </Popover>
-                  </div>
+                    } />
                 ) : <Button size="md" disabled>Comment</Button>}
                 </div>
               </div>

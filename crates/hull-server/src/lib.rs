@@ -100,6 +100,10 @@ struct AuthState {
     reg_flows: HashMap<String, passkey::RegFlow>,
     add_flows: HashMap<String, passkey::AddFlow>,
     auth_flows: HashMap<String, passkey::AuthFlow>,
+    /// In-flight GitHub App install handoffs: opaque state → (account id, expiry). Minted only for an
+    /// authed admin of that account, single-use, so the setup callback can connect the installation
+    /// WITHOUT the browser redirect carrying a session — and nobody can connect an org they don't admin.
+    gh_pending: HashMap<String, (String, u64)>,
 }
 
 #[derive(Clone)]
@@ -314,7 +318,8 @@ fn make_router(app: App) -> Router {
         .route("/api/repos", get(repos_list).post(create_repo_handler))
         .route("/api/accounts/:id/github", get(github_status).delete(github_disconnect))
         .route("/api/accounts/:id/github/connect", post(github_connect))
-        .route("/api/accounts/:id/github/installations", get(github_installations))
+        .route("/api/accounts/:id/github/connect-url", post(github_connect_url))
+        .route("/api/github/setup", get(github_setup))
         .route("/api/accounts/:id/github/importable", get(github_importable))
         .route("/api/accounts/:id/repos/import", post(import_repo_handler))
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
@@ -928,16 +933,59 @@ async fn github_status(State(app): State<App>, Path(id): Path<String>, headers: 
     }
 }
 
-/// `GET /api/accounts/:id/github/installations` — the App's installations as `[{id, login}]`, so an
-/// admin can pick their org to connect instead of pasting an installation id. Admin only.
-async fn github_installations(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(resp) = require_account_admin_ref(&app, &headers, &id) {
-        return resp;
+/// `POST /api/accounts/:id/github/connect-url` — begin a GitHub App install for THIS account. Returns
+/// the GitHub install URL the admin is redirected to, where THEY pick their org + the repos to grant.
+/// A one-time signed `state` (stored server-side for this authed admin) rides along so the setup
+/// callback can attach the resulting installation to this account — and to NO other. Admin only.
+/// This is what makes it impossible to connect (or even see) an org you don't administer: we never
+/// list the App's installations; you only ever get back the one YOU just authorized on GitHub.
+async fn github_connect_url(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let slug = std::env::var("GITHUB_APP_SLUG").unwrap_or_default();
+    if slug.trim().is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "GitHub isn't configured on this instance (set GITHUB_APP_SLUG).").into_response();
     }
+    let state = identity::random_hex(24);
+    {
+        let mut a = app.auth.lock().unwrap();
+        let cutoff = now().saturating_sub(1800);
+        a.gh_pending.retain(|_, (_, exp)| *exp > cutoff);
+        a.gh_pending.insert(state.clone(), (acct.id.clone(), now() + 900));
+    }
+    // GitHub appends ?installation_id=&setup_action=install&state= to this app's Setup URL after install.
+    let url = format!("https://github.com/apps/{slug}/installations/new?state={state}");
+    Json(json!({ "url": url })).into_response()
+}
+
+/// `GET /api/github/setup?installation_id=&state=` — GitHub redirects here after the admin installs the
+/// App on THEIR org and selects repos. We consume the one-time `state` (proving an authed admin of a
+/// specific account started this), verify the installation, and connect it to THAT account only.
+async fn github_setup(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let state = q.get("state").cloned().unwrap_or_default();
+    let installation = q.get("installation_id").cloned().unwrap_or_default();
+    let pending = {
+        let mut a = app.auth.lock().unwrap();
+        a.gh_pending.remove(&state)
+    };
+    let Some((acct_id, exp)) = pending else {
+        return (StatusCode::BAD_REQUEST, "This GitHub install link is invalid or has expired — start the connect from your org again.").into_response();
+    };
+    if now() > exp || installation.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "This GitHub install link has expired.").into_response();
+    }
+    let handle = app.store.accounts().into_iter().find(|a| a.id == acct_id).map(|a| a.handle).unwrap_or_default();
     let reg = app.registry.clone();
-    let insts = tokio::task::spawn_blocking(move || reg.mirror_installations()).await.unwrap_or_default();
-    let items: Vec<Value> = insts.into_iter().map(|(id, login)| json!({ "id": id, "login": login })).collect();
-    Json(json!({ "installations": items })).into_response()
+    let inst = installation.clone();
+    let login = tokio::task::spawn_blocking(move || reg.mirror_verify_connection(&inst)).await.ok().flatten();
+    let Some(login) = login else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "Could not verify that GitHub installation.").into_response();
+    };
+    app.connections.set(&acct_id, connections::Connection { provider: "github".into(), installation, login, connected_unix: now() });
+    // Back to the org page; the connection now shows as active.
+    axum::response::Redirect::to(&format!("/orgs/{handle}?github=connected")).into_response()
 }
 
 /// `POST /api/accounts/:id/github/connect` — `{installation}`. Verifies the App installation is real
