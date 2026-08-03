@@ -63,9 +63,12 @@
 
 body { @apply font-sans text-ink bg-paper antialiased; text-wrap: pretty; }
 
-/* Diff line flash (jump target from "What changed here"). */
-@keyframes flash-line { 0%, 40% { background-color: var(--brass-wash); box-shadow: inset 3px 0 0 var(--brass); } 100% { background-color: transparent; box-shadow: none; } }
-.flash-line { animation: flash-line 1.3s ease-out; }
+/* Diff line flash (jump target from "What changed here") — held longer, clearer colour. */
+@keyframes flash-line {
+  0%, 55% { background-color: var(--steel-wash); box-shadow: inset 4px 0 0 var(--steel); }
+  100% { background-color: transparent; box-shadow: inset 4px 0 0 transparent; }
+}
+.flash-line, .flash-line > span { animation: flash-line 2.4s ease-out; }
 a { @apply text-steel-text no-underline; }
 a:hover { @apply underline; text-underline-offset: 2px; text-decoration-thickness: 1px; }
 

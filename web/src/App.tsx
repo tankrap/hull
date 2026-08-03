@@ -3,7 +3,7 @@ import * as ed from "@noble/ed25519";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
 import { SearchInput, Switch, Select } from "./ui/Field";
-import { StatusBadge, IdChip, Tag } from "./ui/Badge";
+import { StatusBadge, Tag } from "./ui/Badge";
 import { Alert } from "./ui/Alert";
 import { Drawer, Dialog, PromptModal } from "./ui/Overlay";
 import { SemanticDiff, CodePanel, LocationBar, OldTok, NewTok } from "./ui/SemanticDiff";
@@ -349,6 +349,32 @@ function NewIssueModal({ repos, defaultRepo, actors, onClose, onCreate }: { repo
   );
 }
 
+// A long list that only shows a slice until expanded, with a search box once it's big enough. Keeps
+// a "705 unclaimed changes" list from swamping the page.
+function SearchableList<T>({ items, renderItem, searchOf, initial = 15, searchThreshold = 20, placeholder = "Search…" }: { items: T[]; renderItem: (it: T, i: number) => React.ReactNode; searchOf: (it: T) => string; initial?: number; searchThreshold?: number; placeholder?: string }) {
+  const [q, setQ] = useState("");
+  const [expanded, setExpanded] = useState(false);
+  const ql = q.trim().toLowerCase();
+  const filtered = ql ? items.filter((it) => searchOf(it).toLowerCase().includes(ql)) : items;
+  const shown = expanded ? filtered : filtered.slice(0, initial);
+  return (
+    <div className="grid gap-2">
+      {items.length >= searchThreshold && (
+        <div className="relative">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="absolute left-2 top-1/2 -translate-y-1/2 text-faint pointer-events-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={placeholder} className="w-full box-border h-ctl-sm pl-7 pr-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" />
+        </div>
+      )}
+      <div className="grid gap-1">{shown.map(renderItem)}</div>
+      <div className="flex items-center gap-3">
+        {filtered.length > shown.length && <button onClick={() => setExpanded(true)} className="text-[12px] font-medium text-steel-text hover:underline">Show all {filtered.length}{ql ? " matches" : ""} ↓</button>}
+        {expanded && filtered.length > initial && <button onClick={() => setExpanded(false)} className="text-[12px] text-muted hover:text-ink">Show less ↑</button>}
+        {ql && filtered.length === 0 && <span className="text-[12px] text-muted">no matches</span>}
+      </div>
+    </div>
+  );
+}
+
 // Small semantic status glyph — a filled dot/check/x/question in a soft disc. Calmer than a full
 // pill when a whole list of statuses is shown together.
 const StatusDot = ({ tone, size = 18 }: { tone: "ok" | "bad" | "warn" | "wait" | "info"; size?: number }) => {
@@ -394,7 +420,7 @@ function CommandPalette({ open, items, onClose }: { open: boolean; items: CmdIte
       <div className="fixed left-1/2 top-[11vh] -translate-x-1/2 z-50 w-[580px] max-w-[92vw] bg-surface rounded-[13px] shadow-modal overflow-hidden animate-ov-in border border-rule">
         <div className="flex items-center gap-2.5 px-4 h-[50px] border-b border-rule2">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
-          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search or jump to a repo, issue, voyage, or action…" className="flex-1 bg-transparent outline-none font-sans text-[14px] text-ink placeholder:text-faint" />
+          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search or jump to a repo, issue, pull request, or action…" className="flex-1 bg-transparent outline-none font-sans text-[14px] text-ink placeholder:text-faint" />
           <span className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-1.5 py-0.5 bg-paper">esc</span>
         </div>
         <div className="max-h-[54vh] overflow-y-auto py-1.5">
@@ -422,9 +448,6 @@ function CommandPalette({ open, items, onClose }: { open: boolean; items: CmdIte
   );
 }
 // verification/state → StatusBadge kind
-const verifKind = (v: string): "passed" | "failed" | "running" | "queued" =>
-  v === "green" ? "passed" : v === "red" ? "failed" : v === "running" ? "running" : "queued";
-
 /**
  * The home page IS a live projection of the fleet's coordination stream: repos rank by activity
  * (an agent starting work floats a repo up), and the event ticker shows what's happening now.
@@ -929,7 +952,6 @@ export function App() {
     if (res.ok) loadIssues();
     else uiAlert(await res.text());
   };
-  const transition = (number: number, action: "close" | "reopen") => issueAction(number, action);
   const [labelDraft, setLabelDraft] = useState<Record<number, string>>({});
   // Issue comment composer mode per target (Comment / Close with comment / Close as not planned / Reopen).
   const [issueMode, setIssueMode] = useState<Record<string, string>>({});
@@ -1123,15 +1145,16 @@ export function App() {
           const issue = issues.find((i) => i.number === num);
           const isOpen = (issue?.status.state ?? "open") === "open";
           const draft = (commentDraft[target] ?? "").trim();
-          const modes = isOpen
+          const ic = (d: React.ReactNode) => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{d}</svg>;
+          const modes: { id: string; label: string; hint: string; sub?: string; color: string; icon: React.ReactNode }[] = isOpen
             ? [
-                { id: "comment", label: "Comment", hint: "Add a note", dot: "bg-rule" },
-                { id: "close", label: draft ? "Close with comment" : "Close issue", hint: "Resolved / completed", dot: "bg-steel" },
-                { id: "close_np", label: draft ? "Close with comment" : "Close issue", sub: "not planned", hint: "Won't fix / not planned", dot: "bg-brass" },
+                { id: "comment", label: "Comment", hint: "Add a note", color: "text-dim", icon: ic(<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />) },
+                { id: "close", label: draft ? "Close with comment" : "Close issue", hint: "Resolved / completed", color: "text-clear-text", icon: ic(<><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></>) },
+                { id: "close_np", label: draft ? "Close with comment" : "Close issue", sub: "not planned", hint: "Won't fix / not planned", color: "text-muted", icon: ic(<><circle cx="12" cy="12" r="10" /><line x1="4.93" y1="4.93" x2="19.07" y2="19.07" /></>) },
               ]
             : [
-                { id: "comment", label: "Comment", hint: "Add a note", dot: "bg-rule" },
-                { id: "reopen", label: draft ? "Comment & reopen" : "Reopen issue", hint: "Back to open", dot: "bg-clear" },
+                { id: "comment", label: "Comment", hint: "Add a note", color: "text-dim", icon: ic(<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />) },
+                { id: "reopen", label: draft ? "Comment & reopen" : "Reopen issue", hint: "Back to open", color: "text-clear-text", icon: ic(<><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /></>) },
               ];
           const mode = modes.find((m) => m.id === (issueMode[target] ?? "comment")) ?? modes[0];
           const disabled = !canAct || (mode.id === "comment" && !draft);
@@ -1142,7 +1165,7 @@ export function App() {
               <div className="flex justify-end">
               {canAct ? (
                 <div className="flex-none inline-flex h-ctl">
-                  <Button size="md" disabled={disabled} onClick={() => runIssueMode(target, num, mode.id)} className="!rounded-r-none whitespace-nowrap">{mode.label}{mode.sub ? ` — ${mode.sub}` : ""}</Button>
+                  <Button size="md" disabled={disabled} onClick={() => runIssueMode(target, num, mode.id)} className="!rounded-r-none whitespace-nowrap inline-flex items-center gap-1.5">{mode.icon}{mode.label}{mode.sub ? ` — ${mode.sub}` : ""}</Button>
                   <Popover align="right" width={250} direction="up" trigger={(open) => (
                     <span className={`inline-flex items-center h-ctl px-1.5 rounded-ctl rounded-l-none border-l border-l-white/25 bg-ink text-surface ${open ? "opacity-90" : ""}`}>
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={open ? "rotate-180 transition-transform" : "transition-transform"}><polyline points="6 9 12 15 18 9" /></svg>
@@ -1152,7 +1175,7 @@ export function App() {
                       {modes.map((m) => (
                         <button key={m.id} type="button" onClick={() => setIssueMode((s) => ({ ...s, [target]: m.id }))}
                           className={`w-full text-left px-3 py-2 flex items-start gap-2.5 hover:bg-paper ${m.id === mode.id ? "bg-paper" : ""}`}>
-                          <span className={`w-2 h-2 rounded-full mt-1.5 flex-none ${m.dot}`} />
+                          <span className={`mt-[1px] flex-none ${m.color}`}>{m.icon}</span>
                           <span className="min-w-0 flex-1"><span className="block text-[13px] font-medium text-body leading-tight">{m.label}{m.sub ? ` — ${m.sub}` : ""}</span><span className="block text-[11.5px] text-muted leading-tight mt-0.5">{m.hint}</span></span>
                           {m.id === mode.id && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text mt-0.5 flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
                         </button>
@@ -1289,7 +1312,7 @@ export function App() {
           <span onClick={() => setShowShortcuts(false)} className="text-muted cursor-pointer hover:text-ink">×</span>
         </div>
         <div className="px-5 py-4 grid gap-2.5 text-[13px]">
-          {([["⌘K  /  /", "Open the command palette"], ["g h", "Go home"], ["g i", "Go to issues"], ["g p", "Go to voyages"], ["g s", "Go to repo settings"], ["c", "Focus the comment box"], ["?", "Toggle this help"]] as [string, string][]).map(([k, d]) => (
+          {([["⌘K  /  /", "Open the command palette"], ["g h", "Go home"], ["g i", "Go to issues"], ["g p", "Go to pull requests"], ["g s", "Go to repo settings"], ["c", "Focus the comment box"], ["?", "Toggle this help"]] as [string, string][]).map(([k, d]) => (
             <div key={k} className="flex items-center justify-between gap-4">
               <span className="text-body">{d}</span>
               <span className="flex gap-1">{k.split("  ").map((part, i) => <kbd key={i} className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-[6px] py-0.5 bg-paper">{part}</kbd>)}</span>
@@ -1466,7 +1489,7 @@ export function App() {
 
   // ── shared chrome (top bar + notifications drawer) ────────────────────────
   const topBar = (
-    <header className="h-14 border-b border-rule2 bg-surface flex items-center gap-5 px-6 sticky top-0 z-20">
+    <header className="h-14 border-b border-rule2 bg-surface flex items-center gap-5 px-6 sticky top-0 z-40">
       <button className="flex items-center gap-2.5 cursor-pointer shrink-0" onClick={() => navigate("/")} title="situation room">
         <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
         <span className="text-[19px] font-extrabold tracking-tight">hull</span>
@@ -1537,7 +1560,7 @@ export function App() {
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-muted"><polyline points="6 9 12 15 18 9" /></svg>
             </button>
             {showProfile && profile && (
-              <div className="absolute right-0 top-[calc(100%+8px)] w-[320px] z-30 bg-surface border border-rule rounded-[12px] shadow-menu p-4 grid gap-3">
+              <div className="absolute right-0 top-[calc(100%+8px)] w-[320px] z-50 bg-surface border border-rule rounded-[12px] shadow-menu p-4 grid gap-3">
                 <div className="flex items-center gap-2">
                   <b className={profile.kind === "agent" ? "text-steel-text" : ""}>{profile.handle}</b>
                   <span className="text-[12.5px] text-muted">{profile.kind}</span>
@@ -1620,7 +1643,7 @@ export function App() {
         <Stat k="repo" v={issueRepo} />
         <Stat k="tenant" v={tenant} />
         <Stat k="open issues" v={openIssues} />
-        <Stat k="voyages" v={prs.length} />
+        <Stat k="pull requests" v={prs.length} />
         {isTenantOwner && <div className="pt-1"><LinkButton onClick={() => navigate(`${repoBase()}/settings`)}>Settings ↗</LinkButton></div>}
       </Module>
       {secrets.length > 0 && (
@@ -1802,7 +1825,7 @@ export function App() {
                       ))}
                       {it.assignees.length === 0 && <span className="text-[12.5px] text-muted">none</span>}
                     </div>
-                    {canAct && me && !it.assignees.includes(me.id) && <LinkButton onClick={() => issueAction(it.number, "assign", { assignee: me.id })}>assign me</LinkButton>}
+                    {canAct && me && !it.assignees.includes(me.id) && <button className="text-[11.5px] text-muted hover:text-ink inline-flex items-center gap-1 w-fit" onClick={() => issueAction(it.number, "assign", { assignee: me.id })}><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><line x1="19" y1="8" x2="19" y2="14" /><line x1="22" y1="11" x2="16" y2="11" /></svg>assign me</button>}
                   </div>
                   <div className="grid gap-1.5 pt-1">
                     <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">labels</span>
@@ -1821,11 +1844,6 @@ export function App() {
                   </div>
                   {it.resolved_by && <Stat k="resolved by" v={<code className="text-[12px] text-steel-text">⬡ {it.resolved_by.slice(0, 8)}</code>} />}
                 </Module>
-                <div className="flex gap-2">
-                  {it.status.state === "open"
-                    ? <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => transition(it.number, "close")}>Close issue</Button>
-                    : <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => transition(it.number, "reopen")}>Reopen issue</Button>}
-                </div>
               </aside>
             </div>
           </div>
@@ -1894,9 +1912,9 @@ export function App() {
               </div>
               {/* action */}
               <div className="px-4 py-3 bg-paper flex items-center gap-3 flex-wrap">
-                <Button size="sm" disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}>Merge voyage</Button>
+                <Button size="sm" disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}>Merge</Button>
                 {!canLand && <span className="text-[12.5px] text-muted">Every check must pass before merging.</span>}
-                {canAct && <LinkButton className="ml-auto" onClick={() => closePr(p.number, false)}>Close voyage</LinkButton>}
+                {canAct && <LinkButton className="ml-auto" onClick={() => closePr(p.number, false)}>Close</LinkButton>}
               </div>
             </Card>
           </div>
@@ -2084,7 +2102,7 @@ export function App() {
                 </div>
               </Card>
               <Card>
-                <SectionHeader label="Default reviewers" right={<span className="text-[12.5px] text-muted">auto-requested on new voyages</span>} />
+                <SectionHeader label="Default reviewers" right={<span className="text-[12.5px] text-muted">auto-requested on new pull requests</span>} />
                 <div className="px-5 py-4 grid gap-3">
                   <div className="flex flex-wrap gap-1.5">
                     {(s?.default_reviewers ?? []).map((r) => (
@@ -2199,9 +2217,9 @@ export function App() {
           </div>
 
           <div className="flex items-end justify-between gap-4 border-b border-rule2 mb-7">
-            <HTabs items={[`Issues ${openIssues}`, `Voyages ${prs.length}`]} value={tab === "issues" ? 0 : 1} onChange={(i: number) => navigate(i === 0 ? repoBase() : `${repoBase()}/voyages`)} />
+            <HTabs items={[`Issues ${openIssues}`, `Pull requests ${prs.length}`]} value={tab === "issues" ? 0 : 1} onChange={(i: number) => navigate(i === 0 ? repoBase() : `${repoBase()}/voyages`)} />
             <div className="w-[240px] pb-1.5 hidden sm:block">
-              <SearchInput placeholder={tab === "issues" ? "Filter issues" : "Filter voyages"} shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} />
+              <SearchInput placeholder={tab === "issues" ? "Filter issues" : "Filter pull requests"} shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} />
             </div>
           </div>
 
@@ -2237,7 +2255,7 @@ export function App() {
                                   <span className="text-[15px] font-semibold group-hover:text-steel-text transition-colors">{it.title}</span>
                                   {it.code_refs.length > 0 && <span className="text-[11.5px] text-steel-text">⬡ {it.code_refs.length}</span>}
                                   {it.resolved_by && <Tag>⬡ resolved</Tag>}
-                                  {!it.resolved_by && (it.linked_prs?.length ?? 0) > 0 && <Tag>⇄ {it.linked_prs!.length} voyage{it.linked_prs!.length > 1 ? "s" : ""}</Tag>}
+                                  {!it.resolved_by && (it.linked_prs?.length ?? 0) > 0 && <Tag>⇄ {it.linked_prs!.length} PR{it.linked_prs!.length > 1 ? "s" : ""}</Tag>}
                                 </div>
                                 <div className="text-[12.5px] text-muted mt-1 flex items-center gap-1.5 flex-wrap tabular-nums">
                                   <span>#{it.number}</span>
@@ -2284,7 +2302,7 @@ export function App() {
               {tab === "prs" && (
                 <>
                   <div>
-                    {prs.length === 0 && <div className="py-8 text-[13px] text-muted">no voyages yet — agents open these when they push a change for review</div>}
+                    {prs.length === 0 && <div className="py-8 text-[13px] text-muted">no pull requests yet — agents open these when they push a change for review</div>}
                     {[...prs].filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
                       const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
                       return (
@@ -2474,6 +2492,21 @@ function ReviewPage({
       setFixing(null);
     }
   };
+  // Fix-with-AI for a reconciliation claim: hand the claim text to the fixer against the change's files.
+  const [fixingClaim, setFixingClaim] = useState<string | null>(null);
+  const fixClaim = async (c: Claim) => {
+    if (!canAct || !pr) return uiAlert("Sign in to act.");
+    setFixingClaim(c.id);
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/prs/${pr.number}/fix`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ path: change?.files[0]?.path ?? "", note: `Reconcile claim: ${c.text}`, severity: c.status === "contradicted" ? "blocker" : "warn" }),
+      });
+      if (res.ok) { const d = await res.json(); uiAlert("AI fix applied as a new change (re-verified):\n\n" + (d.fix?.explanation ?? "")); loadThread(); loadChange(); }
+      else uiAlert(await res.text());
+    } finally { setFixingClaim(null); }
+  };
 
   const [checking, setChecking] = useState(false);
   const [checkResult, setCheckResult] = useState<{ status: string; summary: string; memoized: boolean } | null>(null);
@@ -2654,7 +2687,7 @@ function ReviewPage({
       <header className="h-[52px] border-b border-rule2 bg-surface flex items-center gap-4 px-6 sticky top-0 z-20">
         <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer" onClick={onBack}>
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
-          {repo} · voyages
+          {repo} · pull requests
         </button>
         <span className="text-[11.5px] font-semibold px-[9px] py-[3px] rounded-full border border-rule text-dim">review package</span>
       </header>
@@ -2662,7 +2695,7 @@ function ReviewPage({
       <div className="max-w-[1320px] mx-auto px-6 sm:px-8 py-8">
         <h1 className="text-[23px] font-semibold tracking-tight">{pr ? `${pr.title}` : active.target}</h1>
         <div className="flex items-center gap-2 flex-wrap text-[12.5px] text-muted mt-2 mb-5 tabular-nums">
-          {pr && <span className="font-medium text-body">voyage v{pr.number}</span>}
+          {pr && <span className="font-medium text-body">PR #{pr.number}</span>}
           <span className="text-faint">·</span>
           {pr && <><Avatar id={pr.author} handle={handleOf(pr.author)} kind={kindOf(pr.author)} size={16} /><span className={kindOf(pr.author) === "agent" ? "text-steel-text" : ""}>{handleOf(pr.author)}</span></>}
           <span className="text-faint">·</span>
@@ -2684,12 +2717,18 @@ function ReviewPage({
               {checks.map((c, i) => (
                 <div key={i} className="flex items-start gap-2.5 px-4 py-2.5 border-b border-rule2 last:border-0">
                   <StatusDot tone={c.tone} />
-                  <div className="min-w-0">
+                  <div className="min-w-0 flex-1">
                     <div className="text-[13px] font-medium text-body leading-tight">{c.label}</div>
                     <div className="text-[12px] text-muted mt-0.5">{c.detail}</div>
                   </div>
                 </div>
               ))}
+              {canAct && (
+                <div className="px-4 py-2.5 flex items-center gap-2 bg-paper">
+                  <Button size="sm" disabled={checking} onClick={() => runChecks(false)}>{checking ? "Running…" : "Run checks"}</Button>
+                  {checkResult && <span className="text-[12px] text-muted">{checkResult.status}{checkResult.memoized ? " · memoized" : ""}</span>}
+                </div>
+              )}
             </div>
           </Popover>
         </div>
@@ -2888,36 +2927,28 @@ function ReviewPage({
             const uniq = transforms.filter((t) => { const k = t.old + "→" + t.next; if (seen.has(k)) return false; seen.add(k); return true; });
             return (
               <>
-                {f.ops.length > 0 && (
-                  <div className="flex items-center gap-2 flex-wrap mb-2">
-                    <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">{opKind(f) === "signature" ? "Signature change" : "Behavior change"}</span>
-                    {f.ops.slice(0, 6).map((o, j) => (
-                      <span key={j} className={`text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge ${o.startsWith("removed") ? "bg-fault-wash text-fault-text" : "bg-clear-wash text-clear-text"}`}>{o}</span>
-                    ))}
-                  </div>
-                )}
                 {uniq.length > 0 && (() => {
-                  const clip = (s: string) => (s.length > 48 ? s.slice(0, 47).trimEnd() + "…" : s);
+                  const clip = (s: string) => (s.length > 52 ? s.slice(0, 51).trimEnd() + "…" : s);
                   const SHOWN = 12;
                   return (
                     <div className="mb-3 rounded-ctl border border-rule2 overflow-hidden">
                       <div className="px-3.5 py-2 bg-paper border-b border-rule2 flex items-center justify-between">
                         <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">What changed here</span>
-                        <span className="text-[11px] text-faint tabular-nums">{uniq.length} edit{uniq.length > 1 ? "s" : ""} · click a line to open</span>
+                        <span className="text-[11px] text-faint tabular-nums">{uniq.length} edit{uniq.length > 1 ? "s" : ""} · click to open</span>
                       </div>
-                      <div className="px-3.5 py-2.5 grid gap-2.5">
+                      <div className="py-1">
                         {uniq.slice(0, SHOWN).map((t, i) => (
-                          <div key={i} className="grid grid-cols-[auto_1fr] items-start gap-x-2.5 gap-y-1 text-[13px]">
-                            <button onClick={() => revealDiff(f.path, `L-${f.path}-${t.ln}`)} title={`Open line ${t.ln}`}
-                              className="inline-flex items-center h-[19px] px-1.5 mt-px rounded-[3px] bg-rule2 text-dim text-[11px] font-semibold tabular-nums hover:bg-steel-wash hover:text-steel-text transition-colors flex-none">L{t.ln}</button>
-                            <div className="flex items-center gap-2 flex-wrap min-w-0 leading-relaxed">
+                          <button key={i} onClick={() => revealDiff(f.path, `L-${f.path}-${t.ln}`)} title={`Open line ${t.ln}`}
+                            className="group w-full grid grid-cols-[auto_1fr] items-center gap-x-2.5 text-[13px] text-left px-3.5 py-1.5 hover:bg-steel-wash/60 transition-colors">
+                            <span className="inline-flex items-center h-[19px] px-1.5 rounded-[3px] bg-rule2 text-dim text-[11px] font-semibold tabular-nums group-hover:bg-steel group-hover:text-white transition-colors flex-none">L{t.ln}</span>
+                            <span className="flex items-center gap-2 flex-wrap min-w-0 leading-relaxed">
                               {t.old ? <OldTok>{clip(t.old)}</OldTok> : <span className="text-muted italic text-[12.5px]">added</span>}
                               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-faint flex-none"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg>
                               {t.next ? <NewTok>{clip(t.next)}</NewTok> : <span className="text-muted italic text-[12.5px]">removed</span>}
-                            </div>
-                          </div>
+                            </span>
+                          </button>
                         ))}
-                        {uniq.length > SHOWN && <div className="text-[12px] text-muted pl-[42px]">+{uniq.length - SHOWN} more edit{uniq.length - SHOWN > 1 ? "s" : ""}</div>}
+                        {uniq.length > SHOWN && <div className="text-[12px] text-muted px-3.5 py-1.5">+{uniq.length - SHOWN} more edit{uniq.length - SHOWN > 1 ? "s" : ""}</div>}
                       </div>
                     </div>
                   );
@@ -3040,6 +3071,11 @@ function ReviewPage({
                   <div className="flex items-center gap-2 mt-2.5 flex-wrap">
                     <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}>✓ I checked — verified</Button>
                     <Button size="sm" variant="destructive" disabled={!canAct} onClick={() => resolveClaim(c.id, "concern")}>⚑ Raise concern</Button>
+                    {pr && change && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
+                  </div>
+                ) : c.status === "contradicted" ? (
+                  <div className="flex items-center gap-2 mt-2.5 flex-wrap">
+                    {pr && change && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
                   </div>
                 ) : null}
               </div>
@@ -3057,15 +3093,17 @@ function ReviewPage({
                 </div>
               )}
               {(ledger.unclaimed?.length ?? 0) > 0 && (
-                <div className="px-5 py-3.5 border-b border-rule2 flex gap-3">
-                  <StatusDot tone="warn" />
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[13.5px] text-body leading-snug"><b>{ledger.unclaimed!.length} unclaimed change{ledger.unclaimed!.length > 1 ? "s" : ""}</b> — work the narrative never mentions; account for it before landing.</div>
-                    <div className="grid gap-1 mt-2">
-                      {ledger.unclaimed!.map((op, i) => <div key={i} className="text-[12.5px] text-fault-text flex gap-2 items-baseline"><span className="text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded bg-fault-wash flex-none">phantom</span><span className="leading-snug">{op}</span></div>)}
-                    </div>
+                <details className="group border-b border-rule2" open={(ledger.unclaimed!.length) <= 8}>
+                  <summary className="px-5 py-3.5 flex gap-3 cursor-pointer select-none list-none items-start hover:bg-paper/40">
+                    <StatusDot tone="warn" />
+                    <div className="min-w-0 flex-1 text-[13.5px] text-body leading-snug"><b>{ledger.unclaimed!.length} unclaimed change{ledger.unclaimed!.length > 1 ? "s" : ""}</b> — work the narrative never mentions; account for it before landing.</div>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-faint mt-0.5 flex-none group-open:rotate-90 transition-transform"><polyline points="9 18 15 12 9 6" /></svg>
+                  </summary>
+                  <div className="px-5 pb-3.5 pl-[52px]">
+                    <SearchableList items={ledger.unclaimed!} searchOf={(op) => op} placeholder="Search unclaimed changes…"
+                      renderItem={(op, i) => <div key={i} className="text-[12.5px] text-fault-text flex gap-2 items-baseline"><span className="text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded bg-fault-wash flex-none">phantom</span><span className="leading-snug break-all">{op}</span></div>} />
                   </div>
-                </div>
+                </details>
               )}
               {attention.length > 0 ? attention.map(Row) : (
                 <div className="px-5 py-4 text-[13px] text-dim flex items-center gap-2.5"><StatusDot tone="ok" /> Every claim is supported — nothing needs your judgment.</div>
@@ -3131,7 +3169,7 @@ function ReviewPage({
                     <span className={`grid place-items-center w-[24px] h-[24px] rounded-full flex-none text-[12px] ${vcolor(e.r.verdict)}`}>{e.r.verdict === "approve" ? "✓" : e.r.verdict === "reject" || e.r.verdict === "request_changes" ? "!" : "◍"}</span>
                     <Avatar id={e.r.reviewer} handle={handleOf(e.r.reviewer)} kind={kindOf(e.r.reviewer)} size={18} />
                     <b className={kindOf(e.r.reviewer) === "agent" ? "text-steel-text" : ""}>{handleOf(e.r.reviewer)}</b>
-                    <span className="text-muted">{verb[e.r.verdict] ?? "reviewed"} this voyage</span>
+                    <span className="text-muted">{verb[e.r.verdict] ?? "reviewed"} this pull request</span>
                     {e.r.findings.length > 0 && <button onClick={() => setActiveId(e.r.id)} className="cursor-pointer"><Tag>{e.r.findings.length} finding{e.r.findings.length > 1 ? "s" : ""}</Tag></button>}
                     <span className="text-faint tabular-nums ml-auto" title={new Date(e.ts * 1000).toLocaleString()}>{timeAgo(e.ts)}</span>
                   </div>
@@ -3184,55 +3222,8 @@ function ReviewPage({
         )}
 
           </div>
-          {/* details — moved below the full-width diff so the diff gets the whole page width */}
-          <div className="grid md:grid-cols-3 gap-6 content-start">
-        {/* proposed change — the file list + provenance; the "why" lives in the brief above */}
-        <Card>
-          <SectionHeader label="Files" right={<span className="text-[12.5px] text-muted tabular-nums">{change ? `${change.files.length} · +${addN} −${delN}` : ""}</span>} />
-          <div className="px-5 py-4">
-            {change ? (
-              <>
-                <p className="text-[12.5px] text-muted flex items-center gap-2 flex-wrap">
-                  <IdChip>⬡ {change.id.slice(0, 12)}</IdChip> by <b className="text-body">{change.author.split(" ")[0]}</b>
-                </p>
-                <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted mt-4 mb-2">What it touches <span className="text-faint normal-case tracking-normal">(from keel)</span></div>
-                <div className="grid gap-1">
-                  {change.files.map((f) => (
-                    <div key={f.path} className="flex items-center gap-2 text-[13px]">
-                      <span className={`w-4 h-4 grid place-items-center rounded text-[10px] font-bold ${f.status === "added" ? "bg-clear-wash text-clear-text" : f.status === "deleted" ? "bg-fault-wash text-fault-text" : "bg-steel-wash text-steel-text"}`}>{f.status[0].toUpperCase()}</span>
-                      <code className="text-body">{f.path}</code>
-                    </div>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <p className="text-[13px] text-muted">resolving the change from keel…</p>
-            )}
-          </div>
-        </Card>
-
-        {/* tests & CI · risk */}
-        <Card>
-          <SectionHeader label="Checks" right={<StatusBadge kind={verifKind(verification)}>{verification}</StatusBadge>} />
-          <div className="px-5 py-4 grid gap-3">
-            <div className="flex items-center gap-3 flex-wrap">
-              <Button size="sm" disabled={checking} onClick={() => runChecks(false)}>{checking ? "Running…" : "Run checks"}</Button>
-              {checkResult && (
-                <span className="flex items-center gap-2 text-[13px]">
-                  <StatusBadge kind={checkResult.status === "passed" ? "passed" : checkResult.status === "failed" ? "failed" : "queued"}>{checkResult.status}</StatusBadge>
-                  {checkResult.memoized && <Tag>memoized</Tag>}
-                  <span className="text-muted">{checkResult.summary}</span>
-                </span>
-              )}
-            </div>
-            <p className="text-[12.5px] text-muted leading-[1.55]">
-              Checks run in a fresh checkout and memoize by content, so an unchanged tree is an instant cache hit.
-              {checkResult && <> <LinkButton onClick={() => runChecks(true)}>re-run without cache</LinkButton></>}
-            </p>
-          </div>
-        </Card>
-
-        {/* session */}
+          {/* details — the agent session behind the change. Files live in the diff; checks in the gate. */}
+          <div>
         <Card>
           <SectionHeader label="Session" right={<span className="text-[12.5px] text-muted">the agent session behind this change</span>} />
           <div className="px-5 py-4">
