@@ -2679,11 +2679,17 @@ function ReviewPage({
   // Raw diff bodies are minified (just the "What changed here" summary) until expanded — click a
   // summary line or the Show-diff toggle to reveal the lines.
   const [expandedDiffs, setExpandedDiffs] = useState<Set<string>>(() => new Set());
-  // A big diff shows only a head + tail window until "show all" — so one huge file can't swamp the page.
-  const [fullLines, setFullLines] = useState<Set<string>>(() => new Set());
-  const revealDiff = (path: string, thenLine?: string) => {
+  // A big diff only ever RENDERS a bounded window (never thousands of rows). diffFocus[path] centres
+  // the window on a line (set by a "What changed here" click); diffExpand[path] grows it on "show more".
+  const [diffFocus, setDiffFocus] = useState<Record<string, number>>({});
+  const [diffExpand, setDiffExpand] = useState<Record<string, number>>({});
+  const revealDiff = (path: string, line?: number) => {
     setExpandedDiffs((s) => (s.has(path) ? s : new Set(s).add(path)));
-    if (thenLine) { setFullLines((s) => (s.has(path) ? s : new Set(s).add(path))); setTimeout(() => flashLine(thenLine), 80); }
+    if (line != null) {
+      setDiffFocus((f) => ({ ...f, [path]: line }));
+      setDiffExpand((e) => ({ ...e, [path]: 0 }));
+      setTimeout(() => flashLine(`L-${path}-${line}`), 140);
+    }
   };
   const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => new Set());
   const seenFindingsRef = useRef<Set<string>>(new Set());
@@ -2923,22 +2929,72 @@ function ReviewPage({
             const anchoredLines = new Set<number>([...fs.map((x) => x.f.line ?? -1), ...lcs.map((c) => c.line ?? -1)]);
             if (commenting?.path === f.path) anchoredLines.add(commenting.line);
             const keepAnchored = (r: Row) => typeof r.n === "number" && anchoredLines.has(r.n);
-            // Cap a huge diff to a head + tail window (unless annotated or fully expanded), so one
-            // enormous file doesn't take over the page. "Show N more" reveals the whole thing.
-            const capRows = (rows: Row[]): Row[] => {
-              const HEAD = 10, TAIL = 10;
-              if (fullLines.has(f.path) || forceOpen || rows.length <= HEAD + TAIL + 8) return rows;
-              const hidden = rows.length - HEAD - TAIL;
-              const expander: Row = { n: "", code: null, note: (
-                <button onClick={() => setFullLines((s) => new Set(s).add(f.path))} className="w-full py-2 text-[12.5px] font-medium text-steel-text hover:bg-steel-wash/50 flex items-center justify-center gap-1.5 bg-paper/40">
+            // A huge diff only ever RENDERS a bounded window of rows, so one enormous file can never
+            // swamp the page. The window centres on diffFocus[path] (set by a "What changed here"
+            // click) and grows by diffExpand[path] on "show more". Annotated files render in full.
+            const expander = (hidden: number, where: "above" | "below"): Row => ({
+              n: "", code: null, note: (
+                <button onClick={() => setDiffExpand((e) => ({ ...e, [f.path]: (e[f.path] ?? 0) + 200 }))}
+                  className="w-full py-2 text-[12.5px] font-medium text-steel-text hover:bg-steel-wash/50 flex items-center justify-center gap-1.5 bg-paper/40">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
-                  Show {hidden} more line{hidden > 1 ? "s" : ""}
+                  Show {Math.min(hidden, 200)} more {where} · {hidden} line{hidden > 1 ? "s" : ""} hidden
                 </button>
-              ) };
-              return [...rows.slice(0, HEAD), expander, ...rows.slice(-TAIL)];
+              ),
+            });
+            const capRows = (rows: Row[]): Row[] => {
+              if (forceOpen) return rows;
+              const grow = diffExpand[f.path] ?? 0;
+              const RAD = 24 + grow;
+              if (rows.length <= RAD * 2 + 8) return rows;
+              const focus = diffFocus[f.path];
+              const idx = focus != null ? rows.findIndex((r) => typeof r.n === "number" && r.n === focus) : -1;
+              let lo: number, hi: number;
+              if (idx >= 0) { lo = Math.max(0, idx - RAD); hi = Math.min(rows.length, idx + RAD + 1); }
+              else { lo = 0; hi = Math.min(rows.length, RAD * 2 + 1); }
+              const parts: Row[] = [];
+              if (lo > 0) parts.push(expander(lo, "above"));
+              parts.push(...rows.slice(lo, hi));
+              if (hi < rows.length) parts.push(expander(rows.length - hi, "below"));
+              return parts;
             };
+            const isOpen = expandedDiffs.has(f.path) || forceOpen;
+            // Take the span from first-changed to last-changed token so inner spaces/punctuation are
+            // preserved (otherwise "walk_all ()" → "slice ( task )" collapses to "slicetask").
+            const span = (segs: Seg[]) => {
+              const first = segs.findIndex((s) => s.changed);
+              if (first === -1) return "";
+              let last = segs.length - 1; while (last >= 0 && !segs[last].changed) last--;
+              return segs.slice(first, last + 1).map((s) => s.text).join("").trim();
+            };
+            // Cheap always-on pass: extract the "What changed here" summary WITHOUT building any React
+            // elements. The heavy row/syntax-highlight build happens only for an OPEN diff (below), so a
+            // huge collapsed file costs nothing per render — it no longer swamps the page.
             const transforms: { old: string; next: string; ln: number }[] = [];
-            const hunkNodes = f.hunks.map((h, hi) => {
+            for (const h of f.hunks) {
+              let n = h.new_start;
+              const L = h.lines;
+              for (let k = 0; k < L.length;) {
+                const l = L[k];
+                if (l.tag === "del") {
+                  let d = k; while (L[d] && L[d].tag === "del") d++;
+                  let a = d; while (L[a] && L[a].tag === "add") a++;
+                  const dels = L.slice(k, d), adds = L.slice(d, a);
+                  const pairs = Math.min(dels.length, adds.length);
+                  for (let p = 0; p < pairs; p++) {
+                    const w = wordDiff(dels[p].text, adds[p].text);
+                    const oldS = span(w.old), nextS = span(w.next);
+                    if (oldS || nextS) transforms.push({ old: oldS, next: nextS, ln: n + p });
+                  }
+                  for (let p = pairs; p < dels.length; p++) { const t = dels[p].text.trim(); if (t) transforms.push({ old: t, next: "", ln: n }); }
+                  for (let p = pairs; p < adds.length; p++) { const t = adds[p].text.trim(); if (t) transforms.push({ old: "", next: t, ln: n + p }); }
+                  n += adds.length; k = a;
+                } else if (l.tag === "add") {
+                  const t = l.text.trim(); if (t) transforms.push({ old: "", next: t, ln: n });
+                  n++; k++;
+                } else { n++; k++; }
+              }
+            }
+            const hunkNodes = isOpen ? f.hunks.map((h, hi) => {
               let o = h.old_start, n = h.new_start;
               const L = h.lines;
               const out: Row[] = [];
@@ -2950,27 +3006,10 @@ function ReviewPage({
                   const dels = L.slice(k, d), adds = L.slice(d, a);
                   const pairs = Math.min(dels.length, adds.length);
                   const wds = Array.from({ length: pairs }, (_, p) => wordDiff(dels[p].text, adds[p].text));
-                  // Collect the actual token-level edits for the "What changed" summary. Take the span
-                  // from first-changed to last-changed token so inner spaces/punctuation are preserved
-                  // (otherwise "walk_all ()" → "slice ( task )" collapses to "slicetask").
-                  const span = (segs: Seg[]) => {
-                    const first = segs.findIndex((s) => s.changed);
-                    if (first === -1) return "";
-                    let last = segs.length - 1; while (last >= 0 && !segs[last].changed) last--;
-                    return segs.slice(first, last + 1).map((s) => s.text).join("").trim();
-                  };
-                  wds.forEach((w, p) => {
-                    const oldS = span(w.old), nextS = span(w.next);
-                    if (oldS || nextS) transforms.push({ old: oldS, next: nextS, ln: n + p });
-                  });
-                  // Unpaired removals/additions in the run are pure delete/add — still summarize them.
-                  for (let p = pairs; p < dels.length; p++) { const t = dels[p].text.trim(); if (t) transforms.push({ old: t, next: "", ln: n }); }
-                  for (let p = pairs; p < adds.length; p++) { const t = adds[p].text.trim(); if (t) transforms.push({ old: "", next: t, ln: n + p }); }
                   dels.forEach((dl, p) => { out.push({ n: o, sign: "-", code: p < pairs ? <>{wdRender(wds[p].old, f.path, "old")}</> : <Hl text={dl.text} path={f.path} /> }); o++; });
                   adds.forEach((al, p) => { out.push({ n, sign: "+", code: p < pairs ? <>{wdRender(wds[p].next, f.path, "new")}</> : <Hl text={al.text} path={f.path} /> }); n++; });
                   k = a;
                 } else if (l.tag === "add") {
-                  const t = l.text.trim(); if (t) transforms.push({ old: "", next: t, ln: n });
                   out.push({ n, sign: "+", code: <Hl text={l.text} path={f.path} /> }); n++; k++;
                 } else {
                   out.push({ n, sign: undefined, code: <Hl text={l.text} path={f.path} /> }); o++; n++; k++;
@@ -2985,7 +3024,7 @@ function ReviewPage({
                     onCommentLine={(ln: number) => openLineComment(f.path, ln)} />
                 </div>
               );
-            });
+            }) : null;
             // Dedupe the transforms so a repeated edit isn't listed twice.
             const seen = new Set<string>();
             const uniq = transforms.filter((t) => { const k = t.old + "→" + t.next; if (seen.has(k)) return false; seen.add(k); return true; });
@@ -3002,7 +3041,7 @@ function ReviewPage({
                       </div>
                       <div className="py-1">
                         {uniq.slice(0, SHOWN).map((t, i) => (
-                          <button key={i} onClick={() => revealDiff(f.path, `L-${f.path}-${t.ln}`)} title={`Open line ${t.ln}`}
+                          <button key={i} onClick={() => revealDiff(f.path, t.ln)} title={`Open line ${t.ln}`}
                             className="group w-full grid grid-cols-[auto_1fr] items-center gap-x-2.5 text-[13px] text-left px-3.5 py-1.5 hover:bg-steel-wash/60 transition-colors">
                             <span className="inline-flex items-center h-[19px] px-1.5 rounded-[3px] bg-rule2 text-dim text-[11px] font-semibold tabular-nums group-hover:bg-steel group-hover:text-white transition-colors flex-none">L{t.ln}</span>
                             <span className="flex items-center gap-2 flex-wrap min-w-0 leading-relaxed">
@@ -3017,7 +3056,7 @@ function ReviewPage({
                     </div>
                   );
                 })()}
-                {(expandedDiffs.has(f.path) || forceOpen) ? (() => {
+                {isOpen ? (() => {
                   // A compact review bar top + bottom of the open diff, so you can act right after reading.
                   const reviewBar = canAct && pr ? (
                     <div className="flex items-center gap-2 py-1.5">
