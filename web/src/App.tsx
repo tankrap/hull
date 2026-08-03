@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import * as ed from "@noble/ed25519";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
@@ -61,7 +62,7 @@ const timeAgo = (unix: number) => {
 // router on navigate/popstate.
 type RouteState = {
   view: "home" | "repo";
-  authPage: "login" | "signup" | "account" | null;
+  authPage: "login" | "signup" | "account" | "profile" | null;
   orgHandle: string | null;
   tenant: string;
   issueRepo: string;
@@ -75,6 +76,7 @@ function parseRoute(path: string): RouteState {
   const r: RouteState = { view: "home", authPage: null, orgHandle: null, tenant: "", issueRepo: "", tab: "issues", openIssue: null, openPr: null };
   if (seg[0] === "login" || seg[0] === "signup") { r.authPage = seg[0]; return r; }
   if (seg[0] === "settings") { r.authPage = "account"; return r; }
+  if (seg[0] === "me") { r.authPage = "profile"; return r; }
   if (seg[0] === "orgs" && seg[1]) { r.orgHandle = seg[1]; return r; }
   const [t, rp, s, n] = seg;
   if (t && rp) {
@@ -207,24 +209,40 @@ const Stat = ({ k, v }: { k: React.ReactNode; v: React.ReactNode }) => (
 // header "checks" summary, so the landing gate is reachable from the top of the page.
 function Popover({ trigger, children, align = "left", width = 300, direction = "down", block = false, onToggle }: { trigger: (open: boolean) => React.ReactNode; children: React.ReactNode; align?: "left" | "right"; width?: number; direction?: "down" | "up"; block?: boolean; onToggle?: (open: boolean) => void }) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLSpanElement>(null);
+  const [rect, setRect] = useState<DOMRect | null>(null);
+  const wrapRef = useRef<HTMLSpanElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const set = (v: boolean) => { setOpen(v); onToggle?.(v); };
+  const measure = () => { if (wrapRef.current) setRect(wrapRef.current.getBoundingClientRect()); };
+  useLayoutEffect(() => { if (open) measure(); /* eslint-disable-next-line */ }, [open]);
   useEffect(() => {
     if (!open) return;
-    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) set(false); };
+    const onDoc = (e: MouseEvent) => { const t = e.target as Node; if (!wrapRef.current?.contains(t) && !panelRef.current?.contains(t)) set(false); };
     const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") set(false); };
+    const reflow = () => measure();
     document.addEventListener("mousedown", onDoc);
     document.addEventListener("keydown", onEsc);
-    return () => { document.removeEventListener("mousedown", onDoc); document.removeEventListener("keydown", onEsc); };
+    window.addEventListener("scroll", reflow, true);
+    window.addEventListener("resize", reflow);
+    return () => { document.removeEventListener("mousedown", onDoc); document.removeEventListener("keydown", onEsc); window.removeEventListener("scroll", reflow, true); window.removeEventListener("resize", reflow); };
   }, [open]);
+  // The panel renders in a body portal with FIXED positioning, so it escapes every ancestor's
+  // overflow-hidden / stacking context and always paints on top — no clipping, no z-index fights.
+  const style: React.CSSProperties = { position: "fixed", zIndex: 60, width: block ? (rect?.width ?? width) : width };
+  if (rect) {
+    if (direction === "up") { style.bottom = window.innerHeight - rect.top + 6; style.maxHeight = rect.top - 16; }
+    else { style.top = rect.bottom + 6; style.maxHeight = window.innerHeight - rect.bottom - 16; }
+    if (align === "right") style.right = window.innerWidth - rect.right; else style.left = rect.left;
+  }
   return (
-    <span ref={ref} className={`relative inline-flex ${block ? "w-full" : ""}`}>
+    <span ref={wrapRef} className={`relative inline-flex ${block ? "w-full" : ""}`}>
       <button type="button" onClick={() => set(!open)} className={`inline-flex ${block ? "w-full" : ""}`}>{trigger(open)}</button>
-      {open && (
-        <div style={block ? undefined : { width }} onClick={() => set(false)}
-          className={`absolute z-40 ${block ? "inset-x-0" : ""} ${direction === "up" ? "bottom-full mb-2" : "top-full mt-2"} ${align === "right" ? "right-0" : "left-0"} bg-surface border border-rule rounded-card shadow-menu overflow-hidden animate-[bd-in_120ms_ease-out]`}>
+      {open && rect && createPortal(
+        <div ref={panelRef} style={style} onClick={() => set(false)}
+          className="bg-surface border border-rule rounded-card shadow-menu overflow-y-auto overflow-x-hidden animate-[bd-in_120ms_ease-out]">
           {children}
-        </div>
+        </div>,
+        document.body,
       )}
     </span>
   );
@@ -290,25 +308,48 @@ const Field = ({ label, hint, children }: { label: string; hint?: string; childr
 );
 const modalInput = "w-full box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint";
 
-// New repository modal: owner, name, default branch, private (item 7).
-function NewRepoModal({ accounts, onClose, onCreate }: { accounts: string[]; onClose: () => void; onCreate: (p: { account: string; name: string; isPrivate: boolean; branch: string }) => Promise<boolean> }) {
+// New repository modal: owner/name shown inline (owner ∕ name), a live name-availability check like
+// org handles, a Public/Unlisted/Private dropdown, and the default branch.
+function NewRepoModal({ accounts, onClose, onCreate }: { accounts: string[]; onClose: () => void; onCreate: (p: { account: string; name: string; visibility: "public" | "private" | "unlisted"; branch: string }) => Promise<boolean> }) {
   const [account, setAccount] = useState(accounts[0] ?? "");
   const [name, setName] = useState("");
-  const [isPrivate, setIsPrivate] = useState(false);
+  const [visibility, setVisibility] = useState<"public" | "private" | "unlisted">("public");
   const [branch, setBranch] = useState("main");
   const [busy, setBusy] = useState(false);
-  const ok = !!account && !!name.trim();
-  const submit = async () => { if (!ok || busy) return; setBusy(true); const done = await onCreate({ account, name: name.trim(), isPrivate, branch: branch.trim() || "main" }); setBusy(false); if (done) onClose(); };
+  const [avail, setAvail] = useState<boolean | null>(null);
+  const [checking, setChecking] = useState(false);
+  useEffect(() => {
+    const n = name.trim();
+    if (!n || !account) { setAvail(null); setChecking(false); return; }
+    setChecking(true);
+    const t = setTimeout(() => {
+      fetch(`/api/repos/available?account=${encodeURIComponent(account)}&name=${encodeURIComponent(n)}`)
+        .then((r) => r.json()).then((d) => setAvail(!!d.available)).catch(() => setAvail(null)).finally(() => setChecking(false));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [name, account]);
+  const ok = !!account && !!name.trim() && avail !== false;
+  const submit = async () => { if (!ok || busy) return; setBusy(true); const done = await onCreate({ account, name: name.trim(), visibility, branch: branch.trim() || "main" }); setBusy(false); if (done) onClose(); };
   return (
-    <ModalShell title="New repository" onClose={onClose} width={460}>
+    <ModalShell title="New repository" onClose={onClose} width={480}>
       <div className="grid gap-4">
-        <Field label="Owner"><Picker block value={account} onChange={setAccount} options={accounts.map((a) => ({ value: a, label: a }))} placeholder="Choose an owner…" /></Field>
-        <Field label="Repository name"><input autoFocus className={modalInput} value={name} onChange={(e) => setName(sanitizeHandle(e.target.value))} onKeyDown={(e) => e.key === "Enter" && submit()} placeholder="my-service" spellCheck={false} /></Field>
+        <Field label="Repository">
+          <div className="flex items-stretch gap-1.5">
+            <div className="flex-none min-w-[130px] max-w-[190px]"><Picker block value={account} onChange={setAccount} options={accounts.map((a) => ({ value: a, label: a }))} placeholder="owner" searchable /></div>
+            <span className="flex items-center text-[16px] text-faint px-0.5">/</span>
+            <input autoFocus className={`${modalInput} flex-1`} value={name} onChange={(e) => setName(sanitizeHandle(e.target.value))} onKeyDown={(e) => e.key === "Enter" && submit()} placeholder="my-service" spellCheck={false} />
+          </div>
+          {name.trim() && (
+            <div className={`text-[12px] mt-1.5 ${checking ? "text-muted" : avail ? "text-clear-text" : "text-fault-text"}`}>
+              {checking ? "checking…" : avail ? `✓ ${account}/${name.trim()} is available` : `✗ ${account}/${name.trim()} is taken`}
+            </div>
+          )}
+        </Field>
         <Field label="Default branch"><input className={modalInput} value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="main" spellCheck={false} /></Field>
-        <div className="flex items-center justify-between gap-4 py-0.5">
-          <div><div className="text-[13px] font-medium">Private</div><div className="text-[12px] text-muted">Only members of {account || "the owner"} can see it.</div></div>
-          <Switch on={isPrivate} onChange={setIsPrivate} />
-        </div>
+        <Field label="Visibility">
+          <Picker block value={visibility} onChange={(v) => setVisibility(v as "public" | "private" | "unlisted")}
+            options={[{ value: "public", label: "Public · anyone can find it" }, { value: "unlisted", label: "Unlisted · anyone with the link" }, { value: "private", label: `Private · members of ${account || "the owner"}` }]} />
+        </Field>
         <div className="flex justify-end gap-2 pt-1">
           <Button variant="secondary" size="sm" onClick={onClose}>Cancel</Button>
           <Button size="sm" disabled={!ok || busy} onClick={submit}>{busy ? "Creating…" : "Create repository"}</Button>
@@ -534,7 +575,9 @@ function CommandPalette({ open, items, onClose }: { open: boolean; items: CmdIte
  */
 export function App() {
   const [repos, setRepos] = useState<RepoActivity[]>([]);
-  const [events, setEvents] = useState<ActivityEvent[]>([]);
+  type HomeItem = { tenant: string; repo: string; number: number; title: string; author: string; reason: string; verification?: string };
+  const [homeIssues, setHomeIssues] = useState<HomeItem[]>([]);
+  const [homePrs, setHomePrs] = useState<HomeItem[]>([]);
   const [tenant, setTenant] = useState<string>(() => parseRoute(location.pathname).tenant || "tankrap");
   const feedRef = useRef<EventSource | null>(null);
 
@@ -730,7 +773,7 @@ export function App() {
   };
   // ── passkey auth (signup / login) + account settings ─────────────────────
   // Full-screen auth/account pages, orthogonal to the home/repo views. null = normal app.
-  const [authPage, setAuthPage] = useState<"login" | "signup" | "account" | null>(() => parseRoute(location.pathname).authPage);
+  const [authPage, setAuthPage] = useState<"login" | "signup" | "account" | "profile" | null>(() => parseRoute(location.pathname).authPage);
   const [authForm, setAuthForm] = useState({ username: "", email: "" });
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
@@ -876,12 +919,14 @@ export function App() {
   // The "+" navbar menu opens these modals (New repo / New issue); New org still uses the prompt.
   const [newRepoOpen, setNewRepoOpen] = useState(false);
   const [newIssueOpen, setNewIssueOpen] = useState(false);
-  const doCreateRepo = async (p: { account: string; name: string; isPrivate: boolean; branch: string }): Promise<boolean> => {
+  const [importOpen, setImportOpen] = useState(false);
+  const [importAcct, setImportAcct] = useState("");
+  const doCreateRepo = async (p: { account: string; name: string; visibility: "public" | "private" | "unlisted"; branch: string }): Promise<boolean> => {
     if (!canAct) { uiAlert("Sign in to act."); return false; }
     const res = await fetch("/api/repos", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ account: p.account, name: sanitizeHandle(p.name), default_branch: p.branch }) });
     if (!res.ok) { uiAlert(await res.text()); return false; }
     const d = await res.json();
-    if (p.isPrivate) await fetch(`/api/repos/${encodeURIComponent(d.tenant)}/${encodeURIComponent(d.name)}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ private: true }) });
+    if (p.visibility !== "public") await fetch(`/api/repos/${encodeURIComponent(d.tenant)}/${encodeURIComponent(d.name)}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ visibility: p.visibility }) });
     navigate(`/${encodeURIComponent(d.tenant)}/${encodeURIComponent(d.name)}`);
     return true;
   };
@@ -938,7 +983,7 @@ export function App() {
     }
   };
   // repo settings
-  type RepoSettings = { private: boolean; require_review_to_land: boolean; default_reviewers: { actor: string; handle: string }[]; team_access: { team: string; role: string }[] };
+  type RepoSettings = { private: boolean; unlisted?: boolean; visibility?: "public" | "private" | "unlisted"; require_review_to_land: boolean; default_reviewers: { actor: string; handle: string }[]; team_access: { team: string; role: string }[] };
   const [repoSettings, setRepoSettings] = useState<RepoSettings | null>(null);
   const [ownerRules, setOwnerRules] = useState<{ glob: string; owners: string[] }[]>([]);
   const loadRepoSettings = () => {
@@ -947,7 +992,7 @@ export function App() {
     if (orgAccountFor(tenant)) loadTeams(orgAccountFor(tenant)!.id);
   };
   const orgAccountFor = (handle: string) => accounts.find((a) => a.handle === handle);
-  const saveRepoSettings = async (patch: Partial<{ private: boolean; require_review_to_land: boolean; default_reviewers: string[]; team_access: { team: string; role: string }[] }>) => {
+  const saveRepoSettings = async (patch: Partial<{ private: boolean; visibility: "public" | "private" | "unlisted"; require_review_to_land: boolean; default_reviewers: string[]; team_access: { team: string; role: string }[] }>) => {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
     if (!res.ok) return uiAlert(await res.text());
     setRepoSettings(await res.json());
@@ -1086,28 +1131,7 @@ export function App() {
       .catch(() => {});
   }, [tenant, issueRepo, view, prs]);
 
-  // CI endpoint config for the selected repo (owners can point it at a CI system per CI-SPEC.md).
-  type CiConfig = { url: string | null; has_secret: boolean; source: string };
-  const [ciConfig, setCiConfig] = useState<CiConfig | null>(null);
-  const [ciUrl, setCiUrl] = useState("");
-  const [ciSecret, setCiSecret] = useState("");
-  const loadCiConfig = () =>
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/ci-config`, { headers: authHeaders() })
-      .then((r) => r.json())
-      .then((d) => { setCiConfig(d); setCiUrl(d.url ?? ""); })
-      .catch(() => {});
-  useEffect(() => { loadCiConfig(); }, [tenant, issueRepo, view]);
   const isTenantOwner = !!profile?.memberships.some((m) => m.account === tenant && (m.role === "owner" || m.role === "admin"));
-  const saveCiConfig = async (clear: boolean) => {
-    if (!canAct) return uiAlert("Sign in to act.");
-    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/ci-config`, {
-      method: "PUT",
-      headers: { "content-type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ url: clear ? "" : ciUrl.trim(), secret: clear ? "" : ciSecret }),
-    });
-    if (res.ok) { setCiSecret(""); loadCiConfig(); }
-    else uiAlert(await res.text());
-  };
 
   // Autonomy policy for the selected repo (tier T0–T3, resolved repo → account → instance).
   type Autonomy = { tier: string; source: string; protected_paths: string[] };
@@ -1268,27 +1292,25 @@ export function App() {
   // activity. Not tied to a single tenant. `myAccounts` also scopes the live feed.
   const [myAccounts, setMyAccounts] = useState<string[]>([]);
   useEffect(() => {
-    if (!token) { setRepos([]); setMyAccounts([]); return; }
+    if (!token) { setRepos([]); setMyAccounts([]); setHomeIssues([]); setHomePrs([]); return; }
     const load = () =>
       fetch("/api/home", { headers: authHeaders() })
         .then((r) => (r.ok ? r.json() : { repos: [], accounts: [] }))
-        .then((d) => { setRepos(d.repos ?? []); setMyAccounts(d.accounts ?? []); })
+        .then((d) => { setRepos(d.repos ?? []); setMyAccounts(d.accounts ?? []); setHomeIssues(d.issues ?? []); setHomePrs(d.prs ?? []); })
         .catch(() => {});
     load();
     const t = setInterval(load, 3000);
     return () => clearInterval(t);
   }, [token]);
 
-  // Live event stream over SSE, scoped to the user's accounts.
+  // Live event stream over SSE, scoped to the user's accounts — drives live refresh of the open lists.
   useEffect(() => {
-    setEvents([]);
     if (myAccounts.length === 0) return;
     const es = new EventSource(`/api/feed?accounts=${encodeURIComponent(myAccounts.join(","))}`);
     feedRef.current = es;
     es.onmessage = (m) => {
       try {
         const ev = JSON.parse(m.data) as ActivityEvent;
-        setEvents((prev) => [ev, ...prev].slice(0, 40));
         if (ev.kind === "issue") loadIssues(); // reflect new issues live
       } catch {
         /* ignore keep-alives */
@@ -1361,6 +1383,48 @@ export function App() {
     <>
       {newRepoOpen && <NewRepoModal accounts={myAccounts} onClose={() => setNewRepoOpen(false)} onCreate={doCreateRepo} />}
       {newIssueOpen && <NewIssueModal repos={repos.map((r) => ({ tenant: r.tenant, repo: r.repo }))} defaultRepo={view === "repo" ? `${tenant}/${issueRepo}` : ""} actors={actors} onClose={() => setNewIssueOpen(false)} onCreate={doCreateIssue} />}
+      {importOpen && (() => {
+        const adminAccounts = accounts.filter((a) => me && a.members.some((m) => m.actor === me.id && (m.role === "owner" || m.role === "admin")));
+        return (
+          <ModalShell title="Import from GitHub" onClose={() => { setImportOpen(false); setImportList(null); setGhStatus(null); setImportAcct(""); }} width={540}>
+            <div className="grid gap-4">
+              {adminAccounts.length === 0 ? (
+                <p className="text-[13px] text-muted leading-[1.5]">You need to be an owner/admin of an organization to import repositories. Create one from the <b>+</b> menu first.</p>
+              ) : (
+                <>
+                  <Field label="Organization" hint="you must be an admin">
+                    <Picker block value={importAcct} onChange={(v) => { setImportAcct(v); setImportList(null); loadGh(v); }} options={adminAccounts.map((a) => ({ value: a.id, label: a.handle }))} placeholder="Pick an organization…" />
+                  </Field>
+                  {importAcct && (ghStatus?.connected ? (
+                    <>
+                      <div className="text-[12.5px] text-muted flex items-center gap-2 flex-wrap">
+                        Connected as <b className="text-body">{ghStatus.login}</b>
+                        <LinkButton onClick={() => openImport(importAcct)}>refresh</LinkButton>
+                        <LinkButton onClick={() => disconnectGh(importAcct)}>disconnect</LinkButton>
+                      </div>
+                      <div className="border border-rule2 rounded-ctl overflow-hidden max-h-[340px] overflow-y-auto">
+                        {importList === null && <div className="px-4 py-6 text-center"><Button size="sm" onClick={() => openImport(importAcct)}>List importable repos</Button></div>}
+                        {importList?.length === 0 && <div className="px-4 py-6 text-[13px] text-muted">No repositories available from this connection.</div>}
+                        {importList?.map((full) => (
+                          <div key={full} className="flex items-center gap-3 px-4 py-2.5 border-b border-rule3 last:border-0 text-[13px]">
+                            <span className="flex-1 truncate">{full}</span>
+                            <Button size="sm" disabled={importBusy === full} onClick={() => importRepo(importAcct, full)}>{importBusy === full ? "importing…" : "Import"}</Button>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="grid gap-2">
+                      <p className="text-[12.5px] text-muted leading-[1.5]">Connect this org to a GitHub App installation to import its repositories. Only an admin can see or import them.</p>
+                      <div><Button size="sm" onClick={() => connectGh(importAcct)}>Connect GitHub</Button></div>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          </ModalShell>
+        );
+      })()}
     </>
   );
 
@@ -1438,6 +1502,39 @@ export function App() {
     }
 
     // account settings
+    if (authPage === "profile") {
+      return shell(me ? me.handle : "Profile", (
+        <div className="grid gap-6">
+          {me && (
+            <Card>
+              <div className="px-5 py-4 flex items-center gap-3">
+                <Avatar id={me.id} handle={me.handle} kind={me.kind} size={40} />
+                <div className="min-w-0">
+                  <div className="text-[16px] font-semibold">{me.handle}</div>
+                  <div className="text-[12.5px] text-muted">{me.kind}{profile?.accountable ? " · accountable" : ""} · member of {myAccounts.length} org{myAccounts.length === 1 ? "" : "s"}</div>
+                </div>
+                <button onClick={() => navigate("/settings")} className="ml-auto text-[12.5px] text-steel-text hover:underline flex-none">Account settings →</button>
+              </div>
+            </Card>
+          )}
+          <div>
+            <Eyebrow label="All repositories" right={`${repos.length}`} />
+            {repos.length === 0 && <div className="py-8 text-[13px] text-muted">No repositories yet.</div>}
+            <div>
+              {repos.map((r) => (
+                <button key={`${r.tenant}/${r.repo}`} onClick={() => navigate(`/${encodeURIComponent(r.tenant)}/${encodeURIComponent(r.repo)}`)} className="group w-full text-left block border-b border-rule2">
+                  <div className="flex items-center gap-3 py-3 -mx-3 px-3 rounded-ctl group-hover:bg-surface transition-colors">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-muted flex-none"><path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8ZM5 12.25a.25.25 0 0 1 .25-.25h3.5a.25.25 0 0 1 .25.25v3.25a.25.25 0 0 1-.4.2l-1.45-1.087a.25.25 0 0 0-.3 0L5.4 15.7a.25.25 0 0 1-.4-.2Z" /></svg>
+                    <span className="flex-1 text-[14px] font-medium group-hover:text-steel-text transition-colors truncate"><span className="text-faint font-normal">{r.tenant}/</span>{r.repo}</span>
+                    {r.score > 0 ? <StatusBadge kind="running">active</StatusBadge> : <span className="text-[12px] text-faint flex-none">quiet</span>}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ), true);
+    }
     return shell("Account settings", (
       !me ? (
         <Card><div className="px-6 py-6 grid gap-3"><p className="text-[13.5px] text-body">You are not signed in.</p><div className="flex gap-2"><Button size="sm" onClick={() => navigate("/login")}>Log in</Button><Button size="sm" variant="secondary" onClick={() => navigate("/signup")}>Sign up</Button></div></div></Card>
@@ -1547,6 +1644,7 @@ export function App() {
                 { label: "New issue", hint: view === "repo" ? `in ${issueRepo}` : "pick a repository", run: () => setNewIssueOpen(true), icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="16" /><line x1="8" y1="12" x2="16" y2="12" /></svg> },
                 { label: "New repository", hint: "", run: () => setNewRepoOpen(true), icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" /><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" /></svg> },
                 { label: "New organization", hint: "", run: createOrg, icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 21h18M5 21V7l8-4v18M19 21V11l-6-4" /></svg> },
+                { label: "Import from GitHub", hint: "into an org you admin", run: () => setImportOpen(true), icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg> },
               ].map((it) => (
                 <button key={it.label} type="button" onClick={it.run} className="w-full text-left px-3 py-2 flex items-center gap-2.5 hover:bg-paper">
                   <span className="text-muted flex-none">{it.icon}</span>
@@ -1701,27 +1799,61 @@ export function App() {
           </div>
         </div>
       )}
-      {view === "home" && !orgHandle && me && (
+      {view === "home" && !orgHandle && me && (() => {
+        const activeRepos = repos.filter((r) => r.score > 0 && matchQ(`${r.tenant}/${r.repo}`));
+        return (
         <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
           <div className="flex flex-wrap items-end justify-between gap-4 mb-8">
             <div>
               <h1 className="text-[27px] font-semibold tracking-tight leading-none">Your work</h1>
               <p className="text-[13.5px] text-muted mt-2.5">
-                {repos.length} {repos.length === 1 ? "repo" : "repos"} across {myAccounts.length} {myAccounts.length === 1 ? "org" : "orgs"} · ranked by what's active
+                {activeRepos.length} active {activeRepos.length === 1 ? "repo" : "repos"} · {homePrs.length + homeIssues.length} {homePrs.length + homeIssues.length === 1 ? "item" : "items"} needing you
               </p>
             </div>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-x-12 gap-y-9">
-            <section className="min-w-0">
-              <Eyebrow label="Repositories" right="by live activity" />
-              {repos.length === 0 && (
-                <div className="py-12 text-[13px] text-muted">
-                  No repos yet. Create one, import from GitHub (in an org's settings), or <code className="text-body">git push http://localhost:8930/&lt;org&gt;/&lt;repo&gt; main</code>.
+            <section className="min-w-0 grid gap-8 content-start">
+              {(homePrs.length > 0 || homeIssues.length > 0) && (
+                <div>
+                  <Eyebrow label="Needs your attention" right={`${homePrs.length + homeIssues.length}`} />
+                  <div>
+                    {homePrs.map((p) => (
+                      <button key={`pr-${p.tenant}/${p.repo}#${p.number}`} onClick={() => navigate(`/${encodeURIComponent(p.tenant)}/${encodeURIComponent(p.repo)}/voyages/${p.number}`)} className="group w-full text-left block border-b border-rule2">
+                        <div className="flex items-start gap-3 py-3 -mx-3 px-3 rounded-ctl group-hover:bg-surface transition-colors">
+                          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-clear-text mt-0.5 flex-none"><path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354Z" /></svg>
+                          <div className="flex-1 min-w-0">
+                            <div className="text-[14px] font-medium group-hover:text-steel-text transition-colors truncate">{p.title}</div>
+                            <div className="text-[12px] text-muted mt-0.5 tabular-nums"><span className="text-faint">{p.tenant}/{p.repo}</span> · #{p.number} · <span className="text-steel-text">{p.reason}</span></div>
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                    {homeIssues.map((it) => (
+                      <button key={`is-${it.tenant}/${it.repo}#${it.number}`} onClick={() => navigate(`/${encodeURIComponent(it.tenant)}/${encodeURIComponent(it.repo)}/issues/${it.number}`)} className="group w-full text-left block border-b border-rule2">
+                        <div className="flex items-start gap-3 py-3 -mx-3 px-3 rounded-ctl group-hover:bg-surface transition-colors">
+                          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-clear-text mt-0.5 flex-none"><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" /><path fillRule="evenodd" d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0ZM1.5 8a6.5 6.5 0 1 1 13 0 6.5 6.5 0 0 1-13 0Z" /></svg>
+                          <div className="flex-1 min-w-0">
+                            <div className="text-[14px] font-medium group-hover:text-steel-text transition-colors truncate">{it.title}</div>
+                            <div className="text-[12px] text-muted mt-0.5 tabular-nums"><span className="text-faint">{it.tenant}/{it.repo}</span> · #{it.number} · <span className="text-steel-text">{it.reason}</span></div>
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
               <div>
-                {repos.filter((r) => matchQ(`${r.tenant}/${r.repo}`)).map((r) => (
+              <Eyebrow label="Active repositories" right="by live activity" />
+              {activeRepos.length === 0 && (
+                <div className="py-8 text-[13px] text-muted">
+                  {repos.length === 0
+                    ? <>No repos yet. Create one, import from GitHub, or <code className="text-body">git push http://localhost:8930/&lt;org&gt;/&lt;repo&gt; main</code>.</>
+                    : <>No active repositories right now — <button className="text-steel-text hover:underline" onClick={() => navigate("/me")}>see all {repos.length} on your profile →</button></>}
+                </div>
+              )}
+              <div>
+                {activeRepos.map((r) => (
                   <button key={`${r.tenant}/${r.repo}`} onClick={() => navigate(`/${encodeURIComponent(r.tenant)}/${encodeURIComponent(r.repo)}`)} className="group w-full text-left block">
                     <div className="flex items-start gap-4 py-4 -mx-3 px-3 rounded-ctl border-b border-rule2 group-hover:bg-surface transition-colors">
                       <div className="flex-1 min-w-0">
@@ -1751,6 +1883,7 @@ export function App() {
                   </button>
                 ))}
               </div>
+              </div>
             </section>
 
             <aside className="grid gap-5 content-start">
@@ -1761,20 +1894,18 @@ export function App() {
                     <span>{h}</span><span className="text-faint">→</span>
                   </button>
                 ))}
-                <div className="pt-1"><LinkButton onClick={createOrg}>+ new organization</LinkButton></div>
               </Module>
-              <Module title="Live feed" tone="var(--clear)">
-                <div className="max-h-[440px] overflow-y-auto -mx-4 -my-3.5">
-                  {events.length === 0 && <div className="px-4 py-7 text-[13px] text-muted text-center">listening…</div>}
-                  {events.map((e, i) => (
-                    <div key={i} className="px-4 py-2.5 border-b border-rule3 last:border-0 text-[12.5px] leading-[1.5] text-body">{renderEvent(e)}</div>
-                  ))}
-                </div>
+              <Module title="Profile">
+                <button className="text-left text-[13.5px] text-body hover:text-steel-text cursor-pointer flex items-center justify-between w-full" onClick={() => navigate("/me")}>
+                  <span>All {repos.length} {repos.length === 1 ? "repository" : "repositories"}</span><span className="text-faint">→</span>
+                </button>
+                <p className="text-[12px] text-muted mt-1 leading-[1.5]">Every repo you can access, across orgs.</p>
               </Module>
             </aside>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* ── ISSUE detail page ─────────────────────────────────────────────── */}
       {view === "repo" && currentIssue && (() => {
@@ -1985,21 +2116,6 @@ export function App() {
             <p className="text-[13px] text-muted mb-6">{acct.members.length} member{acct.members.length === 1 ? "" : "s"} · {teams.length} team{teams.length === 1 ? "" : "s"} · {acct.repos.length} repo{acct.repos.length === 1 ? "" : "s"}</p>
             <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-12 gap-y-9">
               <section className="min-w-0 grid gap-8">
-                {importList !== null && (
-                  <Card>
-                    <SectionHeader label="Import from GitHub" right={<LinkButton onClick={() => setImportList(null)}>close</LinkButton>} />
-                    <div className="max-h-[420px] overflow-y-auto">
-                      {importList.length === 0 && <div className="px-5 py-6 text-[13px] text-muted">No repositories available from this connection.</div>}
-                      {importList.map((full) => (
-                        <div key={full} className="px-5 py-3 border-b border-rule2 last:border-0 flex items-center gap-3">
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" className="text-dim"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.71.08-.71 1.17.08 1.79 1.2 1.79 1.2 1.04 1.79 2.73 1.27 3.4.97.1-.76.4-1.27.74-1.56-2.56-.29-5.26-1.28-5.26-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.7 5.4-5.28 5.69.42.36.79 1.07.79 2.16v3.2c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z" /></svg>
-                          <span className="flex-1 text-[13.5px] font-medium tabular-nums">{full}</span>
-                          <Button size="sm" disabled={importBusy === full} onClick={() => importRepo(acct.id, full)}>{importBusy === full ? "importing…" : "Import"}</Button>
-                        </div>
-                      ))}
-                    </div>
-                  </Card>
-                )}
                 <div>
                   <Eyebrow label="Members" />
                   <Card>
@@ -2062,24 +2178,6 @@ export function App() {
                   ))}
                   {amAdmin && <div className="pt-1"><LinkButton onClick={() => setNewRepoOpen(true)}>+ new repo</LinkButton></div>}
                 </Module>
-                {amAdmin && (
-                  <Module title="GitHub" tone={ghStatus?.connected ? "var(--clear)" : ""}>
-                    {ghStatus?.connected ? (
-                      <>
-                        <Stat k="connected" v={ghStatus.login} />
-                        <div className="flex gap-2 items-center pt-1">
-                          <Button size="sm" onClick={() => openImport(acct.id)}>Import a repo</Button>
-                          <LinkButton onClick={() => disconnectGh(acct.id)}>disconnect</LinkButton>
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <p className="text-[12.5px] text-muted leading-[1.5]">Connect this org to a GitHub App installation to import its repositories. Only you (an admin) can see or import them.</p>
-                        <Button size="sm" onClick={() => connectGh(acct.id)}>Connect GitHub</Button>
-                      </>
-                    )}
-                  </Module>
-                )}
                 {!amAdmin && <Module title="Access"><span className="text-[12.5px] text-muted">You are viewing as a {me ? "member" : "guest"}. Owner/admin rights are needed to manage members and teams.</span></Module>}
               </aside>
             </div>
@@ -2274,8 +2372,12 @@ export function App() {
                 <SectionHeader label="General" />
                 <div className="px-5 py-4 grid gap-4">
                   <div className="flex items-center justify-between gap-4">
-                    <div><div className="text-[13.5px] font-medium">Private</div><div className="text-[12.5px] text-muted">Hidden from non-members.</div></div>
-                    <Switch on={!!s?.private} onChange={(on: boolean) => isTenantOwner && saveRepoSettings({ private: on })} />
+                    <div>
+                      <div className="text-[13.5px] font-medium">Visibility</div>
+                      <div className="text-[12.5px] text-muted">{(s?.visibility ?? (s?.private ? "private" : "public")) === "private" ? "Only members can see it." : (s?.visibility === "unlisted" ? "Anyone with the link can see it, but it's hidden from listings." : "Anyone can find and view it.")}</div>
+                    </div>
+                    <Picker width={200} value={s?.visibility ?? (s?.private ? "private" : "public")} onChange={(v) => isTenantOwner && saveRepoSettings({ visibility: v as "public" | "private" | "unlisted" })}
+                      options={[{ value: "public", label: "Public" }, { value: "unlisted", label: "Unlisted" }, { value: "private", label: "Private" }]} />
                   </div>
                   <div className="flex items-center justify-between gap-4">
                     <div><div className="text-[13.5px] font-medium">Require a review to merge</div><div className="text-[12.5px] text-muted">On top of the built-in author-independence gate.</div></div>
@@ -2283,13 +2385,19 @@ export function App() {
                   </div>
                 </div>
               </Card>
-              <Card>
-                <SectionHeader label="Default reviewers" right={<span className="text-[12.5px] text-muted">auto-requested on new pull requests</span>} />
+              {(() => {
+                const coOwners = [...new Set(ownerRules.flatMap((r) => r.owners))];
+                const isOwner = (actor: string) => coOwners.includes(actor);
+                const missingOwners = coOwners.filter((o) => !(s?.default_reviewers ?? []).some((x) => x.actor === o));
+                return (
+                <Card>
+                <SectionHeader label="Default reviewers" right={<span className="text-[12.5px] text-muted">auto-requested on new pull requests · code owners are pre-suggested</span>} />
                 <div className="px-5 py-4 grid gap-3">
                   <div className="flex flex-wrap gap-1.5">
                     {(s?.default_reviewers ?? []).map((r) => (
                       <span key={r.actor} className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-chip bg-paper border border-rule">
                         {r.handle || r.actor.slice(0, 8)}
+                        {isOwner(r.actor) && <span className="text-[9.5px] font-bold uppercase tracking-[0.05em] text-steel-text bg-steel-wash rounded-[3px] px-1" title="also a code owner">owner</span>}
                         {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveRepoSettings({ default_reviewers: (s!.default_reviewers.filter((x) => x.actor !== r.actor)).map((x) => x.actor) })}>×</button>}
                       </span>
                     ))}
@@ -2297,10 +2405,19 @@ export function App() {
                   </div>
                   {isTenantOwner && (
                     <div className="max-w-[280px]"><Picker block value="" placeholder="Add a reviewer…" onChange={(v) => { if (v && s) saveRepoSettings({ default_reviewers: [...new Set([...s.default_reviewers.map((x) => x.actor), v])] }); }}
-                      options={reviewerCandidates.filter((a) => !(s?.default_reviewers ?? []).some((x) => x.actor === a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} /></div>
+                      options={reviewerCandidates.filter((a) => !(s?.default_reviewers ?? []).some((x) => x.actor === a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}${isOwner(a.id) ? " · code owner" : ""}` }))} /></div>
+                  )}
+                  {isTenantOwner && coOwners.length > 0 && (
+                    <div className="text-[12px] text-muted pt-2 border-t border-rule3 flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                      <span>Code owners:</span>
+                      <span className="text-body">{coOwners.map((o) => handleOf(o)).join(", ")}.</span>
+                      {missingOwners.length > 0 && s && <button className="text-steel-text font-medium hover:underline" onClick={() => saveRepoSettings({ default_reviewers: [...new Set([...s.default_reviewers.map((x) => x.actor), ...coOwners])] })}>Add {missingOwners.length} as default reviewer{missingOwners.length > 1 ? "s" : ""} →</button>}
+                    </div>
                   )}
                 </div>
               </Card>
+                );
+              })()}
               <Card>
                 <SectionHeader label="Team access" />
                 <div className="px-5 py-4 grid gap-3">
@@ -2336,28 +2453,6 @@ export function App() {
                   )}
                 </div>
               </Card>
-              {ciConfig && (
-                <Card>
-                  <SectionHeader label="Checks" right={<span className="text-[12.5px] text-muted">how checks run</span>} />
-                  <div className="px-5 py-4 grid gap-3">
-                    <p className="text-[13px] text-body leading-[1.5]">
-                      {ciConfig.url ? <>Dispatched to <code className="text-[12px]">{ciConfig.url}</code></> : "Run on the built-in local runner."}
-                      <span className="text-faint"> · {ciConfig.source}{ciConfig.has_secret ? " · secret set" : ""}</span>
-                    </p>
-                    {isTenantOwner && (
-                      <div className="grid gap-2 max-w-[420px]">
-                        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="https://your-ci/hull (blank = local runner)" value={ciUrl} onChange={(e) => setCiUrl(e.target.value)} spellCheck={false} />
-                        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="shared secret (optional)" value={ciSecret} onChange={(e) => setCiSecret(e.target.value)} spellCheck={false} />
-                        <div className="flex gap-2">
-                          <Button size="sm" variant="secondary" onClick={() => setCiSecret(bytesToHex(crypto.getRandomValues(new Uint8Array(32))))}>Generate secret</Button>
-                          <Button size="sm" onClick={() => saveCiConfig(false)}>Save</Button>
-                          {ciConfig.source === "repo" && <Button size="sm" variant="ghost" onClick={() => saveCiConfig(true)}>Clear</Button>}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </Card>
-              )}
               {mirror?.target && (
                 <Card>
                   <SectionHeader label="Mirror" right={<span className="text-[12.5px] text-muted">outbound delivery</span>} />
@@ -3574,17 +3669,5 @@ function ReviewPage({
   );
 }
 
-function renderEvent(e: ActivityEvent) {
-  switch (e.kind) {
-    case "agent_brief":
-      return <><b>{e.actor}</b> is working in <b>{e.repo}</b> · <code className="text-muted">{e.file}</code> — {e.task}</>;
-    case "lesson":
-      return <>lesson in <b>{e.repo}</b> · <code className="text-muted">{e.file}</code>: <i>{e.lesson}</i></>;
-    case "push":
-      return <><b>{e.actor}</b> pushed to <b>{e.repo}</b> · <code className="text-muted">{e.change}</code></>;
-    case "issue":
-      return <><b>{e.actor}</b> {e.action} issue #{e.number} in <b>{e.repo}</b></>;
-  }
-}
 
 

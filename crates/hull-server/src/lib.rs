@@ -288,6 +288,7 @@ fn make_router(app: App) -> Router {
         .route("/api/actors/:id/github", post(link_github))
         .route("/api/accounts", get(accounts_list).post(create_account))
         .route("/api/accounts/available", get(account_available))
+        .route("/api/repos/available", get(repo_available))
         .route("/api/auth/available", get(username_available))
         .route("/api/accounts/:id/members", post(add_member))
         .route("/api/accounts/:id/members/:actor", axum::routing::delete(remove_member))
@@ -452,8 +453,32 @@ async fn home(State(app): State<App>, headers: axum::http::HeaderMap, Query(_q):
             .partial_cmp(&a.get("score").and_then(Value::as_f64).unwrap_or(0.0))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    // Relevant open work across the user's repos — issues they opened / are assigned / are mentioned in,
+    // and open PRs they authored or were asked to review — so the home page surfaces the actual to-dos,
+    // not just repos.
+    let me = actor.id.as_str();
+    let mut rel_issues: Vec<Value> = Vec::new();
+    let mut rel_prs: Vec<Value> = Vec::new();
+    for acct in &accts {
+        for repo in app.store.repos().into_iter().filter(|rp| rp.owner == acct.id) {
+            let key = format!("{}/{}", acct.handle, repo.name);
+            for is in app.store.issues(&key) {
+                if !matches!(is.status, IssueStatus::Open) { continue; }
+                let reason = if is.author == me { "you opened" } else if is.assignees.iter().any(|a| a == me) { "assigned to you" } else if is.referenced_actors.iter().any(|a| a == me) { "you're mentioned" } else { continue };
+                rel_issues.push(json!({ "tenant": acct.handle, "repo": repo.name, "number": is.number, "title": is.title, "author": is.author, "reason": reason, "ts": is.created_unix }));
+            }
+            for pr in app.store.prs(&key) {
+                if pr.state != PrState::Open { continue; }
+                let reason = if pr.reviewers.iter().any(|a| a == me) { "review requested" } else if pr.author == me { "you opened" } else { continue };
+                rel_prs.push(json!({ "tenant": acct.handle, "repo": repo.name, "number": pr.number, "title": pr.title, "author": pr.author, "reason": reason, "verification": pr.verification }));
+            }
+        }
+    }
+    rel_issues.sort_by(|a, b| b["ts"].as_u64().unwrap_or(0).cmp(&a["ts"].as_u64().unwrap_or(0)));
+    rel_issues.truncate(15);
+    rel_prs.truncate(15);
     let handles: Vec<String> = accts.iter().map(|a| a.handle.clone()).collect();
-    Json(json!({ "repos": items, "accounts": handles }))
+    Json(json!({ "repos": items, "accounts": handles, "issues": rel_issues, "prs": rel_prs }))
 }
 
 /// The accounts an actor is a member of.
@@ -637,6 +662,20 @@ async fn account_available(State(app): State<App>, Query(q): Query<HashMap<Strin
     Json(json!({ "handle": handle, "available": !handle.is_empty() && !taken }))
 }
 
+/// `GET /api/repos/available?account=X&name=Y` — is a repo name free under that account?
+async fn repo_available(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+    let account = q.get("account").map(String::as_str).unwrap_or("");
+    let name = sanitize_handle(q.get("name").map(String::as_str).unwrap_or(""));
+    let taken = app
+        .store
+        .accounts()
+        .into_iter()
+        .find(|a| a.handle.eq_ignore_ascii_case(account))
+        .map(|acct| app.store.repos().into_iter().any(|r| r.owner == acct.id && r.name.eq_ignore_ascii_case(&name)))
+        .unwrap_or(false);
+    Json(json!({ "name": name, "available": !name.is_empty() && !taken }))
+}
+
 /// `GET /api/auth/available?username=X` — is a username free? Returns the sanitized form.
 async fn username_available(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
     let username = sanitize_handle(q.get("username").map(String::as_str).unwrap_or(""));
@@ -774,6 +813,8 @@ fn repo_settings_value(app: &App, tenant: &str, repo: &str) -> Value {
     let teams: Vec<Value> = s.team_access.iter().map(|t| json!({ "team": t.team, "role": t.role })).collect();
     json!({
         "private": s.private,
+        "unlisted": s.unlisted,
+        "visibility": if s.private { "private" } else if s.unlisted { "unlisted" } else { "public" },
         "require_review_to_land": s.require_review_to_land,
         "default_reviewers": reviewers,
         "team_access": teams,
@@ -804,8 +845,16 @@ async fn set_repo_settings(State(app): State<App>, Path((tenant, repo)): Path<(S
     }
     let key = format!("{tenant}/{repo}");
     let mut s = app.repo_settings.get(&key);
+    // Accept either a `visibility` enum ("public"|"private"|"unlisted") or the legacy `private` bool.
+    if let Some(vis) = body.get("visibility").and_then(Value::as_str) {
+        s.private = vis == "private";
+        s.unlisted = vis == "unlisted";
+    }
     if let Some(p) = body.get("private").and_then(Value::as_bool) {
         s.private = p;
+    }
+    if let Some(u) = body.get("unlisted").and_then(Value::as_bool) {
+        s.unlisted = u;
     }
     if let Some(r) = body.get("require_review_to_land").and_then(Value::as_bool) {
         s.require_review_to_land = r;

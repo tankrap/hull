@@ -21,6 +21,9 @@ pub struct RepoSettings {
     /// Private repos are hidden from non-members (advisory in this build; the flag is authoritative).
     #[serde(default)]
     pub private: bool,
+    /// Unlisted: readable by anyone with the link (not private), but excluded from public listings.
+    #[serde(default)]
+    pub unlisted: bool,
     /// Reviewers auto-requested on every new voyage.
     #[serde(default)]
     pub default_reviewers: Vec<ActorId>,
