@@ -188,6 +188,9 @@ pub struct User {
     pub passkeys: Vec<PasskeyCred>,
     #[serde(default)]
     pub created_unix: u64,
+    /// A short self-description shown on the profile page. Free text, user-editable.
+    #[serde(default)]
+    pub bio: String,
 }
 
 /// A registered WebAuthn passkey. `data` is the opaque `webauthn_rs::prelude::Passkey`, kept as JSON

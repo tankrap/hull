@@ -872,6 +872,16 @@ export function App() {
       .catch(() => {});
   };
   useEffect(() => { if (authPage === "account") loadAccount(); }, [authPage, token]);
+  // Profile page: bio + a year of contributions (mine + my agents'), for the heatmap.
+  type ProfileStats = { handle: string; bio: string; total: number; human_count: number; days: { day: number; count: number }[]; agents: { handle: string; count: number }[] };
+  const [profileStats, setProfileStats] = useState<ProfileStats | null>(null);
+  const [bioDraft, setBioDraft] = useState<string | null>(null); // non-null = editing
+  const loadProfile = () => { if (token) fetch("/api/profile", { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then(setProfileStats).catch(() => {}); };
+  useEffect(() => { if (authPage === "profile") loadProfile(); /* eslint-disable-next-line */ }, [authPage, token]);
+  const saveBio = async (bio: string) => {
+    await fetch("/api/account", { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ bio }) });
+    setBioDraft(null); loadProfile();
+  };
   const saveAccount = async (patch: { username?: string; email?: string }) => {
     const res = await fetch("/api/account", { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
     if (!res.ok) return uiAlert(await res.text());
@@ -1537,16 +1547,61 @@ export function App() {
         <div className="grid gap-6">
           {me && (
             <Card>
-              <div className="px-5 py-4 flex items-center gap-3">
-                <Avatar id={me.id} handle={me.handle} kind={me.kind} size={40} />
-                <div className="min-w-0">
-                  <div className="text-[16px] font-semibold">{me.handle}</div>
-                  <div className="text-[12.5px] text-muted">{me.kind}{profile?.accountable ? " · accountable" : ""} · member of {myAccounts.length} org{myAccounts.length === 1 ? "" : "s"}</div>
+              {/* Banner (future) — a placeholder header the account will later be able to customize. */}
+              <div className="h-[104px] bg-gradient-to-r from-steel-wash via-paper to-brass-wash relative" title="Profile banner — coming soon">
+                <span className="absolute right-3 top-2.5 text-[11px] font-semibold uppercase tracking-[0.06em] text-muted/70">banner · soon</span>
+              </div>
+              <div className="px-5 pb-4">
+                <div className="flex items-end gap-3 -mt-8">
+                  <span className="rounded-full ring-4 ring-surface bg-surface"><Avatar id={me.id} handle={me.handle} kind={me.kind} size={72} /></span>
+                  <div className="flex-1 min-w-0 pb-1">
+                    <div className="text-[19px] font-semibold leading-tight">{me.handle}</div>
+                    <div className="text-[12.5px] text-muted">{me.kind}{profile?.accountable ? " · accountable" : ""} · member of {myAccounts.length} org{myAccounts.length === 1 ? "" : "s"}</div>
+                  </div>
+                  <button onClick={() => navigate("/settings")} className="text-[12.5px] text-steel-text hover:underline flex-none pb-1">Account settings →</button>
                 </div>
-                <button onClick={() => navigate("/settings")} className="ml-auto text-[12.5px] text-steel-text hover:underline flex-none">Account settings →</button>
+                {/* Bio */}
+                <div className="mt-3 max-w-[560px]">
+                  {bioDraft !== null ? (
+                    <div className="grid gap-2">
+                      <textarea autoFocus value={bioDraft} onChange={(e) => setBioDraft(e.target.value.slice(0, 280))} rows={2} placeholder="Tell people what you work on…" className="w-full box-border px-2.5 py-2 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body resize-y" />
+                      <div className="flex items-center gap-2"><Button size="sm" onClick={() => saveBio(bioDraft)}>Save</Button><LinkButton onClick={() => setBioDraft(null)}>cancel</LinkButton><span className="text-[11.5px] text-faint ml-auto">{bioDraft.length}/280</span></div>
+                    </div>
+                  ) : (profileStats?.bio || "").trim() ? (
+                    <p className="text-[13.5px] text-body leading-[1.55]">{profileStats!.bio} <button onClick={() => setBioDraft(profileStats!.bio)} className="text-[12px] text-steel-text hover:underline">edit</button></p>
+                  ) : (
+                    <button onClick={() => setBioDraft("")} className="text-[13px] text-muted hover:text-steel-text">+ Add a bio</button>
+                  )}
+                </div>
               </div>
             </Card>
           )}
+
+          {/* Contributions */}
+          <Card>
+            <SectionHeader label={`${profileStats?.total ?? 0} contribution${(profileStats?.total ?? 0) === 1 ? "" : "s"} in the last year`} right={<span className="text-[12.5px] text-muted">you + your agents</span>} />
+            <div className="px-5 py-4">
+              <ContributionHeatmap days={profileStats?.days ?? []} />
+              <div className="mt-4 grid gap-1.5 pt-3 border-t border-rule3">
+                <div className="flex items-center gap-2 text-[13px]">
+                  <Avatar id={me?.id} handle={me?.handle} kind="human" size={18} />
+                  <span className="font-medium">{me?.handle}</span>
+                  <span className="text-muted">directly</span>
+                  <span className="ml-auto tabular-nums text-body">{profileStats?.human_count ?? 0}</span>
+                </div>
+                {(profileStats?.agents ?? []).map((a) => (
+                  <div key={a.handle} className="flex items-center gap-2 text-[13px] pl-5">
+                    <span className="text-faint">↳</span>
+                    <Avatar handle={a.handle} kind="agent" size={16} />
+                    <span className="text-steel-text">{a.handle}</span>
+                    <span className="ml-auto tabular-nums text-muted">{a.count}</span>
+                  </div>
+                ))}
+                {(profileStats?.agents ?? []).length === 0 && <div className="text-[12px] text-faint pl-5">no agents accountable to you have contributed yet</div>}
+              </div>
+            </div>
+          </Card>
+
           <div>
             <Eyebrow label="All repositories" right={`${repos.length}`} />
             {repos.length === 0 && <div className="py-8 text-[13px] text-muted">No repositories yet.</div>}
@@ -2513,6 +2568,42 @@ export function App() {
     </div>
   );
 }
+// A GitHub-style contribution heatmap: ~53 weeks × 7 days, coloured by daily contribution count.
+// `days` are (day-since-epoch, count) pairs; cells outside the trailing year render empty.
+function ContributionHeatmap({ days }: { days: { day: number; count: number }[] }) {
+  const byDay = new Map(days.map((d) => [d.day, d.count]));
+  const today = Math.floor(Date.now() / 86_400_000);
+  const start = today - 371;
+  const dow = (e: number) => ((e % 7) + 4) % 7; // epoch day 0 = Thursday; 0=Sun … 6=Sat
+  const gridStart = start - dow(start);
+  const max = Math.max(1, ...days.map((d) => d.count));
+  const level = (c: number) => (c <= 0 ? 0 : c <= max * 0.25 ? 1 : c <= max * 0.5 ? 2 : c <= max * 0.75 ? 3 : 4);
+  const shade = ["bg-rule2/70", "bg-clear/30", "bg-clear/55", "bg-clear/80", "bg-clear"];
+  const weeks: number[][] = [];
+  for (let w = 0; gridStart + w * 7 <= today; w++) {
+    const col: number[] = [];
+    for (let d = 0; d < 7; d++) { const e = gridStart + w * 7 + d; col.push(e >= start && e <= today ? (byDay.get(e) ?? 0) : -1); }
+    weeks.push(col);
+  }
+  const fmt = (e: number) => new Date(e * 86_400_000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return (
+    <div className="grid gap-2">
+      <div className="flex gap-[3px] overflow-x-auto pb-1">
+        {weeks.map((col, i) => (
+          <div key={i} className="grid gap-[3px] content-start">
+            {col.map((c, j) => c < 0
+              ? <span key={j} className="w-[11px] h-[11px]" />
+              : <span key={j} title={`${c} contribution${c === 1 ? "" : "s"} · ${fmt(gridStart + i * 7 + j)}`} className={`w-[11px] h-[11px] rounded-[2px] ${shade[level(c)]}`} />)}
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-1.5 text-[11.5px] text-muted self-end">
+        Less {shade.map((s, i) => <span key={i} className={`w-[11px] h-[11px] rounded-[2px] ${s}`} />)} More
+      </div>
+    </div>
+  );
+}
+
 // ── Files tab: a branch-aware file browser with fuzzy/full-text search ──────────────────────────
 type TreeItem = { name: string; path: string; dir: boolean; size: number };
 type SearchHit = { path: string; line: number; text: string; kind: "path" | "content" };

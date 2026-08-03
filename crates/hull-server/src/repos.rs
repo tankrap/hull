@@ -233,6 +233,42 @@ impl RepoHost {
     }
 }
 
+impl RepoHost {
+    /// `(author, unix)` for every change reachable from ANY ref (all branches) newer than `since` —
+    /// the raw material for a contribution heatmap. Each change is counted once. Stops descending a
+    /// branch once it predates `since` (parents are older still) and caps total work.
+    pub fn history(&self, tenant: &str, repo: &str, extra_roots: &[String], since: u64) -> Vec<(String, u64)> {
+        let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return vec![] };
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<keel_store::ObjectId> = store.list_refs().unwrap_or_default().into_iter().map(|(_, id)| id).collect();
+        // Feature branches aren't keel refs, but every PR/voyage points at its change — seed those too
+        // so work on unmerged branches still counts.
+        for hex in extra_roots {
+            if let Some(oid) = keel_store::ObjectId::from_hex(hex) {
+                stack.push(oid);
+            }
+        }
+        while let Some(id) = stack.pop() {
+            if out.len() > 50_000 {
+                break;
+            }
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.insert(id);
+            let Ok(Some(Object::Change(c))) = store.get(&id) else { continue };
+            if c.timestamp >= since {
+                out.push((c.author.clone(), c.timestamp));
+                for p in c.parents {
+                    stack.push(p);
+                }
+            }
+        }
+        out
+    }
+}
+
 /// One entry in a directory listing for the file browser.
 #[derive(serde::Serialize)]
 pub struct TreeItem {

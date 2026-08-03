@@ -310,6 +310,7 @@ fn make_router(app: App) -> Router {
         .route("/api/auth/passkey/finish", post(passkey_finish))
         // account self-service (settings): username/email + passkey management
         .route("/api/account", get(account_get).put(account_update))
+        .route("/api/profile", get(profile))
         .route("/api/account/passkeys/start", post(account_passkey_start))
         .route("/api/account/passkeys/finish", post(account_passkey_finish))
         .route("/api/account/passkeys/:cred", axum::routing::delete(account_passkey_delete))
@@ -485,6 +486,55 @@ async fn home(State(app): State<App>, headers: axum::http::HeaderMap, Query(_q):
     rel_prs.truncate(15);
     let handles: Vec<String> = accts.iter().map(|a| a.handle.clone()).collect();
     Json(json!({ "repos": items, "accounts": handles, "issues": rel_issues, "prs": rel_prs }))
+}
+
+/// `GET /api/profile` — the signed-in user's profile: bio + a year of contributions (their own and
+/// their accountable agents'), bucketed by day, across every repo they belong to. Powers the heatmap.
+async fn profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    let Some(me) = authed_actor(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "not signed in").into_response();
+    };
+    let bio = app.store.user_by_actor(&me.id).map(|u| u.bio).unwrap_or_default();
+    let since = now().saturating_sub(371 * 86_400);
+    // A change's author is the git author string ("handle <email> ..."), so we attribute by HANDLE:
+    // mine = my own handle + every agent handle whose accountability roots at me.
+    let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
+    mine.insert(me.handle.clone());
+    let mut agent_handles: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for a in app.store.actors() {
+        if a.id != me.id && a.human_principal().map(|h| h == &me.id).unwrap_or(false) {
+            mine.insert(a.handle.clone());
+            agent_handles.insert(a.handle.clone());
+        }
+    }
+    // The git author header is "Name <email> unixtime tz"; take the name part as the handle.
+    let handle_of = |author: &str| -> String { author.split_once(" <").map(|(n, _)| n.trim().to_string()).unwrap_or_else(|| author.trim().to_string()) };
+    let mut days: HashMap<u64, u64> = HashMap::new();
+    let mut by_handle: HashMap<String, u64> = HashMap::new();
+    let mut total = 0u64;
+    for acct in member_accounts(&app, &me.id) {
+        for repo in app.store.repos().into_iter().filter(|r| r.owner == acct.id) {
+            let key = format!("{}/{}", acct.handle, repo.name);
+            let roots: Vec<String> = app.store.prs(&key).into_iter().flat_map(|p| p.changes).collect();
+            for (author, ts) in app.repos.history(&acct.handle, &repo.name, &roots, since) {
+                let h = handle_of(&author);
+                if mine.contains(&h) {
+                    *days.entry(ts / 86_400).or_default() += 1;
+                    *by_handle.entry(h).or_default() += 1;
+                    total += 1;
+                }
+            }
+        }
+    }
+    let days_v: Vec<Value> = days.into_iter().map(|(d, c)| json!({ "day": d, "count": c })).collect();
+    let mut agents_v: Vec<Value> = by_handle
+        .iter()
+        .filter(|(h, _)| agent_handles.contains(*h))
+        .map(|(h, c)| json!({ "handle": h, "count": c }))
+        .collect();
+    agents_v.sort_by(|a, b| b["count"].as_u64().unwrap_or(0).cmp(&a["count"].as_u64().unwrap_or(0)));
+    let human_count = by_handle.get(&me.handle).copied().unwrap_or(0);
+    Json(json!({ "handle": me.handle, "bio": bio, "total": total, "human_count": human_count, "days": days_v, "agents": agents_v })).into_response()
 }
 
 /// The accounts an actor is a member of.
@@ -1435,6 +1485,7 @@ async fn register_finish(State(app): State<App>, Json(body): Json<Value>) -> Res
         secret_key: minted.secret_key,
         passkeys: vec![PasskeyCred { id: cred_id, name: "passkey".into(), created_unix: now(), data: serde_json::to_value(&pk).unwrap_or(Value::Null) }],
         created_unix: now(),
+        bio: String::new(),
     };
     app.store.put_actor(minted.actor.clone());
     app.store.put_user(user.clone());
@@ -1509,7 +1560,7 @@ async fn account_get(State(app): State<App>, headers: axum::http::HeaderMap) -> 
         return (StatusCode::NOT_FOUND, "this actor is a legacy key login, not a hosted account").into_response();
     };
     let passkeys: Vec<Value> = user.passkeys.iter().map(|p| json!({ "id": p.id, "name": p.name, "created_unix": p.created_unix })).collect();
-    Json(json!({ "username": user.username, "email": user.email, "actor": user.actor, "passkeys": passkeys, "created_unix": user.created_unix })).into_response()
+    Json(json!({ "username": user.username, "email": user.email, "bio": user.bio, "actor": user.actor, "passkeys": passkeys, "created_unix": user.created_unix })).into_response()
 }
 
 /// `PUT /api/account` — change username and/or email. Keeps the actor + personal-account handle in sync.
@@ -1539,8 +1590,11 @@ async fn account_update(State(app): State<App>, headers: axum::http::HeaderMap, 
     if let Some(em) = body.get("email").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
         user.email = em.to_string();
     }
+    if let Some(bio) = body.get("bio").and_then(Value::as_str) {
+        user.bio = bio.chars().take(280).collect();
+    }
     app.store.put_user(user.clone());
-    Json(json!({ "username": user.username, "email": user.email })).into_response()
+    Json(json!({ "username": user.username, "email": user.email, "bio": user.bio })).into_response()
 }
 
 /// `POST /api/account/passkeys/start` — begin adding another passkey to the signed-in account.
