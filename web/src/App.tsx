@@ -233,19 +233,28 @@ function Popover({ trigger, children, align = "left", width = 300, direction = "
 
 // Styled select (replaces native <select>). options: {value,label}[]. When value is "" it shows the
 // placeholder — used both for bound selects and "pick to act" menus.
-function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", block = false, className = "" }: { value: string; onChange: (v: string) => void; options: { value: string; label: string }[]; placeholder?: string; width?: number; size?: "sm" | "md"; block?: boolean; className?: string }) {
+function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", block = false, direction = "down", className = "" }: { value: string; onChange: (v: string) => void; options: { value: string; label: string }[]; placeholder?: string; width?: number; size?: "sm" | "md"; block?: boolean; direction?: "down" | "up"; className?: string }) {
   const cur = options.find((o) => o.value === value);
   const h = size === "sm" ? "h-ctl-sm text-xs" : "h-ctl text-[13px]";
+  const [q, setQ] = useState("");
+  const searchable = options.length >= 8;
+  const ql = q.trim().toLowerCase();
+  const filtered = ql ? options.filter((o) => o.label.toLowerCase().includes(ql)) : options;
   return (
-    <Popover align="left" width={width} block={block} trigger={(open) => (
+    <Popover align="left" width={width} block={block} direction={direction} onToggle={(o) => { if (!o) setQ(""); }} trigger={(open) => (
       <span className={`inline-flex items-center justify-between gap-2 ${h} px-2.5 rounded-ctl border bg-surface transition-colors ${block ? "w-full" : ""} ${open ? "border-body" : "border-ctl hover:border-dim"} ${className}`}>
         <span className={`truncate ${cur ? "text-ink" : "text-faint"}`}>{cur?.label ?? placeholder}</span>
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`text-muted flex-none transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
       </span>
     )}>
-      <div className="py-1 max-h-[300px] overflow-auto">
-        {options.length === 0 && <div className="px-3 py-1.5 text-[12.5px] text-muted">none available</div>}
-        {options.map((o) => (
+      {searchable && (
+        <div className="p-1.5 border-b border-rule2 sticky top-0 bg-surface" onClick={(e) => e.stopPropagation()}>
+          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…" className="w-full box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" />
+        </div>
+      )}
+      <div className="py-1 max-h-[240px] overflow-auto">
+        {filtered.length === 0 && <div className="px-3 py-1.5 text-[12.5px] text-muted">{ql ? "no matches" : "none available"}</div>}
+        {filtered.map((o) => (
           <button key={o.value} type="button" onClick={() => onChange(o.value)} className={`w-full text-left px-3 py-1.5 text-[13px] hover:bg-paper ${o.value === value ? "bg-paper font-medium text-ink" : "text-body"}`}>{o.label}</button>
         ))}
       </div>
@@ -336,7 +345,7 @@ function NewIssueModal({ repos, defaultRepo, actors, onClose, onCreate }: { repo
                 <button className="hover:text-fault-text" onClick={() => setAssignees((s) => s.filter((x) => x !== id))}>✕</button>
               </span>
             ); })}
-            <Picker size="sm" width={240} value="" placeholder="Add assignee…" onChange={(v) => setAssignees((s) => s.includes(v) ? s : [...s, v])}
+            <Picker size="sm" width={240} direction="up" value="" placeholder="Add assignee…" onChange={(v) => setAssignees((s) => s.includes(v) ? s : [...s, v])}
               options={sorted.filter((a) => !assignees.includes(a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} />
           </div>
         </Field>
@@ -389,6 +398,78 @@ const StatusDot = ({ tone, size = 18 }: { tone: "ok" | "bad" | "warn" | "wait" |
     </span>
   );
 };
+
+// The issue discussion thread + composer, as a STABLE top-level component so typing doesn't remount
+// it (which would steal focus on every keystroke). All state is passed in from App.
+type ThreadComment = { id: string; target: string; author: string; body: string; created_unix: number };
+function IssueThread({ target, comments, issues, commentDraft, setCommentDraft, issueMode, setIssueMode, runIssueMode, canAct, tenant, repo, handleOf, kindOf, boxRef }: {
+  target: string; comments: ThreadComment[]; issues: Issue[]; commentDraft: Record<string, string>; setCommentDraft: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  issueMode: Record<string, string>; setIssueMode: React.Dispatch<React.SetStateAction<Record<string, string>>>; runIssueMode: (target: string, num: number, mode: string) => void;
+  canAct: boolean; tenant: string; repo: string; handleOf: (id: string) => string; kindOf: (id: string) => string | undefined; boxRef: React.MutableRefObject<HTMLDivElement | null>;
+}) {
+  const msgs = comments.filter((c) => c.target === target).sort((a, b) => a.created_unix - b.created_unix);
+  const num = Number(target.split(":")[1]);
+  const issue = issues.find((i) => i.number === num);
+  const isOpen = (issue?.status.state ?? "open") === "open";
+  const draft = (commentDraft[target] ?? "").trim();
+  const ic = (d: React.ReactNode) => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{d}</svg>;
+  const modes: { id: string; label: string; hint: string; sub?: string; color: string; icon: React.ReactNode }[] = isOpen
+    ? [
+        { id: "comment", label: "Comment", hint: "Add a note", color: "text-dim", icon: ic(<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />) },
+        { id: "close", label: draft ? "Close with comment" : "Close issue", hint: "Resolved / completed", color: "text-clear-text", icon: ic(<><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></>) },
+        { id: "close_np", label: draft ? "Close with comment" : "Close issue", sub: "not planned", hint: "Won't fix / not planned", color: "text-muted", icon: ic(<><circle cx="12" cy="12" r="10" /><line x1="4.93" y1="4.93" x2="19.07" y2="19.07" /></>) },
+      ]
+    : [
+        { id: "comment", label: "Comment", hint: "Add a note", color: "text-dim", icon: ic(<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />) },
+        { id: "reopen", label: draft ? "Comment & reopen" : "Reopen issue", hint: "Back to open", color: "text-clear-text", icon: ic(<><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /></>) },
+      ];
+  const mode = modes.find((m) => m.id === (issueMode[target] ?? "comment")) ?? modes[0];
+  const disabled = !canAct || (mode.id === "comment" && !draft);
+  return (
+    <div className="grid gap-3">
+      {msgs.map((c) => (
+        <div className="flex gap-2.5" key={c.id}>
+          <Avatar id={c.author} handle={handleOf(c.author)} kind={kindOf(c.author)} size={26} />
+          <div className="flex-1 min-w-0 border border-rule2 rounded-ctl overflow-hidden">
+            <div className="flex items-center gap-2 px-3 py-1.5 bg-paper border-b border-rule3 text-[12.5px]">
+              <b className={kindOf(c.author) === "agent" ? "text-steel-text" : ""}>{handleOf(c.author)}</b>
+              <span className="text-faint tabular-nums" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
+            </div>
+            <Markdown text={c.body} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} className="px-3 py-2 text-[13.5px] text-body" />
+          </div>
+        </div>
+      ))}
+      {msgs.length === 0 && <div className="text-[13px] text-muted">no comments yet</div>}
+      <div className="mt-1 grid gap-2" ref={boxRef}>
+        {canAct ? <RichText value={commentDraft[target] ?? ""} onChange={(v) => setCommentDraft((d) => ({ ...d, [target]: v }))} rows={3} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} onSubmit={() => !disabled && runIssueMode(target, num, mode.id)} placeholder="Leave a comment…" />
+          : <div className="border border-ctl rounded-ctl px-2.5 py-2 text-[13px] text-faint">sign in to comment</div>}
+        <div className="flex justify-end">
+          {canAct ? (
+            <div className="flex-none inline-flex h-ctl">
+              <Button size="md" disabled={disabled} onClick={() => runIssueMode(target, num, mode.id)} className="!rounded-r-none whitespace-nowrap inline-flex items-center gap-1.5">{mode.icon}{mode.label}{mode.sub ? ` — ${mode.sub}` : ""}</Button>
+              <Popover align="right" width={250} direction="up" trigger={(open) => (
+                <span className={`inline-flex items-center h-ctl px-1.5 rounded-ctl rounded-l-none border-l border-l-white/25 bg-ink text-surface ${open ? "opacity-90" : ""}`}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={open ? "rotate-180 transition-transform" : "transition-transform"}><polyline points="6 9 12 15 18 9" /></svg>
+                </span>
+              )}>
+                <div className="py-1">
+                  {modes.map((m) => (
+                    <button key={m.id} type="button" onClick={() => setIssueMode((s) => ({ ...s, [target]: m.id }))}
+                      className={`w-full text-left px-3 py-2 flex items-start gap-2.5 hover:bg-paper ${m.id === mode.id ? "bg-paper" : ""}`}>
+                      <span className={`mt-[1px] flex-none ${m.color}`}>{m.icon}</span>
+                      <span className="min-w-0 flex-1"><span className="block text-[13px] font-medium text-body leading-tight">{m.label}{m.sub ? ` — ${m.sub}` : ""}</span><span className="block text-[11.5px] text-muted leading-tight mt-0.5">{m.hint}</span></span>
+                      {m.id === mode.id && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text mt-0.5 flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
+                    </button>
+                  ))}
+                </div>
+              </Popover>
+            </div>
+          ) : <Button size="md" disabled>Comment</Button>}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ── ⌘K command palette: search or jump to repos / issues / voyages / actions ──────
 type CmdItem = { id: string; group: string; label: string; sublabel?: string; icon?: React.ReactNode; run: () => void };
@@ -916,6 +997,9 @@ export function App() {
   const [view, setView] = useState<"home" | "repo">(() => parseRoute(location.pathname).view);
   const [tab, setTab] = useState<"issues" | "prs">(() => parseRoute(location.pathname).tab);
   const [issueView, setIssueView] = useState<"list" | "board">("list");
+  type StateFilter = "open" | "closed" | "all";
+  const [issueFilter, setIssueFilter] = useState<StateFilter>("open");
+  const [prFilter, setPrFilter] = useState<StateFilter>("open");
   const [openIssue, setOpenIssue] = useState<number | null>(() => parseRoute(location.pathname).openIssue);
   // Default the issues/PRs repo to whatever's actually active, so it's never stuck on a stale name.
   useEffect(() => {
@@ -1122,75 +1206,10 @@ export function App() {
     if (res.ok) { setCommentDraft((d) => ({ ...d, [target]: "" })); loadComments(); }
     else uiAlert(await res.text());
   };
-  // A reusable thread block for a target (pr:N / issue:N).
-  const Thread = ({ target }: { target: string }) => {
-    const msgs = comments.filter((c) => c.target === target).sort((a, b) => a.created_unix - b.created_unix);
-    return (
-      <div className="grid gap-3">
-        {msgs.map((c) => (
-          <div className="flex gap-2.5" key={c.id}>
-            <Avatar id={c.author} handle={handleOf(c.author)} kind={kindOf(c.author)} size={26} />
-            <div className="flex-1 min-w-0 border border-rule2 rounded-ctl overflow-hidden">
-              <div className="flex items-center gap-2 px-3 py-1.5 bg-paper border-b border-rule3 text-[12.5px]">
-                <b className={kindOf(c.author) === "agent" ? "text-steel-text" : ""}>{handleOf(c.author)}</b>
-                <span className="text-faint tabular-nums" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
-              </div>
-              <Markdown text={c.body} linkBase={`/${encodeURIComponent(tenant)}/${issueRepo}`} className="px-3 py-2 text-[13.5px] text-body" />
-            </div>
-          </div>
-        ))}
-        {msgs.length === 0 && <div className="text-[13px] text-muted">no comments yet</div>}
-        {(() => {
-          const num = Number(target.split(":")[1]);
-          const issue = issues.find((i) => i.number === num);
-          const isOpen = (issue?.status.state ?? "open") === "open";
-          const draft = (commentDraft[target] ?? "").trim();
-          const ic = (d: React.ReactNode) => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{d}</svg>;
-          const modes: { id: string; label: string; hint: string; sub?: string; color: string; icon: React.ReactNode }[] = isOpen
-            ? [
-                { id: "comment", label: "Comment", hint: "Add a note", color: "text-dim", icon: ic(<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />) },
-                { id: "close", label: draft ? "Close with comment" : "Close issue", hint: "Resolved / completed", color: "text-clear-text", icon: ic(<><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></>) },
-                { id: "close_np", label: draft ? "Close with comment" : "Close issue", sub: "not planned", hint: "Won't fix / not planned", color: "text-muted", icon: ic(<><circle cx="12" cy="12" r="10" /><line x1="4.93" y1="4.93" x2="19.07" y2="19.07" /></>) },
-              ]
-            : [
-                { id: "comment", label: "Comment", hint: "Add a note", color: "text-dim", icon: ic(<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />) },
-                { id: "reopen", label: draft ? "Comment & reopen" : "Reopen issue", hint: "Back to open", color: "text-clear-text", icon: ic(<><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /></>) },
-              ];
-          const mode = modes.find((m) => m.id === (issueMode[target] ?? "comment")) ?? modes[0];
-          const disabled = !canAct || (mode.id === "comment" && !draft);
-          return (
-            <div className="mt-1 grid gap-2" ref={commentBoxRef}>
-              {canAct ? <RichText value={commentDraft[target] ?? ""} onChange={(v) => setCommentDraft((d) => ({ ...d, [target]: v }))} rows={3} linkBase={`/${encodeURIComponent(tenant)}/${issueRepo}`} onSubmit={() => !disabled && runIssueMode(target, num, mode.id)} placeholder="Leave a comment…" />
-                : <div className="border border-ctl rounded-ctl px-2.5 py-2 text-[13px] text-faint">sign in to comment</div>}
-              <div className="flex justify-end">
-              {canAct ? (
-                <div className="flex-none inline-flex h-ctl">
-                  <Button size="md" disabled={disabled} onClick={() => runIssueMode(target, num, mode.id)} className="!rounded-r-none whitespace-nowrap inline-flex items-center gap-1.5">{mode.icon}{mode.label}{mode.sub ? ` — ${mode.sub}` : ""}</Button>
-                  <Popover align="right" width={250} direction="up" trigger={(open) => (
-                    <span className={`inline-flex items-center h-ctl px-1.5 rounded-ctl rounded-l-none border-l border-l-white/25 bg-ink text-surface ${open ? "opacity-90" : ""}`}>
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={open ? "rotate-180 transition-transform" : "transition-transform"}><polyline points="6 9 12 15 18 9" /></svg>
-                    </span>
-                  )}>
-                    <div className="py-1">
-                      {modes.map((m) => (
-                        <button key={m.id} type="button" onClick={() => setIssueMode((s) => ({ ...s, [target]: m.id }))}
-                          className={`w-full text-left px-3 py-2 flex items-start gap-2.5 hover:bg-paper ${m.id === mode.id ? "bg-paper" : ""}`}>
-                          <span className={`mt-[1px] flex-none ${m.color}`}>{m.icon}</span>
-                          <span className="min-w-0 flex-1"><span className="block text-[13px] font-medium text-body leading-tight">{m.label}{m.sub ? ` — ${m.sub}` : ""}</span><span className="block text-[11.5px] text-muted leading-tight mt-0.5">{m.hint}</span></span>
-                          {m.id === mode.id && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text mt-0.5 flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
-                        </button>
-                      ))}
-                    </div>
-                  </Popover>
-                </div>
-              ) : <Button size="md" disabled>Comment</Button>}
-              </div>
-            </div>
-          );
-        })()}
-      </div>
-    );
-  };
+  // The issue discussion thread is a stable top-level component (IssueThread) so typing in its
+  // composer doesn't remount and steal focus. This closure just binds the current App state to it.
+  const commentBoxRef = useRef<HTMLDivElement | null>(null);
+  const threadProps = { comments, issues, commentDraft, setCommentDraft, issueMode, setIssueMode, runIssueMode, canAct, tenant, repo: issueRepo, handleOf, kindOf, boxRef: commentBoxRef };
   const [autoReviewing, setAutoReviewing] = useState<number | null>(null);
   const requestReviewer = async (prNumber: number, reviewer: string) => {
     if (!canAct || !reviewer) return;
@@ -1283,7 +1302,6 @@ export function App() {
 
   // ── full-screen auth / account pages ──────────────────────────────────────
   // keyboard shortcuts: g→h/i/p navigation, c to comment, ? for help, / for the palette
-  const commentBoxRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     let lastG = 0;
     const onKey = (e: KeyboardEvent) => {
@@ -1810,7 +1828,7 @@ export function App() {
                 )}
                 <div className="grid gap-2.5">
                   <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">Discussion</span>
-                  <Thread target={`issue:${it.number}`} />
+                  <IssueThread target={`issue:${it.number}`} {...threadProps} />
                 </div>
               </section>
 
@@ -1917,8 +1935,8 @@ export function App() {
               {/* action */}
               <div className="px-4 py-3 bg-paper flex items-center gap-3 flex-wrap">
                 <Button size="sm" disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}>Merge</Button>
-                {!canLand && <span className="text-[12.5px] text-muted">Every check must pass before merging.</span>}
-                {!canLand && isTenantOwner && <LinkButton className="ml-auto" onClick={() => mergePr(p.number, true)}>Merge anyway (override)</LinkButton>}
+                {!canLand && <span className="text-[12.5px] text-muted">{isTenantOwner ? "Or override as an owner:" : "Every check must pass before merging."}</span>}
+                {!canLand && isTenantOwner && <Button size="sm" variant="secondary" className="ml-auto !text-fault-text" onClick={() => mergePr(p.number, true)}>Merge without checks</Button>}
                 {canAct && <LinkButton className="ml-auto" onClick={() => closePr(p.number, false)}>Close</LinkButton>}
               </div>
             </Card>
@@ -2233,8 +2251,14 @@ export function App() {
             <section className="min-w-0">
               {tab === "issues" && (
                 <>
-                  <div className="flex items-center justify-between gap-3 mb-6">
-                    <span className="text-[13px] text-muted"><b className="text-body font-medium tabular-nums">{openIssues} open</b>{issues.length - openIssues > 0 ? ` · ${issues.length - openIssues} closed` : ""}</span>
+                  <div className="flex items-center justify-between gap-3 mb-6 flex-wrap">
+                    <div className="inline-flex items-center gap-0.5 text-[13px] tabular-nums">
+                      {(["open", "closed", "all"] as const).map((fk) => (
+                        <button key={fk} onClick={() => setIssueFilter(fk)} className={`px-2.5 py-1 rounded-ctl-sm capitalize transition-colors ${issueFilter === fk ? "bg-rule2 text-ink font-medium" : "text-muted hover:text-ink"}`}>
+                          {fk === "open" ? `${openIssues} open` : fk === "closed" ? `${issues.length - openIssues} closed` : "all"}
+                        </button>
+                      ))}
+                    </div>
                     <div className="flex items-center gap-2.5">
                       <Segmented items={["List", "Board"]} value={issueView === "list" ? 0 : 1} onChange={(i: number) => setIssueView(i === 0 ? "list" : "board")} />
                       {canAct && <Button size="sm" variant="ghost" className="inline-flex items-center gap-1.5" onClick={() => setNewIssueOpen(true)}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>New issue</Button>}
@@ -2244,6 +2268,7 @@ export function App() {
                     <div>
                       {issues.length === 0 && <div className="py-8 text-[13px] text-muted">no issues yet — open one with the New issue button</div>}
                       {[...issues]
+                        .filter((it) => issueFilter === "all" || (issueFilter === "open" ? it.status.state === "open" : it.status.state !== "open"))
                         .filter((it) => matchQ(`${it.title} ${it.body} #${it.number} ${it.labels.join(" ")}`))
                         .sort((a, b) => Number(a.status.state !== "open") - Number(b.status.state !== "open") || b.number - a.number)
                         .map((it) => (
@@ -2307,9 +2332,15 @@ export function App() {
 
               {tab === "prs" && (
                 <>
+                  <div className="inline-flex items-center gap-0.5 text-[13px] tabular-nums mb-6">
+                    {(["open", "closed", "all"] as const).map((fk) => {
+                      const n = fk === "open" ? prs.filter((p) => p.state === "open").length : fk === "closed" ? prs.filter((p) => p.state !== "open").length : prs.length;
+                      return <button key={fk} onClick={() => setPrFilter(fk)} className={`px-2.5 py-1 rounded-ctl-sm capitalize transition-colors ${prFilter === fk ? "bg-rule2 text-ink font-medium" : "text-muted hover:text-ink"}`}>{fk === "all" ? `all ${n}` : `${n} ${fk}`}</button>;
+                    })}
+                  </div>
                   <div>
                     {prs.length === 0 && <div className="py-8 text-[13px] text-muted">no pull requests yet — agents open these when they push a change for review</div>}
-                    {[...prs].filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
+                    {[...prs].filter((p) => prFilter === "all" || (prFilter === "open" ? p.state === "open" : p.state !== "open")).filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
                       const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
                       return (
                         <button key={p.number} onClick={() => navigate(`${repoBase()}/voyages/${p.number}`)} className="group w-full text-left block border-b border-rule2">
@@ -2913,10 +2944,14 @@ function ReviewPage({
                     const oldS = span(w.old), nextS = span(w.next);
                     if (oldS || nextS) transforms.push({ old: oldS, next: nextS, ln: n + p });
                   });
+                  // Unpaired removals/additions in the run are pure delete/add — still summarize them.
+                  for (let p = pairs; p < dels.length; p++) { const t = dels[p].text.trim(); if (t) transforms.push({ old: t, next: "", ln: n }); }
+                  for (let p = pairs; p < adds.length; p++) { const t = adds[p].text.trim(); if (t) transforms.push({ old: "", next: t, ln: n + p }); }
                   dels.forEach((dl, p) => { out.push({ n: o, sign: "-", code: p < pairs ? <>{wdRender(wds[p].old, f.path, "old")}</> : <Hl text={dl.text} path={f.path} /> }); o++; });
                   adds.forEach((al, p) => { out.push({ n, sign: "+", code: p < pairs ? <>{wdRender(wds[p].next, f.path, "new")}</> : <Hl text={al.text} path={f.path} /> }); n++; });
                   k = a;
                 } else if (l.tag === "add") {
+                  const t = l.text.trim(); if (t) transforms.push({ old: "", next: t, ln: n });
                   out.push({ n, sign: "+", code: <Hl text={l.text} path={f.path} /> }); n++; k++;
                 } else {
                   out.push({ n, sign: undefined, code: <Hl text={l.text} path={f.path} /> }); o++; n++; k++;
