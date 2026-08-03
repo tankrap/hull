@@ -1,0 +1,89 @@
+@import url('https://fonts.googleapis.com/css2?family=Mona+Sans:ital,wght@0,400;0,500;0,600;0,800;1,400&display=swap');
+/* keel/hull globals — the ONLY raw CSS. Palette vars consumed by tailwind.config.js.
+   Toggle theme by setting data-theme="dark" on <html>. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Palette aligned to the Atlassian Design System token values (light + dark).
+   Neutrals: navy-tinted N-ramp. Accent: ADS Blue (#0C66E4). Semantics use ADS subtle
+   backgrounds + accessible text pairs. Bold vars feed status dots/bars; *-wash are the ADS
+   "subtle" surfaces used behind lozenges and diff lines. */
+:root {
+  --paper: #F7F8F9;       /* elevation.surface.sunken — page ground */
+  --surface: #FFFFFF;     /* elevation.surface — cards */
+  --rule: #DBDDE1;        /* color.border */
+  --rule2: #EBECF0;       /* color.border (subtle) */
+  --rule3: #F1F2F4;
+  --ctl-border: #B3B9C4;  /* input outline */
+  --ink: #172B4D;         /* color.text */
+  --body: #44546F;        /* color.text (paragraph) */
+  --dim: #5E6C84;         /* color.text.subtle */
+  --muted: #626F86;       /* color.text.subtlest */
+  --faint: #8590A2;       /* color.text.disabled */
+  --steel: #0C66E4;       /* color.background.brand.bold / Blue */
+  --steel-text: #0C66E4;  /* color.text.brand / link */
+  --steel-wash: #E9F2FF;  /* color.background.information / selected */
+  --brass: #E2B203;       /* Yellow (warning) bold */
+  --brass-text: #974F0C;  /* color.text.warning */
+  --brass-wash: #FFF7D6;  /* color.background.warning */
+  --clear: #22A06B;       /* Green (success) bold */
+  --clear-text: #216E4E;  /* color.text.success */
+  --clear-wash: #DCFFF1;  /* color.background.success */
+  --fault: #CA3521;       /* Red (danger) bold */
+  --fault-text: #AE2E24;  /* color.text.danger */
+  --fault-wash: #FFECEB;  /* color.background.danger */
+}
+
+[data-theme="dark"] {
+  --paper: #1D2125;       /* dark surface.sunken */
+  --surface: #22272B;     /* dark elevation.surface (raised) */
+  --rule: #38414A;
+  --rule2: #2C333A;
+  --rule3: #262B31;
+  --ctl-border: #454F59;
+  --ink: #DEE4EA;
+  --body: #B6C2CF;
+  --dim: #9FADBC;
+  --muted: #96A0AE;
+  --faint: #738496;
+  --steel: #579DFF;
+  --steel-text: #85B8FF;
+  --steel-wash: #1C2B41;
+  --brass: #F5CD47;
+  --brass-text: #F5CD47;
+  --brass-wash: #332E1B;
+  --clear: #7EE2B8;
+  --clear-text: #7EE2B8;
+  --clear-wash: #1C3329;
+  --fault: #F87168;
+  --fault-text: #FD9891;
+  --fault-wash: #42221F;
+}
+
+body { @apply font-sans text-ink bg-paper antialiased; text-wrap: pretty; }
+
+/* Diff line flash (jump target from "What changed here"). */
+@keyframes flash-line { 0%, 40% { background-color: var(--brass-wash); box-shadow: inset 3px 0 0 var(--brass); } 100% { background-color: transparent; box-shadow: none; } }
+.flash-line { animation: flash-line 1.3s ease-out; }
+a { @apply text-steel-text border-b border-steel/30 no-underline; }
+a:hover { @apply border-steel/60; }
+
+/* ── syntax highlighting (highlight.js token classes) — GitHub-style, theme-aware ── */
+.hljs-comment,.hljs-quote{color:#6e7781;font-style:italic}
+.hljs-keyword,.hljs-selector-tag,.hljs-doctag,.hljs-variable.language_{color:#cf222e}
+.hljs-string,.hljs-meta .hljs-string,.hljs-regexp{color:#0a3069}
+.hljs-number,.hljs-literal,.hljs-attr,.hljs-symbol,.hljs-bullet,.hljs-selector-attr,.hljs-selector-pseudo{color:#0550ae}
+.hljs-title,.hljs-title.function_,.hljs-section{color:#8250df}
+.hljs-title.class_,.hljs-type,.hljs-built_in,.hljs-selector-class,.hljs-params .hljs-keyword{color:#953800}
+.hljs-attribute,.hljs-name,.hljs-tag{color:#116329}
+.hljs-meta{color:#6e7781}
+.hljs-emphasis{font-style:italic}.hljs-strong{font-weight:600}
+[data-theme="dark"] .hljs-comment,[data-theme="dark"] .hljs-quote{color:#8b949e}
+[data-theme="dark"] .hljs-keyword,[data-theme="dark"] .hljs-selector-tag,[data-theme="dark"] .hljs-doctag,[data-theme="dark"] .hljs-variable.language_{color:#ff7b72}
+[data-theme="dark"] .hljs-string,[data-theme="dark"] .hljs-meta .hljs-string,[data-theme="dark"] .hljs-regexp{color:#a5d6ff}
+[data-theme="dark"] .hljs-number,[data-theme="dark"] .hljs-literal,[data-theme="dark"] .hljs-attr,[data-theme="dark"] .hljs-symbol,[data-theme="dark"] .hljs-bullet{color:#79c0ff}
+[data-theme="dark"] .hljs-title,[data-theme="dark"] .hljs-title.function_,[data-theme="dark"] .hljs-section{color:#d2a8ff}
+[data-theme="dark"] .hljs-title.class_,[data-theme="dark"] .hljs-type,[data-theme="dark"] .hljs-built_in,[data-theme="dark"] .hljs-selector-class{color:#ffa657}
+[data-theme="dark"] .hljs-attribute,[data-theme="dark"] .hljs-name,[data-theme="dark"] .hljs-tag{color:#7ee787}
+[data-theme="dark"] .hljs-meta{color:#8b949e}

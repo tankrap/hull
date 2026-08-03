@@ -11,12 +11,15 @@ pub mod activity;
 pub mod artifacts;
 pub mod autonomy;
 pub mod ci;
+pub mod connections;
 pub mod claims;
 pub mod reviewcache;
 pub mod ingress;
 pub mod keeld;
 pub mod mirror;
 pub mod nostr;
+pub mod passkey;
+pub mod reposettings;
 pub mod plugins;
 pub mod quic;
 pub mod repos;
@@ -38,6 +41,7 @@ use hull_core::store::{FileStore, InMemory, Store};
 use hull_core::*;
 use hull_plugin::Registry;
 use serde_json::{json, Value};
+use webauthn_rs::prelude::{Passkey, PublicKeyCredential, RegisterPublicKeyCredential, Uuid};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
@@ -92,6 +96,10 @@ impl Notifier for RecordingNotifier {
 struct AuthState {
     challenges: HashMap<String, u64>,
     tokens: HashMap<String, String>,
+    /// In-flight passkey ceremonies, keyed by an opaque flow id handed to the client.
+    reg_flows: HashMap<String, passkey::RegFlow>,
+    add_flows: HashMap<String, passkey::AddFlow>,
+    auth_flows: HashMap<String, passkey::AuthFlow>,
 }
 
 #[derive(Clone)]
@@ -113,6 +121,12 @@ struct App {
     /// Hull's own public base URL, used to build the clone + callback URLs in a dispatch payload.
     public_url: Arc<str>,
     mirror: Arc<mirror::MirrorLedger>,
+    /// WebAuthn relying party for passkey accounts.
+    webauthn: Arc<webauthn_rs::prelude::Webauthn>,
+    /// Per-repo settings (visibility, default reviewers, team access).
+    repo_settings: Arc<reposettings::RepoSettingsStore>,
+    /// Per-account forge connections (GitHub App installations).
+    connections: Arc<connections::ForgeConnections>,
 }
 
 impl repos::HasRepoHost for App {
@@ -160,6 +174,9 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         http: reqwest::Client::new(),
         public_url: std::env::var("HULL_PUBLIC_URL").unwrap_or_else(|_| "http://127.0.0.1:8930".into()).into(),
         mirror: Arc::new(mirror::MirrorLedger::from_env()),
+        webauthn: Arc::new(passkey::build()),
+        repo_settings: Arc::new(reposettings::RepoSettingsStore::from_env()),
+        connections: Arc::new(connections::ForgeConnections::from_env()),
     }
 }
 
@@ -268,14 +285,35 @@ fn make_router(app: App) -> Router {
         .route("/api/actors/:id/renew", post(renew_delegation))
         .route("/api/actors/:id/nostr", post(set_nostr_key))
         .route("/api/actors/:id/github", post(link_github))
-        .route("/api/accounts", get(accounts_list))
+        .route("/api/accounts", get(accounts_list).post(create_account))
+        .route("/api/accounts/available", get(account_available))
+        .route("/api/auth/available", get(username_available))
         .route("/api/accounts/:id/members", post(add_member))
+        .route("/api/accounts/:id/members/:actor", axum::routing::delete(remove_member))
+        .route("/api/accounts/:id/teams", get(teams_list).post(create_team))
+        .route("/api/accounts/:id/teams/:team", axum::routing::delete(delete_team))
+        .route("/api/accounts/:id/teams/:team/members", post(team_add_member))
+        .route("/api/accounts/:id/teams/:team/members/:actor", axum::routing::delete(team_remove_member))
         .route("/api/auth/challenge", get(auth_challenge))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/me", get(auth_me))
+        // passkey (WebAuthn) accounts — passwordless signup + login
+        .route("/api/auth/register/start", post(register_start))
+        .route("/api/auth/register/finish", post(register_finish))
+        .route("/api/auth/passkey/start", post(passkey_start))
+        .route("/api/auth/passkey/finish", post(passkey_finish))
+        // account self-service (settings): username/email + passkey management
+        .route("/api/account", get(account_get).put(account_update))
+        .route("/api/account/passkeys/start", post(account_passkey_start))
+        .route("/api/account/passkeys/finish", post(account_passkey_finish))
+        .route("/api/account/passkeys/:cred", axum::routing::delete(account_passkey_delete))
         .route("/api/me", get(me_profile))
         .route("/api/notifications", get(notifications_list))
-        .route("/api/repos", get(repos_list))
+        .route("/api/repos", get(repos_list).post(create_repo_handler))
+        .route("/api/accounts/:id/github", get(github_status).delete(github_disconnect))
+        .route("/api/accounts/:id/github/connect", post(github_connect))
+        .route("/api/accounts/:id/github/importable", get(github_importable))
+        .route("/api/accounts/:id/repos/import", post(import_repo_handler))
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
         .route("/api/repos/:tenant/:repo/issues/:number", axum::routing::patch(update_issue))
         .route("/api/repos/:tenant/:repo/why", get(why))
@@ -305,6 +343,7 @@ fn make_router(app: App) -> Router {
         .route("/api/accounts/:id/autonomy", put(set_account_autonomy))
         .route("/api/repos/:tenant/:repo/security", get(repo_security))
         .route("/api/repos/:tenant/:repo/owners", get(owners_list).post(set_owners))
+        .route("/api/repos/:tenant/:repo/settings", get(get_repo_settings).put(set_repo_settings))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
@@ -381,9 +420,71 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
 
 /// Home for a tenant: `GET /api/home?tenant=acme` (defaults to `local`). The tenant will come from
 /// the authenticated session once auth lands (NEW-1166); until then it's an explicit param.
-async fn home(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
-    let tenant = q.get("tenant").map(String::as_str).unwrap_or("local");
-    Json(json!({ "tenant": tenant, "repos": app.hub.home(tenant) }))
+async fn home(State(app): State<App>, headers: axum::http::HeaderMap, Query(_q): Query<HashMap<String, String>>) -> Json<Value> {
+    // Personalized: the signed-in user's repos across EVERY account they belong to, ranked by
+    // activity (active repos first, then their quiet repos). Not a global tenant. Logged out → empty.
+    let Some(actor) = authed_actor(&app, &headers) else {
+        return Json(json!({ "repos": [], "accounts": [] }));
+    };
+    let accts = member_accounts(&app, &actor.id);
+    let mut items: Vec<Value> = Vec::new();
+    for acct in &accts {
+        let ranked = app.hub.home(&acct.handle);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for r in &ranked {
+            seen.insert(r.repo.clone());
+            items.push(json!({ "tenant": acct.handle, "repo": r.repo, "score": r.score, "last_ts": r.last_ts, "active_actors": r.active_actors, "hot_files": r.hot_files }));
+        }
+        // Include the account's repos that have no recent activity, so created/imported repos show.
+        for repo in app.store.repos().into_iter().filter(|rp| rp.owner == acct.id) {
+            if !seen.contains(&repo.name) {
+                items.push(json!({ "tenant": acct.handle, "repo": repo.name, "score": 0.0, "last_ts": 0, "active_actors": [], "hot_files": [] }));
+            }
+        }
+    }
+    items.sort_by(|a, b| {
+        b.get("score").and_then(Value::as_f64).unwrap_or(0.0)
+            .partial_cmp(&a.get("score").and_then(Value::as_f64).unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let handles: Vec<String> = accts.iter().map(|a| a.handle.clone()).collect();
+    Json(json!({ "repos": items, "accounts": handles }))
+}
+
+/// The accounts an actor is a member of.
+fn member_accounts(app: &App, actor_id: &str) -> Vec<Account> {
+    app.store.accounts().into_iter().filter(|a| a.members.iter().any(|m| m.actor == actor_id)).collect()
+}
+
+/// Visibility gate: may `actor` (or an anonymous caller) read this repo? Public repos are readable by
+/// anyone; a private repo only by a member of its owning account, or a member of a team the repo
+/// grants access to.
+fn can_read_repo(app: &App, actor_id: Option<&str>, tenant: &str, repo: &str) -> bool {
+    let key = format!("{tenant}/{repo}");
+    let settings = app.repo_settings.get(&key);
+    if !settings.private {
+        return true;
+    }
+    let Some(aid) = actor_id else { return false };
+    let Some(acct) = app.store.accounts().into_iter().find(|a| a.handle == tenant) else { return false };
+    if acct.members.iter().any(|m| m.actor == aid) {
+        return true;
+    }
+    app.store
+        .teams(&acct.id)
+        .into_iter()
+        .any(|t| settings.team_access.iter().any(|ta| ta.team == t.id) && t.members.iter().any(|m| m.actor == aid))
+}
+
+/// A 404 for repos the caller can't see — used so a private repo doesn't even reveal its existence.
+#[allow(clippy::result_large_err)]
+fn require_repo_read(app: &App, headers: &axum::http::HeaderMap, tenant: &str, repo: &str) -> Result<(), Response> {
+    let actor = authed_actor(app, headers).map(|a| a.id);
+    if can_read_repo(app, actor.as_deref(), tenant, repo) {
+        Ok(())
+    } else {
+        Err((StatusCode::NOT_FOUND, "not found").into_response())
+    }
 }
 
 /// The repos actually hosted on disk (the filesystem registry), plus the seeded domain repos.
@@ -417,11 +518,14 @@ async fn notifications_list(
 }
 
 /// Accounts (orgs / personal) with their members (handle + role) and owned repos.
-async fn accounts_list(State(app): State<App>) -> Json<Value> {
+async fn accounts_list(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<Value> {
     let repos = app.store.repos();
-    let accounts: Vec<Value> = app
-        .store
-        .accounts()
+    // Only the accounts the caller belongs to — an org you're not a member of is not yours to see.
+    let visible = match authed_actor(&app, &headers) {
+        Some(a) => member_accounts(&app, &a.id),
+        None => Vec::new(),
+    };
+    let accounts: Vec<Value> = visible
         .into_iter()
         .map(|a| {
             let members: Vec<Value> = a
@@ -461,20 +565,395 @@ async fn add_member(
     if !is_admin {
         return (StatusCode::FORBIDDEN, "only an org owner/admin can manage members").into_response();
     }
-    let actor = body.get("actor").and_then(Value::as_str).unwrap_or("").to_string();
-    if app.store.actor(&actor).is_none() {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "unknown actor").into_response();
-    }
-    let role = match body.get("role").and_then(Value::as_str) {
-        Some("owner") => Role::Owner,
-        Some("admin") => Role::Admin,
-        Some("read") => Role::Read,
-        _ => Role::Write,
+    let Some(actor) = resolve_actor_ref(&app, &body) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "unknown actor or username").into_response();
     };
+    let role = parse_role(body.get("role").and_then(Value::as_str));
     acct.members.retain(|m| m.actor != actor);
     acct.members.push(Membership { actor, role });
     app.store.put_account(acct.clone());
     (StatusCode::CREATED, Json(json!({ "account": acct }))).into_response()
+}
+
+/// Gate an org-management action: the caller must be an Owner or Admin of the account. Returns the
+/// loaded account + the acting actor.
+#[allow(clippy::result_large_err)]
+fn require_account_admin(app: &App, headers: &axum::http::HeaderMap, account_id: &str) -> Result<(Account, Actor), Response> {
+    let acting = require_actor(app, headers, "")?;
+    let Some(acct) = app.store.accounts().into_iter().find(|a| a.id == account_id) else {
+        return Err((StatusCode::NOT_FOUND, "no such account").into_response());
+    };
+    let is_admin = acct.members.iter().any(|m| m.actor == acting.id && matches!(m.role, Role::Owner | Role::Admin));
+    if !is_admin {
+        return Err((StatusCode::FORBIDDEN, "only an org owner/admin can do that").into_response());
+    }
+    Ok((acct, acting))
+}
+
+/// Resolve a member reference in a body to an actor id: `{actor}` (existing actor) or `{username}`
+/// (a hosted account's driving actor).
+fn resolve_actor_ref(app: &App, body: &Value) -> Option<String> {
+    if let Some(a) = body.get("actor").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        if app.store.actor(a).is_some() {
+            return Some(a.to_string());
+        }
+    }
+    if let Some(un) = body.get("username").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        return app.store.user_by_username(un).map(|u| u.actor);
+    }
+    None
+}
+
+fn parse_role(s: Option<&str>) -> Role {
+    match s {
+        Some("owner") => Role::Owner,
+        Some("admin") => Role::Admin,
+        Some("read") => Role::Read,
+        _ => Role::Write,
+    }
+}
+
+/// Normalize a user/org/repo handle: trim, and collapse any run of whitespace to a single `_`. The
+/// canonical form the UI shows while typing and the server stores.
+fn sanitize_handle(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join("_")
+}
+
+/// `GET /api/accounts/available?handle=X` — is an org/account handle free? Returns the sanitized form.
+async fn account_available(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+    let handle = sanitize_handle(q.get("handle").map(String::as_str).unwrap_or(""));
+    let taken = handle.is_empty() || app.store.accounts().iter().any(|a| a.handle.eq_ignore_ascii_case(&handle));
+    Json(json!({ "handle": handle, "available": !handle.is_empty() && !taken }))
+}
+
+/// `GET /api/auth/available?username=X` — is a username free? Returns the sanitized form.
+async fn username_available(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+    let username = sanitize_handle(q.get("username").map(String::as_str).unwrap_or(""));
+    let taken = username.is_empty() || app.store.user_by_username(&username).is_some();
+    Json(json!({ "username": username, "available": !username.is_empty() && !taken }))
+}
+
+/// `POST /api/accounts` — create an organization (the caller becomes its Owner).
+async fn create_account(State(app): State<App>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let acting = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let handle = sanitize_handle(body.get("handle").and_then(Value::as_str).unwrap_or(""));
+    if handle.is_empty() {
+        return (StatusCode::BAD_REQUEST, "handle is required").into_response();
+    }
+    if app.store.accounts().iter().any(|a| a.handle.eq_ignore_ascii_case(&handle)) {
+        return (StatusCode::CONFLICT, "that handle is taken").into_response();
+    }
+    let kind = match body.get("kind").and_then(Value::as_str) {
+        Some("personal") => AccountKind::Personal,
+        _ => AccountKind::Organization,
+    };
+    let acct = Account {
+        id: format!("acct_{}", identity::random_hex(8)),
+        kind,
+        handle,
+        members: vec![Membership { actor: acting.id.clone(), role: Role::Owner }],
+    };
+    app.store.put_account(acct.clone());
+    (StatusCode::CREATED, Json(json!({ "account": acct }))).into_response()
+}
+
+/// `DELETE /api/accounts/:id/members/:actor` — remove a member (never the last owner).
+async fn remove_member(State(app): State<App>, Path((id, actor)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    let (mut acct, _) = match require_account_admin(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let owners = acct.members.iter().filter(|m| matches!(m.role, Role::Owner)).count();
+    let removing_owner = acct.members.iter().any(|m| m.actor == actor && matches!(m.role, Role::Owner));
+    if removing_owner && owners <= 1 {
+        return (StatusCode::BAD_REQUEST, "cannot remove the last owner").into_response();
+    }
+    acct.members.retain(|m| m.actor != actor);
+    app.store.put_account(acct.clone());
+    Json(json!({ "account": acct })).into_response()
+}
+
+/// `GET /api/accounts/:id/teams` — the org's teams and their members (public read).
+async fn teams_list(State(app): State<App>, Path(id): Path<String>) -> Json<Value> {
+    let teams: Vec<Value> = app
+        .store
+        .teams(&id)
+        .into_iter()
+        .map(|t| {
+            let members: Vec<Value> = t
+                .members
+                .iter()
+                .map(|m| json!({ "actor": m.actor, "handle": app.store.actor(&m.actor).map(|a| a.handle).unwrap_or_default(), "role": m.role }))
+                .collect();
+            json!({ "id": t.id, "name": t.name, "members": members })
+        })
+        .collect();
+    Json(json!({ "teams": teams }))
+}
+
+/// `POST /api/accounts/:id/teams` — create a team (`{name}`).
+async fn create_team(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    if let Err(resp) = require_account_admin(&app, &headers, &id) {
+        return resp;
+    }
+    let name = body.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "team name is required").into_response();
+    }
+    let team = Team { id: format!("team_{}", identity::random_hex(8)), account: id, name, members: vec![] };
+    app.store.put_team(team.clone());
+    (StatusCode::CREATED, Json(json!({ "team": team }))).into_response()
+}
+
+/// `DELETE /api/accounts/:id/teams/:team` — remove a team.
+async fn delete_team(State(app): State<App>, Path((id, team)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(resp) = require_account_admin(&app, &headers, &id) {
+        return resp;
+    }
+    if app.store.team(&team).map(|t| t.account != id).unwrap_or(true) {
+        return (StatusCode::NOT_FOUND, "no such team").into_response();
+    }
+    app.store.delete_team(&team);
+    Json(json!({ "ok": true })).into_response()
+}
+
+/// `POST /api/accounts/:id/teams/:team/members` — add a member (`{actor|username, role}`).
+async fn team_add_member(State(app): State<App>, Path((id, team)): Path<(String, String)>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    if let Err(resp) = require_account_admin(&app, &headers, &id) {
+        return resp;
+    }
+    let Some(mut t) = app.store.team(&team).filter(|t| t.account == id) else {
+        return (StatusCode::NOT_FOUND, "no such team").into_response();
+    };
+    let Some(actor) = resolve_actor_ref(&app, &body) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "unknown actor or username").into_response();
+    };
+    let role = parse_role(body.get("role").and_then(Value::as_str));
+    t.members.retain(|m| m.actor != actor);
+    t.members.push(Membership { actor, role });
+    app.store.put_team(t.clone());
+    (StatusCode::CREATED, Json(json!({ "team": t }))).into_response()
+}
+
+/// `DELETE /api/accounts/:id/teams/:team/members/:actor` — remove a team member.
+async fn team_remove_member(State(app): State<App>, Path((id, team, actor)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(resp) = require_account_admin(&app, &headers, &id) {
+        return resp;
+    }
+    let Some(mut t) = app.store.team(&team).filter(|t| t.account == id) else {
+        return (StatusCode::NOT_FOUND, "no such team").into_response();
+    };
+    t.members.retain(|m| m.actor != actor);
+    app.store.put_team(t.clone());
+    Json(json!({ "team": t })).into_response()
+}
+
+/// Build the settings JSON (no auth — callers gate).
+fn repo_settings_value(app: &App, tenant: &str, repo: &str) -> Value {
+    let key = format!("{tenant}/{repo}");
+    let s = app.repo_settings.get(&key);
+    let reviewers: Vec<Value> = s
+        .default_reviewers
+        .iter()
+        .map(|id| json!({ "actor": id, "handle": app.store.actor(id).map(|a| a.handle).unwrap_or_default() }))
+        .collect();
+    let teams: Vec<Value> = s.team_access.iter().map(|t| json!({ "team": t.team, "role": t.role })).collect();
+    json!({
+        "private": s.private,
+        "require_review_to_land": s.require_review_to_land,
+        "default_reviewers": reviewers,
+        "team_access": teams,
+    })
+}
+
+/// `GET /api/repos/:tenant/:repo/settings` — repo settings. **Owner/admin only** (settings expose
+/// access grants, so they are not public).
+async fn get_repo_settings(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    let acting = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_repo_admin(&app, &tenant, &repo, &acting.id) {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin can view settings").into_response();
+    }
+    Json(repo_settings_value(&app, &tenant, &repo)).into_response()
+}
+
+/// `PUT /api/repos/:tenant/:repo/settings` — update repo settings (owner/admin only).
+async fn set_repo_settings(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let acting = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_repo_admin(&app, &tenant, &repo, &acting.id) {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin can change settings").into_response();
+    }
+    let key = format!("{tenant}/{repo}");
+    let mut s = app.repo_settings.get(&key);
+    if let Some(p) = body.get("private").and_then(Value::as_bool) {
+        s.private = p;
+    }
+    if let Some(r) = body.get("require_review_to_land").and_then(Value::as_bool) {
+        s.require_review_to_land = r;
+    }
+    if let Some(arr) = body.get("default_reviewers").and_then(Value::as_array) {
+        s.default_reviewers = arr.iter().filter_map(|v| v.as_str()).filter(|id| app.store.actor(id).is_some()).map(str::to_string).collect();
+    }
+    if let Some(arr) = body.get("team_access").and_then(Value::as_array) {
+        s.team_access = arr
+            .iter()
+            .filter_map(|v| {
+                let team = v.get("team").and_then(Value::as_str)?.to_string();
+                let role = v.get("role").and_then(Value::as_str).unwrap_or("read").to_string();
+                Some(reposettings::TeamAccess { team, role })
+            })
+            .collect();
+    }
+    app.repo_settings.set(&key, s);
+    Json(repo_settings_value(&app, &tenant, &repo)).into_response()
+}
+
+/// Resolve an account by id or handle and require the caller be its owner/admin.
+#[allow(clippy::result_large_err)]
+fn require_account_admin_ref(app: &App, headers: &axum::http::HeaderMap, acct_ref: &str) -> Result<(Account, Actor), Response> {
+    let acting = require_actor(app, headers, "")?;
+    let Some(acct) = app.store.accounts().into_iter().find(|a| a.id == acct_ref || a.handle.eq_ignore_ascii_case(acct_ref)) else {
+        return Err((StatusCode::NOT_FOUND, "no such account").into_response());
+    };
+    let is_admin = acct.members.iter().any(|m| m.actor == acting.id && matches!(m.role, Role::Owner | Role::Admin));
+    if !is_admin {
+        return Err((StatusCode::FORBIDDEN, "only an org owner/admin can do that").into_response());
+    }
+    Ok((acct, acting))
+}
+
+/// `POST /api/repos` — create an empty repo under an account you administer. Body `{account, name}`
+/// (`account` = an account id or handle). The repo can then be cloned + pushed to.
+async fn create_repo_handler(State(app): State<App>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let acct_ref = body.get("account").and_then(Value::as_str).unwrap_or("").trim();
+    let (acct, _) = match require_account_admin_ref(&app, &headers, acct_ref) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let name = sanitize_handle(body.get("name").and_then(Value::as_str).unwrap_or(""));
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name is required").into_response();
+    }
+    let tenant = acct.handle.clone();
+    if app.store.repos().iter().any(|r| r.owner == acct.id && r.name == name) {
+        return (StatusCode::CONFLICT, "a repo with that name already exists").into_response();
+    }
+    if let Err(e) = app.repos.create_repo(&tenant, &name) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, format!("could not create repo: {e}")).into_response();
+    }
+    let repo = Repo { id: format!("repo_{tenant}_{name}"), owner: acct.id.clone(), name: name.clone(), default_branch: "main".into() };
+    app.store.put_repo(repo.clone());
+    (StatusCode::CREATED, Json(json!({ "repo": repo, "tenant": tenant, "name": name }))).into_response()
+}
+
+/// `GET /api/accounts/:id/github` — the account's GitHub connection status (admin only). Never
+/// exposes anything unless the caller administers the account.
+async fn github_status(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    match app.connections.get(&acct.id) {
+        Some(c) => Json(json!({ "connected": true, "provider": c.provider, "login": c.login, "connected_unix": c.connected_unix })).into_response(),
+        None => Json(json!({ "connected": false })).into_response(),
+    }
+}
+
+/// `POST /api/accounts/:id/github/connect` — `{installation}`. Verifies the App installation is real
+/// (returns its GitHub login) and stores it against the account. Admin only.
+async fn github_connect(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let installation = body.get("installation").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if installation.is_empty() {
+        return (StatusCode::BAD_REQUEST, "installation id is required").into_response();
+    }
+    let reg = app.registry.clone();
+    let inst = installation.clone();
+    let login = tokio::task::spawn_blocking(move || reg.mirror_verify_connection(&inst)).await.ok().flatten();
+    let Some(login) = login else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "could not verify that installation (wrong id, or the GitHub App isn't installed / configured)").into_response();
+    };
+    app.connections.set(&acct.id, connections::Connection { provider: "github".into(), installation, login: login.clone(), connected_unix: now() });
+    (StatusCode::CREATED, Json(json!({ "connected": true, "provider": "github", "login": login }))).into_response()
+}
+
+/// `DELETE /api/accounts/:id/github` — disconnect the account's GitHub connection (admin only).
+async fn github_disconnect(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    app.connections.remove(&acct.id);
+    Json(json!({ "connected": false })).into_response()
+}
+
+/// `GET /api/accounts/:id/github/importable` — repos importable via THIS account's connection. Admin
+/// only, and only when the account has explicitly connected — never a global list.
+async fn github_importable(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let Some(conn) = app.connections.get(&acct.id) else {
+        return (StatusCode::FORBIDDEN, "this account is not connected to GitHub").into_response();
+    };
+    let reg = app.registry.clone();
+    let repos = tokio::task::spawn_blocking(move || reg.mirror_importable(&conn.installation)).await.unwrap_or_default();
+    Json(json!({ "repos": repos })).into_response()
+}
+
+/// `POST /api/accounts/:id/repos/import` — `{source, name?}`. Import a GitHub repo through the
+/// account's own connection. Admin only, connection required.
+async fn import_repo_handler(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let Some(conn) = app.connections.get(&acct.id) else {
+        return (StatusCode::FORBIDDEN, "connect this account to GitHub first").into_response();
+    };
+    let source = body.get("source").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if source.is_empty() {
+        return (StatusCode::BAD_REQUEST, "source (owner/name on GitHub) is required").into_response();
+    }
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| source.rsplit('/').next().unwrap_or(&source).to_string());
+    let tenant = acct.handle.clone();
+    if app.store.repos().iter().any(|r| r.owner == acct.id && r.name == name) {
+        return (StatusCode::CONFLICT, "a repo with that name already exists").into_response();
+    }
+    let dest = format!("{tenant}/{name}");
+    // The import shells out to `git`, and it pushes back into THIS server's git endpoint — so it must
+    // run off the async runtime (spawn_blocking), or it starves the workers that serve that push and
+    // the whole thing deadlocks.
+    let reg = app.registry.clone();
+    let (inst, src_c, dst_c) = (conn.installation.clone(), source.clone(), dest.clone());
+    let res = match tokio::task::spawn_blocking(move || reg.mirror_import(&inst, &src_c, &dst_c)).await {
+        Ok(r) => r,
+        Err(_) => hull_plugin::MirrorResult { ok: false, external_ref: None, detail: "import task failed".into() },
+    };
+    if !res.ok {
+        return (StatusCode::UNPROCESSABLE_ENTITY, format!("import failed: {}", res.detail)).into_response();
+    }
+    let repo = Repo { id: format!("repo_{tenant}_{name}"), owner: acct.id.clone(), name: name.clone(), default_branch: "main".into() };
+    app.store.put_repo(repo.clone());
+    (StatusCode::CREATED, Json(json!({ "repo": repo, "tenant": tenant, "name": name, "detail": res.detail }))).into_response()
 }
 
 /// Registered actors (public — no secret keys), each with its accountability root.
@@ -540,10 +1019,18 @@ async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, 
                     None => return (StatusCode::UNPROCESSABLE_ENTITY, "delegation did not verify — bad signature, widened scope, or unaccountable parent").into_response(),
                 }
             }
-            // Fallback: only the demo owner's key is known server-side, so Hull can sign for it.
+            // Server-signed fallback: Hull holds the signing key for (a) the demo owner and (b) any
+            // hosted account (passkey users), so it can sign the delegation on their behalf — this is
+            // how "delegate an agent" works from the web when the human logs in with a passkey and
+            // never holds a raw key. A legacy key-login human (no stored secret) must sign client-side.
             let demo_id = identity::human_from_secret("demo", DEMO_OWNER_SECRET).map(|m| m.actor.id).unwrap_or_default();
             if parent.id == demo_id {
                 match identity::mint_agent(&handle, &parent, DEMO_OWNER_SECRET, scope, lifetime) {
+                    Some(m) => m,
+                    None => return (StatusCode::UNPROCESSABLE_ENTITY, "could not mint — parent is not accountable").into_response(),
+                }
+            } else if let Some(user) = app.store.user_by_actor(&parent.id) {
+                match identity::mint_agent(&handle, &parent, &user.secret_key, scope, lifetime) {
                     Some(m) => m,
                     None => return (StatusCode::UNPROCESSABLE_ENTITY, "could not mint — parent is not accountable").into_response(),
                 }
@@ -714,7 +1201,14 @@ async fn auth_login(State(app): State<App>, Json(body): Json<Value>) -> Response
 /// `GET /api/auth/me` (Bearer token) — the authenticated actor, or 401.
 async fn auth_me(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
     match authed_actor(&app, &headers) {
-        Some(a) => Json(json!({ "id": a.id, "handle": a.handle, "kind": a.kind, "accountable": a.is_accountable() })).into_response(),
+        Some(a) => {
+            let user = app.store.user_by_actor(&a.id);
+            Json(json!({
+                "id": a.id, "handle": a.handle, "kind": a.kind, "accountable": a.is_accountable(),
+                "username": user.as_ref().map(|u| u.username.clone()),
+                "email": user.as_ref().map(|u| u.email.clone()),
+            })).into_response()
+        }
         None => (StatusCode::UNAUTHORIZED, "not signed in").into_response(),
     }
 }
@@ -746,6 +1240,7 @@ async fn me_profile(State(app): State<App>, headers: axum::http::HeaderMap) -> R
             acct.members.iter().find(|m| m.actor == a.id).map(|m| json!({ "account": acct.handle, "role": m.role }))
         })
         .collect();
+    let user = app.store.user_by_actor(&a.id);
     Json(json!({
         "id": a.id,
         "handle": a.handle,
@@ -754,8 +1249,242 @@ async fn me_profile(State(app): State<App>, headers: axum::http::HeaderMap) -> R
         "human_root": a.human_principal(),
         "delegation": chain,
         "memberships": memberships,
+        "username": user.as_ref().map(|u| u.username.clone()),
+        "email": user.as_ref().map(|u| u.email.clone()),
     }))
     .into_response()
+}
+
+/// base64url (no padding) — the encoding WebAuthn uses for credential ids.
+fn b64u(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+// ── passkey (WebAuthn) accounts ──────────────────────────────────────────────
+// Signup and login are two-step ceremonies: `/start` returns the browser challenge (and an opaque
+// flow id we hold the server state under); `/finish` verifies the authenticator's response. No
+// passwords ever touch Hull.
+
+/// `POST /api/auth/register/start` — `{username, email}` → a WebAuthn creation challenge.
+async fn register_start(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let username = sanitize_handle(body.get("username").and_then(Value::as_str).unwrap_or(""));
+    let email = body.get("email").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if username.is_empty() || email.is_empty() {
+        return (StatusCode::BAD_REQUEST, "username and email are required").into_response();
+    }
+    if app.store.user_by_username(&username).is_some() {
+        return (StatusCode::CONFLICT, "that username is taken").into_response();
+    }
+    let uuid = Uuid::new_v4();
+    match app.webauthn.start_passkey_registration(uuid, &username, &username, None) {
+        Ok((ccr, state)) => {
+            let flow = identity::random_hex(16);
+            app.auth.lock().unwrap().reg_flows.insert(flow.clone(), passkey::RegFlow { username, email, uuid, state });
+            Json(json!({ "flow_id": flow, "options": ccr })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("could not start registration: {e}")).into_response(),
+    }
+}
+
+/// `POST /api/auth/register/finish` — `{flow_id, credential}` → creates the user + a human actor Hull
+/// signs for, gives them a personal account, and returns a session token.
+async fn register_finish(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let flow_id = body.get("flow_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let cred = body.get("credential").cloned().unwrap_or(Value::Null);
+    let Some(flow) = app.auth.lock().unwrap().reg_flows.remove(&flow_id) else {
+        return (StatusCode::BAD_REQUEST, "unknown or expired registration flow").into_response();
+    };
+    let reg: RegisterPublicKeyCredential = match serde_json::from_value(cred) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad credential: {e}")).into_response(),
+    };
+    let pk = match app.webauthn.finish_passkey_registration(&reg, &flow.state) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::UNAUTHORIZED, format!("passkey registration failed: {e}")).into_response(),
+    };
+    // The user drives a fresh human actor; Hull holds its key to sign delegations for them.
+    let minted = identity::mint_human(&flow.username);
+    let cred_id = b64u(pk.cred_id().as_ref());
+    let user = User {
+        id: flow.uuid.to_string(),
+        username: flow.username.clone(),
+        email: flow.email,
+        actor: minted.actor.id.clone(),
+        secret_key: minted.secret_key,
+        passkeys: vec![PasskeyCred { id: cred_id, name: "passkey".into(), created_unix: now(), data: serde_json::to_value(&pk).unwrap_or(Value::Null) }],
+        created_unix: now(),
+    };
+    app.store.put_actor(minted.actor.clone());
+    app.store.put_user(user.clone());
+    app.store.put_account(Account {
+        id: format!("acct_{}", flow.uuid),
+        kind: AccountKind::Personal,
+        handle: user.username.clone(),
+        members: vec![Membership { actor: user.actor.clone(), role: Role::Owner }],
+    });
+    let token = identity::random_hex(24);
+    app.auth.lock().unwrap().tokens.insert(token.clone(), user.actor.clone());
+    (StatusCode::CREATED, Json(json!({ "token": token, "actor": user.actor, "username": user.username }))).into_response()
+}
+
+/// `POST /api/auth/passkey/start` — `{username}` → a WebAuthn assertion challenge for that account.
+async fn passkey_start(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let username = body.get("username").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let Some(user) = app.store.user_by_username(&username) else {
+        return (StatusCode::NOT_FOUND, "no account with that username").into_response();
+    };
+    let passkeys: Vec<Passkey> = user.passkeys.iter().filter_map(|p| serde_json::from_value(p.data.clone()).ok()).collect();
+    if passkeys.is_empty() {
+        return (StatusCode::BAD_REQUEST, "this account has no passkeys").into_response();
+    }
+    match app.webauthn.start_passkey_authentication(&passkeys) {
+        Ok((rcr, state)) => {
+            let flow = identity::random_hex(16);
+            app.auth.lock().unwrap().auth_flows.insert(flow.clone(), passkey::AuthFlow { user_id: user.id.clone(), state });
+            Json(json!({ "flow_id": flow, "options": rcr })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("could not start authentication: {e}")).into_response(),
+    }
+}
+
+/// `POST /api/auth/passkey/finish` — `{flow_id, credential}` → verifies the assertion, issues a token.
+async fn passkey_finish(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let flow_id = body.get("flow_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let cred = body.get("credential").cloned().unwrap_or(Value::Null);
+    let Some(flow) = app.auth.lock().unwrap().auth_flows.remove(&flow_id) else {
+        return (StatusCode::BAD_REQUEST, "unknown or expired login flow").into_response();
+    };
+    let pkc: PublicKeyCredential = match serde_json::from_value(cred) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad credential: {e}")).into_response(),
+    };
+    let res = match app.webauthn.finish_passkey_authentication(&pkc, &flow.state) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::UNAUTHORIZED, format!("passkey login failed: {e}")).into_response(),
+    };
+    let Some(mut user) = app.store.user(&flow.user_id) else {
+        return (StatusCode::UNAUTHORIZED, "account no longer exists").into_response();
+    };
+    // Update the used credential's counter (clone/replay detection lives in the Passkey).
+    for pc in user.passkeys.iter_mut() {
+        if let Ok(mut pk) = serde_json::from_value::<Passkey>(pc.data.clone()) {
+            if pk.cred_id() == res.cred_id() {
+                pk.update_credential(&res);
+                pc.data = serde_json::to_value(&pk).unwrap_or_else(|_| pc.data.clone());
+            }
+        }
+    }
+    app.store.put_user(user.clone());
+    let token = identity::random_hex(24);
+    app.auth.lock().unwrap().tokens.insert(token.clone(), user.actor.clone());
+    Json(json!({ "token": token, "actor": user.actor, "username": user.username })).into_response()
+}
+
+/// `GET /api/account` — the signed-in user's hosted account (username, email, passkeys).
+async fn account_get(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    let Some(a) = authed_actor(&app, &headers) else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
+    let Some(user) = app.store.user_by_actor(&a.id) else {
+        return (StatusCode::NOT_FOUND, "this actor is a legacy key login, not a hosted account").into_response();
+    };
+    let passkeys: Vec<Value> = user.passkeys.iter().map(|p| json!({ "id": p.id, "name": p.name, "created_unix": p.created_unix })).collect();
+    Json(json!({ "username": user.username, "email": user.email, "actor": user.actor, "passkeys": passkeys, "created_unix": user.created_unix })).into_response()
+}
+
+/// `PUT /api/account` — change username and/or email. Keeps the actor + personal-account handle in sync.
+async fn account_update(State(app): State<App>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let Some(a) = authed_actor(&app, &headers) else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
+    let Some(mut user) = app.store.user_by_actor(&a.id) else {
+        return (StatusCode::NOT_FOUND, "not a hosted account").into_response();
+    };
+    if let Some(un) = body.get("username").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(other) = app.store.user_by_username(un) {
+            if other.id != user.id {
+                return (StatusCode::CONFLICT, "that username is taken").into_response();
+            }
+        }
+        user.username = un.to_string();
+        // keep the display handle on the actor + personal account aligned with the username
+        if let Some(mut actor) = app.store.actor(&user.actor) {
+            actor.handle = un.to_string();
+            app.store.put_actor(actor);
+        }
+        let acct_id = format!("acct_{}", user.id);
+        if let Some(mut acct) = app.store.accounts().into_iter().find(|x| x.id == acct_id) {
+            acct.handle = un.to_string();
+            app.store.put_account(acct);
+        }
+    }
+    if let Some(em) = body.get("email").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        user.email = em.to_string();
+    }
+    app.store.put_user(user.clone());
+    Json(json!({ "username": user.username, "email": user.email })).into_response()
+}
+
+/// `POST /api/account/passkeys/start` — begin adding another passkey to the signed-in account.
+async fn account_passkey_start(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    let Some(a) = authed_actor(&app, &headers) else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
+    let Some(user) = app.store.user_by_actor(&a.id) else { return (StatusCode::NOT_FOUND, "not a hosted account").into_response(); };
+    let Ok(uuid) = Uuid::parse_str(&user.id) else { return (StatusCode::INTERNAL_SERVER_ERROR, "bad user id").into_response(); };
+    let exclude: Vec<_> = user.passkeys.iter().filter_map(|p| serde_json::from_value::<Passkey>(p.data.clone()).ok().map(|pk| pk.cred_id().clone())).collect();
+    match app.webauthn.start_passkey_registration(uuid, &user.username, &user.username, Some(exclude)) {
+        Ok((ccr, state)) => {
+            let flow = identity::random_hex(16);
+            app.auth.lock().unwrap().add_flows.insert(flow.clone(), passkey::AddFlow { user_id: user.id.clone(), state });
+            Json(json!({ "flow_id": flow, "options": ccr })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("could not start: {e}")).into_response(),
+    }
+}
+
+/// `POST /api/account/passkeys/finish` — `{flow_id, credential, name?}` → store the new passkey.
+async fn account_passkey_finish(State(app): State<App>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let Some(a) = authed_actor(&app, &headers) else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
+    let flow_id = body.get("flow_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = body.get("name").and_then(Value::as_str).unwrap_or("passkey").trim().to_string();
+    let cred = body.get("credential").cloned().unwrap_or(Value::Null);
+    let Some(flow) = app.auth.lock().unwrap().add_flows.remove(&flow_id) else {
+        return (StatusCode::BAD_REQUEST, "unknown or expired flow").into_response();
+    };
+    let Some(mut user) = app.store.user_by_actor(&a.id) else { return (StatusCode::NOT_FOUND, "not a hosted account").into_response(); };
+    if user.id != flow.user_id {
+        return (StatusCode::FORBIDDEN, "flow does not belong to you").into_response();
+    }
+    let reg: RegisterPublicKeyCredential = match serde_json::from_value(cred) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad credential: {e}")).into_response(),
+    };
+    let pk = match app.webauthn.finish_passkey_registration(&reg, &flow.state) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::UNAUTHORIZED, format!("failed: {e}")).into_response(),
+    };
+    user.passkeys.push(PasskeyCred {
+        id: b64u(pk.cred_id().as_ref()),
+        name: if name.is_empty() { "passkey".into() } else { name },
+        created_unix: now(),
+        data: serde_json::to_value(&pk).unwrap_or(Value::Null),
+    });
+    app.store.put_user(user.clone());
+    let passkeys: Vec<Value> = user.passkeys.iter().map(|p| json!({ "id": p.id, "name": p.name, "created_unix": p.created_unix })).collect();
+    Json(json!({ "passkeys": passkeys })).into_response()
+}
+
+/// `DELETE /api/account/passkeys/:cred` — remove a passkey (never the last one).
+async fn account_passkey_delete(State(app): State<App>, headers: axum::http::HeaderMap, Path(cred): Path<String>) -> Response {
+    let Some(a) = authed_actor(&app, &headers) else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
+    let Some(mut user) = app.store.user_by_actor(&a.id) else { return (StatusCode::NOT_FOUND, "not a hosted account").into_response(); };
+    if user.passkeys.len() <= 1 {
+        return (StatusCode::BAD_REQUEST, "cannot remove your only passkey").into_response();
+    }
+    let before = user.passkeys.len();
+    user.passkeys.retain(|p| p.id != cred);
+    if user.passkeys.len() == before {
+        return (StatusCode::NOT_FOUND, "no such passkey").into_response();
+    }
+    app.store.put_user(user.clone());
+    let passkeys: Vec<Value> = user.passkeys.iter().map(|p| json!({ "id": p.id, "name": p.name, "created_unix": p.created_unix })).collect();
+    Json(json!({ "passkeys": passkeys })).into_response()
 }
 
 /// Verify a service-to-service shared secret from a request header — for webhook-style endpoints
@@ -1875,8 +2604,11 @@ async fn mirror_inbound(
 
 /// List reviews for a hosted repo (`GET /api/repos/:tenant/:repo/reviews`); the client filters by
 /// target (e.g. `pr:1`).
-async fn reviews(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "reviews": app.store.reviews(&format!("{tenant}/{repo}")) }))
+async fn reviews(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "reviews": app.store.reviews(&format!("{tenant}/{repo}")) })).into_response()
 }
 
 /// The content-addressed review **audit artifact** (`GET …/artifacts/:id`) — the immutable record of
@@ -1920,6 +2652,8 @@ async fn create_comment(
         return (StatusCode::BAD_REQUEST, "target and body are required").into_response();
     }
     let count = app.store.comments(&key).len();
+    let path = body.get("path").and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let line = body.get("line").and_then(Value::as_u64).map(|n| n as u32);
     let comment = Comment {
         id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
         repo: key.clone(),
@@ -1927,6 +2661,8 @@ async fn create_comment(
         author: author.id.clone(),
         body: text,
         created_unix: now(),
+        path,
+        line,
     };
     app.store.put_comment(comment.clone());
     // Notify the people watching the target (not the commenter): a PR's author + reviewers, or an
@@ -2375,6 +3111,8 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
                     author: agent.id.clone(),
                     body: format!("🔧 **Applied fix** as change ⬡{} — {}\n\n```diff\n{diff}\n```", &fix_change[..12], res.explanation),
                     created_unix: now(),
+                    path: None,
+                    line: None,
                 });
                 app.registry.notify(&NotifyEvent {
                     kind: "fix_applied".into(),
@@ -2393,6 +3131,8 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
                     author: agent.id.clone(),
                     body: format!("🔧 **Proposed fix** for `{path}` (couldn't apply cleanly — the code moved): {}", res.explanation),
                     created_unix: now(),
+                    path: None,
+                    line: None,
                 });
             }
         }
@@ -2442,7 +3182,10 @@ fn independent_agent_reviewer(app: &App, author: &str) -> Option<hull_core::Acto
 /// List pull requests for a hosted repo (`GET /api/repos/:tenant/:repo/prs`). Each PR's verification
 /// is refreshed live from keel (the change's verify state), so an approving review + green keel
 /// verify shows on the badge.
-async fn prs(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+async fn prs(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let mut list = app.store.prs(&format!("{tenant}/{repo}"));
     for pr in &mut list {
         if let Some(c) = pr.changes.first() {
@@ -2455,7 +3198,7 @@ async fn prs(State(app): State<App>, Path((tenant, repo)): Path<(String, String)
             }
         }
     }
-    Json(json!({ "prs": list }))
+    Json(json!({ "prs": list })).into_response()
 }
 
 /// Set a change's keel verification (`POST /api/repos/:tenant/:repo/change/:id/verify` with
@@ -2512,6 +3255,13 @@ async fn create_pr(
         .map(|ci| ci.files.into_iter().map(|f| f.path).collect())
         .unwrap_or_default();
     let owners = owners_for(&app, &key, &files);
+    // Code owners plus any repo-configured default reviewers are auto-requested on the new voyage.
+    let mut reviewers = owners.clone();
+    for r in app.repo_settings.get(&key).default_reviewers {
+        if !reviewers.contains(&r) {
+            reviewers.push(r);
+        }
+    }
     let pr = PullRequest {
         id: format!("pr_{}_{number}", key.replace('/', "_")),
         repo: key,
@@ -2520,7 +3270,7 @@ async fn create_pr(
         author: actor.id,
         changes,
         verification: Verification::Unverified,
-        reviewers: owners.clone(),
+        reviewers: reviewers.clone(),
         state: PrState::Open,
         merged_by: None,
         created_unix: now(),
@@ -2565,8 +3315,11 @@ async fn create_pr(
 }
 
 /// List issues for a hosted repo (`GET /api/repos/:tenant/:repo/issues`).
-async fn issues(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "issues": app.store.issues(&format!("{tenant}/{repo}")) }))
+async fn issues(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "issues": app.store.issues(&format!("{tenant}/{repo}")) })).into_response()
 }
 
 /// Open an issue (`POST /api/repos/:tenant/:repo/issues`). An optional `code_ref` `{path, line_start,
@@ -2731,11 +3484,17 @@ async fn feed(
     State(app): State<App>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let tenant = q.get("tenant").cloned().unwrap_or_else(|| "local".into());
+    // Scoped to the caller's accounts (`?accounts=a,b,c`), falling back to a single `?tenant=` for
+    // compatibility. Empty → no events (a logged-out viewer sees nothing personal).
+    let tenants: Vec<String> = q
+        .get("accounts")
+        .map(|s| s.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect())
+        .or_else(|| q.get("tenant").map(|t| vec![t.clone()]))
+        .unwrap_or_default();
     let stream = BroadcastStream::new(app.hub.subscribe()).filter_map(move |ev| {
         let te = ev.ok()?;
-        if te.tenant != tenant {
-            return None; // not this subscriber's tenant
+        if !tenants.contains(&te.tenant) {
+            return None; // not one of this subscriber's accounts
         }
         Event::default().json_data(&te.event).ok().map(Ok)
     });

@@ -166,6 +166,54 @@ pub enum Role {
     Read,
 }
 
+/// A login identity (a hosted account). Distinct from [`Actor`]: a `User` authenticates with
+/// **passkeys** (WebAuthn) + email/username — no passwords — and *owns* a human [`Actor`] whose
+/// Ed25519 signing key Hull holds server-side, so Hull can sign agent delegations on the user's
+/// behalf. Passkeys can only sign server challenges (not arbitrary delegation messages), so login
+/// and signing are deliberately separated here. Legacy key-import login (proving possession of an
+/// actor keypair) still works and needs no `User`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    /// Stable id = the WebAuthn user handle (a uuid), independent of `username` (which may change).
+    pub id: String,
+    pub username: String,
+    pub email: String,
+    /// The human actor this user drives (its id is that actor's public key).
+    pub actor: ActorId,
+    /// Hex Ed25519 secret Hull holds to sign delegations for this user. Plaintext in the dev store;
+    /// a real deployment encrypts this at rest (KMS/enclave). This is the tradeoff the hosted-account
+    /// model accepts in exchange for passkey login.
+    pub secret_key: String,
+    #[serde(default)]
+    pub passkeys: Vec<PasskeyCred>,
+    #[serde(default)]
+    pub created_unix: u64,
+}
+
+/// A registered WebAuthn passkey. `data` is the opaque `webauthn_rs::prelude::Passkey`, kept as JSON
+/// so hull-core never has to depend on the WebAuthn crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasskeyCred {
+    /// Base64url credential id — the stable handle for display / removal.
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub created_unix: u64,
+    pub data: serde_json::Value,
+}
+
+/// A team within an organization account: a named group of members, used to grant repo access
+/// collectively (see repo settings). Personal accounts have no teams.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Team {
+    pub id: String,
+    /// Owning account id.
+    pub account: String,
+    pub name: String,
+    #[serde(default)]
+    pub members: Vec<Membership>,
+}
+
 /// A hosted keel repository.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Repo {
@@ -344,6 +392,11 @@ pub struct Comment {
     pub author: ActorId,
     pub body: String,
     pub created_unix: u64,
+    /// Optional file + line this comment is anchored to (a line-level review comment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
 }
 
 /// A specific issue a review raises, anchored to a file (and optionally a line). What turns a

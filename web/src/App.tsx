@@ -1,8 +1,92 @@
 import { useEffect, useRef, useState } from "react";
 import * as ed from "@noble/ed25519";
+import { Button, LinkButton } from "./ui/Button";
+import { HTabs, Segmented } from "./ui/Tabs";
+import { SearchInput, Switch, Select } from "./ui/Field";
+import { StatusBadge, IdChip, Tag } from "./ui/Badge";
+import { Alert } from "./ui/Alert";
+import { Drawer, Dialog, PromptModal } from "./ui/Overlay";
+import { SemanticDiff, CodePanel, LocationBar, OldTok, NewTok } from "./ui/SemanticDiff";
+import { createPasskey, getPasskey } from "./webauthn";
+import { hlToHtml, wordDiff, type Seg } from "./highlight";
+import { Markdown } from "./markdown";
+
+// Syntax-highlighted code fragment (hljs HTML). Used across the diff viewer.
+const Hl = ({ text, path }: { text: string; path: string }) => <span dangerouslySetInnerHTML={{ __html: hlToHtml(text, path) }} />;
+// Render word-diff segments: unchanged parts syntax-highlighted, changed parts tinted (removed/added).
+const wdRender = (segs: Seg[], path: string, side: "old" | "new") =>
+  segs.map((s, i) => s.changed
+    ? <span key={i} className={side === "old" ? "bg-fault-wash text-fault-text rounded-[3px]" : "bg-clear-wash text-clear-text font-semibold rounded-[3px]"} style={{ padding: "1px 2px" }}>{s.text}</span>
+    : <Hl key={i} text={s.text} path={path} />);
+
+// Scroll a diff line into view and flash it — the target of "What changed here" jumps.
+const flashLine = (id: string) => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.scrollIntoView({ block: "center", behavior: "smooth" });
+  el.classList.add("flash-line");
+  setTimeout(() => el.classList.remove("flash-line"), 1300);
+};
 
 const hexToBytes = (h: string) => Uint8Array.from((h.match(/../g) ?? []).map((x) => parseInt(x, 16)));
 const bytesToHex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+
+// ── in-app modal system (replaces window.prompt/confirm/alert) ───────────────
+// Promise-based so call sites stay simple: `await uiPrompt(...)`, `await uiConfirm(...)`, `uiAlert(...)`.
+// A module-level bridge lets both App and ReviewPage reach the one modal host that App renders.
+type ModalReq =
+  | { kind: "prompt"; title: string; label?: string; placeholder?: string; initial?: string; sanitize?: (s: string) => string; check?: "account" | "username"; confirmLabel?: string }
+  | { kind: "confirm"; title: string; body?: string; danger?: boolean; confirmLabel?: string }
+  | { kind: "alert"; title: string; body?: string };
+let _pushModal: ((req: ModalReq, resolve: (v: unknown) => void) => void) | null = null;
+const uiPrompt = (o: Omit<Extract<ModalReq, { kind: "prompt" }>, "kind">) =>
+  new Promise<string | null>((res) => (_pushModal ? _pushModal({ kind: "prompt", ...o }, (v) => res(v as string | null)) : res(null)));
+const uiConfirm = (o: Omit<Extract<ModalReq, { kind: "confirm" }>, "kind">) =>
+  new Promise<boolean>((res) => (_pushModal ? _pushModal({ kind: "confirm", ...o }, (v) => res(!!v)) : res(false)));
+const uiAlert = (title: string, body?: string) =>
+  new Promise<void>((res) => (_pushModal ? _pushModal({ kind: "alert", title, body }, () => res()) : res()));
+const sanitizeHandle = (s: string) => s.replace(/\s+/g, "_");
+
+// Compact relative time ("3h ago") from a unix seconds timestamp.
+const timeAgo = (unix: number) => {
+  if (!unix) return "";
+  const s = Math.max(1, Math.floor(Date.now() / 1000 - unix));
+  const steps: [number, string][] = [[60, "s"], [60, "m"], [24, "h"], [30, "d"], [12, "mo"], [Infinity, "y"]];
+  let v = s, u = "s";
+  for (const [div, unit] of steps) { if (v < div) { u = unit; break; } v = Math.floor(v / div); u = unit; }
+  return `${v}${u} ago`;
+};
+
+// Parse a path into view state. Used both to seed initial state synchronously (so the first render —
+// and its data fetches — already match the URL, no default-tenant race on deep links) and by the
+// router on navigate/popstate.
+type RouteState = {
+  view: "home" | "repo";
+  authPage: "login" | "signup" | "account" | null;
+  orgHandle: string | null;
+  tenant: string;
+  issueRepo: string;
+  tab: "issues" | "prs";
+  openIssue: number | null;
+  openPr: number | null;
+  repoSettingsOpen: boolean;
+};
+function parseRoute(path: string): RouteState {
+  const seg = path.split("?")[0].split("/").filter(Boolean).map(decodeURIComponent);
+  const r: RouteState = { view: "home", authPage: null, orgHandle: null, tenant: "", issueRepo: "", tab: "issues", openIssue: null, openPr: null, repoSettingsOpen: false };
+  if (seg[0] === "login" || seg[0] === "signup") { r.authPage = seg[0]; return r; }
+  if (seg[0] === "settings") { r.authPage = "account"; return r; }
+  if (seg[0] === "orgs" && seg[1]) { r.orgHandle = seg[1]; return r; }
+  const [t, rp, s, n] = seg;
+  if (t && rp) {
+    r.view = "repo"; r.tenant = t; r.issueRepo = rp;
+    if (s === "settings") r.repoSettingsOpen = true;
+    else if (s === "issues" && n) { r.openIssue = Number(n); r.tab = "issues"; }
+    else if (s === "voyages" && n) { r.openPr = Number(n); r.tab = "prs"; }
+    else if (s === "voyages") r.tab = "prs";
+  }
+  return r;
+}
 
 // The published demo-owner secret (mirrors hull-server's DEMO_OWNER_SECRET). "Sign in as demo" signs
 // the login challenge with this key — real signature auth, just a publicly-known demo credential.
@@ -10,6 +94,7 @@ const DEMO_OWNER_SECRET = "68756c6c2d64656d6f2d6f776e65722d6b65792d64656d6f2d6f6
 
 // Mirrors hull-server's activity model.
 type RepoActivity = {
+  tenant: string;
   repo: string;
   score: number;
   last_ts: number;
@@ -28,7 +113,7 @@ type PR = { number: number; title: string; author: string; changes: string[]; ve
 type Finding = { path: string; line?: number; severity: string; note: string };
 type ClaimEv = { kind: string; detail: string; supports: boolean };
 type LedgerSnap = { change: string; claims: { id: string; text: string; source: string; status: string; evidence: ClaimEv[] }[]; unclaimed?: string[] };
-type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string; findings: Finding[]; ledger?: LedgerSnap; artifact_id?: string };
+type Review = { id: string; target: string; reviewer: string; verdict: string; summary: string; findings: Finding[]; ledger?: LedgerSnap; artifact_id?: string; created_unix?: number };
 type CodeRef = { repo: string; blob: string; path: string; line_start: number; line_end?: number };
 type Issue = {
   number: number;
@@ -43,6 +128,198 @@ type Issue = {
   linked_prs?: string[];
 };
 
+// Deterministic identicon: a gradient derived from the id, initial letter, shape by kind (humans
+// round, agents/orgs a rounded square). Gives every actor a stable, recognizable face.
+function avatarColors(seed: string): { from: string; to: string } {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) { h ^= seed.charCodeAt(i); h = Math.imul(h, 16777619); }
+  const hue = (h >>> 0) % 360;
+  return { from: `hsl(${hue} 58% 55%)`, to: `hsl(${(hue + 42) % 360} 60% 42%)` };
+}
+const Avatar = ({ id, handle, kind, size = 22 }: { id?: string; handle?: string; kind?: string; size?: number }) => {
+  const seed = id || handle || "?";
+  const { from, to } = avatarColors(seed);
+  const initial = ((handle || "?").replace(/[^a-zA-Z0-9]/g, "").charAt(0) || "?").toUpperCase();
+  const shape = kind === "agent" ? "rounded-[5px]" : kind === "organization" ? "rounded-[6px]" : "rounded-full";
+  return (
+    <span className={`inline-grid place-items-center ${shape} text-white font-semibold shrink-0 select-none`}
+      style={{ width: size, height: size, background: `linear-gradient(135deg, ${from}, ${to})`, fontSize: Math.round(size * 0.46) }}
+      title={handle} aria-hidden>
+      {initial}
+    </span>
+  );
+};
+
+// A colored issue label (GitHub-style), hue deterministically derived from the label text.
+const Label = ({ name }: { name: string }) => {
+  let h = 2166136261;
+  for (let i = 0; i < name.length; i++) { h ^= name.charCodeAt(i); h = Math.imul(h, 16777619); }
+  const hue = (h >>> 0) % 360;
+  return (
+    <span className="inline-flex items-center text-[11.5px] font-medium px-2 py-[2px] rounded-full" style={{ background: `hsl(${hue} 70% 95%)`, color: `hsl(${hue} 48% 34%)`, border: `1px solid hsl(${hue} 55% 84%)` }}>{name}</span>
+  );
+};
+
+// ── small token-only layout atoms (not controls — controls come from ./ui) ──────────
+const Card = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
+  <div className={`bg-surface border border-rule rounded-card overflow-hidden ${className}`}>{children}</div>
+);
+const SectionHeader = ({ label, right }: { label: string; right?: React.ReactNode }) => (
+  <div className="flex items-center justify-between gap-3 px-5 py-3.5 border-b border-rule2">
+    <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">{label}</span>
+    {right}
+  </div>
+);
+// An eyebrow label that sits directly on the page ground (no card), above a section.
+const Eyebrow = ({ label, right }: { label: string; right?: React.ReactNode }) => (
+  <div className="flex items-baseline justify-between gap-3 mb-2.5">
+    <span className="text-[11px] font-semibold uppercase tracking-[0.09em] text-muted">{label}</span>
+    {right && <span className="text-[12.5px] text-muted">{right}</span>}
+  </div>
+);
+// A compact sidebar metadata module (About / Delivery / Autonomy …).
+const Module = ({ title, children, tone = "" }: { title: string; children: React.ReactNode; tone?: string }) => (
+  <div className="bg-surface border border-rule rounded-card">
+    <div className="px-4 py-2.5 border-b border-rule2 flex items-center justify-between">
+      <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">{title}</span>
+      {tone && <span className="w-1.5 h-1.5 rounded-full" style={{ background: tone }} />}
+    </div>
+    <div className="px-4 py-3.5 grid gap-2.5 text-[13px]">{children}</div>
+  </div>
+);
+// label-left / value-right stat line inside a Module.
+const Stat = ({ k, v }: { k: React.ReactNode; v: React.ReactNode }) => (
+  <div className="flex items-baseline justify-between gap-3">
+    <span className="text-muted">{k}</span>
+    <span className="font-medium text-body tabular-nums text-right">{v}</span>
+  </div>
+);
+
+// A click-to-open popover anchored under its trigger. Closes on outside-click or Escape. Used for the
+// header "checks" summary, so the landing gate is reachable from the top of the page.
+function Popover({ trigger, children, align = "left", width = 300, direction = "down", onToggle }: { trigger: (open: boolean) => React.ReactNode; children: React.ReactNode; align?: "left" | "right"; width?: number; direction?: "down" | "up"; onToggle?: (open: boolean) => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLSpanElement>(null);
+  const set = (v: boolean) => { setOpen(v); onToggle?.(v); };
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) set(false); };
+    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") set(false); };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onEsc);
+    return () => { document.removeEventListener("mousedown", onDoc); document.removeEventListener("keydown", onEsc); };
+  }, [open]);
+  return (
+    <span ref={ref} className="relative inline-flex">
+      <button type="button" onClick={() => set(!open)} className="inline-flex">{trigger(open)}</button>
+      {open && (
+        <div style={{ width }} onClick={() => set(false)}
+          className={`absolute z-40 ${direction === "up" ? "bottom-full mb-2" : "top-full mt-2"} ${align === "right" ? "right-0" : "left-0"} bg-surface border border-rule rounded-card shadow-menu overflow-hidden animate-[bd-in_120ms_ease-out]`}>
+          {children}
+        </div>
+      )}
+    </span>
+  );
+}
+
+// Styled select (replaces native <select>). options: {value,label}[]. When value is "" it shows the
+// placeholder — used both for bound selects and "pick to act" menus.
+function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", className = "" }: { value: string; onChange: (v: string) => void; options: { value: string; label: string }[]; placeholder?: string; width?: number; size?: "sm" | "md"; className?: string }) {
+  const cur = options.find((o) => o.value === value);
+  const h = size === "sm" ? "h-ctl-sm text-xs" : "h-ctl text-[13px]";
+  return (
+    <Popover align="left" width={width} trigger={(open) => (
+      <span className={`inline-flex items-center justify-between gap-2 ${h} px-2.5 rounded-ctl border bg-surface transition-colors ${open ? "border-body" : "border-ctl hover:border-dim"} ${className}`}>
+        <span className={`truncate ${cur ? "text-ink" : "text-faint"}`}>{cur?.label ?? placeholder}</span>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`text-muted flex-none transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
+      </span>
+    )}>
+      <div className="py-1 max-h-[300px] overflow-auto">
+        {options.length === 0 && <div className="px-3 py-1.5 text-[12.5px] text-muted">none available</div>}
+        {options.map((o) => (
+          <button key={o.value} type="button" onClick={() => onChange(o.value)} className={`w-full text-left px-3 py-1.5 text-[13px] hover:bg-paper ${o.value === value ? "bg-paper font-medium text-ink" : "text-body"}`}>{o.label}</button>
+        ))}
+      </div>
+    </Popover>
+  );
+}
+
+// Small semantic status glyph — a filled dot/check/x/question in a soft disc. Calmer than a full
+// pill when a whole list of statuses is shown together.
+const StatusDot = ({ tone, size = 18 }: { tone: "ok" | "bad" | "warn" | "wait" | "info"; size?: number }) => {
+  const map = { ok: "bg-clear text-white", bad: "bg-fault text-white", warn: "bg-brass text-[#1D2125]", wait: "border border-ctl text-muted", info: "bg-steel text-white" } as const;
+  return (
+    <span className={`rounded-full grid place-items-center flex-none ${map[tone]}`} style={{ width: size, height: size }}>
+      {tone === "ok" ? <svg width={size * 0.6} height={size * 0.6} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+        : tone === "bad" ? <svg width={size * 0.55} height={size * 0.55} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="4" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+          : tone === "warn" ? <span className="font-bold leading-none" style={{ fontSize: size * 0.65 }}>!</span>
+            : tone === "info" ? <span className="font-bold leading-none lowercase" style={{ fontSize: size * 0.62 }}>i</span>
+              : <span className="font-bold leading-none" style={{ fontSize: size * 0.6 }}>?</span>}
+    </span>
+  );
+};
+
+// ── ⌘K command palette: search or jump to repos / issues / voyages / actions ──────
+type CmdItem = { id: string; group: string; label: string; sublabel?: string; icon?: React.ReactNode; run: () => void };
+function CommandPalette({ open, items, onClose }: { open: boolean; items: CmdItem[]; onClose: () => void }) {
+  const [q, setQ] = useState("");
+  const [sel, setSel] = useState(0);
+  useEffect(() => { if (open) { setQ(""); setSel(0); } }, [open]);
+  const ql = q.trim().toLowerCase();
+  const matches = ql ? items.filter((it) => `${it.label} ${it.sublabel ?? ""} ${it.group}`.toLowerCase().includes(ql)) : items;
+  useEffect(() => { setSel(0); }, [ql]);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "ArrowDown") { e.preventDefault(); setSel((s) => Math.min(matches.length - 1, s + 1)); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); setSel((s) => Math.max(0, s - 1)); }
+      else if (e.key === "Enter") { e.preventDefault(); const m = matches[sel]; if (m) { m.run(); onClose(); } }
+      else if (e.key === "Escape") { e.preventDefault(); onClose(); }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, matches, sel, onClose]);
+  if (!open) return null;
+  const groups: string[] = [];
+  matches.forEach((m) => { if (!groups.includes(m.group)) groups.push(m.group); });
+  let idx = -1;
+  return (
+    <>
+      <div onClick={onClose} className="fixed inset-0 z-40 bg-ink/30 animate-bd-in" />
+      <div className="fixed left-1/2 top-[11vh] -translate-x-1/2 z-50 w-[580px] max-w-[92vw] bg-surface rounded-[13px] shadow-modal overflow-hidden animate-ov-in border border-rule">
+        <div className="flex items-center gap-2.5 px-4 h-[50px] border-b border-rule2">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
+          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search or jump to a repo, issue, voyage, or action…" className="flex-1 bg-transparent outline-none font-sans text-[14px] text-ink placeholder:text-faint" />
+          <span className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-1.5 py-0.5 bg-paper">esc</span>
+        </div>
+        <div className="max-h-[54vh] overflow-y-auto py-1.5">
+          {matches.length === 0 && <div className="px-4 py-8 text-[13px] text-muted text-center">no matches</div>}
+          {groups.map((g) => (
+            <div key={g}>
+              <div className="px-4 pt-2.5 pb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">{g}</div>
+              {matches.filter((m) => m.group === g).map((m) => {
+                idx++;
+                const i = idx;
+                return (
+                  <button key={m.id} onMouseEnter={() => setSel(i)} onClick={() => { m.run(); onClose(); }}
+                    className={`w-full text-left flex items-center gap-2.5 px-4 py-2 cursor-pointer ${sel === i ? "bg-steel-wash" : "hover:bg-paper"}`}>
+                    <span className="flex-none w-4 grid place-items-center text-muted">{m.icon ?? <span className="text-faint">›</span>}</span>
+                    <span className={`text-[13.5px] flex-1 truncate ${sel === i ? "text-steel-text font-medium" : "text-ink"}`}>{m.label}</span>
+                    {m.sublabel && <span className="text-[12px] text-faint truncate flex-none max-w-[40%]">{m.sublabel}</span>}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      </div>
+    </>
+  );
+}
+// verification/state → StatusBadge kind
+const verifKind = (v: string): "passed" | "failed" | "running" | "queued" =>
+  v === "green" ? "passed" : v === "red" ? "failed" : v === "running" ? "running" : "queued";
+
 /**
  * The home page IS a live projection of the fleet's coordination stream: repos rank by activity
  * (an agent starting work floats a repo up), and the event ticker shows what's happening now.
@@ -50,10 +327,48 @@ type Issue = {
 export function App() {
   const [repos, setRepos] = useState<RepoActivity[]>([]);
   const [events, setEvents] = useState<ActivityEvent[]>([]);
-  const [tenant, setTenant] = useState<string>(
-    () => new URLSearchParams(location.search).get("tenant") || "tankrap",
-  );
+  const [tenant, setTenant] = useState<string>(() => parseRoute(location.pathname).tenant || "tankrap");
   const feedRef = useRef<EventSource | null>(null);
+
+  // ⌘K command palette + keyboard shortcuts
+  const [cmdOpen, setCmdOpen] = useState(false);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); setCmdOpen((o) => !o); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // modal host: one place renders whatever uiPrompt/uiConfirm/uiAlert asked for
+  const [modalReq, setModalReq] = useState<{ req: ModalReq; resolve: (v: unknown) => void } | null>(null);
+  useEffect(() => {
+    _pushModal = (req, resolve) => setModalReq({ req, resolve });
+    return () => { _pushModal = null; };
+  }, []);
+  const closeModal = (v: unknown) => { modalReq?.resolve(v); setModalReq(null); };
+  const checkAvail = async (kind: "account" | "username", v: string) => {
+    const url = kind === "account" ? `/api/accounts/available?handle=${encodeURIComponent(v)}` : `/api/auth/available?username=${encodeURIComponent(v)}`;
+    const d = await fetch(url).then((r) => r.json()).catch(() => ({ available: false }));
+    return { available: !!d.available, hint: "taken" };
+  };
+  const uiModalNode = (() => {
+    if (!modalReq) return null;
+    const req = modalReq.req;
+    if (req.kind === "prompt") {
+      const check = req.check;
+      return (
+        <PromptModal open title={req.title} label={req.label} placeholder={req.placeholder} initial={req.initial ?? ""} sanitize={req.sanitize} confirmLabel={req.confirmLabel ?? "Confirm"}
+          validate={check ? (v: string) => checkAvail(check, v) : undefined}
+          onCancel={() => closeModal(null)} onConfirm={(v: string) => closeModal(v)} />
+      );
+    }
+    if (req.kind === "confirm") {
+      return <Dialog open title={req.title} body={req.body} cancelLabel="Cancel" actionLabel={req.confirmLabel ?? "Confirm"} onClose={() => closeModal(false)} onAction={() => closeModal(true)} />;
+    }
+    return <Dialog open title={req.title} body={req.body} cancelLabel={null} actionLabel="OK" onClose={() => closeModal(undefined)} onAction={() => closeModal(undefined)} />;
+  })();
 
   // Theme: light-first (the design's default), dark via [data-theme] on <html>. Persisted.
   const [theme, setTheme] = useState<string>(
@@ -65,7 +380,7 @@ export function App() {
   }, [theme]);
 
   // Issues for the selected repo under the selected tenant (M2). Click a repo card to switch.
-  const [issueRepo, setIssueRepo] = useState<string>("hull");
+  const [issueRepo, setIssueRepo] = useState<string>(() => parseRoute(location.pathname).issueRepo || "hull");
   const [issues, setIssues] = useState<Issue[]>([]);
   const [prov, setProv] = useState<Record<string, { change: string; intent: string; author: string }[]>>({});
 
@@ -74,16 +389,14 @@ export function App() {
   const [showNotifs, setShowNotifs] = useState(false);
   // Unread tracking: the badge counts only notifications newer than what you've last opened.
   const [seenTs, setSeenTs] = useState<number>(() => Number(localStorage.getItem("hull_notif_seen") ?? 0));
-  const toggleNotifs = () =>
-    setShowNotifs((s) => {
-      const opening = !s;
-      if (opening && notifs.length) {
-        const maxTs = Math.max(...notifs.map((n) => n.ts));
-        setSeenTs(maxTs);
-        localStorage.setItem("hull_notif_seen", String(maxTs));
-      }
-      return opening;
-    });
+  const openNotifs = () => {
+    if (notifs.length) {
+      const maxTs = Math.max(...notifs.map((n) => n.ts));
+      setSeenTs(maxTs);
+      localStorage.setItem("hull_notif_seen", String(maxTs));
+    }
+    setShowNotifs(true);
+  };
 
   // Auth: sign in by proving possession of an actor's Ed25519 key → session token.
   const [token, setToken] = useState<string>(() => localStorage.getItem("hull_token") ?? "");
@@ -120,7 +433,7 @@ export function App() {
   }, [token, me]);
   // Register a fresh human identity and sign in with it — one click to a usable session.
   const registerAndSignIn = async () => {
-    const handle = prompt("handle for your new identity", "you") ?? "";
+    const handle = (await uiPrompt({ title: "New identity", label: "handle", initial: "you", sanitize: sanitizeHandle })) ?? "";
     if (!handle.trim()) return;
     const res = await fetch("/api/actors", {
       method: "POST",
@@ -128,12 +441,12 @@ export function App() {
       body: JSON.stringify({ handle: handle.trim(), kind: "human" }),
     });
     if (!res.ok) {
-      alert(await res.text());
+      uiAlert(await res.text());
       return;
     }
     const { secret_key } = await res.json();
     await signInWith(secret_key);
-    alert("Your secret key (save it to sign in again):\n\n" + secret_key);
+    uiAlert("Your secret key (save it to sign in again):\n\n" + secret_key);
   };
   const signIn = () => signInWith(secretInput.trim());
   const signInWith = async (secret: string) => {
@@ -149,7 +462,7 @@ export function App() {
         body: JSON.stringify({ actor, nonce, signature: bytesToHex(sig) }),
       });
       if (!res.ok) {
-        alert(await res.text());
+        uiAlert(await res.text());
         return;
       }
       const { token: t } = await res.json();
@@ -160,13 +473,14 @@ export function App() {
       sessionSecret.current = secret;
       setSecretInput("");
     } catch (e) {
-      alert("bad secret key");
+      uiAlert("bad secret key");
     }
   };
   const signOut = () => {
     localStorage.removeItem("hull_token");
     setToken("");
     setMe(null);
+    setShowProfile(false);
     sessionSecret.current = "";
   };
   // Mint an agent that cryptographically chains to you. The delegation hop is signed **client-side**
@@ -174,27 +488,256 @@ export function App() {
   // secret — it only stores a signed delegation it can verify. Matches the server's canonical
   // hop_message (identity::hop_message) exactly.
   const createAgent = async () => {
-    if (!sessionSecret.current || !me) {
-      alert("Sign in again (paste your secret key) to delegate an agent — Hull needs your key in memory to sign the delegation, and it isn't stored.");
-      return;
-    }
-    const handle = prompt("handle for your agent (it will chain to you)", "agent:mine") ?? "";
+    if (!me) return uiAlert("Sign in to delegate an agent.");
+    const handle = (await uiPrompt({ title: "Delegate an agent", label: "handle (chains to you)", initial: "agent:mine" })) ?? "";
     if (!handle.trim()) return;
     const scope = "*";
-    // 1. generate the agent's keypair locally — its secret never leaves the browser
-    const childSk = ed.utils.randomSecretKey();
-    const childPub = bytesToHex(await ed.getPublicKeyAsync(childSk));
-    // 2. sign the canonical delegation hop with YOUR key (the parent)
-    const msg = new TextEncoder().encode(`hull-delegation:v1\nparent=${me.id}\nchild=${childPub}\nkind=agent\nscope=${scope}\nexpires=0`);
-    const sig = bytesToHex(await ed.signAsync(msg, hexToBytes(sessionSecret.current)));
-    const res = await fetch("/api/actors", {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ handle: handle.trim(), kind: "agent", child_pub: childPub, scope, delegation_sig: sig }),
-    });
-    if (!res.ok) return alert(await res.text());
-    fetch("/api/actors").then((r) => r.json()).then((d) => setActors(d.actors ?? []));
-    alert(`Agent created, cryptographically delegated by you (Hull never saw this key).\n\nIts secret key — save it, the agent signs in with this:\n\n${bytesToHex(childSk)}`);
+    const refresh = () => fetch("/api/actors").then((r) => r.json()).then((d) => setActors(d.actors ?? []));
+    if (sessionSecret.current) {
+      // Legacy key login: sign the delegation client-side so Hull never sees the agent's secret.
+      const childSk = ed.utils.randomSecretKey();
+      const childPub = bytesToHex(await ed.getPublicKeyAsync(childSk));
+      const msg = new TextEncoder().encode(`hull-delegation:v1\nparent=${me.id}\nchild=${childPub}\nkind=agent\nscope=${scope}\nexpires=0`);
+      const sig = bytesToHex(await ed.signAsync(msg, hexToBytes(sessionSecret.current)));
+      const res = await fetch("/api/actors", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ handle: handle.trim(), kind: "agent", child_pub: childPub, scope, delegation_sig: sig }),
+      });
+      if (!res.ok) return uiAlert(await res.text());
+      refresh();
+      uiAlert(`Agent created, cryptographically delegated by you (Hull never saw this key).\n\nIts secret key — save it, the agent signs in with this:\n\n${bytesToHex(childSk)}`);
+    } else {
+      // Hosted account: Hull signs the delegation with your held key and returns the agent's secret.
+      const res = await fetch("/api/actors", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ handle: handle.trim(), kind: "agent", scope }),
+      });
+      if (!res.ok) return uiAlert(await res.text());
+      const d = await res.json();
+      refresh();
+      uiAlert(`Agent created — Hull signed the delegation on your behalf.\n\nIts secret key — save it, the agent signs in with this:\n\n${d.secret_key ?? "(stored)"}`);
+    }
+  };
+  // ── passkey auth (signup / login) + account settings ─────────────────────
+  // Full-screen auth/account pages, orthogonal to the home/repo views. null = normal app.
+  const [authPage, setAuthPage] = useState<"login" | "signup" | "account" | null>(() => parseRoute(location.pathname).authPage);
+  const [authForm, setAuthForm] = useState({ username: "", email: "" });
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+  // Live username availability on the signup form.
+  const [usernameAvail, setUsernameAvail] = useState<{ available: boolean } | null>(null);
+  useEffect(() => {
+    if (authPage !== "signup") { setUsernameAvail(null); return; }
+    const u = authForm.username.trim();
+    if (!u) { setUsernameAvail(null); return; }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      fetch(`/api/auth/available?username=${encodeURIComponent(u)}`).then((r) => r.json()).then((d) => { if (!cancelled) setUsernameAvail({ available: !!d.available }); }).catch(() => {});
+    }, 300);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [authForm.username, authPage]);
+  const finishSession = (t: string) => {
+    localStorage.setItem("hull_token", t);
+    setToken(t);
+    sessionSecret.current = "";
+  };
+  const signupPasskey = async () => {
+    setAuthError("");
+    if (!authForm.username.trim() || !authForm.email.trim()) { setAuthError("username and email are required"); return; }
+    setAuthBusy(true);
+    try {
+      const start = await fetch("/api/auth/register/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(authForm) });
+      if (!start.ok) { setAuthError(await start.text()); return; }
+      const { flow_id, options } = await start.json();
+      const credential = await createPasskey(options);
+      const fin = await fetch("/api/auth/register/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ flow_id, credential }) });
+      if (!fin.ok) { setAuthError(await fin.text()); return; }
+      const { token: t } = await fin.json();
+      finishSession(t);
+      setAuthForm({ username: "", email: "" });
+      navigate("/");
+    } catch (e: any) {
+      setAuthError(e?.message || "passkey creation was cancelled");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+  const loginPasskey = async (username: string) => {
+    setAuthError("");
+    if (!username.trim()) { setAuthError("enter your username"); return; }
+    setAuthBusy(true);
+    try {
+      const start = await fetch("/api/auth/passkey/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ username }) });
+      if (!start.ok) { setAuthError(await start.text()); return; }
+      const { flow_id, options } = await start.json();
+      const credential = await getPasskey(options);
+      const fin = await fetch("/api/auth/passkey/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ flow_id, credential }) });
+      if (!fin.ok) { setAuthError(await fin.text()); return; }
+      const { token: t } = await fin.json();
+      finishSession(t);
+      navigate("/");
+    } catch (e: any) {
+      setAuthError(e?.message || "passkey login was cancelled");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+  // Account settings data
+  type AccountInfo = { username: string; email: string; actor: string; passkeys: { id: string; name: string; created_unix: number }[] };
+  const [account, setAccount] = useState<AccountInfo | null>(null);
+  const loadAccount = () => {
+    if (!token) return;
+    fetch("/api/account", { headers: { authorization: `Bearer ${token}` } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then(setAccount)
+      .catch(() => {});
+  };
+  useEffect(() => { if (authPage === "account") loadAccount(); }, [authPage, token]);
+  const saveAccount = async (patch: { username?: string; email?: string }) => {
+    const res = await fetch("/api/account", { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
+    if (!res.ok) return uiAlert(await res.text());
+    loadAccount();
+    fetch("/api/auth/me", { headers: { authorization: `Bearer ${token}` } }).then((r) => (r.ok ? r.json() : null)).then((m) => setMe(m)).catch(() => {});
+  };
+  const addPasskey = async () => {
+    const name = (await uiPrompt({ title: "Add a passkey", label: "name", initial: "my device" })) ?? "";
+    try {
+      const start = await fetch("/api/account/passkeys/start", { method: "POST", headers: { authorization: `Bearer ${token}` } });
+      if (!start.ok) return uiAlert(await start.text());
+      const { flow_id, options } = await start.json();
+      const credential = await createPasskey(options);
+      const fin = await fetch("/api/account/passkeys/finish", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ flow_id, credential, name }) });
+      if (!fin.ok) return uiAlert(await fin.text());
+      loadAccount();
+    } catch (e: any) {
+      uiAlert(e?.message || "cancelled");
+    }
+  };
+  const removePasskey = async (id: string) => {
+    if (!(await uiConfirm({ title: "Remove passkey", body: "Remove this passkey?", danger: true, confirmLabel: "Remove" }))) return;
+    const res = await fetch(`/api/account/passkeys/${encodeURIComponent(id)}`, { method: "DELETE", headers: { authorization: `Bearer ${token}` } });
+    if (!res.ok) return uiAlert(await res.text());
+    loadAccount();
+  };
+
+  // ── org management (members + teams) + repo settings ──────────────────────
+  const [orgHandle, setOrgHandle] = useState<string | null>(() => parseRoute(location.pathname).orgHandle);
+  const [repoSettingsOpen, setRepoSettingsOpen] = useState(() => parseRoute(location.pathname).repoSettingsOpen);
+  type TeamT = { id: string; name: string; members: { actor: string; handle: string; role: string }[] };
+  const [teams, setTeams] = useState<TeamT[]>([]);
+  const [memberPick, setMemberPick] = useState({ actor: "", role: "write" });
+  const [teamDraft, setTeamDraft] = useState("");
+  const loadTeams = (accountId: string) => {
+    fetch(`/api/accounts/${encodeURIComponent(accountId)}/teams`).then((r) => r.json()).then((d) => setTeams(d.teams ?? [])).catch(() => {});
+  };
+  const reloadAccounts = () => fetch("/api/accounts", { headers: authHeaders() }).then((r) => (r.ok ? r.json() : { accounts: [] })).then((d) => setAccounts(d.accounts ?? [])).catch(() => {});
+  const orgApi = async (path: string, method: string, body?: unknown) => {
+    const res = await fetch(`/api/accounts/${path}`, { method, headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: body ? JSON.stringify(body) : undefined });
+    if (!res.ok) { uiAlert(await res.text()); return false; }
+    return true;
+  };
+  const addOrgMember = async (accountId: string, ref: { actor?: string; username?: string }, role: string) => {
+    if (await orgApi(`${accountId}/members`, "POST", { ...ref, role })) reloadAccounts();
+  };
+  const removeOrgMember = async (accountId: string, actor: string) => {
+    if (await orgApi(`${accountId}/members/${encodeURIComponent(actor)}`, "DELETE")) reloadAccounts();
+  };
+  const createTeam = async (accountId: string, name: string) => {
+    if (!name.trim()) return;
+    if (await orgApi(`${accountId}/teams`, "POST", { name: name.trim() })) loadTeams(accountId);
+  };
+  const deleteTeam = async (accountId: string, teamId: string) => {
+    if (!(await uiConfirm({ title: "Delete team", body: "Delete this team?", danger: true, confirmLabel: "Delete" }))) return;
+    if (await orgApi(`${accountId}/teams/${teamId}`, "DELETE")) loadTeams(accountId);
+  };
+  const teamAddMember = async (accountId: string, teamId: string, ref: { actor?: string; username?: string }, role: string) => {
+    if (await orgApi(`${accountId}/teams/${teamId}/members`, "POST", { ...ref, role })) loadTeams(accountId);
+  };
+  const teamRemoveMember = async (accountId: string, teamId: string, actor: string) => {
+    if (await orgApi(`${accountId}/teams/${teamId}/members/${encodeURIComponent(actor)}`, "DELETE")) loadTeams(accountId);
+  };
+  const createOrg = async () => {
+    const handle = (await uiPrompt({ title: "New organization", label: "handle", placeholder: "e.g. acme", sanitize: sanitizeHandle, check: "account", confirmLabel: "Create" })) ?? "";
+    if (!handle.trim()) return;
+    const res = await fetch("/api/accounts", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ handle: handle.trim(), kind: "organization" }) });
+    if (!res.ok) return uiAlert(await res.text());
+    await reloadAccounts();
+    navigate(`/orgs/${encodeURIComponent(handle.trim())}`);
+  };
+  const createRepoFlow = async (account?: string) => {
+    let acct = account;
+    if (!acct) {
+      if (myAccounts.length === 0) return uiAlert("Create an organization first.");
+      acct = myAccounts.length === 1 ? myAccounts[0] : ((await uiPrompt({ title: "Which organization?", label: `org (${myAccounts.join(", ")})`, initial: myAccounts[0] })) ?? "");
+    }
+    if (!acct?.trim()) return;
+    const name = (await uiPrompt({ title: "New repository", label: `name under ${acct}`, sanitize: sanitizeHandle, confirmLabel: "Create" })) ?? "";
+    if (!name.trim()) return;
+    const res = await fetch("/api/repos", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ account: acct, name: name.trim() }) });
+    if (!res.ok) return uiAlert(await res.text());
+    const d = await res.json();
+    navigate(`/${encodeURIComponent(d.tenant)}/${encodeURIComponent(d.name)}`);
+  };
+  // GitHub connection is per-account (org). Import lives under an org you administer + have connected.
+  type GhStatus = { connected: boolean; login?: string; provider?: string };
+  const [ghStatus, setGhStatus] = useState<GhStatus | null>(null);
+  const [importList, setImportList] = useState<string[] | null>(null);
+  const [importBusy, setImportBusy] = useState("");
+  const loadGh = (acctId: string) => {
+    fetch(`/api/accounts/${encodeURIComponent(acctId)}/github`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : { connected: false }))
+      .then(setGhStatus)
+      .catch(() => setGhStatus({ connected: false }));
+  };
+  const connectGh = async (acctId: string) => {
+    const inst = (await uiPrompt({ title: "Connect GitHub", label: "App installation id", placeholder: "e.g. 147613000" })) ?? "";
+    if (!inst.trim()) return;
+    const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/github/connect`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ installation: inst.trim() }) });
+    if (!res.ok) return uiAlert(await res.text());
+    loadGh(acctId);
+  };
+  const disconnectGh = async (acctId: string) => {
+    if (!(await uiConfirm({ title: "Disconnect GitHub", body: "Disconnect GitHub from this org?", danger: true, confirmLabel: "Disconnect" }))) return;
+    await fetch(`/api/accounts/${encodeURIComponent(acctId)}/github`, { method: "DELETE", headers: authHeaders() });
+    setImportList(null);
+    loadGh(acctId);
+  };
+  const openImport = async (acctId: string) => {
+    setImportList([]);
+    const d = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/github/importable`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : { repos: [] })).catch(() => ({ repos: [] }));
+    setImportList(d.repos ?? []);
+  };
+  const importRepo = async (acctId: string, source: string) => {
+    const name = (await uiPrompt({ title: `Import ${source}`, label: "as (repository name)", initial: source.split("/").pop() ?? "", sanitize: sanitizeHandle, confirmLabel: "Import" })) ?? "";
+    if (!name.trim()) return;
+    setImportBusy(source);
+    try {
+      const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/repos/import`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ source, name: name.trim() }) });
+      if (!res.ok) { uiAlert(await res.text()); return; }
+      const d = await res.json();
+      setImportList(null);
+      navigate(`/${encodeURIComponent(d.tenant)}/${encodeURIComponent(d.name)}`);
+    } finally {
+      setImportBusy("");
+    }
+  };
+  // repo settings
+  type RepoSettings = { private: boolean; require_review_to_land: boolean; default_reviewers: { actor: string; handle: string }[]; team_access: { team: string; role: string }[] };
+  const [repoSettings, setRepoSettings] = useState<RepoSettings | null>(null);
+  const [ownerRules, setOwnerRules] = useState<{ glob: string; owners: string[] }[]>([]);
+  const loadRepoSettings = () => {
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setRepoSettings(d)).catch(() => {});
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/owners`).then((r) => r.json()).then((d) => setOwnerRules(d.owners ?? [])).catch(() => {});
+    if (orgAccountFor(tenant)) loadTeams(orgAccountFor(tenant)!.id);
+  };
+  const orgAccountFor = (handle: string) => accounts.find((a) => a.handle === handle);
+  useEffect(() => { if (repoSettingsOpen) loadRepoSettings(); }, [repoSettingsOpen, tenant, issueRepo]);
+  const saveRepoSettings = async (patch: Partial<{ private: boolean; require_review_to_land: boolean; default_reviewers: string[]; team_access: { team: string; role: string }[] }>) => {
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
+    if (!res.ok) return uiAlert(await res.text());
+    setRepoSettings(await res.json());
   };
 
   // Registered actors (for display / handle resolution only — you cannot *act* as any of them).
@@ -206,21 +749,22 @@ export function App() {
       .catch(() => {});
   }, []);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
+  const kindOf = (id: string) => actors.find((a) => a.id === id)?.kind;
+  // Human-readable label for an actor token that may be a known id, a bare pubkey, or a raw git-author
+  // string ("Rando <rando@x>"). Resolves handles, strips emails, shortens naked pubkeys.
+  const actorLabel = (a: string) => {
+    const found = actors.find((x) => x.id === a);
+    if (found) return found.handle;
+    const named = a.replace(/\s*<[^>]*>/, "").trim();
+    if (/^[0-9a-f]{16,}$/i.test(named)) return named.slice(0, 7);
+    return named || a.slice(0, 7);
+  };
   // You act only as your signed-in self. No token ⇒ no identity ⇒ writes are blocked (server 401s).
   const actingAs = me?.id ?? "";
   const canAct = !!me;
   // Quick filter across the current repo's issues / PRs (title, body, #number).
   const [q, setQ] = useState("");
   const matchQ = (s: string) => q.trim() === "" || s.toLowerCase().includes(q.trim().toLowerCase());
-  // Compact relative time ("3h ago") from a unix seconds timestamp.
-  const timeAgo = (unix: number) => {
-    if (!unix) return "";
-    const s = Math.max(1, Math.floor(Date.now() / 1000 - unix));
-    const steps: [number, string][] = [[60, "s"], [60, "m"], [24, "h"], [30, "d"], [12, "mo"], [Infinity, "y"]];
-    let v = s, u = "s";
-    for (const [div, unit] of steps) { if (v < div) { u = unit; break; } v = Math.floor(v / div); u = unit; }
-    return `${v}${u} ago`;
-  };
 
   // Notifications inbox, scoped to the acting actor (addressed-to-them + broadcasts). Polled.
   useEffect(() => {
@@ -234,16 +778,10 @@ export function App() {
   }, [actingAs]);
 
   // Two views: Home (situation room) and a focused Repo view with Issues / PRs tabs.
-  const [view, setView] = useState<"home" | "repo">("home");
-  const [tab, setTab] = useState<"issues" | "prs">("issues");
+  const [view, setView] = useState<"home" | "repo">(() => parseRoute(location.pathname).view);
+  const [tab, setTab] = useState<"issues" | "prs">(() => parseRoute(location.pathname).tab);
   const [issueView, setIssueView] = useState<"list" | "board">("list");
-  const [openIssue, setOpenIssue] = useState<number | null>(null);
-  const selectRepo = (repo: string) => {
-    setIssueRepo(repo);
-    setOpenIssue(null);
-    setTab("issues");
-    setView("repo");
-  };
+  const [openIssue, setOpenIssue] = useState<number | null>(() => parseRoute(location.pathname).openIssue);
   // Default the issues/PRs repo to whatever's actually active, so it's never stuck on a stale name.
   useEffect(() => {
     if (repos.length && !repos.some((r) => r.repo === issueRepo)) setIssueRepo(repos[0].repo);
@@ -271,25 +809,27 @@ export function App() {
   }, [tenant, issueRepo]);
 
   const issueAction = async (number: number, action: string, extra: Record<string, unknown> = {}) => {
-    if (!canAct) return alert("Sign in to act.");
+    if (!canAct) return uiAlert("Sign in to act.");
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues/${number}`, {
       method: "PATCH",
       headers: { "content-type": "application/json", ...authHeaders() },
       body: JSON.stringify({ action, ...(action === "close" ? { reason: "completed" } : {}), ...extra }),
     });
     if (res.ok) loadIssues();
-    else alert(await res.text());
+    else uiAlert(await res.text());
   };
   const transition = (number: number, action: "close" | "reopen") => issueAction(number, action);
   const [labelDraft, setLabelDraft] = useState<Record<number, string>>({});
 
   // Accounts / orgs (membership + roles).
-  type Account = { id: string; handle: string; kind: string; repos: string[]; members: { handle: string; role: string }[] };
+  type Account = { id: string; handle: string; kind: string; repos: string[]; members: { actor: string; handle: string; role: string }[] };
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const orgAccount = accounts.find((a) => a.handle === (orgHandle ?? " "));
+  useEffect(() => { if (orgAccount) { loadTeams(orgAccount.id); loadGh(orgAccount.id); setImportList(null); } }, [orgAccount?.id]);
   useEffect(() => {
-    fetch("/api/accounts").then((r) => r.json()).then((d) => setAccounts(d.accounts ?? [])).catch(() => {});
-  }, []);
-  const org = accounts.find((a) => a.handle === tenant);
+    if (!token) { setAccounts([]); return; }
+    fetch("/api/accounts", { headers: authHeaders() }).then((r) => (r.ok ? r.json() : { accounts: [] })).then((d) => setAccounts(d.accounts ?? [])).catch(() => {});
+  }, [token]);
 
   // Server-side secret-scan findings for the selected repo.
   const [secrets, setSecrets] = useState<{ path: string; line: number; title: string; redacted: string }[]>([]);
@@ -336,14 +876,14 @@ export function App() {
   useEffect(() => { loadCiConfig(); }, [tenant, issueRepo, view]);
   const isTenantOwner = !!profile?.memberships.some((m) => m.account === tenant && (m.role === "owner" || m.role === "admin"));
   const saveCiConfig = async (clear: boolean) => {
-    if (!canAct) return alert("Sign in to act.");
+    if (!canAct) return uiAlert("Sign in to act.");
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/ci-config`, {
       method: "PUT",
       headers: { "content-type": "application/json", ...authHeaders() },
       body: JSON.stringify({ url: clear ? "" : ciUrl.trim(), secret: clear ? "" : ciSecret }),
     });
     if (res.ok) { setCiSecret(""); loadCiConfig(); }
-    else alert(await res.text());
+    else uiAlert(await res.text());
   };
 
   // Autonomy policy for the selected repo (tier T0–T3, resolved repo → account → instance).
@@ -356,14 +896,14 @@ export function App() {
       .catch(() => {});
   useEffect(() => { loadAutonomy(); }, [tenant, issueRepo, view]);
   const setTier = async (tier: string) => {
-    if (!canAct) return alert("Sign in to act.");
+    if (!canAct) return uiAlert("Sign in to act.");
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/autonomy`, {
       method: "PUT",
       headers: { "content-type": "application/json", ...authHeaders() },
       body: JSON.stringify({ tier }),
     });
     if (res.ok) loadAutonomy();
-    else alert(await res.text());
+    else uiAlert(await res.text());
   };
   const TIERS: Record<string, string> = {
     t0: "Observe — no autonomous action",
@@ -374,9 +914,41 @@ export function App() {
 
   // Reviews (first-class), loaded per repo and filtered to a PR target.
   const [reviews, setReviews] = useState<Review[]>([]);
-  const [openPr, setOpenPr] = useState<number | null>(null);
-  const [openReview, setOpenReview] = useState<Review | null>(null);
-  const [reviewForm, setReviewForm] = useState({ verdict: "approve", summary: "", findPath: "", findNote: "", findSev: "warn" });
+  const [openPr, setOpenPr] = useState<number | null>(() => parseRoute(location.pathname).openPr);
+
+  // ── client-side routing: real URLs, back/forward, deep links ──────────────
+  // Parse a path into view state. Routes:
+  //   /                              situation room
+  //   /:tenant/:repo                 repo · issues
+  //   /:tenant/:repo/voyages         repo · voyages
+  //   /:tenant/:repo/issues/:n       issue page
+  //   /:tenant/:repo/voyages/:n      voyage page
+  const applyPath = (path: string) => {
+    const r = parseRoute(path);
+    setAuthPage(r.authPage);
+    setOrgHandle(r.orgHandle);
+    setRepoSettingsOpen(r.repoSettingsOpen);
+    setView(r.view);
+    setTab(r.tab);
+    setOpenIssue(r.openIssue);
+    setOpenPr(r.openPr);
+    if (r.tenant) setTenant(r.tenant);
+    if (r.issueRepo) setIssueRepo(r.issueRepo);
+  };
+  const navigate = (path: string) => {
+    if (path !== location.pathname) history.pushState({}, "", path);
+    applyPath(path);
+  };
+  const repoBase = () => `/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}`;
+  // initial deep-link parse + browser back/forward. All in-app navigation goes through navigate()
+  // (which pushState's), so no reactive URL-sync effect is needed — and having one would clobber the
+  // deep-linked path on mount (stale state → replaceState("/")).
+  useEffect(() => {
+    applyPath(location.pathname);
+    const onPop = () => applyPath(location.pathname);
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
   const loadReviews = () =>
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`)
       .then((r) => r.json())
@@ -398,7 +970,7 @@ export function App() {
   useEffect(() => { loadComments(); }, [tenant, issueRepo]);
   // Post to any target — `pr:N` or `issue:N` — keyed by the target string so drafts don't collide.
   const postComment = async (target: string) => {
-    if (!canAct) return alert("Sign in to act.");
+    if (!canAct) return uiAlert("Sign in to act.");
     const body = (commentDraft[target] ?? "").trim();
     if (!body) return;
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/comments`, {
@@ -407,55 +979,41 @@ export function App() {
       body: JSON.stringify({ target, body }),
     });
     if (res.ok) { setCommentDraft((d) => ({ ...d, [target]: "" })); loadComments(); }
-    else alert(await res.text());
+    else uiAlert(await res.text());
   };
   // A reusable thread block for a target (pr:N / issue:N).
-  const Thread = ({ target }: { target: string }) => (
-    <div className="pr-thread">
-      {comments.filter((c) => c.target === target).sort((a, b) => a.created_unix - b.created_unix).map((c) => (
-        <div className="cmt" key={c.id}>
-          <b className={actors.find((a) => a.id === c.author)?.kind ?? ""}>{handleOf(c.author)}</b>
-          <span className="cmt-body">{c.body}</span>
-          <span className="cmt-ts" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
+  const Thread = ({ target }: { target: string }) => {
+    const msgs = comments.filter((c) => c.target === target).sort((a, b) => a.created_unix - b.created_unix);
+    return (
+      <div className="grid gap-3">
+        {msgs.map((c) => (
+          <div className="flex gap-2.5" key={c.id}>
+            <Avatar id={c.author} handle={handleOf(c.author)} kind={kindOf(c.author)} size={26} />
+            <div className="flex-1 min-w-0 border border-rule2 rounded-ctl overflow-hidden">
+              <div className="flex items-center gap-2 px-3 py-1.5 bg-paper border-b border-rule3 text-[12.5px]">
+                <b className={kindOf(c.author) === "agent" ? "text-steel-text" : ""}>{handleOf(c.author)}</b>
+                <span className="text-faint tabular-nums" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
+              </div>
+              <Markdown text={c.body} className="px-3 py-2 text-[13.5px] text-body" />
+            </div>
+          </div>
+        ))}
+        {msgs.length === 0 && <div className="text-[13px] text-muted">no comments yet</div>}
+        <div className="flex gap-2 mt-1">
+          <input
+            ref={commentBoxRef}
+            className="flex-1 box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none transition-colors duration-150 focus:border-body placeholder:text-faint"
+            placeholder={canAct ? "comment…" : "sign in to comment"}
+            disabled={!canAct}
+            value={commentDraft[target] ?? ""}
+            onChange={(e) => setCommentDraft((d) => ({ ...d, [target]: e.target.value }))}
+            onKeyDown={(e) => e.key === "Enter" && postComment(target)}
+          />
+          <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => postComment(target)}>Comment</Button>
         </div>
-      ))}
-      {comments.filter((c) => c.target === target).length === 0 && <div className="muted cmt-empty">no comments yet</div>}
-      <div className="cmt-form">
-        <input
-          placeholder={canAct ? "comment…" : "sign in to comment"}
-          disabled={!canAct}
-          value={commentDraft[target] ?? ""}
-          onChange={(e) => setCommentDraft((d) => ({ ...d, [target]: e.target.value }))}
-          onKeyDown={(e) => e.key === "Enter" && postComment(target)}
-        />
-        <button disabled={!canAct} onClick={() => postComment(target)}>Comment</button>
       </div>
-    </div>
-  );
-  const submitReview = async (prNumber: number) => {
-    if (!canAct) return alert("Sign in to act.");
-    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/reviews`, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...authHeaders() },
-      body: JSON.stringify({
-        target: `pr:${prNumber}`,
-        reviewer: actingAs,
-        verdict: reviewForm.verdict,
-        summary: reviewForm.summary.trim(),
-        findings:
-          reviewForm.findPath.trim() && reviewForm.findNote.trim()
-            ? [{ path: reviewForm.findPath.trim(), severity: reviewForm.findSev, note: reviewForm.findNote.trim() }]
-            : [],
-      }),
-    });
-    if (res.ok) {
-      setReviewForm({ verdict: "approve", summary: "", findPath: "", findNote: "", findSev: "warn" });
-      loadReviews();
-    } else {
-      alert(await res.text());
-    }
+    );
   };
-
   const [autoReviewing, setAutoReviewing] = useState<number | null>(null);
   const requestReviewer = async (prNumber: number, reviewer: string) => {
     if (!canAct || !reviewer) return;
@@ -465,10 +1023,10 @@ export function App() {
       body: JSON.stringify({ reviewer }),
     });
     if (res.ok) loadPrs();
-    else alert(await res.text());
+    else uiAlert(await res.text());
   };
   const autoReview = async (prNumber: number) => {
-    if (!canAct) return alert("Sign in to act.");
+    if (!canAct) return uiAlert("Sign in to act.");
     setAutoReviewing(prNumber);
     try {
       // The server picks an independent agent reviewer — the client never names one (no impersonation).
@@ -481,7 +1039,7 @@ export function App() {
         loadReviews();
         loadPrs();
       } else {
-        alert(await res.text());
+        uiAlert(await res.text());
       }
     } finally {
       setAutoReviewing(null);
@@ -489,29 +1047,28 @@ export function App() {
   };
 
   const closePr = async (number: number, reopen: boolean) => {
-    if (!canAct) return alert("Sign in to act.");
+    if (!canAct) return uiAlert("Sign in to act.");
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${number}/close`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders() },
       body: JSON.stringify({ reopen }),
     });
     if (res.ok) loadPrs();
-    else alert(await res.text());
+    else uiAlert(await res.text());
   };
   const mergePr = async (number: number) => {
-    if (!canAct) return alert("Sign in to act.");
+    if (!canAct) return uiAlert("Sign in to act.");
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${number}/merge`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders() },
       body: JSON.stringify({ actor: actingAs }),
     });
     if (res.ok) loadPrs();
-    else alert(await res.text());
+    else uiAlert(await res.text());
   };
 
-  const createPr = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!canAct) return alert("Sign in to act.");
+  const createPr = async () => {
+    if (!canAct) return uiAlert("Sign in to act.");
     if (!prTitle.trim()) return;
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs`, {
       method: "POST",
@@ -522,13 +1079,12 @@ export function App() {
       setPrTitle("");
       loadPrs();
     } else {
-      alert(await res.text());
+      uiAlert(await res.text());
     }
   };
 
-  const createIssue = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!canAct) return alert("Sign in to act.");
+  const createIssue = async () => {
+    if (!canAct) return uiAlert("Sign in to act.");
     if (!form.title.trim()) return;
     const code_ref = form.path.trim()
       ? { path: form.path.trim(), line_start: Number(form.line) || 1 }
@@ -547,27 +1103,30 @@ export function App() {
       setForm({ title: "", path: "", line: "", assignee: "" });
       loadIssues();
     } else {
-      alert(await res.text());
+      uiAlert(await res.text());
     }
   };
 
-  // Poll the activity-ranked home for the selected tenant (each org sees only its own fleet).
+  // Personalized home: the signed-in user's repos across every org they belong to, ranked by
+  // activity. Not tied to a single tenant. `myAccounts` also scopes the live feed.
+  const [myAccounts, setMyAccounts] = useState<string[]>([]);
   useEffect(() => {
-    setRepos([]);
+    if (!token) { setRepos([]); setMyAccounts([]); return; }
     const load = () =>
-      fetch(`/api/home?tenant=${encodeURIComponent(tenant)}`)
-        .then((r) => r.json())
-        .then((d) => setRepos(d.repos ?? []))
+      fetch("/api/home", { headers: authHeaders() })
+        .then((r) => (r.ok ? r.json() : { repos: [], accounts: [] }))
+        .then((d) => { setRepos(d.repos ?? []); setMyAccounts(d.accounts ?? []); })
         .catch(() => {});
     load();
-    const t = setInterval(load, 2000);
+    const t = setInterval(load, 3000);
     return () => clearInterval(t);
-  }, [tenant]);
+  }, [token]);
 
-  // Live event stream over SSE, scoped to the selected tenant.
+  // Live event stream over SSE, scoped to the user's accounts.
   useEffect(() => {
     setEvents([]);
-    const es = new EventSource(`/api/feed?tenant=${encodeURIComponent(tenant)}`);
+    if (myAccounts.length === 0) return;
+    const es = new EventSource(`/api/feed?accounts=${encodeURIComponent(myAccounts.join(","))}`);
     feedRef.current = es;
     es.onmessage = (m) => {
       try {
@@ -579,677 +1138,1071 @@ export function App() {
       }
     };
     return () => es.close();
-  }, [tenant]);
+  }, [myAccounts.join(",")]);
 
-  if (openReview) {
-    return (
-      <ReviewPage
-        review={openReview}
-        pr={prs.find((p) => `pr:${p.number}` === openReview.target) ?? null}
-        actors={actors}
-        tenant={tenant}
-        repo={issueRepo}
-        token={token}
-        me={me}
-        onBack={() => setOpenReview(null)}
-      />
+  // ── full-screen auth / account pages ──────────────────────────────────────
+  // keyboard shortcuts: g→h/i/p navigation, c to comment, ? for help, / for the palette
+  const commentBoxRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    let lastG = 0;
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "?") { e.preventDefault(); setShowShortcuts((s) => !s); return; }
+      if (e.key === "/") { e.preventDefault(); setCmdOpen(true); return; }
+      const now = Date.now();
+      if (e.key === "g") { lastG = now; return; }
+      if (now - lastG < 900 && lastG) {
+        lastG = 0;
+        if (e.key === "h") { e.preventDefault(); navigate("/"); }
+        else if (e.key === "i" && view === "repo") { e.preventDefault(); navigate(repoBase()); }
+        else if (e.key === "p" && view === "repo") { e.preventDefault(); navigate(`${repoBase()}/voyages`); }
+        else if (e.key === "s" && view === "repo" && isTenantOwner) { e.preventDefault(); navigate(`${repoBase()}/settings`); }
+        return;
+      }
+      if (e.key === "c" && commentBoxRef.current) { e.preventDefault(); commentBoxRef.current.focus(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [view, tenant, issueRepo, isTenantOwner]);
+  const shortcutsNode = showShortcuts ? (
+    <>
+      <div onClick={() => setShowShortcuts(false)} className="fixed inset-0 z-40 bg-ink/30 animate-bd-in" />
+      <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[440px] max-w-[92vw] bg-surface rounded-[13px] shadow-modal border border-rule animate-ov-in overflow-hidden">
+        <div className="px-5 py-3.5 border-b border-rule2 flex items-center justify-between">
+          <span className="text-[14.5px] font-semibold">Keyboard shortcuts</span>
+          <span onClick={() => setShowShortcuts(false)} className="text-muted cursor-pointer hover:text-ink">×</span>
+        </div>
+        <div className="px-5 py-4 grid gap-2.5 text-[13px]">
+          {([["⌘K  /  /", "Open the command palette"], ["g h", "Go home"], ["g i", "Go to issues"], ["g p", "Go to voyages"], ["g s", "Go to repo settings"], ["c", "Focus the comment box"], ["?", "Toggle this help"]] as [string, string][]).map(([k, d]) => (
+            <div key={k} className="flex items-center justify-between gap-4">
+              <span className="text-body">{d}</span>
+              <span className="flex gap-1">{k.split("  ").map((part, i) => <kbd key={i} className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-[6px] py-0.5 bg-paper">{part}</kbd>)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </>
+  ) : null;
+
+  // command-palette items (built from what's loaded) + the palette node, rendered in every branch
+  const cmdItems: CmdItem[] = [];
+  cmdItems.push({ id: "go-home", group: "Go to", label: "Home", run: () => navigate("/") });
+  if (me) cmdItems.push({ id: "go-settings", group: "Go to", label: "Account settings", run: () => navigate("/settings") });
+  myAccounts.forEach((h) => cmdItems.push({ id: `org-${h}`, group: "Organizations", label: h, run: () => navigate(`/orgs/${encodeURIComponent(h)}`) }));
+  repos.forEach((r) => cmdItems.push({ id: `repo-${r.tenant}/${r.repo}`, group: "Repositories", label: `${r.tenant}/${r.repo}`, sublabel: r.score > 0 ? "active" : undefined, run: () => navigate(`/${encodeURIComponent(r.tenant)}/${encodeURIComponent(r.repo)}`) }));
+  if (view === "repo") {
+    issues.forEach((it) => cmdItems.push({ id: `issue-${it.number}`, group: "Issues", label: `#${it.number}  ${it.title}`, sublabel: it.status.state, run: () => navigate(`${repoBase()}/issues/${it.number}`) }));
+    prs.forEach((p) => cmdItems.push({ id: `voyage-${p.number}`, group: "Voyages", label: `v${p.number}  ${p.title}`, sublabel: p.state, run: () => navigate(`${repoBase()}/voyages/${p.number}`) }));
+  }
+  if (me) {
+    cmdItems.push({ id: "act-neworg", group: "Actions", label: "New organization", run: createOrg });
+    cmdItems.push({ id: "act-newrepo", group: "Actions", label: "New repository", run: () => createRepoFlow() });
+  }
+  const cmdNode = <CommandPalette open={cmdOpen} items={cmdItems} onClose={() => setCmdOpen(false)} />;
+
+  if (authPage) {
+    const shell = (title: string, children: React.ReactNode, wide = false) => (
+      <div className="bg-paper min-h-screen text-ink">
+        {uiModalNode}
+        {cmdNode}
+        {shortcutsNode}
+        <header className="h-14 border-b border-rule2 bg-surface flex items-center px-6">
+          <button className="flex items-center gap-2.5 cursor-pointer" onClick={() => navigate("/")}>
+            <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
+            <span className="text-[19px] font-extrabold tracking-tight">hull</span>
+          </button>
+        </header>
+        <div className={`mx-auto px-6 py-12 ${wide ? "max-w-[720px]" : "max-w-[420px]"}`}>
+          <h1 className="text-[24px] font-semibold tracking-tight mb-6">{title}</h1>
+          {children}
+        </div>
+      </div>
     );
+    const errBox = authError ? <div className="text-[13px] text-fault-text bg-fault-wash border border-fault/30 rounded-ctl px-3 py-2 mb-3">{authError}</div> : null;
+
+    if (authPage === "signup") {
+      return shell("Create your hull account", (
+        <Card>
+          <div className="px-6 py-6 grid gap-4">
+            {errBox}
+            <div className="grid gap-1.5">
+              <label className="text-[12.5px] font-semibold text-body">username</label>
+              <input className={`box-border h-ctl px-2.5 rounded-ctl border bg-surface font-sans text-[13.5px] text-ink outline-none placeholder:text-faint transition-colors ${usernameAvail && !usernameAvail.available ? "border-fault" : "border-ctl focus:border-body"}`} placeholder="e.g. mira" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} autoFocus />
+              {authForm.username.trim() && usernameAvail && (
+                <div className={`text-[12px] ${usernameAvail.available ? "text-clear-text" : "text-fault-text"}`}>{usernameAvail.available ? `✓ ${authForm.username} is available` : "✗ that username is taken"}</div>
+              )}
+            </div>
+            <div className="grid gap-1.5">
+              <label className="text-[12.5px] font-semibold text-body">email</label>
+              <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="you@example.com" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value.trim() })} onKeyDown={(e) => e.key === "Enter" && signupPasskey()} />
+            </div>
+            <Button disabled={authBusy || (!!usernameAvail && !usernameAvail.available)} onClick={signupPasskey}>{authBusy ? "waiting for passkey…" : "Create account with a passkey"}</Button>
+            <p className="text-[12.5px] text-muted leading-[1.55]">No passwords. Your device (Touch ID, Windows Hello, a security key, or your phone) creates a passkey and that is your login.</p>
+            <div className="text-[13px] text-muted pt-1 border-t border-rule2">Already have an account? <LinkButton onClick={() => { setAuthError(""); navigate("/login"); }}>Log in</LinkButton></div>
+          </div>
+        </Card>
+      ));
+    }
+
+    if (authPage === "login") {
+      return shell("Log in to hull", (
+        <Card>
+          <div className="px-6 py-6 grid gap-4">
+            {errBox}
+            <div className="grid gap-1.5">
+              <label className="text-[12.5px] font-semibold text-body">username</label>
+              <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="your username" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} onKeyDown={(e) => e.key === "Enter" && loginPasskey(authForm.username)} autoFocus />
+            </div>
+            <Button disabled={authBusy} onClick={() => loginPasskey(authForm.username)}>{authBusy ? "waiting for passkey…" : "Continue with a passkey"}</Button>
+            <div className="text-[13px] text-muted pt-1 border-t border-rule2">New here? <LinkButton onClick={() => { setAuthError(""); navigate("/signup"); }}>Create an account</LinkButton></div>
+            <details className="text-[12.5px]">
+              <summary className="text-muted cursor-pointer">Advanced: key login</summary>
+              <div className="grid gap-2 mt-2.5">
+                <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="ed25519 secret key (hex)" value={secretInput} onChange={(e) => setSecretInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signIn()} />
+                <div className="flex gap-2 items-center">
+                  <Button size="sm" variant="secondary" onClick={signIn}>Sign in with key</Button>
+                  <LinkButton onClick={registerAndSignIn}>new raw identity</LinkButton>
+                  <LinkButton onClick={() => signInWith(DEMO_OWNER_SECRET)}>demo</LinkButton>
+                </div>
+              </div>
+            </details>
+          </div>
+        </Card>
+      ));
+    }
+
+    // account settings
+    return shell("Account settings", (
+      !me ? (
+        <Card><div className="px-6 py-6 grid gap-3"><p className="text-[13.5px] text-body">You are not signed in.</p><div className="flex gap-2"><Button size="sm" onClick={() => navigate("/login")}>Log in</Button><Button size="sm" variant="secondary" onClick={() => navigate("/signup")}>Sign up</Button></div></div></Card>
+      ) : (
+        <div className="grid gap-5">
+          {!account && <Card><div className="px-6 py-6 text-[13px] text-muted">This session is a legacy key login, not a hosted passkey account, so there are no account settings to manage. Your identity is <code className="text-body">{me.handle}</code>.</div></Card>}
+          {account && (
+            <>
+              <Card>
+                <SectionHeader label="Profile" />
+                <div className="px-6 py-5 grid gap-4 max-w-[420px]">
+                  <div className="grid gap-1.5">
+                    <label className="text-[12.5px] font-semibold text-body">username</label>
+                    <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body" value={account.username} onChange={(e) => setAccount({ ...account, username: e.target.value })} />
+                  </div>
+                  <div className="grid gap-1.5">
+                    <label className="text-[12.5px] font-semibold text-body">email</label>
+                    <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body" value={account.email} onChange={(e) => setAccount({ ...account, email: e.target.value })} />
+                  </div>
+                  <div><Button size="sm" onClick={() => saveAccount({ username: account.username, email: account.email })}>Save</Button></div>
+                </div>
+              </Card>
+              <Card>
+                <SectionHeader label="Passkeys" right={<Button size="sm" variant="secondary" onClick={addPasskey}>Add a passkey</Button>} />
+                <div>
+                  {account.passkeys.length === 0 && <div className="px-6 py-5 text-[13px] text-muted">no passkeys</div>}
+                  {account.passkeys.map((p) => (
+                    <div key={p.id} className="px-6 py-3.5 border-b border-rule2 last:border-0 flex items-center gap-3">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" /></svg>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-[14px] font-medium">{p.name}</div>
+                        <div className="text-[12px] text-muted tabular-nums">{p.id.slice(0, 20)}… · added {timeAgo(p.created_unix)}</div>
+                      </div>
+                      <Button size="sm" variant="destructive" disabled={account.passkeys.length <= 1} onClick={() => removePasskey(p.id)}>Remove</Button>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+              <Card>
+                <SectionHeader label="Identity" right={<span className="text-[12.5px] text-muted">accountability</span>} />
+                <div className="px-6 py-5 grid gap-3">
+                  <Stat k="handle" v={me.handle} />
+                  <Stat k="kind" v={me.kind} />
+                  <div className="grid gap-1">
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">actor id (public key)</span>
+                    <code className="text-[11.5px] text-body break-all tabular-nums">{account.actor}</code>
+                  </div>
+                  <div className="pt-1"><Button size="sm" variant="secondary" onClick={createAgent}>+ delegate an agent</Button></div>
+                  <p className="text-[12px] text-muted leading-[1.55]">Agents you delegate chain to you cryptographically. Hull signs the delegation with your held key, so agents are accountable to your identity.</p>
+                </div>
+              </Card>
+            </>
+          )}
+          <Card>
+            <div className="px-6 py-4 flex items-center justify-between">
+              <span className="text-[13px] text-muted">Signed in as <b className="text-body">{me.handle}</b></span>
+              <Button size="sm" variant="secondary" onClick={() => { signOut(); navigate("/"); }}>Sign out</Button>
+            </div>
+          </Card>
+        </div>
+      )
+    ), true);
   }
 
-  return (
-    <div className="app">
-      <header className="top">
-        <button className="brand" onClick={() => setView("home")} title="home">
-          <span className="logo" aria-hidden /> hull
-        </button>
-        <div className="breadcrumb">
-          {view === "repo" ? (
-            <>
-              <button className="link" onClick={() => setView("home")}>{tenant}</button>
-              <span className="sep">/</span>
-              <b>{issueRepo}</b>
-            </>
-          ) : (
-            <span className="tag">situation room</span>
-          )}
-        </div>
-        <div className="spacer" />
-        <button
-          className="theme-toggle"
-          onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-          title={theme === "dark" ? "switch to light" : "switch to dark"}
-          aria-label="toggle theme"
-        >
-          {theme === "dark" ? "☀" : "☾"}
-        </button>
-        <label className="tenant">
-          tenant&nbsp;
-          <input
-            value={tenant}
-            onChange={(e) => setTenant(e.target.value.trim())}
-            spellCheck={false}
-            aria-label="tenant"
-          />
-        </label>
-        <div className="signin">
-          {me ? (
-            <span className="signed-in">
-              signed in as{" "}
-              <button className={"whoami " + me.kind} onClick={() => setShowProfile((s) => !s)} title="your identity & accountability">
-                {me.handle} ▾
-              </button>
-              <button className="link" onClick={signOut}>sign out</button>
-              {showProfile && profile && (
-                <div className="profile-drop">
-                  <div className="profile-head">
-                    <b className={profile.kind}>{profile.handle}</b> <span className="muted">{profile.kind}</span>
-                    {profile.accountable && <span className="badge ok">accountable</span>}
-                  </div>
-                  <div className="profile-row">
-                    <span className="pk-label">actor id (public key)</span>
-                    <code className="pk" title="your Ed25519 public key — this IS your identity; it can't be rotated without becoming a different actor">{profile.id}</code>
-                  </div>
-                  {profile.kind === "agent" && profile.delegation.length > 0 && (
-                    <div className="profile-row">
-                      <span className="pk-label">accountability chain</span>
-                      <span className="chain">
-                        {profile.delegation.map((h, i) => (
-                          <span key={i} className="hop">
-                            <b className={h.kind}>{h.handle}</b>
-                            {i < profile.delegation.length - 1 && <span className="arrow"> → </span>}
-                          </span>
-                        ))}
-                      </span>
-                    </div>
-                  )}
-                  <div className="profile-row">
-                    <span className="pk-label">memberships</span>
-                    {profile.memberships.length > 0 ? (
-                      <span className="memberships">
-                        {profile.memberships.map((m, i) => (
-                          <span key={i} className="mem">{m.account}<span className="role">{m.role}</span></span>
-                        ))}
-                      </span>
-                    ) : (
-                      <span className="muted">none</span>
-                    )}
-                  </div>
-                  {profile.kind === "human" && (
-                    <div className="profile-actions">
-                      <button className="mint-agent" onClick={createAgent}>+ create an agent (chains to you)</button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </span>
-          ) : (
-            <>
-              <input
-                type="password"
-                placeholder="secret key to sign in"
-                value={secretInput}
-                onChange={(e) => setSecretInput(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && signIn()}
-              />
-              <button onClick={signIn}>Sign in</button>
-              <button className="link" onClick={registerAndSignIn}>new identity</button>
-              <button className="link" onClick={() => signInWith(DEMO_OWNER_SECRET)} title="log in as the published demo owner (real signature login)">demo</button>
-            </>
-          )}
-        </div>
-        <div className="bell-wrap">
-          <button className="bell" onClick={toggleNotifs} title="notifications">
-            🔔{notifs.filter((n) => n.ts > seenTs).length > 0 && <span className="bell-count">{notifs.filter((n) => n.ts > seenTs).length}</span>}
-          </button>
-          {showNotifs && (
-            <div className="notif-drop">
-              <div className="notif-head">
-                inbox for <b>{handleOf(actingAs)}</b> <span className="muted">· via Notifier plugin</span>
-              </div>
-              {notifs.length === 0 && <div className="empty">nothing yet</div>}
-              {notifs.slice(0, 15).map((n, i) => {
-                const icon =
-                  n.kind === "review_posted" ? "✍" :
-                  n.kind === "review_requested" ? "👀" :
-                  n.kind === "ci_passed" ? "✓" :
-                  n.kind === "ci_failed" ? "✗" :
-                  n.kind === "code_owner_referenced" ? "⬡" :
-                  n.kind === "mirror_pushed" ? "⇄" : "•";
-                return (
-                  <div className={"notif" + (n.ts > seenTs ? " unread" : "")} key={i}>
-                    <span className={"nk " + n.kind}>{icon} {n.kind.replace(/_/g, " ")}</span>
-                    {n.broadcast && <span className="nbcast">team</span>}
-                    <span className="ns">{n.summary}</span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      </header>
 
-      {view === "home" && org && (
-        <div className="org-card">
-          <span className="org-name">{org.handle}</span>
-          <span className="muted">{org.kind}</span>
-          <span className="org-members">
-            {org.members.map((m, i) => (
-              <span className="mem" key={i}>
-                {m.handle}<span className="role">{m.role}</span>
-              </span>
-            ))}
-          </span>
-        </div>
-      )}
-      {view === "home" && (
-      <main className="grid">
-        <section>
-          <h2>Repositories <span className="muted">by live activity — click one to open it</span></h2>
-          <div className="repos">
-            {repos.length === 0 && (
-              <div className="empty">
-                no active repos for <b>{tenant}</b> — host one:{" "}
-                <code>git push http://localhost:8930/{tenant}/&lt;repo&gt; main</code>
-              </div>
-            )}
-            {repos.map((r) => (
-              <article
-                className={"repo" + (r.repo === issueRepo ? " selected" : "")}
-                key={r.repo}
-                onClick={() => selectRepo(r.repo)}
-                title="open this repo's issues"
-              >
-                <div className="repo-head">
-                  <span className="repo-name">{r.repo}</span>
-                  <span className="score" title="live activity score">{r.score.toFixed(0)}</span>
-                </div>
-                {r.active_actors.length > 0 && (
-                  <div className="actors">
-                    {r.active_actors.map((a) => (
-                      <span className={"chip " + (a.startsWith("agent") ? "agent" : "human")} key={a}>
-                        {a}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                {r.hot_files.length > 0 && (
-                  <ul className="files">
-                    {r.hot_files.map((f) => (
-                      <li key={f}><code>{f}</code></li>
-                    ))}
-                  </ul>
-                )}
-              </article>
-            ))}
-          </div>
-        </section>
+  const unread = notifs.filter((n) => n.ts > seenTs).length;
+  const openIssues = issues.filter((i) => i.status.state === "open").length;
 
-        <section>
-          <h2>Live feed</h2>
-          <ul className="feed">
-            {events.length === 0 && <li className="empty">listening…</li>}
-            {events.map((e, i) => (
-              <li key={i} className={"ev ev-" + e.kind}>
-                {renderEvent(e)}
-              </li>
-            ))}
-          </ul>
-        </section>
-      </main>
-      )}
-
+  // ── shared chrome (top bar + notifications drawer) ────────────────────────
+  const topBar = (
+    <header className="h-14 border-b border-rule2 bg-surface flex items-center gap-5 px-6 sticky top-0 z-20">
+      <button className="flex items-center gap-2.5 cursor-pointer shrink-0" onClick={() => navigate("/")} title="situation room">
+        <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
+        <span className="text-[19px] font-extrabold tracking-tight">hull</span>
+      </button>
       {view === "repo" && (
-      <main className="repo-view">
-        {secrets.length > 0 && (
-          <div className="sec-banner">
-            <b>⚠ {secrets.length} secret{secrets.length > 1 ? "s" : ""} detected on push</b>
-            <ul>
-              {secrets.slice(0, 5).map((s, i) => (
-                <li key={i}>
-                  {s.title} — <code>{s.path}:{s.line}</code> <span className="muted">{s.redacted}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-        {mirror?.target && (
-          <div className="mirror-panel">
-            <span className="mirror-badge">⇄ mirrored</span>
-            <span>
-              linked to <code>{mirror.target}</code> · {mirror.outbound.length} change{mirror.outbound.length === 1 ? "" : "s"} pushed outbound
-            </span>
-            <span className="muted mirror-note">loop-safe: forge-originated changes are never pushed back; webhook redelivery is idempotent</span>
-          </div>
-        )}
-        {autonomy && (
-          <div className={"autonomy-panel tier-" + autonomy.tier}>
-            <span className="auto-badge">⚙ autonomy</span>
-            <span className="auto-tier">{autonomy.tier.toUpperCase()}</span>
-            <span className="muted">{TIERS[autonomy.tier]}</span>
-            <span className="muted auto-src">· from {autonomy.source}</span>
-            {isTenantOwner && (
-              <select className="auto-select" value={autonomy.tier} onChange={(e) => setTier(e.target.value)} title="set the repo's autonomy tier">
-                {["t0", "t1", "t2", "t3"].map((t) => (
-                  <option key={t} value={t}>{t.toUpperCase()}</option>
-                ))}
-              </select>
-            )}
-          </div>
-        )}
-        {ciConfig && (
-          <div className="ci-panel">
-            <span className="ci-badge">⚙ CI</span>
-            <span>
-              {ciConfig.url ? (
-                <>dispatches to <code>{ciConfig.url}</code> <span className="muted">({ciConfig.source}{ciConfig.has_secret ? ", secret set" : ", no secret"})</span></>
-              ) : (
-                <span className="muted">{ciConfig.source} — checks run on the built-in local runner</span>
-              )}
-            </span>
-            {isTenantOwner && (
-              <form className="ci-form" onSubmit={(e) => { e.preventDefault(); saveCiConfig(false); }}>
-                <input className="ci-url" placeholder="https://your-ci/hull" value={ciUrl} onChange={(e) => setCiUrl(e.target.value)} spellCheck={false} />
-                <input className="ci-secret" type="text" placeholder="shared secret (optional)" value={ciSecret} onChange={(e) => setCiSecret(e.target.value)} spellCheck={false} />
-                <button type="button" className="link" title="generate a random 32-byte secret" onClick={() => setCiSecret(bytesToHex(crypto.getRandomValues(new Uint8Array(32))))}>generate</button>
-                <button type="submit">Set</button>
-                {ciConfig.source === "repo" && <button type="button" className="link" onClick={() => saveCiConfig(true)}>clear</button>}
-                <a className="ci-spec-link" href="https://github.com/tankrap/hull/blob/main/CI-SPEC.md" target="_blank" rel="noreferrer">spec ↗</a>
-              </form>
-            )}
-          </div>
-        )}
-        <div className="tabs">
-          <button className={"tab" + (tab === "issues" ? " active" : "")} onClick={() => setTab("issues")}>
-            Issues <span className="muted">{issues.filter((i) => i.status.state === "open").length}</span>
-          </button>
-          <button className={"tab" + (tab === "prs" ? " active" : "")} onClick={() => setTab("prs")}>
-            Pull requests <span className="muted">{prs.length}</span>
-          </button>
-          <input
-            className="repo-search"
-            placeholder={`filter ${tab === "issues" ? "issues" : "pull requests"}…`}
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            spellCheck={false}
-          />
-          {!canAct && (
-            <span className="acting-note">
-              read-only — <button className="link" onClick={() => signInWith(DEMO_OWNER_SECRET)}>sign in</button> to act
-            </span>
+        <div className="hidden md:flex text-[13px] gap-1.5 items-center tabular-nums shrink-0">
+          <button className="text-faint hover:text-ink cursor-pointer" onClick={() => navigate("/")}>{tenant}</button>
+          <span className="text-rule">/</span>
+          <button className="font-medium hover:text-steel-text cursor-pointer" onClick={() => navigate(repoBase())}>{issueRepo}</button>
+        </div>
+      )}
+      <div className="flex-1 max-w-[440px] mx-auto">
+        <button onClick={() => setCmdOpen(true)} className="w-full flex items-center gap-2 h-ctl px-2.5 rounded-ctl border border-ctl bg-surface hover:border-[oklch(0.6_0.015_250)] transition-colors cursor-pointer text-left">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
+          <span className="flex-1 text-[13.5px] text-faint">Search or jump to…</span>
+          <span className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-[5px] py-0.5 bg-paper flex-none">⌘K</span>
+        </button>
+      </div>
+      <div className="flex items-center gap-2.5 shrink-0">
+        <div className="flex items-center gap-1.5 text-muted" title={theme === "dark" ? "switch to light" : "switch to dark"}>
+          {theme === "dark" ? (
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></svg>
+          ) : (
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" /></svg>
           )}
+          <Switch on={theme === "dark"} onChange={(on: boolean) => setTheme(on ? "dark" : "light")} />
         </div>
-
-        {tab === "issues" && (
-        <section className="issues">
-        <div className="view-toggle">
-          <button className={issueView === "list" ? "on" : ""} onClick={() => setIssueView("list")}>List</button>
-          <button className={issueView === "board" ? "on" : ""} onClick={() => setIssueView("board")}>Board</button>
-        </div>
-        <form className="issue-form" onSubmit={createIssue}>
-          <input
-            placeholder="Open an issue…"
-            value={form.title}
-            onChange={(e) => setForm({ ...form, title: e.target.value })}
-          />
-          <input
-            className="path"
-            placeholder="path (optional, e.g. crates/hull-server/src/quic.rs)"
-            value={form.path}
-            onChange={(e) => setForm({ ...form, path: e.target.value })}
-            spellCheck={false}
-          />
-          <input
-            className="line"
-            placeholder="line"
-            value={form.line}
-            onChange={(e) => setForm({ ...form, line: e.target.value })}
-          />
-          <select
-            className="assignee-pick"
-            value={form.assignee}
-            onChange={(e) => setForm({ ...form, assignee: e.target.value })}
-          >
-            <option value="">assign…</option>
-            {actors.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.handle}
-              </option>
-            ))}
-          </select>
-          <button type="submit">Open</button>
-        </form>
-        {issueView === "list" ? (
-        <ul className="issue-list">
-          {issues.length === 0 && <li className="empty">no issues yet — open one above</li>}
-          {[...issues]
-            .filter((it) => matchQ(`${it.title} ${it.body} #${it.number} ${it.labels.join(" ")}`))
-            .sort((a, b) => Number(a.status.state !== "open") - Number(b.status.state !== "open") || b.number - a.number)
-            .map((it) => (
-            <li key={it.number} className={"issue " + it.status.state}>
-              <div className="issue-row">
-                <span className={"state " + it.status.state} title={it.status.reason ?? ""}>
-                  {it.status.state === "open" ? "open" : it.status.reason ?? "closed"}
-                </span>
-                <span className="num">#{it.number}</span>
-                <button
-                  className="it-title"
-                  onClick={() => setOpenIssue(openIssue === it.number ? null : it.number)}
-                  title="open issue"
-                >
-                  {openIssue === it.number ? "▾ " : "▸ "}
-                  {it.title}
-                </button>
-                {it.code_refs.map((c, i) => (
-                  <button
-                    key={i}
-                    className="coderef"
-                    title={`content-addressed → keel blob ${c.blob} · click for provenance`}
-                    onClick={() => showWhy(`${it.number}:${c.path}`, c.path)}
-                  >
-                    <code>
-                      {c.path}:{c.line_start}
-                      {c.line_end ? `-${c.line_end}` : ""}
-                    </code>
-                    <span className="blob">⬡ {c.blob.slice(0, 10)}</span>
-                  </button>
-                ))}
-                {it.labels.map((l) => (
-                  <button key={l} className="row-label" title="filter by this label" onClick={() => setQ(l)}>{l}</button>
-                ))}
-                {it.assignees.map((id) => (
-                  <span key={id} className="assignee-chip" title="assignee">
-                    ◎ {handleOf(id)}
-                  </span>
-                ))}
-                {it.resolved_by && (
-                  <span className="resolved-chip" title="closed by a merged PR — resolving keel change">
-                    ⬡ resolved by {it.resolved_by.slice(0, 10)}
-                  </span>
-                )}
-                {!it.resolved_by && (it.linked_prs?.length ?? 0) > 0 && (
-                  <span className="linked-chip" title="a PR references this issue">
-                    ⇄ {it.linked_prs!.length} linked PR{it.linked_prs!.length > 1 ? "s" : ""}
-                  </span>
-                )}
-                <span className={"by " + (actors.find((a) => a.id === it.author)?.kind ?? "")}>
-                  {handleOf(it.author)}
-                </span>
-                {it.status.state === "open" ? (
-                  <button className="act close" onClick={() => transition(it.number, "close")}>
-                    Close
-                  </button>
-                ) : (
-                  <button className="act reopen" onClick={() => transition(it.number, "reopen")}>
-                    Reopen
-                  </button>
-                )}
-              </div>
-              {openIssue === it.number && (
-                <div className="issue-detail">
-                  <div className="meta">
-                    <span>opened by <b className={actors.find((a) => a.id === it.author)?.kind ?? ""}>{handleOf(it.author)}</b></span>
-                    {it.assignees.length > 0 && (
-                      <span>· assigned to {it.assignees.map((id) => handleOf(id)).join(", ")}</span>
-                    )}
-                    <span>· {it.status.state === "open" ? "open" : `closed (${it.status.reason ?? "closed"})`}</span>
+        <button
+          className="relative h-ctl w-ctl grid place-items-center rounded-ctl border border-ctl bg-surface hover:border-[oklch(0.6_0.015_250)] cursor-pointer"
+          onClick={openNotifs}
+          title="notifications"
+          aria-label="notifications"
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-dim">
+            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.73 21a2 2 0 0 1-3.46 0" />
+          </svg>
+          {unread > 0 && <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 grid place-items-center rounded-full bg-fault text-white text-[10px] font-bold tabular-nums">{unread}</span>}
+        </button>
+        {me ? (
+          <div className="relative">
+            <button
+              className="flex items-center gap-1.5 h-ctl px-2.5 rounded-ctl border border-ctl bg-surface hover:border-[oklch(0.6_0.015_250)] cursor-pointer text-[13px]"
+              onClick={() => setShowProfile((s) => !s)}
+              title="your identity & accountability"
+            >
+              <Avatar id={me.id} handle={me.handle} kind={me.kind} size={18} />
+              <span className="font-medium">{me.handle}</span>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-muted"><polyline points="6 9 12 15 18 9" /></svg>
+            </button>
+            {showProfile && profile && (
+              <div className="absolute right-0 top-[calc(100%+8px)] w-[320px] z-30 bg-surface border border-rule rounded-[12px] shadow-menu p-4 grid gap-3">
+                <div className="flex items-center gap-2">
+                  <b className={profile.kind === "agent" ? "text-steel-text" : ""}>{profile.handle}</b>
+                  <span className="text-[12.5px] text-muted">{profile.kind}</span>
+                  {profile.accountable && <StatusBadge kind="verified">accountable</StatusBadge>}
+                </div>
+                <div className="grid gap-1">
+                  <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">actor id (public key)</span>
+                  <code className="text-[11.5px] text-body break-all tabular-nums" title="your Ed25519 public key — this IS your identity">{profile.id}</code>
+                </div>
+                {profile.kind === "agent" && profile.delegation.length > 0 && (
+                  <div className="grid gap-1">
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">accountability chain</span>
+                    <span className="text-[13px]">
+                      {profile.delegation.map((h, i) => (
+                        <span key={i}>
+                          <b className={h.kind === "agent" ? "text-steel-text" : ""}>{h.handle}</b>
+                          {i < profile.delegation.length - 1 && <span className="text-faint"> → </span>}
+                        </span>
+                      ))}
+                    </span>
                   </div>
-                  {it.body && <p className="body">{it.body}</p>}
-                  {it.code_refs.length === 0 && <p className="muted">no code references</p>}
-                  {it.code_refs.length > 0 && (
-                    <p className="muted">code references (click a ⬡ anchor above for keel provenance)</p>
+                )}
+                <div className="grid gap-1">
+                  <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">memberships</span>
+                  {profile.memberships.length > 0 ? (
+                    <span className="flex flex-wrap gap-1.5">
+                      {profile.memberships.map((m, i) => (
+                        <span key={i} className="inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded-chip bg-paper border border-rule">
+                          {m.account}<span className="text-muted">{m.role}</span>
+                        </span>
+                      ))}
+                    </span>
+                  ) : (
+                    <span className="text-[13px] text-muted">none</span>
                   )}
-                  <div className="issue-manage">
-                    <div className="mrow">
-                      <span className="pk-label">assignees</span>
-                      {it.assignees.map((id) => (
-                        <span key={id} className="chip">
-                          {handleOf(id)}
-                          {canAct && <button className="x" title="unassign" onClick={() => issueAction(it.number, "unassign", { assignee: id })}>×</button>}
-                        </span>
-                      ))}
-                      {canAct && me && !it.assignees.includes(me.id) && (
-                        <button className="link" onClick={() => issueAction(it.number, "assign", { assignee: me.id })}>assign me</button>
-                      )}
-                      {it.assignees.length === 0 && !canAct && <span className="muted">none</span>}
-                    </div>
-                    <div className="mrow">
-                      <span className="pk-label">labels</span>
-                      {it.labels.map((l) => (
-                        <span key={l} className="chip label">
-                          {l}
-                          {canAct && <button className="x" title="remove label" onClick={() => issueAction(it.number, "unlabel", { label: l })}>×</button>}
-                        </span>
-                      ))}
-                      {canAct && (
-                        <span className="label-add">
-                          <input
-                            placeholder="add label…"
-                            value={labelDraft[it.number] ?? ""}
-                            onChange={(e) => setLabelDraft((d) => ({ ...d, [it.number]: e.target.value }))}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" && (labelDraft[it.number] ?? "").trim()) {
-                                issueAction(it.number, "label", { label: labelDraft[it.number].trim() });
-                                setLabelDraft((d) => ({ ...d, [it.number]: "" }));
-                              }
-                            }}
-                          />
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="thread-wrap">
-                    <h5>Discussion</h5>
-                    <Thread target={`issue:${it.number}`} />
-                  </div>
+                </div>
+                <button className="text-left text-[13px] text-body hover:text-steel-text cursor-pointer" onClick={() => { setShowProfile(false); navigate("/settings"); }}>Account settings</button>
+                <div className="flex justify-between items-center pt-1 border-t border-rule2">
+                  {profile.kind === "human"
+                    ? <LinkButton onClick={createAgent}>+ delegate an agent</LinkButton>
+                    : <span />}
+                  <LinkButton onClick={signOut}>sign out</LinkButton>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="secondary" onClick={() => navigate("/login")}>Log in</Button>
+            <Button size="sm" onClick={() => navigate("/signup")}>Sign up</Button>
+          </div>
+        )}
+      </div>
+    </header>
+  );
+
+  const notifDrawer = (
+    <Drawer open={showNotifs} onClose={() => setShowNotifs(false)} title={`inbox · ${handleOf(actingAs)}`}>
+      {notifs.length === 0 && <div className="text-[13px] text-muted">nothing yet</div>}
+      {notifs.slice(0, 20).map((n, i) => (
+        <div key={i} className="flex items-start gap-2 py-2 border-b border-rule3 last:border-0">
+          <span className={`w-1.5 h-1.5 rounded-full mt-1.5 flex-none ${n.ts > seenTs ? "bg-steel" : "bg-rule"}`} />
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[12.5px] font-semibold text-body">{n.kind.replace(/_/g, " ")}</span>
+              {n.broadcast && <Tag>team</Tag>}
+            </div>
+            <div className="text-[12.5px] text-muted mt-0.5">{n.summary}</div>
+          </div>
+        </div>
+      ))}
+      <div className="text-[11px] text-faint pt-1">via Notifier plugin</div>
+    </Drawer>
+  );
+
+  // repo sidebar modules (shared by list + detail pages)
+  const repoSidebar = (
+    <aside className="grid gap-5 content-start">
+      <Module title="About">
+        <Stat k="repo" v={issueRepo} />
+        <Stat k="tenant" v={tenant} />
+        <Stat k="open issues" v={openIssues} />
+        <Stat k="voyages" v={prs.length} />
+        {isTenantOwner && <div className="pt-1"><LinkButton onClick={() => navigate(`${repoBase()}/settings`)}>Settings ↗</LinkButton></div>}
+      </Module>
+      {secrets.length > 0 && (
+        <Module title="Security" tone="var(--fault)">
+          <p className="text-[12.5px] text-fault-text font-medium">{secrets.length} secret{secrets.length > 1 ? "s" : ""} detected on push</p>
+          {secrets.slice(0, 5).map((s, i) => (
+            <div key={i} className="text-[12px] text-muted">{s.title} · <code className="text-body">{s.path}:{s.line}</code></div>
+          ))}
+        </Module>
+      )}
+    </aside>
+  );
+
+  const currentIssue = openIssue != null ? issues.find((i) => i.number === openIssue) ?? null : null;
+  const currentPr = openPr != null ? prs.find((p) => p.number === openPr) ?? null : null;
+
+  return (
+    <div className="bg-paper min-h-screen text-ink">
+      {uiModalNode}
+      {cmdNode}
+      {shortcutsNode}
+      {topBar}
+      {notifDrawer}
+
+      {/* ── HOME · your work ──────────────────────────────────────────────── */}
+      {view === "home" && !orgHandle && !me && (
+        <div className="max-w-[560px] mx-auto px-6 py-20 text-center">
+          <h1 className="text-[28px] font-semibold tracking-tight">Welcome to hull</h1>
+          <p className="text-[14px] text-muted mt-3 leading-[1.6]">The hosted layer for keel — where humans and accountable agents review and land changes together. Sign in to see the work across your organizations.</p>
+          <div className="flex items-center justify-center gap-2.5 mt-6">
+            <Button onClick={() => navigate("/login")}>Log in</Button>
+            <Button variant="secondary" onClick={() => navigate("/signup")}>Create an account</Button>
+          </div>
+        </div>
+      )}
+      {view === "home" && !orgHandle && me && (
+        <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
+          <div className="flex flex-wrap items-end justify-between gap-4 mb-8">
+            <div>
+              <h1 className="text-[27px] font-semibold tracking-tight leading-none">Your work</h1>
+              <p className="text-[13.5px] text-muted mt-2.5">
+                {repos.length} {repos.length === 1 ? "repo" : "repos"} across {myAccounts.length} {myAccounts.length === 1 ? "org" : "orgs"} · ranked by what's active
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="secondary" onClick={() => createRepoFlow()}>New repo</Button>
+              <Button size="sm" variant="secondary" onClick={createOrg}>New org</Button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-x-12 gap-y-9">
+            <section className="min-w-0">
+              <Eyebrow label="Repositories" right="by live activity" />
+              {repos.length === 0 && (
+                <div className="py-12 text-[13px] text-muted">
+                  No repos yet. Create one, import from GitHub (in an org's settings), or <code className="text-body">git push http://localhost:8930/&lt;org&gt;/&lt;repo&gt; main</code>.
                 </div>
               )}
-              {it.code_refs.map((c) => {
-                const key = `${it.number}:${c.path}`;
-                return prov[key] ? (
-                  <ul className="prov" key={key}>
-                    <li className="prov-head">
-                      keel provenance · <code>{c.path}</code>
-                    </li>
-                    {prov[key].length === 0 && <li className="empty">no recorded history</li>}
-                    {prov[key].map((p, j) => (
-                      <li key={j}>
-                        <code className="ch">{p.change.slice(0, 10)}</code>
-                        <span className="intent">{p.intent}</span>
-                        <span className="by">{p.author}</span>
-                      </li>
-                    ))}
-                  </ul>
-                ) : null;
-              })}
-            </li>
-          ))}
-        </ul>
-        ) : (
-        <div className="board">
-          {[
-            { k: "open", label: "Open" },
-            { k: "completed", label: "Completed" },
-            { k: "not_planned", label: "Not planned" },
-            { k: "cancelled", label: "Cancelled" },
-            { k: "duplicate", label: "Duplicate" },
-          ].map((col) => {
-            const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k && matchQ(`${i.title} ${i.body} #${i.number} ${i.labels.join(" ")}`));
-            if (col.k !== "open" && inCol.length === 0) return null;
-            return (
-              <div className="col" key={col.k}>
-                <div className="col-head">
-                  {col.label} <span className="muted">{inCol.length}</span>
-                </div>
-                {inCol.map((it) => (
-                  <div
-                    className="card"
-                    key={it.number}
-                    onClick={() => {
-                      setIssueView("list");
-                      setOpenIssue(it.number);
-                    }}
-                  >
-                    <div className="card-num">#{it.number}</div>
-                    <div className="card-title">{it.title}</div>
-                    {it.assignees.length > 0 && (
-                      <div className="card-assignees">◎ {it.assignees.map((id) => handleOf(id)).join(", ")}</div>
-                    )}
-                  </div>
+              <div>
+                {repos.filter((r) => matchQ(`${r.tenant}/${r.repo}`)).map((r) => (
+                  <button key={`${r.tenant}/${r.repo}`} onClick={() => navigate(`/${encodeURIComponent(r.tenant)}/${encodeURIComponent(r.repo)}`)} className="group w-full text-left block">
+                    <div className="flex items-start gap-4 py-4 -mx-3 px-3 rounded-ctl border-b border-rule2 group-hover:bg-surface transition-colors">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2.5">
+                          <span className="text-[16px] font-medium group-hover:text-steel-text transition-colors"><span className="text-faint font-normal">{r.tenant}/</span>{r.repo}</span>
+                          {r.active_actors.some((a) => kindOf(a) === "agent" || a.startsWith("agent")) && <StatusBadge kind="agent">agents active</StatusBadge>}
+                        </div>
+                        <div className="flex items-center gap-2 mt-2 text-[12.5px] text-muted min-w-0">
+                          {r.active_actors.length > 0 ? (
+                            <>
+                              <span className="flex -space-x-1.5 flex-none">
+                                {r.active_actors.slice(0, 4).map((a) => <span key={a} className="ring-2 ring-paper rounded-full group-hover:ring-surface transition-colors"><Avatar id={a} handle={actorLabel(a)} kind={kindOf(a)} size={18} /></span>)}
+                              </span>
+                              <span className="truncate">{r.active_actors.slice(0, 3).map((a) => actorLabel(a)).join(", ")}{r.active_actors.length > 3 ? ` +${r.active_actors.length - 3}` : ""}</span>
+                              {r.hot_files.length > 0 && <span className="text-faint flex-none">· {r.hot_files.length} hot file{r.hot_files.length > 1 ? "s" : ""}</span>}
+                            </>
+                          ) : <span className="text-faint">no recent activity</span>}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-3 shrink-0 pt-0.5">
+                        {r.score > 0 && <span className="text-[12.5px] text-muted tabular-nums" title="live activity score">{r.score.toFixed(0)}</span>}
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text opacity-0 -translate-x-1.5 group-hover:opacity-100 group-hover:translate-x-0 transition-all duration-150">
+                          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /><polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" />
+                        </svg>
+                      </div>
+                    </div>
+                  </button>
                 ))}
               </div>
-            );
-          })}
-        </div>
-        )}
-        </section>
-        )}
+            </section>
 
-        {tab === "prs" && (
-        <section className="issues prs">
-        <form className="issue-form" onSubmit={createPr}>
-          <input
-            placeholder="Open a PR from HEAD…"
-            value={prTitle}
-            onChange={(e) => setPrTitle(e.target.value)}
+            <aside className="grid gap-5 content-start">
+              <Module title="Your organizations">
+                {myAccounts.length === 0 && <span className="text-[13px] text-muted">none yet</span>}
+                {myAccounts.map((h) => (
+                  <button key={h} className="text-left text-[13.5px] text-body hover:text-steel-text cursor-pointer flex items-center justify-between" onClick={() => navigate(`/orgs/${encodeURIComponent(h)}`)}>
+                    <span>{h}</span><span className="text-faint">→</span>
+                  </button>
+                ))}
+                <div className="pt-1"><LinkButton onClick={createOrg}>+ new organization</LinkButton></div>
+              </Module>
+              <Module title="Live feed" tone="var(--clear)">
+                <div className="max-h-[440px] overflow-y-auto -mx-4 -my-3.5">
+                  {events.length === 0 && <div className="px-4 py-7 text-[13px] text-muted text-center">listening…</div>}
+                  {events.map((e, i) => (
+                    <div key={i} className="px-4 py-2.5 border-b border-rule3 last:border-0 text-[12.5px] leading-[1.5] text-body">{renderEvent(e)}</div>
+                  ))}
+                </div>
+              </Module>
+            </aside>
+          </div>
+        </div>
+      )}
+
+      {/* ── ISSUE detail page ─────────────────────────────────────────────── */}
+      {view === "repo" && currentIssue && (() => {
+        const it = currentIssue;
+        return (
+          <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-8">
+            <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer mb-5" onClick={() => navigate(repoBase())}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
+              {issueRepo} · issues
+            </button>
+            <div className="flex items-center gap-3 flex-wrap mb-1.5">
+              <StatusBadge kind={it.status.state === "open" ? "running" : "queued"}>{it.status.state === "open" ? "open" : it.status.reason ?? "closed"}</StatusBadge>
+              <h1 className="text-[24px] font-semibold tracking-tight">{it.title}</h1>
+            </div>
+            <p className="text-[13px] text-muted mb-7">
+              <span className="tabular-nums">#{it.number}</span> · opened by <b className={kindOf(it.author) === "agent" ? "text-steel-text" : "text-body"}>{handleOf(it.author)}</b>
+            </p>
+            <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-x-12 gap-y-9">
+              <section className="min-w-0 grid gap-6">
+                {it.body ? <Markdown text={it.body} className="text-[14px] text-body" /> : <p className="text-[13px] text-muted">no description</p>}
+                {it.code_refs.length > 0 && (
+                  <div className="grid gap-2">
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">Code references</span>
+                    {it.code_refs.map((c, i) => {
+                      const key = `${it.number}:${c.path}`;
+                      return (
+                        <div key={i} className="border border-rule2 rounded-ctl overflow-hidden">
+                          <button className="w-full flex items-center gap-2 px-3 py-2.5 bg-paper hover:bg-surface transition-colors text-left" onClick={() => showWhy(key, c.path)}>
+                            <code className="text-[12.5px] text-body flex-1">{c.path}:{c.line_start}{c.line_end ? `-${c.line_end}` : ""}</code>
+                            <span className="text-[11.5px] text-steel-text" title={`content-addressed → keel blob ${c.blob}`}>⬡ {c.blob.slice(0, 10)}</span>
+                            <span className="text-[12px] text-muted">{prov[key] ? "hide ▾" : "provenance ▸"}</span>
+                          </button>
+                          {prov[key] && (
+                            <div className="border-t border-rule3">
+                              {prov[key].length === 0 && <div className="px-3 py-2 text-[12px] text-muted">no recorded history</div>}
+                              {prov[key].map((p, j) => (
+                                <div key={j} className="px-3 py-2 border-b border-rule3 last:border-0 flex gap-3 text-[12.5px]">
+                                  <code className="text-steel-text tabular-nums">{p.change.slice(0, 8)}</code>
+                                  <span className="text-body flex-1">{p.intent}</span>
+                                  <span className="text-muted">{p.author}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <div className="grid gap-2.5">
+                  <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">Discussion</span>
+                  <Thread target={`issue:${it.number}`} />
+                </div>
+              </section>
+
+              <aside className="grid gap-5 content-start">
+                <Module title="Details">
+                  <Stat k="state" v={it.status.state === "open" ? "open" : it.status.reason ?? "closed"} />
+                  <Stat k="author" v={handleOf(it.author)} />
+                  <div className="grid gap-1.5 pt-1">
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">assignees</span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {it.assignees.map((id) => (
+                        <span key={id} className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-chip bg-paper border border-rule">
+                          {handleOf(id)}
+                          {canAct && <button className="text-muted hover:text-fault-text cursor-pointer" title="unassign" onClick={() => issueAction(it.number, "unassign", { assignee: id })}>×</button>}
+                        </span>
+                      ))}
+                      {it.assignees.length === 0 && <span className="text-[12.5px] text-muted">none</span>}
+                    </div>
+                    {canAct && me && !it.assignees.includes(me.id) && <LinkButton onClick={() => issueAction(it.number, "assign", { assignee: me.id })}>assign me</LinkButton>}
+                  </div>
+                  <div className="grid gap-1.5 pt-1">
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">labels</span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {it.labels.map((l) => (
+                        <span key={l} className="inline-flex items-center gap-1">
+                          <Label name={l} />
+                          {canAct && <button className="text-muted hover:text-fault-text cursor-pointer text-xs" title="remove" onClick={() => issueAction(it.number, "unlabel", { label: l })}>×</button>}
+                        </span>
+                      ))}
+                      {it.labels.length === 0 && <span className="text-[12.5px] text-muted">none</span>}
+                    </div>
+                    {canAct && (
+                      <input className="box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-xs text-ink outline-none focus:border-body placeholder:text-faint" placeholder="add label…" value={labelDraft[it.number] ?? ""} onChange={(e) => setLabelDraft((d) => ({ ...d, [it.number]: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter" && (labelDraft[it.number] ?? "").trim()) { issueAction(it.number, "label", { label: labelDraft[it.number].trim() }); setLabelDraft((d) => ({ ...d, [it.number]: "" })); } }} />
+                    )}
+                  </div>
+                  {it.resolved_by && <Stat k="resolved by" v={<code className="text-[12px] text-steel-text">⬡ {it.resolved_by.slice(0, 8)}</code>} />}
+                </Module>
+                <div className="flex gap-2">
+                  {it.status.state === "open"
+                    ? <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => transition(it.number, "close")}>Close issue</Button>
+                    : <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => transition(it.number, "reopen")}>Reopen issue</Button>}
+                </div>
+              </aside>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── VOYAGE page = the review package, front and center ───────────── */}
+      {view === "repo" && currentPr && (() => {
+        const p = currentPr;
+        const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
+        const primary = (prReviews[0] ?? { id: "live", target: `pr:${p.number}`, reviewer: "", verdict: "comment", summary: "", findings: [] }) as Review;
+        const checksOk = p.verification === "green";
+        const changesRequested = prReviews.some((r) => r.verdict === "request_changes" || r.verdict === "reject");
+        const hasApproval = prReviews.some((r) => r.verdict === "approve" && r.reviewer !== p.author);
+        const canLand = checksOk && hasApproval && !changesRequested;
+        const statusRow = (state: "ok" | "bad" | "pend", label: string, detail: string) => (
+          <div className="flex items-start gap-2.5">
+            <span className={`grid place-items-center w-[18px] h-[18px] rounded-full text-[11px] font-bold mt-px flex-none ${state === "ok" ? "bg-clear text-white" : state === "bad" ? "bg-fault text-white" : "border border-rule text-muted"}`}>{state === "ok" ? "✓" : state === "bad" ? "✕" : "•"}</span>
+            <div><div className="text-[13.5px] font-medium text-body">{label}</div><div className="text-[12px] text-muted leading-[1.45]">{detail}</div></div>
+          </div>
+        );
+        const gate = (
+          <div className="grid gap-4">
+            <Card>
+              {p.state === "merged" ? (
+                <div className="px-5 py-4 flex items-center gap-3">
+                  <span className="grid place-items-center w-7 h-7 rounded-full bg-clear text-white text-[14px] flex-none">✓</span>
+                  <div><div className="text-[14.5px] font-semibold text-clear-text">Merged</div><div className="text-[12.5px] text-muted tabular-nums">v{p.number} · ⬡ {(p.changes[0] ?? "").slice(0, 8)} · by {handleOf(p.author)}</div></div>
+                </div>
+              ) : p.state === "closed" ? (
+                <div className="px-5 py-4 flex items-center gap-3">
+                  <span className="grid place-items-center w-7 h-7 rounded-full bg-dim text-white text-[13px] flex-none">✕</span>
+                  <div className="flex-1"><div className="text-[14.5px] font-semibold">Closed without merging</div><div className="text-[12.5px] text-muted tabular-nums">v{p.number} · by {handleOf(p.author)}</div></div>
+                  {canAct && <Button size="sm" variant="secondary" onClick={() => closePr(p.number, true)}>Reopen</Button>}
+                </div>
+              ) : (
+                <>
+                  <div className="px-5 py-4 grid gap-3">
+                    {statusRow(checksOk ? "ok" : p.verification === "red" ? "bad" : "pend", checksOk ? "Checks passed" : p.verification === "red" ? "Checks failed" : "Checks not run", checksOk ? "keel verify is green" : p.verification === "red" ? "keel verify is red — fix and re-run" : "run the checks below")}
+                    {statusRow(changesRequested ? "bad" : hasApproval ? "ok" : "pend", changesRequested ? "Changes requested" : hasApproval ? "Approved" : "Review required", changesRequested ? "a reviewer requested changes" : hasApproval ? "approved by someone other than the author" : "needs an approving review from someone other than the author")}
+                  </div>
+                  <div className="px-5 py-3.5 border-t border-rule2 bg-paper flex items-center gap-3 flex-wrap">
+                    <Button size="sm" disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}>Merge</Button>
+                    {!canLand && <span className="text-[12.5px] text-muted">Blocked until the checks above pass.</span>}
+                    {canAct && <LinkButton className="ml-auto" onClick={() => closePr(p.number, false)}>Close</LinkButton>}
+                  </div>
+                </>
+              )}
+            </Card>
+          </div>
+        );
+        // Secondary review actions (the primary comment/approve/request-changes flow lives in the
+        // conversation composer's split button). Agent auto-review + request-a-reviewer only.
+        const reviewTools = p.state === "open" ? (
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button size="sm" variant="secondary" disabled={autoReviewing === p.number} onClick={() => autoReview(p.number)}>{autoReviewing === p.number ? "agent reviewing…" : "⬡ Agent auto-review"}</Button>
+            {canAct && (
+              <Picker size="sm" width={220} placeholder="Request a reviewer…" value="" onChange={(v) => requestReviewer(p.number, v)}
+                options={actors.filter((a) => a.id !== p.author && !p.reviewers?.includes(a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} />
+            )}
+          </div>
+        ) : null;
+        return (
+          <ReviewPage
+            review={primary}
+            reviews={prReviews}
+            landGate={gate}
+            reviewTools={reviewTools}
+            onReviewsChanged={loadReviews}
+            pr={p}
+            actors={actors}
+            tenant={tenant}
+            repo={issueRepo}
+            token={token}
+            me={me}
+            onBack={() => navigate(`${repoBase()}/voyages`)}
           />
-          <button type="submit">Open PR</button>
-        </form>
-        <ul className="issue-list">
-          {prs.length === 0 && <li className="empty">no pull requests yet</li>}
-          {[...prs].filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
-            const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
-            return (
-            <li key={p.number} className="issue">
-              <div className="issue-row">
-                <span className={"verif " + (p.state === "merged" ? "merged" : p.state === "closed" ? "closed" : p.verification)}>
-                  {p.state === "merged" ? "merged" : p.state === "closed" ? "closed" : p.verification}
-                </span>
-                <span className="num">!{p.number}</span>
-                <button
-                  className="it-title"
-                  onClick={() => setOpenPr(openPr === p.number ? null : p.number)}
-                  title="open reviews"
-                >
-                  {openPr === p.number ? "▾ " : "▸ "}
-                  {p.title}
-                </button>
-                <span className="coderef" title={`proposes keel change ${p.changes[0]}`}>
-                  <span className="blob">⬡ {(p.changes[0] ?? "").slice(0, 10)}</span>
-                </span>
-                {prReviews.length > 0 && (
-                  <span className="review-count" title="reviews">{prReviews.length} review{prReviews.length > 1 ? "s" : ""}</span>
+        );
+      })()}
+
+      {/* ── ORG · members + teams ─────────────────────────────────────────── */}
+      {orgHandle && (() => {
+        const acct = orgAccount;
+        if (!acct) return <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-16 text-[13px] text-muted">no organization <b className="text-body">{orgHandle}</b></div>;
+        const amAdmin = !!me && acct.members.some((m) => m.actor === me.id && (m.role === "owner" || m.role === "admin"));
+        const candidates = actors.filter((a) => !acct.members.some((m) => m.actor === a.id));
+        return (
+          <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
+            <div className="flex items-center gap-3 flex-wrap mb-1.5">
+              <h1 className="text-[25px] font-semibold tracking-tight">{acct.handle}</h1>
+              <span className="text-[11.5px] font-semibold px-2 py-[3px] rounded-full border border-rule text-dim">{acct.kind}</span>
+            </div>
+            <p className="text-[13px] text-muted mb-6">{acct.members.length} member{acct.members.length === 1 ? "" : "s"} · {teams.length} team{teams.length === 1 ? "" : "s"} · {acct.repos.length} repo{acct.repos.length === 1 ? "" : "s"}</p>
+            <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-12 gap-y-9">
+              <section className="min-w-0 grid gap-8">
+                {importList !== null && (
+                  <Card>
+                    <SectionHeader label="Import from GitHub" right={<LinkButton onClick={() => setImportList(null)}>close</LinkButton>} />
+                    <div className="max-h-[420px] overflow-y-auto">
+                      {importList.length === 0 && <div className="px-5 py-6 text-[13px] text-muted">No repositories available from this connection.</div>}
+                      {importList.map((full) => (
+                        <div key={full} className="px-5 py-3 border-b border-rule2 last:border-0 flex items-center gap-3">
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" className="text-dim"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.71.08-.71 1.17.08 1.79 1.2 1.79 1.2 1.04 1.79 2.73 1.27 3.4.97.1-.76.4-1.27.74-1.56-2.56-.29-5.26-1.28-5.26-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.7 5.4-5.28 5.69.42.36.79 1.07.79 2.16v3.2c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z" /></svg>
+                          <span className="flex-1 text-[13.5px] font-medium tabular-nums">{full}</span>
+                          <Button size="sm" disabled={importBusy === full} onClick={() => importRepo(acct.id, full)}>{importBusy === full ? "importing…" : "Import"}</Button>
+                        </div>
+                      ))}
+                    </div>
+                  </Card>
                 )}
-                {p.reviewers?.length > 0 && (
-                  <span className="owners-chip" title="code owners auto-requested">◎ {p.reviewers.map((id) => handleOf(id)).join(", ")}</span>
-                )}
-                <span className={"by " + (actors.find((a) => a.id === p.author)?.kind ?? "")}>
-                  {handleOf(p.author)}
-                </span>
-              </div>
-              {openPr === p.number && (
-                <div className="reviews">
-                  <div className="merge-bar">
-                    {p.state === "merged" ? (
-                      <span className="merged-note">✓ merged</span>
-                    ) : p.state === "closed" ? (
+                <div>
+                  <Eyebrow label="Members" />
+                  <Card>
+                    {acct.members.map((m) => (
+                      <div key={m.actor} className="px-5 py-3 border-b border-rule2 last:border-0 flex items-center gap-3">
+                        <Avatar id={m.actor} handle={m.handle} kind={kindOf(m.actor)} size={30} />
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[14px] font-medium">{m.handle || m.actor.slice(0, 10)}</div>
+                          <div className="text-[12px] text-muted tabular-nums">{m.actor.slice(0, 16)}…</div>
+                        </div>
+                        <span className="text-[11.5px] font-semibold px-2 py-[3px] rounded-full border border-rule text-dim">{m.role}</span>
+                        {amAdmin && <Button size="sm" variant="destructive" onClick={() => removeOrgMember(acct.id, m.actor)}>Remove</Button>}
+                      </div>
+                    ))}
+                    {amAdmin && (
+                      <div className="px-5 py-3 flex gap-2 items-center bg-paper">
+                        <select className="flex-1 box-border h-ctl px-2 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body" value={memberPick.actor} onChange={(e) => setMemberPick({ ...memberPick, actor: e.target.value })}>
+                          <option value="">add a member…</option>
+                          {candidates.map((a) => <option key={a.id} value={a.id}>{a.handle} ({a.kind})</option>)}
+                        </select>
+                        <select className="box-border h-ctl px-2 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body" value={memberPick.role} onChange={(e) => setMemberPick({ ...memberPick, role: e.target.value })}>
+                          {["read", "write", "admin", "owner"].map((r) => <option key={r} value={r}>{r}</option>)}
+                        </select>
+                        <Button size="sm" onClick={() => { if (memberPick.actor) { addOrgMember(acct.id, { actor: memberPick.actor }, memberPick.role); setMemberPick({ actor: "", role: "write" }); } }}>Add</Button>
+                      </div>
+                    )}
+                  </Card>
+                </div>
+                <div>
+                  <Eyebrow label="Teams" right={amAdmin ? <span className="flex gap-2 items-center"><input className="box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-xs text-ink outline-none focus:border-body placeholder:text-faint" placeholder="new team…" value={teamDraft} onChange={(e) => setTeamDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { createTeam(acct.id, teamDraft); setTeamDraft(""); } }} /><Button size="sm" onClick={() => { createTeam(acct.id, teamDraft); setTeamDraft(""); }}>Create</Button></span> : undefined} />
+                  {teams.length === 0 && <div className="text-[13px] text-muted py-4">no teams yet</div>}
+                  <div className="grid gap-4">
+                    {teams.map((t) => (
+                      <Card key={t.id}>
+                        <div className="px-5 py-3 border-b border-rule2 flex items-center justify-between">
+                          <span className="text-[14px] font-semibold">{t.name}</span>
+                          {amAdmin && <Button size="sm" variant="destructive" onClick={() => deleteTeam(acct.id, t.id)}>Delete team</Button>}
+                        </div>
+                        {t.members.map((m) => (
+                          <div key={m.actor} className="px-5 py-2.5 border-b border-rule2 last:border-0 flex items-center gap-3">
+                            <span className="flex-1 text-[13.5px]">{m.handle || m.actor.slice(0, 10)}</span>
+                            <span className="text-[11.5px] text-muted">{m.role}</span>
+                            {amAdmin && <button className="text-muted hover:text-fault-text cursor-pointer text-sm" title="remove" onClick={() => teamRemoveMember(acct.id, t.id, m.actor)}>×</button>}
+                          </div>
+                        ))}
+                        {amAdmin && (
+                          <div className="px-5 py-2.5 bg-paper">
+                            <select className="w-full box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-xs text-ink outline-none focus:border-body" value="" onChange={(e) => { if (e.target.value) { teamAddMember(acct.id, t.id, { actor: e.target.value }, "write"); e.target.value = ""; } }}>
+                              <option value="">add to team…</option>
+                              {acct.members.filter((m) => !t.members.some((x) => x.actor === m.actor)).map((m) => <option key={m.actor} value={m.actor}>{m.handle}</option>)}
+                            </select>
+                          </div>
+                        )}
+                      </Card>
+                    ))}
+                  </div>
+                </div>
+              </section>
+              <aside className="grid gap-5 content-start">
+                <Module title="Repositories">
+                  {acct.repos.length === 0 && <span className="text-[13px] text-muted">none</span>}
+                  {acct.repos.map((rp: string) => (
+                    <button key={rp} className="text-left text-[13.5px] text-body hover:text-steel-text cursor-pointer" onClick={() => navigate(`/${encodeURIComponent(acct.handle)}/${encodeURIComponent(rp)}`)}>{rp} →</button>
+                  ))}
+                  {amAdmin && <div className="pt-1"><LinkButton onClick={() => createRepoFlow(acct.handle)}>+ new repo</LinkButton></div>}
+                </Module>
+                {amAdmin && (
+                  <Module title="GitHub" tone={ghStatus?.connected ? "var(--clear)" : ""}>
+                    {ghStatus?.connected ? (
                       <>
-                        <span className="closed-note">✕ closed without merging</span>
-                        {canAct && <button className="link" onClick={() => closePr(p.number, true)}>reopen</button>}
+                        <Stat k="connected" v={ghStatus.login} />
+                        <div className="flex gap-2 items-center pt-1">
+                          <Button size="sm" onClick={() => openImport(acct.id)}>Import a repo</Button>
+                          <LinkButton onClick={() => disconnectGh(acct.id)}>disconnect</LinkButton>
+                        </div>
                       </>
                     ) : (
                       <>
-                        <button className="merge-btn" onClick={() => mergePr(p.number)}>Merge</button>
-                        {canAct && <button className="link" onClick={() => closePr(p.number, false)}>close</button>}
-                        <span className="muted">
-                          gate: keel-verify green + an approving review from someone other than the author
-                        </span>
+                        <p className="text-[12.5px] text-muted leading-[1.5]">Connect this org to a GitHub App installation to import its repositories. Only you (an admin) can see or import them.</p>
+                        <Button size="sm" onClick={() => connectGh(acct.id)}>Connect GitHub</Button>
                       </>
                     )}
+                  </Module>
+                )}
+                {!amAdmin && <Module title="Access"><span className="text-[12.5px] text-muted">You are viewing as a {me ? "member" : "guest"}. Owner/admin rights are needed to manage members and teams.</span></Module>}
+              </aside>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── REPO · settings ───────────────────────────────────────────────── */}
+      {view === "repo" && repoSettingsOpen && !isTenantOwner && (
+        <div className="max-w-[720px] mx-auto px-6 sm:px-8 py-16">
+          <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer mb-5" onClick={() => navigate(repoBase())}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
+            {issueRepo}
+          </button>
+          <Card><div className="px-6 py-8 grid gap-2"><h2 className="text-[16px] font-semibold">Not authorized</h2><p className="text-[13.5px] text-muted">Repository settings are visible only to owners and admins of <b className="text-body">{tenant}</b>. {!me && <>You are not signed in.</>}</p></div></Card>
+        </div>
+      )}
+      {view === "repo" && repoSettingsOpen && isTenantOwner && (() => {
+        const s = repoSettings;
+        const reviewerCandidates = actors;
+        return (
+          <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-8">
+            <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer mb-5" onClick={() => navigate(repoBase())}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
+              {issueRepo}
+            </button>
+            <h1 className="text-[24px] font-semibold tracking-tight mb-1.5">Repository settings</h1>
+            <p className="text-[13px] text-muted mb-7">{tenant} / {issueRepo}{!isTenantOwner && <span> · read-only (owner/admin required to change)</span>}</p>
+            <div className="grid gap-5 max-w-[760px]">
+              <Card>
+                <SectionHeader label="General" />
+                <div className="px-5 py-4 grid gap-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div><div className="text-[13.5px] font-medium">Private</div><div className="text-[12.5px] text-muted">Hidden from non-members.</div></div>
+                    <Switch on={!!s?.private} onChange={(on: boolean) => isTenantOwner && saveRepoSettings({ private: on })} />
                   </div>
-                  {prReviews.length === 0 && <p className="muted">no reviews yet</p>}
-                  {prReviews.map((r) => (
-                    <button className="review clickable" key={r.id} onClick={() => setOpenReview(r)} title="open review">
-                      <span className={"verdict " + r.verdict}>{r.verdict.replace("_", " ")}</span>
-                      <b className={actors.find((a) => a.id === r.reviewer)?.kind ?? ""}>{handleOf(r.reviewer)}</b>
-                      <span className="rv-summary">{r.summary || "open review →"}</span>
-                      {r.findings?.length > 0 && (
-                        <span className="find-count">{r.findings.length} finding{r.findings.length > 1 ? "s" : ""}</span>
-                      )}
-                    </button>
-                  ))}
-                  <div className="auto-review-bar">
-                    <button className="auto-review-btn" disabled={autoReviewing === p.number} onClick={() => autoReview(p.number)}>
-                      {autoReviewing === p.number ? "agent reviewing…" : "⬡ Agent auto-review"}
-                    </button>
-                    <span className="muted">runs checks + reconciles the change's claims, then posts an accountable agent review</span>
-                    {canAct && (
-                      <select className="req-reviewer" value="" onChange={(e) => { requestReviewer(p.number, e.target.value); e.target.value = ""; }}>
-                        <option value="">request a reviewer…</option>
-                        {actors.filter((a) => a.id !== p.author && !p.reviewers?.includes(a.id)).map((a) => (
-                          <option key={a.id} value={a.id}>{a.handle} ({a.kind})</option>
-                        ))}
-                      </select>
-                    )}
-                  </div>
-                  <div className="review-form">
-                    <select
-                      value={reviewForm.verdict}
-                      onChange={(e) => setReviewForm({ ...reviewForm, verdict: e.target.value })}
-                    >
-                      <option value="approve">approve</option>
-                      <option value="request_changes">request changes</option>
-                      <option value="reject">reject</option>
-                      <option value="comment">comment</option>
-                    </select>
-                    <input
-                      placeholder={`review as ${handleOf(actingAs)}…`}
-                      value={reviewForm.summary}
-                      onChange={(e) => setReviewForm({ ...reviewForm, summary: e.target.value })}
-                    />
-                    <button onClick={() => submitReview(p.number)}>Submit review</button>
-                    <div className="finding-row">
-                      <span className="muted">finding (optional):</span>
-                      <input
-                        className="fp"
-                        placeholder="path"
-                        value={reviewForm.findPath}
-                        onChange={(e) => setReviewForm({ ...reviewForm, findPath: e.target.value })}
-                        spellCheck={false}
-                      />
-                      <select value={reviewForm.findSev} onChange={(e) => setReviewForm({ ...reviewForm, findSev: e.target.value })}>
-                        <option value="info">info</option>
-                        <option value="warn">warn</option>
-                        <option value="blocker">blocker</option>
-                      </select>
-                      <input
-                        className="fn"
-                        placeholder="what's wrong"
-                        value={reviewForm.findNote}
-                        onChange={(e) => setReviewForm({ ...reviewForm, findNote: e.target.value })}
-                      />
-                    </div>
-                  </div>
-                  <div className="thread-wrap">
-                    <h5>Discussion <span className="muted">humans and agents, one accountable thread</span></h5>
-                    <Thread target={`pr:${p.number}`} />
+                  <div className="flex items-center justify-between gap-4">
+                    <div><div className="text-[13.5px] font-medium">Require a review to merge</div><div className="text-[12.5px] text-muted">On top of the built-in author-independence gate.</div></div>
+                    <Switch on={!!s?.require_review_to_land} onChange={(on: boolean) => isTenantOwner && saveRepoSettings({ require_review_to_land: on })} />
                   </div>
                 </div>
+              </Card>
+              <Card>
+                <SectionHeader label="Default reviewers" right={<span className="text-[12.5px] text-muted">auto-requested on new voyages</span>} />
+                <div className="px-5 py-4 grid gap-3">
+                  <div className="flex flex-wrap gap-1.5">
+                    {(s?.default_reviewers ?? []).map((r) => (
+                      <span key={r.actor} className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-chip bg-paper border border-rule">
+                        {r.handle || r.actor.slice(0, 8)}
+                        {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveRepoSettings({ default_reviewers: (s!.default_reviewers.filter((x) => x.actor !== r.actor)).map((x) => x.actor) })}>×</button>}
+                      </span>
+                    ))}
+                    {(s?.default_reviewers ?? []).length === 0 && <span className="text-[12.5px] text-muted">none</span>}
+                  </div>
+                  {isTenantOwner && (
+                    <select className="max-w-[280px] box-border h-ctl px-2 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body" value="" onChange={(e) => { if (e.target.value && s) { const ids = [...new Set([...s.default_reviewers.map((x) => x.actor), e.target.value])]; saveRepoSettings({ default_reviewers: ids }); e.target.value = ""; } }}>
+                      <option value="">add a reviewer…</option>
+                      {reviewerCandidates.filter((a) => !(s?.default_reviewers ?? []).some((x) => x.actor === a.id)).map((a) => <option key={a.id} value={a.id}>{a.handle} ({a.kind})</option>)}
+                    </select>
+                  )}
+                </div>
+              </Card>
+              <Card>
+                <SectionHeader label="Team access" />
+                <div className="px-5 py-4 grid gap-3">
+                  {(s?.team_access ?? []).map((ta, i) => {
+                    const tm = teams.find((t) => t.id === ta.team);
+                    return (
+                      <div key={i} className="flex items-center gap-3">
+                        <span className="flex-1 text-[13.5px]">{tm?.name ?? ta.team}</span>
+                        <span className="text-[11.5px] font-semibold px-2 py-[3px] rounded-full border border-rule text-dim">{ta.role}</span>
+                        {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveRepoSettings({ team_access: (s!.team_access.filter((_, j) => j !== i)) })}>×</button>}
+                      </div>
+                    );
+                  })}
+                  {(s?.team_access ?? []).length === 0 && <span className="text-[12.5px] text-muted">no teams have explicit access</span>}
+                  {isTenantOwner && teams.length > 0 && (
+                    <select className="max-w-[280px] box-border h-ctl px-2 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body" value="" onChange={(e) => { if (e.target.value && s) { saveRepoSettings({ team_access: [...s.team_access, { team: e.target.value, role: "write" }] }); e.target.value = ""; } }}>
+                      <option value="">grant a team access…</option>
+                      {teams.filter((t) => !(s?.team_access ?? []).some((x) => x.team === t.id)).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+                    </select>
+                  )}
+                  {teams.length === 0 && <span className="text-[12px] text-faint">create teams in the org page to grant team access</span>}
+                </div>
+              </Card>
+              <Card>
+                <SectionHeader label="Automation" right={<span className="text-[12.5px] text-muted">autonomy tier</span>} />
+                <div className="px-5 py-4 grid gap-3">
+                  {autonomy && (
+                    <>
+                      <div className="flex items-center gap-2">
+                        <StatusBadge kind={autonomy.tier === "t0" ? "queued" : "agent"}>{autonomy.tier.toUpperCase()}</StatusBadge>
+                        <span className="text-[12.5px] text-muted">{TIERS[autonomy.tier]}</span>
+                      </div>
+                      {isTenantOwner && <div className="max-w-[160px]"><Select options={["t0", "t1", "t2", "t3"].map((t) => t.toUpperCase())} value={autonomy.tier.toUpperCase()} onChange={(v: string) => setTier(v.toLowerCase())} /></div>}
+                    </>
+                  )}
+                </div>
+              </Card>
+              {ciConfig && (
+                <Card>
+                  <SectionHeader label="Checks" right={<span className="text-[12.5px] text-muted">how checks run</span>} />
+                  <div className="px-5 py-4 grid gap-3">
+                    <p className="text-[13px] text-body leading-[1.5]">
+                      {ciConfig.url ? <>Dispatched to <code className="text-[12px]">{ciConfig.url}</code></> : "Run on the built-in local runner."}
+                      <span className="text-faint"> · {ciConfig.source}{ciConfig.has_secret ? " · secret set" : ""}</span>
+                    </p>
+                    {isTenantOwner && (
+                      <div className="grid gap-2 max-w-[420px]">
+                        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="https://your-ci/hull (blank = local runner)" value={ciUrl} onChange={(e) => setCiUrl(e.target.value)} spellCheck={false} />
+                        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="shared secret (optional)" value={ciSecret} onChange={(e) => setCiSecret(e.target.value)} spellCheck={false} />
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="secondary" onClick={() => setCiSecret(bytesToHex(crypto.getRandomValues(new Uint8Array(32))))}>Generate secret</Button>
+                          <Button size="sm" onClick={() => saveCiConfig(false)}>Save</Button>
+                          {ciConfig.source === "repo" && <Button size="sm" variant="ghost" onClick={() => saveCiConfig(true)}>Clear</Button>}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </Card>
               )}
-            </li>
-            );
-          })}
-        </ul>
-        </section>
-        )}
-      </main>
+              {mirror?.target && (
+                <Card>
+                  <SectionHeader label="Mirror" right={<span className="text-[12.5px] text-muted">outbound delivery</span>} />
+                  <div className="px-5 py-4 grid gap-1.5 text-[13px]">
+                    <Stat k="mirror" v={<code className="text-[12px]">{mirror.target}</code>} />
+                    <Stat k="pushed outbound" v={`${mirror.outbound.length}`} />
+                    <p className="text-[11.5px] text-faint leading-[1.5] pt-1">Loop-safe: forge-originated changes are never pushed back.</p>
+                  </div>
+                </Card>
+              )}
+              <Card>
+                <SectionHeader label="Code owners" right={<span className="text-[12.5px] text-muted">path → owners</span>} />
+                <div className="px-5 py-4 grid gap-2">
+                  {ownerRules.length === 0 && <span className="text-[12.5px] text-muted">no code-owner rules</span>}
+                  {ownerRules.map((r, i) => (
+                    <div key={i} className="flex items-center gap-3 text-[13px]">
+                      <code className="text-body">{r.glob}</code>
+                      <span className="text-muted flex-1">{r.owners.map((o) => handleOf(o)).join(", ")}</span>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── REPO · list (issues / voyages) ────────────────────────────────── */}
+      {view === "repo" && !repoSettingsOpen && !currentIssue && !currentPr && (
+        <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mb-1.5">
+            <h1 className="text-[25px] font-semibold tracking-tight">{issueRepo}</h1>
+            {autonomy && <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge bg-rule2 text-dim" title={TIERS[autonomy.tier]}>{autonomy.tier.toUpperCase()}</span>}
+            {secrets.length > 0 && <StatusBadge kind="failed">{secrets.length} secret{secrets.length > 1 ? "s" : ""}</StatusBadge>}
+            <div className="ml-auto flex items-center gap-3">
+              {isTenantOwner && <LinkButton onClick={() => navigate(`${repoBase()}/settings`)}>Settings</LinkButton>}
+              {!canAct && <span className="text-[12.5px] text-muted">read-only, <LinkButton onClick={() => signInWith(DEMO_OWNER_SECRET)}>sign in</LinkButton> to act</span>}
+            </div>
+          </div>
+          <p className="text-[13px] text-muted mb-6">under <b className="text-body font-medium">{tenant}</b></p>
+
+          <div className="flex items-end justify-between gap-4 border-b border-rule2 mb-7">
+            <HTabs items={[`Issues ${openIssues}`, `Voyages ${prs.length}`]} value={tab === "issues" ? 0 : 1} onChange={(i: number) => navigate(i === 0 ? repoBase() : `${repoBase()}/voyages`)} />
+            <div className="w-[240px] pb-1.5 hidden sm:block">
+              <SearchInput placeholder={tab === "issues" ? "Filter issues" : "Filter voyages"} shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-12 gap-y-9">
+            <section className="min-w-0">
+              {tab === "issues" && (
+                <>
+                  <div className="flex items-center justify-between gap-3 mb-5">
+                    <span className="text-[13px] text-muted"><b className="text-body font-medium tabular-nums">{openIssues} open</b>{issues.length - openIssues > 0 ? ` · ${issues.length - openIssues} closed` : ""}</span>
+                    <Segmented items={["List", "Board"]} value={issueView === "list" ? 0 : 1} onChange={(i: number) => setIssueView(i === 0 ? "list" : "board")} />
+                  </div>
+                  <div className="flex flex-wrap gap-2 mb-7">
+                    <input className="flex-1 min-w-[200px] box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="open an issue" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} onKeyDown={(e) => e.key === "Enter" && createIssue()} />
+                    <input className="w-[190px] box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="path (optional)" value={form.path} onChange={(e) => setForm({ ...form, path: e.target.value })} spellCheck={false} />
+                    <input className="w-[56px] box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="line" value={form.line} onChange={(e) => setForm({ ...form, line: e.target.value })} />
+                    <select className="box-border h-ctl px-2 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body" value={form.assignee} onChange={(e) => setForm({ ...form, assignee: e.target.value })}>
+                      <option value="">assign…</option>
+                      {actors.map((a) => <option key={a.id} value={a.id}>{a.handle}</option>)}
+                    </select>
+                    <Button size="sm" onClick={createIssue}>Open</Button>
+                  </div>
+                  {issueView === "list" ? (
+                    <div>
+                      {issues.length === 0 && <div className="py-8 text-[13px] text-muted">no issues yet, open one above</div>}
+                      {[...issues]
+                        .filter((it) => matchQ(`${it.title} ${it.body} #${it.number} ${it.labels.join(" ")}`))
+                        .sort((a, b) => Number(a.status.state !== "open") - Number(b.status.state !== "open") || b.number - a.number)
+                        .map((it) => (
+                          <button key={it.number} onClick={() => navigate(`${repoBase()}/issues/${it.number}`)} className="group w-full text-left block border-b border-rule2">
+                            <div className="py-3 -mx-3 px-3 rounded-ctl group-hover:bg-surface transition-colors flex items-start gap-3">
+                              <span className="mt-0.5 flex-none">
+                                {it.status.state === "open" ? (
+                                  <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-clear-text"><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" /><path fillRule="evenodd" d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0ZM1.5 8a6.5 6.5 0 1 1 13 0 6.5 6.5 0 0 1-13 0Z" /></svg>
+                                ) : (
+                                  <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className={it.status.reason === "completed" || !it.status.reason ? "text-steel-text" : "text-muted"}><path fillRule="evenodd" d="M11.28 6.78a.75.75 0 0 0-1.06-1.06L7.25 8.69 5.78 7.22a.75.75 0 0 0-1.06 1.06l2 2a.75.75 0 0 0 1.06 0l3.5-3.5ZM8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Z" /></svg>
+                                )}
+                              </span>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-[15px] font-semibold group-hover:text-steel-text transition-colors">{it.title}</span>
+                                  {it.code_refs.length > 0 && <span className="text-[11.5px] text-steel-text">⬡ {it.code_refs.length}</span>}
+                                  {it.resolved_by && <Tag>⬡ resolved</Tag>}
+                                  {!it.resolved_by && (it.linked_prs?.length ?? 0) > 0 && <Tag>⇄ {it.linked_prs!.length} voyage{it.linked_prs!.length > 1 ? "s" : ""}</Tag>}
+                                </div>
+                                <div className="text-[12.5px] text-muted mt-1 flex items-center gap-1.5 flex-wrap tabular-nums">
+                                  <span>#{it.number}</span>
+                                  <span className="text-faint">·</span>
+                                  <span>opened by</span>
+                                  <Avatar id={it.author} handle={handleOf(it.author)} kind={kindOf(it.author)} size={15} />
+                                  <span className={kindOf(it.author) === "agent" ? "text-steel-text" : ""}>{handleOf(it.author)}</span>
+                                  {it.assignees.length > 0 && <span className="flex items-center gap-1 ml-1">assigned {it.assignees.map((id) => <Avatar key={id} id={id} handle={handleOf(id)} kind={kindOf(id)} size={15} />)}</span>}
+                                </div>
+                              </div>
+                            </div>
+                          </button>
+                        ))}
+                    </div>
+                  ) : (
+                    <div className="grid grid-flow-col auto-cols-[minmax(210px,1fr)] gap-4 overflow-x-auto pb-2">
+                      {[
+                        { k: "open", label: "Open" },
+                        { k: "completed", label: "Completed" },
+                        { k: "not_planned", label: "Not planned" },
+                        { k: "cancelled", label: "Cancelled" },
+                        { k: "duplicate", label: "Duplicate" },
+                      ].map((col) => {
+                        const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k && matchQ(`${i.title} ${i.body} #${i.number} ${i.labels.join(" ")}`));
+                        if (col.k !== "open" && inCol.length === 0) return null;
+                        return (
+                          <div key={col.k} className="grid gap-2 content-start">
+                            <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted flex gap-1.5 mb-1">{col.label} <span className="text-faint">{inCol.length}</span></div>
+                            {inCol.map((it) => (
+                              <button key={it.number} className="text-left bg-surface border border-rule rounded-ctl p-3 cursor-pointer hover:border-ctl transition-colors" onClick={() => navigate(`${repoBase()}/issues/${it.number}`)}>
+                                <div className="text-xs text-faint tabular-nums">#{it.number}</div>
+                                <div className="text-[13.5px] font-medium mt-0.5 leading-snug">{it.title}</div>
+                                {it.assignees.length > 0 && <div className="text-[11.5px] text-muted mt-1.5">◎ {it.assignees.map((id) => handleOf(id)).join(", ")}</div>}
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              )}
+
+              {tab === "prs" && (
+                <>
+                  <div className="flex flex-wrap gap-2 mb-7">
+                    <input className="flex-1 min-w-[220px] box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="open a voyage from HEAD" value={prTitle} onChange={(e) => setPrTitle(e.target.value)} onKeyDown={(e) => e.key === "Enter" && createPr()} />
+                    <Button size="sm" onClick={createPr}>Open voyage</Button>
+                  </div>
+                  <div>
+                    {prs.length === 0 && <div className="py-8 text-[13px] text-muted">no voyages yet</div>}
+                    {[...prs].filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
+                      const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
+                      return (
+                        <button key={p.number} onClick={() => navigate(`${repoBase()}/voyages/${p.number}`)} className="group w-full text-left block border-b border-rule2">
+                          <div className="py-3 -mx-3 px-3 rounded-ctl group-hover:bg-surface transition-colors flex items-start gap-3">
+                            <span className="mt-0.5 flex-none">
+                              {p.state === "merged" ? (
+                                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-steel-text"><path d="M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Z" /></svg>
+                              ) : p.state === "closed" ? (
+                                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-muted"><path d="M3.25 1A2.25 2.25 0 0 1 4 5.372v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.251 2.251 0 0 1 3.25 1Zm9.5 5.5a.75.75 0 0 1-.75-.75V4.31l-1.97 1.97a.75.75 0 0 1-1.06-1.06L10.94 3.25H9.5a.75.75 0 0 1 0-1.5h3.25a.75.75 0 0 1 .75.75V6.5a.75.75 0 0 1-.75.75ZM3.25 3.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm0 9a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Z" /></svg>
+                              ) : (
+                                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-clear-text"><path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z" /></svg>
+                              )}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-[15px] font-semibold group-hover:text-steel-text transition-colors">{p.title}</span>
+                                {p.state === "open" && (() => {
+                                  const vChanges = prReviews.some((r) => r.verdict === "request_changes" || r.verdict === "reject");
+                                  const vApprove = prReviews.some((r) => r.verdict === "approve" && r.reviewer !== p.author);
+                                  const vBlockers = prReviews.some((r) => (r.findings ?? []).some((f) => f.severity === "blocker"));
+                                  const cks = [p.verification === "green", !vBlockers, vApprove && !vChanges];
+                                  const pass = cks.filter(Boolean).length;
+                                  const bad = p.verification === "red" || vChanges || vBlockers;
+                                  const dot = bad ? "bg-fault" : pass === cks.length ? "bg-clear" : "bg-brass";
+                                  const cls = bad ? "bg-fault-wash text-fault-text" : pass === cks.length ? "bg-clear-wash text-clear-text" : "bg-brass-wash text-brass-text";
+                                  return <span className={`inline-flex items-center gap-1 text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge ${cls}`}><span className={`w-1.5 h-1.5 rounded-full ${dot}`} />{pass}/{cks.length} checks</span>;
+                                })()}
+                                {prReviews.length > 0 && <Tag>{prReviews.length} review{prReviews.length > 1 ? "s" : ""}</Tag>}
+                              </div>
+                              <div className="text-[12.5px] text-muted mt-1 flex items-center gap-1.5 flex-wrap tabular-nums">
+                                <span>v{p.number}</span>
+                                <span className="text-faint">·</span>
+                                <span className="text-steel-text" title={`proposes keel change ${p.changes[0]}`}>⬡ {(p.changes[0] ?? "").slice(0, 8)}</span>
+                                <span className="text-faint">·</span>
+                                <Avatar id={p.author} handle={handleOf(p.author)} kind={kindOf(p.author)} size={15} />
+                                <span className={kindOf(p.author) === "agent" ? "text-steel-text" : ""}>{handleOf(p.author)}</span>
+                                {p.reviewers?.length > 0 && <span className="flex items-center gap-1 ml-1">reviewers {p.reviewers.map((id) => <Avatar key={id} id={id} handle={handleOf(id)} kind={kindOf(id)} size={15} />)}</span>}
+                              </div>
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+            </section>
+
+            {repoSidebar}
+          </div>
+        </div>
       )}
     </div>
   );
 }
-
 /** The review "package" — a dedicated page synthesizing what a reviewer needs, not a one-liner. */
 function ReviewPage({
   review,
+  reviews = [],
+  landGate,
+  reviewTools,
+  onReviewsChanged,
   pr,
   actors,
   tenant,
@@ -1259,6 +2212,10 @@ function ReviewPage({
   onBack,
 }: {
   review: Review;
+  reviews?: Review[];
+  landGate?: React.ReactNode;
+  reviewTools?: React.ReactNode;
+  onReviewsChanged?: () => void;
   pr: PR | null;
   actors: Actor[];
   tenant: string;
@@ -1269,6 +2226,10 @@ function ReviewPage({
 }) {
   const authHeaders = (): Record<string, string> => (token ? { authorization: `Bearer ${token}` } : {});
   const canAct = !!me;
+  // Which verdict's lens we're viewing the package through (default: the primary review). The
+  // synthesized package itself — diff, reconciliation, checks — is the page; verdicts are a strip.
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const active = reviews.find((r) => r.id === activeId) ?? review;
   type Session = { task: string; model: string; lesson: string; tool_calls: number; tokens_in: number; tokens_out: number };
   type ChangeInfo = {
     id: string;
@@ -1288,9 +2249,7 @@ function ReviewPage({
   type Semantic = { moves: { from: string; to: string; blob: string }[]; added: string[]; deleted: string[]; modified: string[]; whitespace_only: string[]; behavioral: string[]; pure_move: boolean; mechanical: boolean };
   const [semantic, setSemantic] = useState<Semantic | null>(null);
   const [ledger, setLedger] = useState<Ledger | null>(null);
-  const [openFile, setOpenFile] = useState<string | null>(null);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
-  const reviewerActor = actors.find((a) => a.id === review.reviewer);
   const changeId = pr?.changes[0];
   const loadChange = () => {
     if (!changeId) return;
@@ -1313,7 +2272,7 @@ function ReviewPage({
   }, [changeId, tenant, repo]);
   // If this review carries an immutable ledger snapshot (an agent reconciliation review), show that
   // — it's the evidence the verdict was actually based on. Otherwise reconcile live.
-  const snapshot = review.ledger ?? null;
+  const snapshot = active.ledger ?? null;
   const loadLedger = () => {
     if (snapshot || !changeId) return;
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/ledger`)
@@ -1342,21 +2301,21 @@ function ReviewPage({
   };
   useEffect(loadResolutions, [changeId, tenant, repo]);
   const resolveClaim = async (claimId: string, judgment: "verified" | "concern") => {
-    if (!canAct) return alert("Sign in to act.");
-    const note = prompt(judgment === "verified" ? "What did you check? (optional note)" : "What's the concern?") ?? "";
+    if (!canAct) return uiAlert("Sign in to act.");
+    const note = (await uiPrompt({ title: judgment === "verified" ? "Mark verified" : "Raise a concern", label: "note (optional)" })) ?? "";
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/claims/${claimId}/resolve`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders() },
       body: JSON.stringify({ judgment, note }),
     });
     if (res.ok) loadResolutions();
-    else alert(await res.text());
+    else uiAlert(await res.text());
   };
 
   // "Fix with AI": ask the fixer to propose a patch for a finding; it posts to the PR thread.
   const [fixing, setFixing] = useState<number | null>(null);
   const fixWithAI = async (idx: number, f: Finding) => {
-    if (!canAct || !pr) return alert("Sign in to act.");
+    if (!canAct || !pr) return uiAlert("Sign in to act.");
     setFixing(idx);
     try {
       const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/prs/${pr.number}/fix`, {
@@ -1364,29 +2323,18 @@ function ReviewPage({
         headers: { "content-type": "application/json", ...authHeaders() },
         body: JSON.stringify({ path: f.path, note: f.note, severity: f.severity }),
       });
-      if (res.ok) { const d = await res.json(); alert("AI fix applied as a new change (re-verified):\n\n" + (d.fix?.explanation ?? "")); loadThread(); loadChange(); }
-      else alert(await res.text());
+      if (res.ok) { const d = await res.json(); uiAlert("AI fix applied as a new change (re-verified):\n\n" + (d.fix?.explanation ?? "")); loadThread(); loadChange(); }
+      else uiAlert(await res.text());
     } finally {
       setFixing(null);
     }
-  };
-
-  const verify = async (green: boolean) => {
-    if (!changeId) return;
-    if (!canAct) return alert("Sign in to act.");
-    await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/verify`, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ green }),
-    });
-    loadChange();
   };
 
   const [checking, setChecking] = useState(false);
   const [checkResult, setCheckResult] = useState<{ status: string; summary: string; memoized: boolean } | null>(null);
   const runChecks = async (force: boolean) => {
     if (!changeId) return;
-    if (!canAct) return alert("Sign in to act.");
+    if (!canAct) return uiAlert("Sign in to act.");
     setChecking(true);
     setCheckResult(null);
     try {
@@ -1404,19 +2352,61 @@ function ReviewPage({
     }
   };
 
-  const independent = pr ? pr.author !== review.reviewer : true;
   const verification = change?.verification ?? "unverified";
-  const risk =
-    verification === "green"
-      ? "low — keel verify is green"
-      : verification === "red"
-        ? "high — keel verify is red"
-        : change && change.files.length > 8
-          ? "elevated — unverified and a broad change"
-          : "moderate — unverified";
+  // ── review brief metrics: the synthesized "what changed / what to review" ──
+  const changedFiles = diff.length || (change?.files.length ?? 0);
+  const addN = diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === "add").length, 0), 0);
+  const delN = diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === "del").length, 0), 0);
+  const behN = semantic?.behavioral.length ?? 0;
+  const moveN = semantic?.moves.length ?? 0;
+  const reformN = semantic?.whitespace_only.length ?? 0;
+  const briefClaims = shownLedger?.claims ?? [];
+  const needsN = briefClaims.filter((c) => c.status === "needs_judgment").length;
+  const contraN = briefClaims.filter((c) => c.status === "contradicted").length;
+  const phantomN = shownLedger?.unclaimed?.length ?? 0;
+  const allFindings = reviews.flatMap((r) => r.findings ?? []);
+  const blockerN = allFindings.filter((f) => f.severity === "blocker").length;
+  // Every finding flattened with its reviewer + a stable key + a global index (for the fix-with-AI
+  // busy state), so findings can be rendered inline in the diff at their line.
+  type FindingRow = { f: Finding; reviewer: string; key: string; idx: number };
+  let _fidx = 0;
+  const findingRows: FindingRow[] = reviews.flatMap((r, ri) => (r.findings ?? []).map((f, fi) => ({ f, reviewer: r.reviewer, key: `${ri}:${fi}`, idx: _fidx++ })));
+  const findingsByFile = new Map<string, FindingRow[]>();
+  for (const x of findingRows) { if (!x.f.path) continue; const arr = findingsByFile.get(x.f.path) ?? []; arr.push(x); findingsByFile.set(x.f.path, arr); }
+  const diffPaths = new Set(diff.map((f) => f.path));
+  // Findings we can't anchor in the diff (no line, or a file that isn't in this diff) still need a home.
+  const unmappedFindings = findingRows.filter((x) => !x.f.line || !diffPaths.has(x.f.path));
+  const sevTone = (s: string): "bad" | "warn" | "info" => (s === "blocker" ? "bad" : s === "warn" ? "warn" : "info");
+  // Risk that reflects the whole picture, not just the check status: a green build with 4 unresolved
+  // claims is not "low risk".
+  const riskLevel =
+    contraN > 0 || blockerN > 0 || verification === "red" ? "high"
+      : needsN > 0 || phantomN > 0 || (change ? change.files.length > 8 : false) ? "elevated"
+        : verification === "green" ? "low"
+          : "moderate";
+  // "What's happening": prefer the change's own description (the why) over the title, which the
+  // heading already shows.
+  const intentFull = (change?.intent ?? pr?.title ?? active.target).trim();
+  const intentLine = intentFull.split("\n")[0].trim();
+  const intentBody = intentFull.includes("\n") ? intentFull.slice(intentFull.indexOf("\n") + 1).trim().replace(/\s+/g, " ") : "";
+  const whatHappening = intentBody || intentLine;
+
+  // ── landing checks: the gate, surfaced as a checklist reachable from the top badge ──
+  const supportedN = briefClaims.filter((c) => ["verified_mechanically", "verified_read_only", "self_attested"].includes(c.status)).length;
+  const hasApproval = reviews.some((r) => r.verdict === "approve" && (!pr || r.reviewer !== pr.author));
+  const changesRequested = reviews.some((r) => r.verdict === "request_changes" || r.verdict === "reject");
+  type Check = { label: string; tone: "ok" | "bad" | "warn" | "wait"; detail: string };
+  const checks: Check[] = [
+    { label: "keel verify", tone: verification === "green" ? "ok" : verification === "red" ? "bad" : "wait", detail: verification === "green" ? "build & tests pass" : verification === "red" ? "build or tests failing" : "not run yet" },
+    ...(briefClaims.length > 0 ? [{ label: "Claims reconciled", tone: (contraN > 0 ? "bad" : needsN > 0 ? "warn" : "ok") as Check["tone"], detail: contraN > 0 ? `${contraN} contradicted` : needsN > 0 ? `${needsN} need a human's judgment` : `${supportedN}/${briefClaims.length} supported` }] : []),
+    { label: "No blocking findings", tone: blockerN > 0 ? "bad" : "ok", detail: blockerN > 0 ? `${blockerN} blocker${blockerN > 1 ? "s" : ""}` : "none raised" },
+    { label: "Independent approval", tone: changesRequested ? "bad" : hasApproval ? "ok" : "wait", detail: changesRequested ? "changes requested" : hasApproval ? "approved by a non-author" : "awaiting review" },
+  ];
+  const checksPass = checks.filter((c) => c.tone === "ok").length;
+  const checksBad = checks.some((c) => c.tone === "bad");
 
   // Discussion thread — the same PR thread as the compact view, followed into the deep review page.
-  type Cmt = { id: string; target: string; author: string; body: string; created_unix: number };
+  type Cmt = { id: string; target: string; author: string; body: string; created_unix: number; path?: string; line?: number };
   const [thread, setThread] = useState<Cmt[]>([]);
   const [draft, setDraft] = useState("");
   const loadThread = () =>
@@ -1433,411 +2423,648 @@ function ReviewPage({
       body: JSON.stringify({ target: `pr:${pr.number}`, body: draft.trim() }),
     });
     if (res.ok) { setDraft(""); loadThread(); }
-    else alert(await res.text());
+    else uiAlert(await res.text());
   };
+  // The composer's split button posts a verdict-carrying review (approve / request changes / reject),
+  // with the draft as its summary. "Comment" alone routes to postThreadComment instead.
+  const [composerBusy, setComposerBusy] = useState(false);
+  const postReview = async (verdict: "approve" | "request_changes" | "reject") => {
+    if (!canAct || !pr) return uiAlert("Sign in to act.");
+    setComposerBusy(true);
+    try {
+      const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/reviews`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ target: `pr:${pr.number}`, reviewer: me?.id ?? "", verdict, summary: draft.trim(), findings: [] }),
+      });
+      if (res.ok) { setDraft(""); onReviewsChanged?.(); loadThread(); }
+      else uiAlert(await res.text());
+    } finally { setComposerBusy(false); }
+  };
+  type ComposerMode = "comment" | "approve" | "request_changes" | "reject";
+  const [composerMode, setComposerMode] = useState<ComposerMode>("comment");
+  const MODES: { id: ComposerMode; label: string; hint: string; color: string; icon: React.ReactNode }[] = [
+    { id: "comment", label: "Comment", hint: "Leave a note, no verdict", color: "text-dim", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg> },
+    { id: "approve", label: "Approve", hint: "Good to merge", color: "text-clear-text", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg> },
+    { id: "request_changes", label: "Request changes", hint: "Needs work before merging", color: "text-brass-text", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7v6h6" /><path d="M21 17a9 9 0 0 0-15-6.7L3 13" /></svg> },
+    { id: "reject", label: "Reject", hint: "Do not merge", color: "text-fault-text", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="4.93" y1="4.93" x2="19.07" y2="19.07" /></svg> },
+  ];
+  const runMode = (m: ComposerMode) => { if (m === "comment") postThreadComment(); else postReview(m); };
+  const composerDisabled = composerBusy || (composerMode === "comment" && !draft.trim());
+  // Inline findings: which are collapsed (hidden inline, reopenable from a gutter marker).
+  const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => new Set());
+  const toggleFinding = (key: string) => setCollapsedFindings((s) => { const n = new Set(s); n.has(key) ? n.delete(key) : n.add(key); return n; });
+  // Line-level review comments: select a diff line, press C (or click the gutter ✎) to comment on it.
+  const [selLine, setSelLine] = useState<{ path: string; line: number } | null>(null);
+  const [commenting, setCommenting] = useState<{ path: string; line: number } | null>(null);
+  const [lineDraft, setLineDraft] = useState("");
+  const postLineComment = async () => {
+    if (!canAct || !pr || !commenting || !lineDraft.trim()) return;
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/comments`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ target: `pr:${pr.number}`, body: lineDraft.trim(), path: commenting.path, line: commenting.line }),
+    });
+    if (res.ok) { setLineDraft(""); setCommenting(null); loadThread(); }
+    else uiAlert(await res.text());
+  };
+  const openLineComment = (path: string, line: number) => { setSelLine({ path, line }); setCommenting({ path, line }); setLineDraft(""); };
+  // Press "c" to comment on the currently-selected line.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement;
+      if ((e.key === "c" || e.key === "C") && selLine && !commenting && !/^(INPUT|TEXTAREA)$/.test(t.tagName)) { e.preventDefault(); setCommenting(selLine); setLineDraft(""); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selLine, commenting]);
+  // Line-anchored comments render in the diff; general comments render in the conversation.
+  const lineCommentsByFile = new Map<string, Cmt[]>();
+  for (const c of thread) { if (c.path && c.line) { const arr = lineCommentsByFile.get(c.path) ?? []; arr.push(c); lineCommentsByFile.set(c.path, arr); } }
+  const kindOf = (id: string) => actors.find((a) => a.id === id)?.kind;
+
 
   return (
-    <div className="app review-page">
-      <header className="top">
-        <button className="back" onClick={onBack}>
-          ← situation room
+    <div className="bg-paper min-h-screen text-ink">
+      <header className="h-[52px] border-b border-rule2 bg-surface flex items-center gap-4 px-6 sticky top-0 z-20">
+        <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer" onClick={onBack}>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
+          {repo} · voyages
         </button>
-        <div className="tag">review package · synthesized understanding, not a diff</div>
+        <span className="text-[11.5px] font-semibold px-[9px] py-[3px] rounded-full border border-rule text-dim">review package</span>
       </header>
-      <main className="review-main">
-        <div className="rp-head">
-          <span className={"verdict " + review.verdict}>{review.verdict.replace("_", " ")}</span>
-          <h1>{pr ? `PR !${pr.number} · ${pr.title}` : review.target}</h1>
-        </div>
-        {(() => {
-          // F5: degraded-state badges — surface where the review is thinner than ideal.
-          const needs = shownLedger?.claims.filter((c) => c.status === "needs_judgment").length ?? 0;
-          const selfAtt = shownLedger?.claims.filter((c) => c.status === "self_attested").length ?? 0;
-          const badges: { cls: string; label: string; title: string }[] = [];
-          if (change && !change.session) badges.push({ cls: "no-plan", label: "no plan captured", title: "pushed as plain git — no session/plan; provenance is reconstructed, not native (commit with keel --session)" });
-          if (change && change.verification !== "green") badges.push({ cls: "unverified", label: `checks ${change.verification}`, title: "checks are not green — the mechanical evidence is incomplete" });
-          if (needs > 0) badges.push({ cls: "partial", label: `${needs} unresolved claim${needs > 1 ? "s" : ""}`, title: "claims the engine couldn't verify — a human must judge them (partial review)" });
-          if (selfAtt > 0) badges.push({ cls: "self", label: "self-attested tests", title: "green, but the change tests itself — not independently verified" });
-          const phantom = shownLedger?.unclaimed?.length ?? 0;
-          if (phantom > 0) badges.push({ cls: "partial", label: `${phantom} unclaimed change${phantom > 1 ? "s" : ""}`, title: "the change did work the narrative never mentions — phantom work a reviewer must account for" });
-          return badges.length > 0 ? (
-            <div className="degraded-badges">
-              {badges.map((b, i) => (
-                <span key={i} className={"degraded " + b.cls} title={b.title}>⚠ {b.label}</span>
+
+      <div className="max-w-[1320px] mx-auto px-6 sm:px-8 py-8">
+        <h1 className="text-[23px] font-semibold tracking-tight">{pr ? `${pr.title}` : active.target}</h1>
+        <div className="flex items-center gap-2 flex-wrap text-[12.5px] text-muted mt-2 mb-5 tabular-nums">
+          {pr && <span className="font-medium text-body">voyage v{pr.number}</span>}
+          <span className="text-faint">·</span>
+          {pr && <><Avatar id={pr.author} handle={handleOf(pr.author)} kind={kindOf(pr.author)} size={16} /><span className={kindOf(pr.author) === "agent" ? "text-steel-text" : ""}>{handleOf(pr.author)}</span></>}
+          <span className="text-faint">·</span>
+          <span className="text-steel-text" title={changeId}>⬡ {(changeId ?? "").slice(0, 8)}</span>
+          <span className="text-faint">·</span>
+          <span>{changedFiles} file{changedFiles === 1 ? "" : "s"}</span>
+          <span className="text-clear-text font-semibold">+{addN}</span>
+          <span className="text-fault-text font-semibold">−{delN}</span>
+          <span className="text-faint">·</span>
+          {/* Checks — clickable, opens the full checklist so the gate is reachable from the top */}
+          <Popover align="left" width={296} trigger={(open) => (
+            <span className={`inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge transition-colors ${checksBad ? "bg-fault-wash text-fault-text" : checksPass === checks.length ? "bg-clear-wash text-clear-text" : "bg-brass-wash text-brass-text"} ${open ? "ring-2 ring-steel/25" : ""}`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${checksBad ? "bg-fault" : checksPass === checks.length ? "bg-clear" : "bg-brass"}`} />
+              {checksPass}/{checks.length} checks
+              <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className={open ? "rotate-180 transition-transform" : "transition-transform"}><polyline points="6 9 12 15 18 9" /></svg>
+            </span>
+          )}>
+            <div>
+              {checks.map((c, i) => (
+                <div key={i} className="flex items-start gap-2.5 px-4 py-2.5 border-b border-rule2 last:border-0">
+                  <StatusDot tone={c.tone} />
+                  <div className="min-w-0">
+                    <div className="text-[13px] font-medium text-body leading-tight">{c.label}</div>
+                    <div className="text-[12px] text-muted mt-0.5">{c.detail}</div>
+                  </div>
+                </div>
               ))}
             </div>
-          ) : null;
+          </Popover>
+        </div>
+
+        {/* Review brief — a calm one-line summary of the change and its shape. It sets context; the
+            reviewer then flows straight into the diff, rather than being handed a to-do list. */}
+        {(() => {
+          const loz = "inline-flex items-center text-[11px] font-bold uppercase tracking-[0.03em] leading-none px-1.5 py-[3px] rounded-badge";
+          const rc = riskLevel === "low" ? "bg-clear-wash text-clear-text" : riskLevel === "high" ? "bg-fault-wash text-fault-text" : "bg-brass-wash text-brass-text";
+          return (
+            <Card className="mb-6">
+              <div className="px-5 py-4 flex items-start gap-4">
+                <div className="min-w-0 flex-1">
+                  <p className="text-[14.5px] text-body leading-[1.55]">{whatHappening.length > 320 ? whatHappening.slice(0, 320).trimEnd() + "…" : whatHappening}</p>
+                  <div className="flex flex-wrap gap-1.5 mt-3">
+                    {behN > 0 && <span className={`${loz} bg-fault-wash text-fault-text`}>{behN} behavioral change{behN > 1 ? "s" : ""}</span>}
+                    {moveN > 0 && <span className={`${loz} bg-steel-wash text-steel-text`}>{moveN} moved</span>}
+                    {reformN > 0 && <span className={`${loz} bg-brass-wash text-brass-text`}>{reformN} reformatted</span>}
+                    {semantic?.pure_move && <span className={`${loz} bg-clear-wash text-clear-text`}>pure move</span>}
+                    {!change?.session && <span className={`${loz} bg-rule2 text-dim`}>no plan captured</span>}
+                  </div>
+                </div>
+                <span className={`${loz} flex-none ${rc}`}>{riskLevel} risk</span>
+              </div>
+            </Card>
+          );
         })()}
 
-        <section className="rp-card">
-          <h3>Reviewer</h3>
-          <p>
-            <b className={reviewerActor?.kind}>{handleOf(review.reviewer)}</b> ({reviewerActor?.kind ?? "actor"})
-            {reviewerActor?.human_root && (
-              <>
-                {" "}· accountable to human <code>{reviewerActor.human_root.slice(0, 10)}</code>
-              </>
-            )}
-            {independent ? (
-              <span className="badge ok"> independent of the author</span>
-            ) : (
-              <span className="badge warn"> same as the author</span>
-            )}
-          </p>
-          {review.summary && <p className="summary">{review.summary}</p>}
-          {review.artifact_id && (
-            <p className="audit-artifact">
-              <span className="muted">audit artifact</span>{" "}
-              <a href={`/api/repos/${encodeURIComponent(tenant)}/${repo}/artifacts/${review.artifact_id}`} target="_blank" rel="noreferrer" title="content-addressed record of why this verdict was reached — immutable">
-                ⬡ {review.artifact_id.slice(0, 12)}
-              </a>{" "}
-              <span className="muted">· content-addressed, immutable</span>
-            </p>
-          )}
-        </section>
+        <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-8 gap-y-6 mt-3">
+          <div className="min-w-0 grid gap-6">
+        {/* changes — the flagship semantic-diff surface (Grouped ⇄ Line-by-line toggle built in) */}
+        {(() => {
+          if (diff.length === 0 && !(semantic?.moves.length)) {
+            return (
+              <Card>
+                <SectionHeader label="Changes" />
+                <div className="px-5 py-6 text-[13px] text-muted">no textual changes (or binary)</div>
+              </Card>
+            );
+          }
+          const cls = (p: string) => (semantic?.behavioral.includes(p) ? "behavioral" : semantic?.whitespace_only.includes(p) ? "reformatted" : "changed");
+          const rank: Record<string, number> = { behavioral: 0, changed: 1, reformatted: 2 };
+          const ordered = [...diff].sort((a, b) => (rank[cls(a.path)] ?? 1) - (rank[cls(b.path)] ?? 1));
+          const count = (f: FileDiff, tag: string) => f.hunks.reduce((s, h) => s + h.lines.filter((l) => l.tag === tag).length, 0);
+          const base = (p: string) => p.split("/").pop() ?? p;
+          const opKind = (f: FileDiff): string => (f.ops.some((o) => /fn |struct |enum |signature|impl /.test(o)) ? "signature" : "behavior");
 
+          // Collapse long runs of unchanged context so the eye lands on what actually changed.
+          // Keeps 3 lines of context on each side of a change; folds the middle into one marker row.
+          const CTX = 3;
+          function fold<T extends { sign?: string }>(rows: T[], marker: (hidden: number) => T, keep?: (r: T) => boolean): T[] {
+            const isCtx = (r: T) => r.sign === undefined && !(keep?.(r));
+            const out: T[] = [];
+            for (let i = 0; i < rows.length;) {
+              if (isCtx(rows[i])) {
+                let j = i; while (j < rows.length && isCtx(rows[j])) j++;
+                const head = i === 0 ? 0 : CTX, tail = j === rows.length ? 0 : CTX;
+                if (j - i > head + tail + 1) {
+                  for (let k = i; k < i + head; k++) out.push(rows[k]);
+                  out.push(marker(j - i - head - tail));
+                  for (let k = j - tail; k < j; k++) out.push(rows[k]);
+                } else for (let k = i; k < j; k++) out.push(rows[k]);
+                i = j;
+              } else { out.push(rows[i]); i++; }
+            }
+            return out;
+          }
+          const foldNote = (hidden: number) => <span className="text-faint italic text-[12px]">⋯ {hidden} unchanged {hidden === 1 ? "line" : "lines"}</span>;
+
+          // The inline finding annotation shown right under its line in the diff (collapsible).
+          const findingNote = (x: FindingRow) => {
+            const { f, reviewer, key, idx } = x;
+            const sevColor = f.severity === "blocker" ? "text-fault-text" : f.severity === "warn" ? "text-brass-text" : "text-steel-text";
+            return (
+              <div className="flex gap-2.5 px-4 py-3 bg-brass-wash/25">
+                <StatusDot tone={sevTone(f.severity)} size={16} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`text-[11px] font-bold uppercase tracking-[0.03em] ${sevColor}`}>{f.severity}</span>
+                    <span className="inline-flex items-center gap-1 text-[11.5px] text-muted"><Avatar id={reviewer} handle={handleOf(reviewer)} kind={kindOf(reviewer)} size={14} />{handleOf(reviewer)}</span>
+                    <button onClick={() => toggleFinding(key)} className="ml-auto text-[11.5px] text-muted hover:text-ink inline-flex items-center gap-1" title="collapse this finding out of the diff">
+                      collapse <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg>
+                    </button>
+                  </div>
+                  <p className="text-[13px] text-body mt-1 leading-snug">{f.note}</p>
+                  {f.severity !== "info" && pr && f.path && (
+                    <div className="mt-2"><Button size="sm" variant="secondary" disabled={!canAct || fixing === idx} onClick={() => fixWithAI(idx, f)}>{fixing === idx ? "fixing…" : "✨ Fix with AI"}</Button></div>
+                  )}
+                </div>
+              </div>
+            );
+          };
+          // A line-level review comment, shown under the line it references.
+          const lineCommentNote = (c: Cmt) => (
+            <div className="flex gap-2.5 px-4 py-3 bg-surface">
+              <Avatar id={c.author} handle={handleOf(c.author)} kind={kindOf(c.author)} size={22} />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 text-[12.5px]">
+                  <b className={kindOf(c.author) === "agent" ? "text-steel-text" : ""}>{handleOf(c.author)}</b>
+                  <span className="text-faint tabular-nums" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
+                  <span className="text-[11px] text-faint">on line {c.line}</span>
+                </div>
+                <Markdown text={c.body} className="text-[13.5px] text-body mt-0.5" />
+              </div>
+            </div>
+          );
+          // The inline composer that opens when you comment on a line.
+          const composerNote = () => (
+            <div className="px-4 py-3 bg-steel-wash/50 grid gap-2">
+              <div className="text-[11.5px] text-muted">Commenting on <b className="text-body">{commenting!.path.split("/").pop()}:{commenting!.line}</b></div>
+              <textarea autoFocus rows={2} value={lineDraft} onChange={(e) => setLineDraft(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) postLineComment(); if (e.key === "Escape") { setCommenting(null); setSelLine(null); } }}
+                placeholder="Leave a comment on this line…  (⌘↵ to submit)"
+                className="w-full box-border px-2.5 py-2 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body resize-y placeholder:text-faint" />
+              <div className="flex gap-2">
+                <Button size="sm" disabled={!lineDraft.trim()} onClick={postLineComment}>Comment</Button>
+                <Button size="sm" variant="secondary" onClick={() => { setCommenting(null); setSelLine(null); }}>Cancel</Button>
+              </div>
+            </div>
+          );
+          type Row = { n: number | string; sign?: string; code: React.ReactNode; note?: React.ReactNode; marker?: { tone: string; onClick: () => void; title: string } };
+          // Interleave findings, line comments, and the open composer under their lines.
+          const annotate = (rows: Row[], f: FileDiff): Row[] => {
+            const fs = findingsByFile.get(f.path) ?? [];
+            const lcs = lineCommentsByFile.get(f.path) ?? [];
+            const res: Row[] = [];
+            for (const row of rows) {
+              if (row.sign !== "-" && typeof row.n === "number") {
+                const ln = row.n;
+                const here = fs.filter((x) => x.f.line === ln);
+                const collapsed = here.filter((x) => collapsedFindings.has(x.key));
+                res.push(collapsed.length ? { ...row, marker: { tone: sevTone(collapsed[0].f.severity), onClick: () => toggleFinding(collapsed[0].key), title: `reopen ${collapsed[0].f.severity} finding` } } : row);
+                for (const x of here) if (!collapsedFindings.has(x.key)) res.push({ n: "", code: null, note: findingNote(x) });
+                for (const c of lcs.filter((c) => c.line === ln)) res.push({ n: "", code: null, note: lineCommentNote(c) });
+                if (commenting && commenting.path === f.path && commenting.line === ln) res.push({ n: "", code: null, note: composerNote() });
+                continue;
+              }
+              res.push(row);
+            }
+            return res;
+          };
+
+          // Grouped (semantic) ops: behavioral/changed files first, then renames, then reformatted.
+          const codeBody = (f: FileDiff) => {
+            const fs = findingsByFile.get(f.path) ?? [];
+            const lcs = lineCommentsByFile.get(f.path) ?? [];
+            const anchoredLines = new Set<number>([...fs.map((x) => x.f.line ?? -1), ...lcs.map((c) => c.line ?? -1)]);
+            if (commenting?.path === f.path) anchoredLines.add(commenting.line);
+            const keepAnchored = (r: Row) => typeof r.n === "number" && anchoredLines.has(r.n);
+            const transforms: { old: string; next: string; ln: number }[] = [];
+            const hunkNodes = f.hunks.map((h, hi) => {
+              let o = h.old_start, n = h.new_start;
+              const L = h.lines;
+              const out: Row[] = [];
+              for (let k = 0; k < L.length;) {
+                const l = L[k];
+                if (l.tag === "del") {
+                  let d = k; while (L[d] && L[d].tag === "del") d++;
+                  let a = d; while (L[a] && L[a].tag === "add") a++;
+                  const dels = L.slice(k, d), adds = L.slice(d, a);
+                  const pairs = Math.min(dels.length, adds.length);
+                  const wds = Array.from({ length: pairs }, (_, p) => wordDiff(dels[p].text, adds[p].text));
+                  // Collect the actual token-level edits for the "What changed" summary. Take the span
+                  // from first-changed to last-changed token so inner spaces/punctuation are preserved
+                  // (otherwise "walk_all ()" → "slice ( task )" collapses to "slicetask").
+                  const span = (segs: Seg[]) => {
+                    const first = segs.findIndex((s) => s.changed);
+                    if (first === -1) return "";
+                    let last = segs.length - 1; while (last >= 0 && !segs[last].changed) last--;
+                    return segs.slice(first, last + 1).map((s) => s.text).join("").trim();
+                  };
+                  wds.forEach((w, p) => {
+                    const oldS = span(w.old), nextS = span(w.next);
+                    if (oldS || nextS) transforms.push({ old: oldS, next: nextS, ln: n + p });
+                  });
+                  dels.forEach((dl, p) => { out.push({ n: o, sign: "-", code: p < pairs ? <>{wdRender(wds[p].old, f.path, "old")}</> : <Hl text={dl.text} path={f.path} /> }); o++; });
+                  adds.forEach((al, p) => { out.push({ n, sign: "+", code: p < pairs ? <>{wdRender(wds[p].next, f.path, "new")}</> : <Hl text={al.text} path={f.path} /> }); n++; });
+                  k = a;
+                } else if (l.tag === "add") {
+                  out.push({ n, sign: "+", code: <Hl text={l.text} path={f.path} /> }); n++; k++;
+                } else {
+                  out.push({ n, sign: undefined, code: <Hl text={l.text} path={f.path} /> }); o++; n++; k++;
+                }
+              }
+              return (
+                <div key={hi}>
+                  <LocationBar crumbs={f.path.split("/")} right={`@@ -${h.old_start} +${h.new_start} @@`} />
+                  <CodePanel lines={annotate(fold(out, (hidden) => ({ n: "⋯", code: foldNote(hidden) }), keepAnchored), f)}
+                    filePath={f.path} selectedLine={selLine?.path === f.path ? selLine.line : null}
+                    onSelectLine={(ln: number | null) => setSelLine(ln == null ? null : { path: f.path, line: ln })}
+                    onCommentLine={(ln: number) => openLineComment(f.path, ln)} />
+                </div>
+              );
+            });
+            // Dedupe the transforms so a repeated edit isn't listed twice.
+            const seen = new Set<string>();
+            const uniq = transforms.filter((t) => { const k = t.old + "→" + t.next; if (seen.has(k)) return false; seen.add(k); return true; });
+            return (
+              <>
+                {f.ops.length > 0 && (
+                  <div className="flex items-center gap-2 flex-wrap mb-2">
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">{opKind(f) === "signature" ? "Signature change" : "Behavior change"}</span>
+                    {f.ops.slice(0, 6).map((o, j) => (
+                      <span key={j} className={`text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge ${o.startsWith("removed") ? "bg-fault-wash text-fault-text" : "bg-clear-wash text-clear-text"}`}>{o}</span>
+                    ))}
+                  </div>
+                )}
+                {uniq.length > 0 && (
+                  <div className="mb-3 rounded-ctl border border-rule2 overflow-hidden">
+                    <div className="px-3.5 py-2 bg-paper border-b border-rule2 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">What changed here</div>
+                    <div className="px-3.5 py-3 grid gap-2">
+                      {uniq.slice(0, 8).map((t, i) => (
+                        <div key={i} className="flex items-center gap-2 flex-wrap text-[13px]">
+                          <button onClick={() => flashLine(`L-${f.path}-${t.ln}`)} title={`Jump to line ${t.ln}`}
+                            className="inline-flex items-center h-[18px] px-1.5 rounded-[3px] bg-rule2 text-dim text-[11px] font-semibold tabular-nums hover:bg-steel-wash hover:text-steel-text transition-colors flex-none">L{t.ln}</button>
+                          {t.old ? <OldTok>{t.old}</OldTok> : <span className="text-muted italic text-[12.5px]">nothing</span>}
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-faint flex-none"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg>
+                          {t.next ? <NewTok>{t.next}</NewTok> : <span className="text-muted italic text-[12.5px]">removed</span>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {hunkNodes}
+              </>
+            );
+          };
+          const fileOps = ordered.filter((f) => cls(f.path) !== "reformatted").map((f) => ({
+            kind: opKind(f),
+            title: base(f.path),
+            meta: `${f.path}  ·  +${count(f, "add")} −${count(f, "del")}`,
+            body: codeBody(f),
+          }));
+          const moveOps = (semantic?.moves ?? []).map((m) => ({
+            kind: "rename",
+            title: `Move ${base(m.from)}`,
+            meta: `exact move · ⬡ ${m.blob.slice(0, 8)}`,
+            body: (
+              <div className="text-[13px] text-body">
+                <div className="flex items-center gap-2 flex-wrap"><OldTok>{m.from}</OldTok><span className="text-muted">→</span><NewTok>{m.to}</NewTok></div>
+                <p className="text-[12.5px] text-muted mt-2.5">Byte-identical relocation (proven by content address). Behavior-preserving.</p>
+              </div>
+            ),
+          }));
+          const reformatOps = (semantic?.whitespace_only ?? []).map((p) => ({
+            kind: "chart",
+            title: base(p),
+            meta: `${p} · whitespace only`,
+            body: <p className="text-[13px] text-muted">Reformatted only — no semantic change (whitespace/layout). Low risk.</p>,
+          }));
+          const ops = [...fileOps, ...moveOps, ...reformatOps];
+          if (ops.length === 0) ops.push({ kind: "behavior", title: "changes", meta: "", body: <p className="text-[13px] text-muted">no semantic operations detected — see line-by-line.</p> });
+
+          // Line-by-line (raw) view with computed old/new line numbers.
+          const rawFiles = ordered.map((f) => ({
+            name: f.path,
+            add: count(f, "add"),
+            del: count(f, "del"),
+            hunks: f.hunks.map((h) => {
+              let o = h.old_start, n = h.new_start;
+              const lines = h.lines.map((l) => {
+                const code = <Hl text={l.text} path={f.path} />;
+                let row: { o: number | string; n: number | string; sign?: string; code: React.ReactNode };
+                if (l.tag === "add") { row = { o: "", n, sign: "+", code }; n++; }
+                else if (l.tag === "del") { row = { o, n: "", sign: "-", code }; o++; }
+                else { row = { o, n, code }; o++; n++; }
+                return row;
+              });
+              return { header: `@@ -${h.old_start} +${h.new_start} @@`, lines: fold(lines, (hidden) => ({ o: "", n: "⋯", code: foldNote(hidden) })) };
+            }),
+          }));
+          const mechanical = (semantic?.moves.length ?? 0) + (semantic?.whitespace_only.length ?? 0);
+          const rawDiff = { files: rawFiles, hiddenNote: mechanical > 0 ? `${semantic!.moves.length} move${semantic!.moves.length === 1 ? "" : "s"} + ${semantic!.whitespace_only.length} reformatted (mechanical) are grouped in the semantic view.` : undefined };
+
+          const voyageMeta = semantic
+            ? `${semantic.behavioral.length} behavior change${semantic.behavioral.length === 1 ? "" : "s"} · ${semantic.moves.length} moved · ${semantic.whitespace_only.length} reformatted`
+            : `${diff.length} file${diff.length === 1 ? "" : "s"} changed`;
+          const voyage = { title: change?.intent ? change.intent.split("\n")[0] : (pr ? pr.title : "changes"), id: (changeId ?? "").slice(0, 8), meta: voyageMeta };
+          return <SemanticDiff voyage={voyage} ops={ops} rawDiff={rawDiff} showMerge={false} storageKey={changeId ? `hull_reviewed_${changeId}` : undefined} />;
+        })()}
+
+        {/* reconciliation — does the change do what its author said? Claims that need a human come
+            first with inline actions; mechanically-verified ones tuck away. */}
         {shownLedger && shownLedger.claims.length > 0 && (() => {
           const ledger = shownLedger;
           const POSITIVE = ["verified_mechanically", "verified_read_only", "self_attested"];
-          const n = (s: string) => ledger.claims.filter((c) => c.status === s).length;
+          const nOf = (s: string) => ledger.claims.filter((c) => c.status === s).length;
           const supported = ledger.claims.filter((c) => POSITIVE.includes(c.status)).length;
-          const contradicted = n("contradicted");
-          const selfAtt = n("self_attested");
-          const needs = n("needs_judgment");
-          // status → glyph, label, css class
-          const meta: Record<string, [string, string]> = {
-            verified_mechanically: ["✓", "verified"],
-            verified_read_only: ["◎", "read-only"],
-            self_attested: ["⚠", "self-attested"],
-            contradicted: ["✗", "contradicted"],
-            needs_judgment: ["?", "needs judgment"],
-          };
-          // Order: contradicted first (surface at top), then needs-judgment, then positives.
-          const order: Record<string, number> = { contradicted: 0, needs_judgment: 1, self_attested: 2, verified_read_only: 3, verified_mechanically: 4 };
-          const claims = [...ledger.claims].sort((a, b) => (order[a.status] ?? 5) - (order[b.status] ?? 5));
-          return (
-            <section className="rp-card reconcile">
-              <h3>
-                Reconciliation{" "}
-                <span className="muted">
-                  · {snapshot ? `evidence ${handleOf(review.reviewer)}'s verdict was based on` : "does the change do what its author said?"}
-                </span>
-              </h3>
-              <div className="recon-summary">
-                <span className="rc supported">{supported} verified</span>
-                {selfAtt > 0 && <span className="rc self">{selfAtt} self-attested</span>}
-                <span className="rc contradicted">{contradicted} contradicted</span>
-                <span className="rc unsupported">{needs} needs judgment</span>
-              </div>
-              {contradicted > 0 && (
-                <p className="recon-warn">⚠ {contradicted} claim{contradicted > 1 ? "s" : ""} the change's own facts contradict — do not merge without resolving.</p>
-              )}
-              {(ledger.unclaimed?.length ?? 0) > 0 && (
-                <div className="claim needs_judgment" style={{ marginBottom: 10 }}>
-                  <div className="claim-head">
-                    <span className="cstat needs_judgment" title="phantom work">?</span>
-                    <span className="claim-text"><b>Unclaimed changes ({ledger.unclaimed!.length})</b> — the change did work its narrative never mentions; a reviewer must account for it.</span>
-                  </div>
-                  <ul className="claim-ev">
-                    {ledger.unclaimed!.map((op, i) => (<li key={i} className="bad"><span className="ev-kind">phantom</span> {op}</li>))}
-                  </ul>
+          const contradicted = nOf("contradicted");
+          const needs = nOf("needs_judgment");
+          const label: Record<string, string> = { verified_mechanically: "verified", verified_read_only: "read-only verified", self_attested: "self-attested", contradicted: "contradicted", needs_judgment: "needs judgment" };
+          const dotTone = (s: string): "ok" | "bad" | "warn" | "wait" => s === "contradicted" ? "bad" : s === "needs_judgment" ? "wait" : s === "self_attested" ? "warn" : "ok";
+          const labelColor = (s: string) => s === "contradicted" ? "text-fault-text" : (s === "needs_judgment" || s === "self_attested") ? "text-brass-text" : "text-clear-text";
+          const isVerified = (s: string) => s === "verified_mechanically" || s === "verified_read_only";
+          const order: Record<string, number> = { contradicted: 0, needs_judgment: 1, self_attested: 2 };
+          const attention = ledger.claims.filter((c) => !isVerified(c.status)).sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
+          const verified = ledger.claims.filter((c) => isVerified(c.status));
+          const Row = (c: Claim) => (
+            <div key={c.id} className="px-5 py-3.5 border-b border-rule2 last:border-0 flex gap-3">
+              <StatusDot tone={dotTone(c.status)} />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-baseline gap-2 flex-wrap">
+                  <span className="text-[13.5px] text-body flex-1 min-w-[200px] leading-snug">{c.text}</span>
+                  <span className={`text-[11px] font-semibold ${labelColor(c.status)}`}>{label[c.status] ?? c.status}</span>
+                  <span className="text-[11px] text-faint">{c.source}</span>
                 </div>
-              )}
-              {(() => {
-                // F1: unverified/contradicted are primary; verified rows collapse by default.
-                const isVerified = (s: string) => s === "verified_mechanically" || s === "verified_read_only";
-                const primary = claims.filter((c) => !isVerified(c.status));
-                const verified = claims.filter((c) => isVerified(c.status));
-                // One traceable row: status → claim → evidence → (resolution / action).
-                const row = (c: (typeof claims)[number]) => (
-                  <li key={c.id} className={"claim " + c.status}>
-                    <div className="claim-head">
-                      <span className={"cstat " + c.status} title={(meta[c.status] ?? ["?", c.status])[1]}>{(meta[c.status] ?? ["?"])[0]}</span>
-                      <span className="claim-text">{c.text}</span>
-                      <span className="claim-status-label">{(meta[c.status] ?? ["", c.status])[1]}</span>
-                      <span className="claim-src">{c.source}</span>
-                    </div>
-                    {c.evidence.length > 0 && (
-                      <ul className="claim-ev">
-                        {c.evidence.map((e, i) => (
-                          <li key={i} className={e.supports ? "ok" : "bad"}>
-                            <span className="ev-kind">{e.kind}</span> {e.detail}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                    {resolutions[c.id] ? (
-                      <div className={"claim-resolution " + resolutions[c.id].judgment}>
-                        {resolutions[c.id].judgment === "verified" ? "✓ verified by a human" : "⚑ concern raised"} · <b>{resolutions[c.id].by}</b>
-                        {resolutions[c.id].note && <span className="res-note"> — {resolutions[c.id].note}</span>}
+                {c.evidence.length > 0 && (
+                  <div className="grid gap-1 mt-2">
+                    {c.evidence.map((e, i) => (
+                      <div key={i} className={`text-[12.5px] flex gap-2 items-baseline ${e.supports ? "text-dim" : "text-fault-text"}`}>
+                        <span className={`text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded flex-none ${e.supports ? "bg-paper text-muted" : "bg-fault-wash text-fault-text"}`}>{e.kind}</span>
+                        <span className="leading-snug">{e.detail}</span>
                       </div>
-                    ) : (c.status === "needs_judgment" || c.status === "self_attested") ? (
-                      <div className="claim-actions">
-                        <span className="ca-prompt">a human must judge this:</span>
-                        <button className="ca ok" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}>✓ I checked — verified</button>
-                        <button className="ca bad" disabled={!canAct} onClick={() => resolveClaim(c.id, "concern")}>⚑ raise concern</button>
-                      </div>
-                    ) : null}
-                  </li>
-                );
-                return (
-                  <>
-                    <ul className="recon-claims">
-                      {primary.length === 0 && <li className="claim-none muted">nothing needs attention — all claims verified</li>}
-                      {primary.map(row)}
-                    </ul>
-                    {verified.length > 0 && (
-                      <details className="verified-fold">
-                        <summary>✓ {verified.length} verified claim{verified.length > 1 ? "s" : ""} <span className="muted">— show</span></summary>
-                        <ul className="recon-claims">{verified.map(row)}</ul>
-                      </details>
-                    )}
-                  </>
-                );
-              })()}
-            </section>
-          );
-        })()}
-
-        {review.findings?.length > 0 && (() => {
-          const rank: Record<string, number> = { blocker: 0, warn: 1, info: 2 };
-          const ranked = [...review.findings].sort((a, b) => (rank[a.severity] ?? 3) - (rank[b.severity] ?? 3));
-          const counts = ranked.reduce((m: Record<string, number>, f) => ({ ...m, [f.severity]: (m[f.severity] ?? 0) + 1 }), {});
-          return (
-            <section className="rp-card">
-              <h3>
-                Findings <span className="muted">· risk-ranked</span>
-                <span className="find-tally">
-                  {counts.blocker ? <span className="sev blocker">{counts.blocker} blocker</span> : null}
-                  {counts.warn ? <span className="sev warn">{counts.warn} warn</span> : null}
-                  {counts.info ? <span className="sev info">{counts.info} info</span> : null}
-                </span>
-              </h3>
-              <ul className="rp-findings">
-                {ranked.map((f, i) => (
-                  <li key={i} className={"sev-row " + f.severity}>
-                    <span className={"sev " + f.severity}>{f.severity}</span>
-                    {f.path && <code>{f.path}{f.line ? `:${f.line}` : ""}</code>}
-                    <span className="fnote">{f.note}</span>
-                    {f.severity !== "info" && pr && f.path && (
-                      <button className="fix-ai" disabled={!canAct || fixing === i} onClick={() => fixWithAI(i, f)}>
-                        {fixing === i ? "fixing…" : "✨ Fix with AI"}
-                      </button>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            </section>
-          );
-        })()}
-
-        <section className="rp-card">
-          <h3>Proposed change</h3>
-          {change ? (
-            <>
-              <p>
-                <span className="blob">⬡ {change.id.slice(0, 12)}</span> · {change.intent} ·{" "}
-                <span className="muted">{change.author.split(" ")[0]}</span>
-              </p>
-              <h4>
-                What it touches <span className="muted">({change.files.length} files — from keel)</span>
-              </h4>
-              <ul className="rp-files">
-                {change.files.map((f) => (
-                  <li key={f.path}>
-                    <span className={"fst " + f.status}>{f.status[0].toUpperCase()}</span> <code>{f.path}</code>
-                  </li>
-                ))}
-              </ul>
-            </>
-          ) : (
-            <p className="muted">resolving the change from keel…</p>
-          )}
-        </section>
-
-        <section className="rp-card">
-          <h3>
-            Changes <span className="muted">({diff.length} files) · what changed, as operations</span>
-            {semantic?.pure_move && <span className="badge ok" title="every file was relocated with byte-identical content (proven by content address) — behavior-preserving"> ⇄ pure move</span>}
-            {semantic?.mechanical && !semantic.pure_move && <span className="badge warn" title="only moves and/or whitespace reformatting — likely mechanical, but whitespace can be semantic (e.g. Python), so not auto-approved"> mechanical</span>}
-            {semantic && semantic.behavioral.length > 0 && <span className="muted" style={{ fontWeight: 400, fontSize: 12 }}> · {semantic.behavioral.length} behavioral</span>}
-          </h3>
-          {semantic && semantic.moves.length > 0 && (
-            <ul className="rp-files" style={{ marginBottom: 10 }}>
-              {semantic.moves.map((m, i) => (
-                <li key={i}><span className="op add">renamed</span> <code>{m.from}</code> <span className="muted">→</span> <code>{m.to}</code> <span className="muted" title="same content-address — an exact move, not a git similarity guess">⬡ {m.blob.slice(0, 10)}</span></li>
-              ))}
-            </ul>
-          )}
-          {semantic && semantic.whitespace_only.length > 0 && (
-            <ul className="rp-files" style={{ marginBottom: 10 }}>
-              {semantic.whitespace_only.map((p, i) => (
-                <li key={i}><span className="op" style={{ background: "var(--brass-wash)", color: "var(--brass-text)" }}>reformatted</span> <code>{p}</code> <span className="muted">whitespace only</span></li>
-              ))}
-            </ul>
-          )}
-          {diff.length === 0 && !semantic?.moves.length && <p className="muted">no textual changes (or binary)</p>}
-          {diff.length > 0 &&
-            (() => {
-              const allOps = [...new Set(diff.flatMap((f) => f.ops))];
-              const count = (t: string) => diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === t).length, 0), 0);
-              return (
-                <div className="ops-summary">
-                  <div className="ops-title">
-                    Semantic operations <span className="shape">· {diff.length} files · +{count("add")} / -{count("del")}</span>
-                  </div>
-                  {allOps.length > 0 ? (
-                    <div className="ops-list">
-                      {allOps.map((o, i) => (
-                        <span className={"op " + (o.startsWith("removed") ? "del" : "add")} key={i}>{o}</span>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="muted">no signature-level operations — see the line diff below</div>
-                  )}
-                </div>
-              );
-            })()}
-          {diff.length > 0 && (() => {
-            // F4/F3 — semantic-first, risk-ordered reading budget: behavioral changes first (they
-            // need attention), then reformatted/mechanical last. Each file is tagged with its class.
-            const cls = (p: string) => (semantic?.behavioral.includes(p) ? "behavioral" : semantic?.whitespace_only.includes(p) ? "reformatted" : "changed");
-            const rank: Record<string, number> = { behavioral: 0, changed: 1, reformatted: 2 };
-            const ordered = [...diff].sort((a, b) => (rank[cls(a.path)] ?? 1) - (rank[cls(b.path)] ?? 1));
-            const beh = ordered.filter((f) => cls(f.path) === "behavioral").length;
-            return (
-              <>
-                {semantic && (semantic.behavioral.length + semantic.whitespace_only.length + semantic.moves.length) > 0 && (
-                  <div className="muted" style={{ fontSize: 12.5, margin: "4px 0 10px" }}>
-                    Reading order — {beh > 0 ? <b>{beh} behavioral first</b> : <span>no behavioral changes</span>}
-                    {semantic.whitespace_only.length > 0 && <> · {semantic.whitespace_only.length} reformatted</>}
-                    {semantic.moves.length > 0 && <> · {semantic.moves.length} moved</>}
+                    ))}
                   </div>
                 )}
-                {ordered.map((f) => (
-                  <div className="fdiff" key={f.path}>
-                    <button className="fdiff-head" onClick={() => setOpenFile(openFile === f.path ? null : f.path)}>
-                      <span className={"fst " + f.status}>{f.status[0].toUpperCase()}</span>
-                      <code>{f.path}</code>
-                      {cls(f.path) === "behavioral" && <span className="badge warn" style={{ padding: "1px 7px" }} title="a real content change — read this">behavioral</span>}
-                      {cls(f.path) === "reformatted" && <span className="op" style={{ background: "var(--brass-wash)", color: "var(--brass-text)" }} title="whitespace only — low risk">reformatted</span>}
-                      {f.ops.length > 0 && (
-                        <span className="ops">
-                          {f.ops.slice(0, 5).map((o, i) => (
-                            <span className={"op " + (o.startsWith("removed") ? "del" : "add")} key={i}>{o}</span>
-                          ))}
-                        </span>
-                      )}
-                      <span className="expand">{openFile === f.path ? "hide diff ▾" : "diff ▸"}</span>
-                    </button>
-                    {openFile === f.path && (
-                      <div className="hunks">
-                        {f.hunks.map((h, i) => (
-                          <div className="hunk" key={i}>
-                            <div className="hunk-h">@@ -{h.old_start} +{h.new_start} @@</div>
-                            {h.lines.map((l, j) => (
-                              <div className={"dl " + l.tag} key={j}>
-                                <span className="mark">{l.tag === "add" ? "+" : l.tag === "del" ? "-" : " "}</span>
-                                {l.text}
-                              </div>
-                            ))}
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                {resolutions[c.id] ? (
+                  <div className={`text-[12.5px] mt-2.5 ${resolutions[c.id].judgment === "verified" ? "text-clear-text" : "text-fault-text"}`}>
+                    {resolutions[c.id].judgment === "verified" ? "✓ verified by a human" : "⚑ concern raised"} · <b>{resolutions[c.id].by}</b>
+                    {resolutions[c.id].note && <span className="text-muted"> — {resolutions[c.id].note}</span>}
                   </div>
-                ))}
-              </>
-            );
-          })()}
-        </section>
-
-        <section className="rp-card">
-          <h3>Tests &amp; CI · risk</h3>
-          <p>
-            keel verification: <span className={"verif " + verification}>{verification}</span> · risk: <b>{risk}</b>
-          </p>
-          <div className="verify-actions">
-            <button className="act run-checks" disabled={checking} onClick={() => runChecks(false)}>
-              {checking ? "running checks…" : "Run checks"}
-            </button>
-            {checkResult && (
-              <span className={"check-result " + checkResult.status}>
-                {checkResult.status}
-                {checkResult.memoized && <span className="memo-tag">memoized</span>}
-                <span className="check-summary">{checkResult.summary}</span>
-              </span>
-            )}
-          </div>
-          <p className="muted checks-note">
-            Checks run the change's own tree in a fresh checkout and memoize by content — an unchanged
-            tree is an instant cache hit. The result writes back to keel verification above.
-            {checkResult && (
-              <>
-                {" "}
-                <button className="linklike" disabled={checking} onClick={() => runChecks(true)}>re-run (bypass memo)</button>
-              </>
-            )}
-          </p>
-          <div className="verify-actions">
-            <button className="act close" onClick={() => verify(true)}>Override: green</button>
-            <button className="act reopen" onClick={() => verify(false)}>Override: red</button>
-          </div>
-        </section>
-
-        {change?.session ? (
-          <section className="rp-card">
-            <h3>
-              Session <span className="muted">the agent session behind this change</span>
-            </h3>
-            <p><b>task:</b> {change.session.task}</p>
-            <p>
-              <b>model:</b> {change.session.model || "—"}
-              {change.session.lesson && <> · <b>lesson:</b> <i>{change.session.lesson}</i></>}
-            </p>
-            {(change.session.tool_calls > 0 || change.session.tokens_out > 0) && (
-              <p className="muted">
-                agent-session totals: {change.session.tool_calls} tool calls · {change.session.tokens_in}/
-                {change.session.tokens_out} tokens (spans the whole run, not just this change)
-              </p>
-            )}
-          </section>
-        ) : (
-          <section className="rp-card muted-card">
-            <h3>Session <span className="muted">reasoning · operations · tokens</span></h3>
-            <p className="muted">
-              No keel session is linked to this change — it was pushed as a plain git commit. Commit with{" "}
-              <code>keel commit --session</code> or <code>keel capture</code> and the task, reasoning, tool calls,
-              and lesson show up here automatically.
-            </p>
-          </section>
-        )}
-
-        {pr && (
-          <section className="rp-card">
-            <h3>Discussion <span className="muted">humans and agents, one accountable thread</span></h3>
-            <div className="pr-thread">
-              {thread.sort((a, b) => a.created_unix - b.created_unix).map((c) => (
-                <div className="cmt" key={c.id}>
-                  <b className={actors.find((a) => a.id === c.author)?.kind ?? ""}>{handleOf(c.author)}</b>
-                  <span className="cmt-body">{c.body}</span>
-                </div>
-              ))}
-              {thread.length === 0 && <div className="muted cmt-empty">no comments yet</div>}
-              <div className="cmt-form">
-                <input
-                  placeholder={canAct ? "comment…" : "sign in to comment"}
-                  disabled={!canAct}
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && postThreadComment()}
-                />
-                <button disabled={!canAct} onClick={postThreadComment}>Comment</button>
+                ) : (c.status === "needs_judgment" || c.status === "self_attested") ? (
+                  <div className="flex items-center gap-2 mt-2.5 flex-wrap">
+                    <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}>✓ I checked — verified</Button>
+                    <Button size="sm" variant="destructive" disabled={!canAct} onClick={() => resolveClaim(c.id, "concern")}>⚑ Raise concern</Button>
+                  </div>
+                ) : null}
               </div>
             </div>
-          </section>
+          );
+          return (
+            <Card>
+              <SectionHeader label="Reconciliation" right={<span className="text-[12.5px] text-muted tabular-nums">{supported} supported{needs ? ` · ${needs} to judge` : ""}{contradicted ? ` · ${contradicted} contradicted` : ""}</span>} />
+              <div className="px-5 py-2.5 bg-paper/40 border-b border-rule2 text-[12.5px] text-muted leading-snug">
+                {snapshot ? "The evidence this verdict was based on." : "Each claim the change makes, checked against what the code actually does."}
+              </div>
+              {contradicted > 0 && (
+                <div className="px-5 pt-3.5">
+                  <Alert kind="error" lead={`${contradicted} claim${contradicted > 1 ? "s" : ""} the change's own facts contradict.`}>Don't land without resolving these.</Alert>
+                </div>
+              )}
+              {(ledger.unclaimed?.length ?? 0) > 0 && (
+                <div className="px-5 py-3.5 border-b border-rule2 flex gap-3">
+                  <StatusDot tone="warn" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13.5px] text-body leading-snug"><b>{ledger.unclaimed!.length} unclaimed change{ledger.unclaimed!.length > 1 ? "s" : ""}</b> — work the narrative never mentions; account for it before landing.</div>
+                    <div className="grid gap-1 mt-2">
+                      {ledger.unclaimed!.map((op, i) => <div key={i} className="text-[12.5px] text-fault-text flex gap-2 items-baseline"><span className="text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded bg-fault-wash flex-none">phantom</span><span className="leading-snug">{op}</span></div>)}
+                    </div>
+                  </div>
+                </div>
+              )}
+              {attention.length > 0 ? attention.map(Row) : (
+                <div className="px-5 py-4 text-[13px] text-dim flex items-center gap-2.5"><StatusDot tone="ok" /> Every claim is supported — nothing needs your judgment.</div>
+              )}
+              {verified.length > 0 && (
+                <details className="group border-t border-rule2">
+                  <summary className="px-5 py-3 text-[13px] cursor-pointer flex items-center gap-2 text-dim hover:text-ink select-none list-none">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="group-open:rotate-90 transition-transform text-faint"><polyline points="9 18 15 12 9 6" /></svg>
+                    <span className="font-semibold text-clear-text">{verified.length} verified claim{verified.length > 1 ? "s" : ""}</span>
+                    <span className="text-muted">— mechanically checked, no action needed</span>
+                  </summary>
+                  <div className="border-t border-rule2">{verified.map(Row)}</div>
+                </details>
+              )}
+            </Card>
+          );
+        })()}
+
+        {/* Findings live inline in the diff now (at their line, collapsible). Only findings we can't
+            anchor to a diff line get a residual card here. */}
+        {unmappedFindings.length > 0 && (() => {
+          const sevColor = (s: string) => s === "blocker" ? "text-fault-text" : s === "warn" ? "text-brass-text" : "text-steel-text";
+          return (
+            <Card>
+              <SectionHeader label="Other findings" right={<span className="text-[12.5px] text-muted">not tied to a diff line</span>} />
+              <div>
+                {unmappedFindings.map(({ f, reviewer, idx }) => (
+                  <div key={idx} className="px-5 py-3.5 border-b border-rule2 last:border-0 flex gap-3">
+                    <StatusDot tone={sevTone(f.severity)} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-baseline gap-2 flex-wrap">
+                        <span className={`text-[11px] font-bold uppercase tracking-[0.03em] ${sevColor(f.severity)}`}>{f.severity}</span>
+                        {f.path && <code className="text-[12px] text-dim">{f.path}{f.line ? `:${f.line}` : ""}</code>}
+                      </div>
+                      <p className="text-[13.5px] text-body mt-1 leading-snug">{f.note}</p>
+                      <div className="flex items-center gap-2 mt-2 flex-wrap">
+                        <span className="inline-flex items-center gap-1.5 text-[11.5px] text-muted"><Avatar id={reviewer} handle={handleOf(reviewer)} kind={kindOf(reviewer)} size={16} />{handleOf(reviewer)}</span>
+                        {f.severity !== "info" && pr && f.path && (<><span className="text-faint">·</span><Button size="sm" variant="secondary" disabled={!canAct || fixing === idx} onClick={() => fixWithAI(idx, f)}>{fixing === idx ? "fixing…" : "✨ Fix with AI"}</Button></>)}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          );
+        })()}
+
+        {/* conversation timeline — reviews + comments, one accountable thread */}
+        {pr && (
+          <Card>
+            <SectionHeader label="Conversation" right={reviewTools ?? <span className="text-[12.5px] text-muted">reviews and comments, humans and agents</span>} />
+            <div className="px-5 py-4 grid gap-3.5">
+              {(() => {
+                const verb: Record<string, string> = { approve: "approved", request_changes: "requested changes on", reject: "rejected", comment: "reviewed" };
+                const vcolor = (v: string) => v === "approve" ? "bg-clear text-white" : v === "reject" ? "bg-fault text-white" : v === "request_changes" ? "bg-brass text-white" : "border border-rule text-muted";
+                const items = [
+                  ...reviews.map((r) => ({ ts: r.created_unix ?? 0, kind: "review" as const, r })),
+                  ...thread.filter((c) => !(c.path && c.line)).map((c) => ({ ts: c.created_unix, kind: "comment" as const, c })),
+                ].sort((a, b) => a.ts - b.ts);
+                if (items.length === 0) return <div className="text-[13px] text-muted">no activity yet — add a review or comment below.</div>;
+                return items.map((e) => e.kind === "review" ? (
+                  <div key={`r${e.r.id}`} className="flex items-center gap-2.5 text-[13px] flex-wrap">
+                    <span className={`grid place-items-center w-[24px] h-[24px] rounded-full flex-none text-[12px] ${vcolor(e.r.verdict)}`}>{e.r.verdict === "approve" ? "✓" : e.r.verdict === "reject" || e.r.verdict === "request_changes" ? "!" : "◍"}</span>
+                    <Avatar id={e.r.reviewer} handle={handleOf(e.r.reviewer)} kind={kindOf(e.r.reviewer)} size={18} />
+                    <b className={kindOf(e.r.reviewer) === "agent" ? "text-steel-text" : ""}>{handleOf(e.r.reviewer)}</b>
+                    <span className="text-muted">{verb[e.r.verdict] ?? "reviewed"} this voyage</span>
+                    {e.r.findings.length > 0 && <button onClick={() => setActiveId(e.r.id)} className="cursor-pointer"><Tag>{e.r.findings.length} finding{e.r.findings.length > 1 ? "s" : ""}</Tag></button>}
+                    <span className="text-faint tabular-nums ml-auto" title={new Date(e.ts * 1000).toLocaleString()}>{timeAgo(e.ts)}</span>
+                  </div>
+                ) : (
+                  <div className="flex gap-2.5" key={`c${e.c.id}`}>
+                    <Avatar id={e.c.author} handle={handleOf(e.c.author)} kind={kindOf(e.c.author)} size={26} />
+                    <div className="flex-1 min-w-0 border border-rule2 rounded-ctl overflow-hidden">
+                      <div className="flex items-center gap-2 px-3 py-1.5 bg-paper border-b border-rule3 text-[12.5px]">
+                        <b className={kindOf(e.c.author) === "agent" ? "text-steel-text" : ""}>{handleOf(e.c.author)}</b>
+                        <span className="text-faint tabular-nums" title={new Date(e.c.created_unix * 1000).toLocaleString()}>{timeAgo(e.c.created_unix)}</span>
+                      </div>
+                      <Markdown text={e.c.body} className="px-3 py-2 text-[13.5px] text-body" />
+                    </div>
+                  </div>
+                ));
+              })()}
+              <div className="flex gap-2 mt-1 items-start">
+                <input className="flex-1 box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder={canAct ? "Leave a comment…" : "sign in to comment"} disabled={!canAct} value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !composerDisabled) runMode(composerMode); }} />
+                {canAct ? (
+                  <div className="flex-none inline-flex h-ctl">
+                    <Button size="md" disabled={composerDisabled} onClick={() => runMode(composerMode)} className="!rounded-r-none inline-flex items-center gap-1.5">{MODES.find((m) => m.id === composerMode)!.icon}{MODES.find((m) => m.id === composerMode)!.label}</Button>
+                    <Popover align="right" width={244} direction="up" trigger={(open) => (
+                      <span className={`inline-flex items-center h-ctl px-1.5 rounded-ctl rounded-l-none border-l border-l-white/25 bg-ink text-surface ${open ? "opacity-90" : ""}`}>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={open ? "rotate-180 transition-transform" : "transition-transform"}><polyline points="6 9 12 15 18 9" /></svg>
+                      </span>
+                    )}>
+                      <div className="py-1">
+                        {/* Selecting only changes what kind of reply this is — it doesn't submit. */}
+                        {MODES.map((m) => (
+                          <button key={m.id} type="button" onClick={() => setComposerMode(m.id)}
+                            className={`w-full text-left px-3 py-2 flex items-start gap-2.5 hover:bg-paper ${m.id === composerMode ? "bg-paper" : ""}`}>
+                            <span className={`mt-[1px] flex-none ${m.color}`}>{m.icon}</span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block text-[13px] font-medium text-body leading-tight">{m.label}</span>
+                              <span className="block text-[11.5px] text-muted leading-tight mt-0.5">{m.hint}</span>
+                            </span>
+                            {m.id === composerMode && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text mt-0.5 flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
+                          </button>
+                        ))}
+                      </div>
+                    </Popover>
+                  </div>
+                ) : <Button size="md" disabled>Comment</Button>}
+              </div>
+            </div>
+          </Card>
         )}
-      </main>
+
+        {/* decision — placed last, so a reviewer lands only after reading the diff, reconciliation,
+            findings, and conversation above. */}
+        {landGate}
+          </div>
+          <aside className="grid gap-6 content-start">
+        {/* proposed change — the file list + provenance; the "why" lives in the brief above */}
+        <Card>
+          <SectionHeader label="Files" right={<span className="text-[12.5px] text-muted tabular-nums">{change ? `${change.files.length} · +${addN} −${delN}` : ""}</span>} />
+          <div className="px-5 py-4">
+            {change ? (
+              <>
+                <p className="text-[12.5px] text-muted flex items-center gap-2 flex-wrap">
+                  <IdChip>⬡ {change.id.slice(0, 12)}</IdChip> by <b className="text-body">{change.author.split(" ")[0]}</b>
+                </p>
+                <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted mt-4 mb-2">What it touches <span className="text-faint normal-case tracking-normal">(from keel)</span></div>
+                <div className="grid gap-1">
+                  {change.files.map((f) => (
+                    <div key={f.path} className="flex items-center gap-2 text-[13px]">
+                      <span className={`w-4 h-4 grid place-items-center rounded text-[10px] font-bold ${f.status === "added" ? "bg-clear-wash text-clear-text" : f.status === "deleted" ? "bg-fault-wash text-fault-text" : "bg-steel-wash text-steel-text"}`}>{f.status[0].toUpperCase()}</span>
+                      <code className="text-body">{f.path}</code>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <p className="text-[13px] text-muted">resolving the change from keel…</p>
+            )}
+          </div>
+        </Card>
+
+        {/* tests & CI · risk */}
+        <Card>
+          <SectionHeader label="Checks" right={<StatusBadge kind={verifKind(verification)}>{verification}</StatusBadge>} />
+          <div className="px-5 py-4 grid gap-3">
+            <div className="flex items-center gap-3 flex-wrap">
+              <Button size="sm" disabled={checking} onClick={() => runChecks(false)}>{checking ? "Running…" : "Run checks"}</Button>
+              {checkResult && (
+                <span className="flex items-center gap-2 text-[13px]">
+                  <StatusBadge kind={checkResult.status === "passed" ? "passed" : checkResult.status === "failed" ? "failed" : "queued"}>{checkResult.status}</StatusBadge>
+                  {checkResult.memoized && <Tag>memoized</Tag>}
+                  <span className="text-muted">{checkResult.summary}</span>
+                </span>
+              )}
+            </div>
+            <p className="text-[12.5px] text-muted leading-[1.55]">
+              Checks run in a fresh checkout and memoize by content, so an unchanged tree is an instant cache hit.
+              {checkResult && <> <LinkButton onClick={() => runChecks(true)}>re-run without cache</LinkButton></>}
+            </p>
+          </div>
+        </Card>
+
+        {/* session */}
+        <Card>
+          <SectionHeader label="Session" right={<span className="text-[12.5px] text-muted">the agent session behind this change</span>} />
+          <div className="px-5 py-4">
+            {change?.session ? (
+              <div className="grid gap-1.5 text-[13.5px] text-body">
+                <p><b>task:</b> {change.session.task}</p>
+                <p><b>model:</b> {change.session.model || "—"}{change.session.lesson && <> · <b>lesson:</b> <i>{change.session.lesson}</i></>}</p>
+                {(change.session.tool_calls > 0 || change.session.tokens_out > 0) && (
+                  <p className="text-[12.5px] text-muted">session totals: {change.session.tool_calls} tool calls · {change.session.tokens_in}/{change.session.tokens_out} tokens</p>
+                )}
+              </div>
+            ) : (
+              <p className="text-[13px] text-muted leading-[1.55]">
+                No keel session is linked to this change — it was pushed as a plain git commit. Commit with <code>keel commit --session</code> or <code>keel capture</code> and the task, reasoning, tool calls, and lesson show up here automatically.
+              </p>
+            )}
+          </div>
+        </Card>
+
+          </aside>
+        </div>
+
+      </div>
     </div>
   );
 }
@@ -1845,29 +3072,14 @@ function ReviewPage({
 function renderEvent(e: ActivityEvent) {
   switch (e.kind) {
     case "agent_brief":
-      return (
-        <>
-          <b>{e.actor}</b> is working in <b>{e.repo}</b> · <code>{e.file}</code>
-          <span className="task"> — {e.task}</span>
-        </>
-      );
+      return <><b>{e.actor}</b> is working in <b>{e.repo}</b> · <code className="text-muted">{e.file}</code> — {e.task}</>;
     case "lesson":
-      return (
-        <>
-          lesson in <b>{e.repo}</b> · <code>{e.file}</code>: <i>{e.lesson}</i>
-        </>
-      );
+      return <>lesson in <b>{e.repo}</b> · <code className="text-muted">{e.file}</code>: <i>{e.lesson}</i></>;
     case "push":
-      return (
-        <>
-          <b>{e.actor}</b> pushed to <b>{e.repo}</b> · <code>{e.change}</code>
-        </>
-      );
+      return <><b>{e.actor}</b> pushed to <b>{e.repo}</b> · <code className="text-muted">{e.change}</code></>;
     case "issue":
-      return (
-        <>
-          <b>{e.actor}</b> {e.action} issue #{e.number} in <b>{e.repo}</b>
-        </>
-      );
+      return <><b>{e.actor}</b> {e.action} issue #{e.number} in <b>{e.repo}</b></>;
   }
 }
+
+
