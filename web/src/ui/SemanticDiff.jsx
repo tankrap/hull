@@ -112,7 +112,7 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
           </div>
           <span className="text-[11.5px] font-semibold text-muted tabular-nums">{allDone ? 'all reviewed' : `${ops.length - done} left`}</span>
           <button onClick={() => setFull((f) => !f)} title={full ? 'Exit full screen (Esc)' : 'Full screen'}
-            className="w-7 h-7 grid place-items-center rounded-ctl border border-ctl text-dim hover:text-ink hover:bg-paper transition-colors">
+            className="w-8 h-8 grid place-items-center rounded-ctl border border-ctl text-dim hover:text-ink hover:bg-paper transition-colors">
             {full ? (
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 3v6H3M21 9h-6V3M3 15h6v6M15 21v-6h6" /></svg>
             ) : (

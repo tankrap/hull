@@ -28,7 +28,7 @@ export function RichText({ value, onChange, placeholder, rows = 4, linkBase = nu
     requestAnimationFrame(() => { ta.focus(); ta.setSelectionRange(lineStart, lineStart + prefixed.length); });
   };
   const T = ({ title, onClick, children }: { title: string; onClick: () => void; children: React.ReactNode }) => (
-    <button type="button" title={title} onClick={onClick} className="w-6 h-6 grid place-items-center rounded-ctl-sm text-dim hover:text-ink hover:bg-rule2 transition-colors">{children}</button>
+    <button type="button" title={title} onClick={onClick} className="w-8 h-8 grid place-items-center rounded-ctl text-dim hover:text-ink hover:bg-rule2 transition-colors">{children}</button>
   );
   const ico = (d: React.ReactNode) => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{d}</svg>;
   return (
