@@ -36,7 +36,7 @@ const bytesToHex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(
 // Promise-based so call sites stay simple: `await uiPrompt(...)`, `await uiConfirm(...)`, `uiAlert(...)`.
 // A module-level bridge lets both App and ReviewPage reach the one modal host that App renders.
 type ModalReq =
-  | { kind: "prompt"; title: string; label?: string; placeholder?: string; initial?: string; sanitize?: (s: string) => string; check?: "account" | "username"; confirmLabel?: string }
+  | { kind: "prompt"; title: string; label?: string; placeholder?: string; initial?: string; sanitize?: (s: string) => string; check?: "account" | "username"; confirmLabel?: string; optional?: boolean }
   | { kind: "confirm"; title: string; body?: string; danger?: boolean; confirmLabel?: string }
   | { kind: "alert"; title: string; body?: string };
 let _pushModal: ((req: ModalReq, resolve: (v: unknown) => void) => void) | null = null;
@@ -568,7 +568,7 @@ export function App() {
     if (req.kind === "prompt") {
       const check = req.check;
       return (
-        <PromptModal open title={req.title} label={req.label} placeholder={req.placeholder} initial={req.initial ?? ""} sanitize={req.sanitize} confirmLabel={req.confirmLabel ?? "Confirm"}
+        <PromptModal open title={req.title} label={req.label} placeholder={req.placeholder} initial={req.initial ?? ""} sanitize={req.sanitize} optional={req.optional} confirmLabel={req.confirmLabel ?? "Confirm"}
           validate={check ? (v: string) => checkAvail(check, v) : undefined}
           onCancel={() => closeModal(null)} onConfirm={(v: string) => closeModal(v)} />
       );
@@ -2504,7 +2504,7 @@ function ReviewPage({
   useEffect(loadResolutions, [changeId, tenant, repo]);
   const resolveClaim = async (claimId: string, judgment: "verified" | "concern") => {
     if (!canAct) return uiAlert("Sign in to act.");
-    const note = (await uiPrompt({ title: judgment === "verified" ? "Mark verified" : "Raise a concern", label: "note (optional)" })) ?? "";
+    const note = (await uiPrompt({ title: judgment === "verified" ? "Mark verified" : "Raise a concern", label: "note (optional)", optional: true, confirmLabel: judgment === "verified" ? "Verify" : "Raise concern" })) ?? "";
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/claims/${claimId}/resolve`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders() },
@@ -2578,8 +2578,11 @@ function ReviewPage({
   const moveN = semantic?.moves.length ?? 0;
   const reformN = semantic?.whitespace_only.length ?? 0;
   const briefClaims = shownLedger?.claims ?? [];
-  const needsN = briefClaims.filter((c) => c.status === "needs_judgment").length;
-  const contraN = briefClaims.filter((c) => c.status === "contradicted").length;
+  // A human resolution (verify / raise concern) overrides the raw ledger status, so the checks and
+  // brief reflect what the reviewer actually decided — not "needs judgment" forever.
+  const needsN = briefClaims.filter((c) => c.status === "needs_judgment" && !resolutions[c.id]).length;
+  const contraN = briefClaims.filter((c) => c.status === "contradicted" && resolutions[c.id]?.judgment !== "verified").length;
+  const concernN = briefClaims.filter((c) => resolutions[c.id]?.judgment === "concern").length;
   const phantomN = shownLedger?.unclaimed?.length ?? 0;
   const allFindings = reviews.flatMap((r) => r.findings ?? []);
   const blockerN = allFindings.filter((f) => f.severity === "blocker").length;
@@ -2615,7 +2618,7 @@ function ReviewPage({
   type Check = { label: string; tone: "ok" | "bad" | "warn" | "wait"; detail: string };
   const checks: Check[] = [
     { label: "keel verify", tone: verification === "green" ? "ok" : verification === "red" ? "bad" : "wait", detail: verification === "green" ? "build & tests pass" : verification === "red" ? "build or tests failing" : "not run yet" },
-    ...(briefClaims.length > 0 ? [{ label: "Claims reconciled", tone: (contraN > 0 ? "bad" : needsN > 0 ? "warn" : "ok") as Check["tone"], detail: contraN > 0 ? `${contraN} contradicted` : needsN > 0 ? `${needsN} need a human's judgment` : `${supportedN}/${briefClaims.length} supported` }] : []),
+    ...(briefClaims.length > 0 ? [{ label: "Claims reconciled", tone: (contraN > 0 || concernN > 0 ? "bad" : needsN > 0 ? "warn" : "ok") as Check["tone"], detail: concernN > 0 ? `${concernN} concern${concernN > 1 ? "s" : ""} raised` : contraN > 0 ? `${contraN} contradicted` : needsN > 0 ? `${needsN} need a human's judgment` : `${supportedN}/${briefClaims.length} reconciled` }] : []),
     { label: "No blocking findings", tone: blockerN > 0 ? "bad" : "ok", detail: blockerN > 0 ? `${blockerN} blocker${blockerN > 1 ? "s" : ""}` : "none raised" },
     { label: "Independent approval", tone: changesRequested ? "bad" : hasApproval ? "ok" : "wait", detail: changesRequested ? "changes requested" : hasApproval ? "approved by a non-author" : "awaiting review" },
   ];
@@ -2676,9 +2679,11 @@ function ReviewPage({
   // Raw diff bodies are minified (just the "What changed here" summary) until expanded — click a
   // summary line or the Show-diff toggle to reveal the lines.
   const [expandedDiffs, setExpandedDiffs] = useState<Set<string>>(() => new Set());
+  // A big diff shows only a head + tail window until "show all" — so one huge file can't swamp the page.
+  const [fullLines, setFullLines] = useState<Set<string>>(() => new Set());
   const revealDiff = (path: string, thenLine?: string) => {
     setExpandedDiffs((s) => (s.has(path) ? s : new Set(s).add(path)));
-    if (thenLine) setTimeout(() => flashLine(thenLine), 70);
+    if (thenLine) { setFullLines((s) => (s.has(path) ? s : new Set(s).add(path))); setTimeout(() => flashLine(thenLine), 80); }
   };
   const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => new Set());
   const seenFindingsRef = useRef<Set<string>>(new Set());
@@ -2918,6 +2923,20 @@ function ReviewPage({
             const anchoredLines = new Set<number>([...fs.map((x) => x.f.line ?? -1), ...lcs.map((c) => c.line ?? -1)]);
             if (commenting?.path === f.path) anchoredLines.add(commenting.line);
             const keepAnchored = (r: Row) => typeof r.n === "number" && anchoredLines.has(r.n);
+            // Cap a huge diff to a head + tail window (unless annotated or fully expanded), so one
+            // enormous file doesn't take over the page. "Show N more" reveals the whole thing.
+            const capRows = (rows: Row[]): Row[] => {
+              const HEAD = 10, TAIL = 10;
+              if (fullLines.has(f.path) || forceOpen || rows.length <= HEAD + TAIL + 8) return rows;
+              const hidden = rows.length - HEAD - TAIL;
+              const expander: Row = { n: "", code: null, note: (
+                <button onClick={() => setFullLines((s) => new Set(s).add(f.path))} className="w-full py-2 text-[12.5px] font-medium text-steel-text hover:bg-steel-wash/50 flex items-center justify-center gap-1.5 bg-paper/40">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+                  Show {hidden} more line{hidden > 1 ? "s" : ""}
+                </button>
+              ) };
+              return [...rows.slice(0, HEAD), expander, ...rows.slice(-TAIL)];
+            };
             const transforms: { old: string; next: string; ln: number }[] = [];
             const hunkNodes = f.hunks.map((h, hi) => {
               let o = h.old_start, n = h.new_start;
@@ -2960,7 +2979,7 @@ function ReviewPage({
               return (
                 <div key={hi}>
                   <LocationBar crumbs={f.path.split("/")} right={`@@ -${h.old_start} +${h.new_start} @@`} />
-                  <CodePanel lines={annotate(fold(out, (hidden) => ({ n: "⋯", code: foldNote(hidden) }), keepAnchored), f)}
+                  <CodePanel lines={capRows(annotate(fold(out, (hidden) => ({ n: "⋯", code: foldNote(hidden) }), keepAnchored), f))}
                     filePath={f.path} selectedLine={selLine?.path === f.path ? selLine.line : null}
                     onSelectLine={(ln: number | null) => setSelLine(ln == null ? null : { path: f.path, line: ln })}
                     onCommentLine={(ln: number) => openLineComment(f.path, ln)} />
@@ -2998,18 +3017,25 @@ function ReviewPage({
                     </div>
                   );
                 })()}
-                {(expandedDiffs.has(f.path) || forceOpen) ? (
-                  <>
-                    {!forceOpen && (
-                      <div className="flex justify-end mb-1.5">
-                        <button onClick={() => setExpandedDiffs((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">
-                          Hide diff <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg>
-                        </button>
-                      </div>
-                    )}
-                    {hunkNodes}
-                  </>
-                ) : (
+                {(expandedDiffs.has(f.path) || forceOpen) ? (() => {
+                  // A compact review bar top + bottom of the open diff, so you can act right after reading.
+                  const reviewBar = canAct && pr ? (
+                    <div className="flex items-center gap-2 py-1.5">
+                      {!forceOpen && <button onClick={() => setExpandedDiffs((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>}
+                      <button onClick={() => postReview("approve")} disabled={composerBusy} className="ml-auto inline-flex items-center gap-1.5 h-ctl-sm px-2.5 rounded-ctl-sm bg-clear-wash text-clear-text text-[12.5px] font-semibold hover:brightness-95 disabled:opacity-50"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>Approve</button>
+                      <button onClick={() => document.getElementById("pr-composer")?.scrollIntoView({ block: "center", behavior: "smooth" })} className="inline-flex items-center gap-1 h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl text-dim text-[12.5px] hover:text-ink hover:border-dim">Comment ↓</button>
+                    </div>
+                  ) : (!forceOpen ? (
+                    <div className="flex justify-end"><button onClick={() => setExpandedDiffs((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff</button></div>
+                  ) : null);
+                  return (
+                    <>
+                      {reviewBar}
+                      {hunkNodes}
+                      {reviewBar}
+                    </>
+                  );
+                })() : (
                   <button onClick={() => revealDiff(f.path)} className="w-full py-2.5 rounded-ctl border border-dashed border-rule text-[12.5px] text-muted hover:text-ink hover:border-ctl hover:bg-paper/50 transition-colors flex items-center justify-center gap-2">
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
                     Show diff · {f.hunks.reduce((acc, h) => acc + h.lines.length, 0)} lines
@@ -3077,10 +3103,10 @@ function ReviewPage({
         {shownLedger && shownLedger.claims.length > 0 && (() => {
           const ledger = shownLedger;
           const POSITIVE = ["verified_mechanically", "verified_read_only", "self_attested"];
-          const nOf = (s: string) => ledger.claims.filter((c) => c.status === s).length;
-          const supported = ledger.claims.filter((c) => POSITIVE.includes(c.status)).length;
-          const contradicted = nOf("contradicted");
-          const needs = nOf("needs_judgment");
+          // Count against human resolutions: a resolved claim is no longer "to judge".
+          const supported = ledger.claims.filter((c) => POSITIVE.includes(c.status) || resolutions[c.id]?.judgment === "verified").length;
+          const contradicted = ledger.claims.filter((c) => c.status === "contradicted" && resolutions[c.id]?.judgment !== "verified").length;
+          const needs = ledger.claims.filter((c) => c.status === "needs_judgment" && !resolutions[c.id]).length;
           const label: Record<string, string> = { verified_mechanically: "verified", verified_read_only: "read-only verified", self_attested: "self-attested", contradicted: "contradicted", needs_judgment: "needs judgment" };
           const dotTone = (s: string): "ok" | "bad" | "warn" | "wait" => s === "contradicted" ? "bad" : s === "needs_judgment" ? "wait" : s === "self_attested" ? "warn" : "ok";
           const labelColor = (s: string) => s === "contradicted" ? "text-fault-text" : (s === "needs_judgment" || s === "self_attested") ? "text-brass-text" : "text-clear-text";
@@ -3234,7 +3260,7 @@ function ReviewPage({
                   </div>
                 ));
               })()}
-              <div className="mt-1 grid gap-2">
+              <div className="mt-1 grid gap-2 scroll-mt-20" id="pr-composer">
                 {canAct ? <RichText value={draft} onChange={setDraft} rows={3} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} onSubmit={() => !composerDisabled && runMode(composerMode)} placeholder="Leave a comment…" />
                   : <div className="border border-ctl rounded-ctl px-2.5 py-2 text-[13px] text-faint">sign in to comment</div>}
                 <div className="flex justify-end">

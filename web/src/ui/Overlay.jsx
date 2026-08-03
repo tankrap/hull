@@ -62,7 +62,7 @@ export function Dialog({ open, onClose, icon, title, body, cancelLabel = 'Cancel
 
 // A single text input in a modal (replaces window.prompt). Sanitizes on type and, if `validate` is
 // given, shows live availability. `validate(value) -> { available, hint }` (async).
-export function PromptModal({ open, title, label, placeholder, initial = '', sanitize, validate, confirmLabel = 'Confirm', onCancel, onConfirm }) {
+export function PromptModal({ open, title, label, placeholder, initial = '', sanitize, validate, optional = false, confirmLabel = 'Confirm', onCancel, onConfirm }) {
   const [val, setVal] = useState(initial);
   const [status, setStatus] = useState(null);
   const [checking, setChecking] = useState(false);
@@ -82,7 +82,7 @@ export function PromptModal({ open, title, label, placeholder, initial = '', san
   }, [val, open]);
   if (!open) return null;
   const blocked = !!validate && status && status.available === false;
-  const ok = val.trim().length > 0 && !blocked;
+  const ok = (optional || val.trim().length > 0) && !blocked;
   const submit = () => { if (ok) onConfirm(val.trim()); };
   return (
     <>
