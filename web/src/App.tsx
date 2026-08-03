@@ -930,6 +930,15 @@ export function App() {
   };
   const transition = (number: number, action: "close" | "reopen") => issueAction(number, action);
   const [labelDraft, setLabelDraft] = useState<Record<number, string>>({});
+  // Issue comment composer mode per target (Comment / Close with comment / Close as not planned / Reopen).
+  const [issueMode, setIssueMode] = useState<Record<string, string>>({});
+  const runIssueMode = async (target: string, num: number, mode: string) => {
+    const hasDraft = (commentDraft[target] ?? "").trim().length > 0;
+    if (mode === "reopen") return issueAction(num, "reopen");
+    if (hasDraft) await postComment(target);
+    if (mode === "close") issueAction(num, "close", { reason: "completed" });
+    else if (mode === "close_np") issueAction(num, "close", { reason: "not_planned" });
+  };
 
   // Accounts / orgs (membership + roles).
   type Account = { id: string; handle: string; kind: string; repos: string[]; members: { actor: string; handle: string; role: string }[] };
@@ -1108,18 +1117,53 @@ export function App() {
           </div>
         ))}
         {msgs.length === 0 && <div className="text-[13px] text-muted">no comments yet</div>}
-        <div className="flex gap-2 mt-1">
-          <input
-            ref={commentBoxRef}
-            className="flex-1 box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none transition-colors duration-150 focus:border-body placeholder:text-faint"
-            placeholder={canAct ? "comment…" : "sign in to comment"}
-            disabled={!canAct}
-            value={commentDraft[target] ?? ""}
-            onChange={(e) => setCommentDraft((d) => ({ ...d, [target]: e.target.value }))}
-            onKeyDown={(e) => e.key === "Enter" && postComment(target)}
-          />
-          <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => postComment(target)}>Comment</Button>
-        </div>
+        {(() => {
+          const num = Number(target.split(":")[1]);
+          const issue = issues.find((i) => i.number === num);
+          const isOpen = (issue?.status.state ?? "open") === "open";
+          const draft = (commentDraft[target] ?? "").trim();
+          const modes = isOpen
+            ? [
+                { id: "comment", label: "Comment", hint: "Add a note", dot: "bg-rule" },
+                { id: "close", label: draft ? "Close with comment" : "Close issue", hint: "Resolved / completed", dot: "bg-steel" },
+                { id: "close_np", label: draft ? "Close with comment" : "Close issue", sub: "not planned", hint: "Won't fix / not planned", dot: "bg-brass" },
+              ]
+            : [
+                { id: "comment", label: "Comment", hint: "Add a note", dot: "bg-rule" },
+                { id: "reopen", label: draft ? "Comment & reopen" : "Reopen issue", hint: "Back to open", dot: "bg-clear" },
+              ];
+          const mode = modes.find((m) => m.id === (issueMode[target] ?? "comment")) ?? modes[0];
+          const disabled = !canAct || (mode.id === "comment" && !draft);
+          return (
+            <div className="flex gap-2 mt-1 items-start">
+              <input ref={commentBoxRef} className="flex-1 box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none transition-colors duration-150 focus:border-body placeholder:text-faint"
+                placeholder={canAct ? "Leave a comment…" : "sign in to comment"} disabled={!canAct} value={commentDraft[target] ?? ""}
+                onChange={(e) => setCommentDraft((d) => ({ ...d, [target]: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === "Enter" && !disabled) runIssueMode(target, num, mode.id); }} />
+              {canAct ? (
+                <div className="flex-none inline-flex h-ctl">
+                  <Button size="md" disabled={disabled} onClick={() => runIssueMode(target, num, mode.id)} className="!rounded-r-none whitespace-nowrap">{mode.label}{mode.sub ? ` — ${mode.sub}` : ""}</Button>
+                  <Popover align="right" width={250} direction="up" trigger={(open) => (
+                    <span className={`inline-flex items-center h-ctl px-1.5 rounded-ctl rounded-l-none border-l border-l-white/25 bg-ink text-surface ${open ? "opacity-90" : ""}`}>
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={open ? "rotate-180 transition-transform" : "transition-transform"}><polyline points="6 9 12 15 18 9" /></svg>
+                    </span>
+                  )}>
+                    <div className="py-1">
+                      {modes.map((m) => (
+                        <button key={m.id} type="button" onClick={() => setIssueMode((s) => ({ ...s, [target]: m.id }))}
+                          className={`w-full text-left px-3 py-2 flex items-start gap-2.5 hover:bg-paper ${m.id === mode.id ? "bg-paper" : ""}`}>
+                          <span className={`w-2 h-2 rounded-full mt-1.5 flex-none ${m.dot}`} />
+                          <span className="min-w-0 flex-1"><span className="block text-[13px] font-medium text-body leading-tight">{m.label}{m.sub ? ` — ${m.sub}` : ""}</span><span className="block text-[11.5px] text-muted leading-tight mt-0.5">{m.hint}</span></span>
+                          {m.id === mode.id && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text mt-0.5 flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
+                        </button>
+                      ))}
+                    </div>
+                  </Popover>
+                </div>
+              ) : <Button size="md" disabled>Comment</Button>}
+            </div>
+          );
+        })()}
       </div>
     );
   };
