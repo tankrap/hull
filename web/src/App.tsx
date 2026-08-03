@@ -2605,6 +2605,13 @@ function ReviewPage({
   // Inline findings: which are collapsed (hidden inline, reopenable from a gutter marker).
   // Findings start collapsed (shown as a gutter marker) so they don't crowd the diff; click to open.
   // Reviews load async, so collapse each finding once when first seen (without undoing manual expands).
+  // Raw diff bodies are minified (just the "What changed here" summary) until expanded — click a
+  // summary line or the Show-diff toggle to reveal the lines.
+  const [expandedDiffs, setExpandedDiffs] = useState<Set<string>>(() => new Set());
+  const revealDiff = (path: string, thenLine?: string) => {
+    setExpandedDiffs((s) => (s.has(path) ? s : new Set(s).add(path)));
+    if (thenLine) setTimeout(() => flashLine(thenLine), 70);
+  };
   const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => new Set());
   const seenFindingsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -2835,6 +2842,8 @@ function ReviewPage({
           const codeBody = (f: FileDiff) => {
             const fs = findingsByFile.get(f.path) ?? [];
             const lcs = lineCommentsByFile.get(f.path) ?? [];
+            // Keep the diff open when it carries comments/an active composer, so they're never hidden.
+            const forceOpen = lcs.length > 0 || commenting?.path === f.path;
             const anchoredLines = new Set<number>([...fs.map((x) => x.f.line ?? -1), ...lcs.map((c) => c.line ?? -1)]);
             if (commenting?.path === f.path) anchoredLines.add(commenting.line);
             const keepAnchored = (r: Row) => typeof r.n === "number" && anchoredLines.has(r.n);
@@ -2903,12 +2912,12 @@ function ReviewPage({
                     <div className="mb-3 rounded-ctl border border-rule2 overflow-hidden">
                       <div className="px-3.5 py-2 bg-paper border-b border-rule2 flex items-center justify-between">
                         <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">What changed here</span>
-                        <span className="text-[11px] text-faint tabular-nums">{uniq.length} edit{uniq.length > 1 ? "s" : ""} · click a line to jump</span>
+                        <span className="text-[11px] text-faint tabular-nums">{uniq.length} edit{uniq.length > 1 ? "s" : ""} · click a line to open</span>
                       </div>
                       <div className="px-3.5 py-2.5 grid gap-2.5">
                         {uniq.slice(0, SHOWN).map((t, i) => (
                           <div key={i} className="grid grid-cols-[auto_1fr] items-start gap-x-2.5 gap-y-1 text-[13px]">
-                            <button onClick={() => flashLine(`L-${f.path}-${t.ln}`)} title={`Jump to line ${t.ln}`}
+                            <button onClick={() => revealDiff(f.path, `L-${f.path}-${t.ln}`)} title={`Open line ${t.ln}`}
                               className="inline-flex items-center h-[19px] px-1.5 mt-px rounded-[3px] bg-rule2 text-dim text-[11px] font-semibold tabular-nums hover:bg-steel-wash hover:text-steel-text transition-colors flex-none">L{t.ln}</button>
                             <div className="flex items-center gap-2 flex-wrap min-w-0 leading-relaxed">
                               {t.old ? <OldTok>{clip(t.old)}</OldTok> : <span className="text-muted italic text-[12.5px]">added</span>}
@@ -2917,12 +2926,28 @@ function ReviewPage({
                             </div>
                           </div>
                         ))}
-                        {uniq.length > SHOWN && <div className="text-[12px] text-muted pl-[42px]">+{uniq.length - SHOWN} more edit{uniq.length - SHOWN > 1 ? "s" : ""} in the diff below</div>}
+                        {uniq.length > SHOWN && <div className="text-[12px] text-muted pl-[42px]">+{uniq.length - SHOWN} more edit{uniq.length - SHOWN > 1 ? "s" : ""}</div>}
                       </div>
                     </div>
                   );
                 })()}
-                {hunkNodes}
+                {(expandedDiffs.has(f.path) || forceOpen) ? (
+                  <>
+                    {!forceOpen && (
+                      <div className="flex justify-end mb-1.5">
+                        <button onClick={() => setExpandedDiffs((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">
+                          Hide diff <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg>
+                        </button>
+                      </div>
+                    )}
+                    {hunkNodes}
+                  </>
+                ) : (
+                  <button onClick={() => revealDiff(f.path)} className="w-full py-2.5 rounded-ctl border border-dashed border-rule text-[12.5px] text-muted hover:text-ink hover:border-ctl hover:bg-paper/50 transition-colors flex items-center justify-center gap-2">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
+                    Show diff · {f.hunks.reduce((acc, h) => acc + h.lines.length, 0)} lines
+                  </button>
+                )}
               </>
             );
           };
