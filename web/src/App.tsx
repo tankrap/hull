@@ -21,12 +21,10 @@ const wdRender = (segs: Seg[], path: string, side: "old" | "new") =>
     : <Hl key={i} text={s.text} path={path} />);
 
 // Scroll a diff line into view and flash it — the target of "What changed here" jumps.
+// Scroll a jump target to the centre. The persistent highlight itself is declarative (CodePanel's
+// highlightLine, driven by diffFocus), so it survives re-renders and never fades.
 const flashLine = (id: string) => {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.scrollIntoView({ block: "center", behavior: "smooth" });
-  el.classList.add("flash-line");
-  setTimeout(() => el.classList.remove("flash-line"), 1300);
+  document.getElementById(id)?.scrollIntoView({ block: "center", behavior: "smooth" });
 };
 
 const hexToBytes = (h: string) => Uint8Array.from((h.match(/../g) ?? []).map((x) => parseInt(x, 16)));
@@ -3020,6 +3018,7 @@ function ReviewPage({
                   <LocationBar crumbs={f.path.split("/")} right={`@@ -${h.old_start} +${h.new_start} @@`} />
                   <CodePanel lines={capRows(annotate(fold(out, (hidden) => ({ n: "⋯", code: foldNote(hidden) }), keepAnchored), f))}
                     filePath={f.path} selectedLine={selLine?.path === f.path ? selLine.line : null}
+                    highlightLine={diffFocus[f.path] ?? null}
                     onSelectLine={(ln: number | null) => setSelLine(ln == null ? null : { path: f.path, line: ln })}
                     onCommentLine={(ln: number) => openLineComment(f.path, ln)} />
                 </div>

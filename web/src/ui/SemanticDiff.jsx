@@ -170,7 +170,7 @@ const MARK = { bad: 'bg-fault', warn: 'bg-brass', info: 'bg-steel' };
 const CommentIcon = () => (
   <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z" /></svg>
 );
-export function CodePanel({ lines, filePath, selectedLine, onSelectLine, onCommentLine }) {
+export function CodePanel({ lines, filePath, selectedLine, onSelectLine, onCommentLine, highlightLine }) {
   return (
     <div className="border border-rule2 rounded-b-ctl overflow-hidden text-[12.5px] leading-[1.6]">
       {lines.map((l, i) => l.note ? (
@@ -179,10 +179,11 @@ export function CodePanel({ lines, filePath, selectedLine, onSelectLine, onComme
         const ln = typeof l.n === 'number' ? l.n : null;
         const canComment = ln != null && l.sign !== '-' && onCommentLine;
         const selected = ln != null && selectedLine === ln;
+        const highlighted = ln != null && highlightLine === ln;
         return (
           <div key={i} id={filePath && ln != null ? `L-${filePath}-${ln}` : undefined}
             className={cx('group grid items-stretch scroll-mt-20', l.sign ? 'grid-cols-[28px_54px_1fr]' : 'grid-cols-[54px_1fr]',
-              selected ? 'bg-steel-wash' : l.sign === '-' ? 'bg-fault-wash' : l.sign === '+' ? 'bg-clear-wash' : 'hover:bg-paper/60')}>
+              highlighted ? 'line-highlight' : selected ? 'bg-steel-wash' : l.sign === '-' ? 'bg-fault-wash' : l.sign === '+' ? 'bg-clear-wash' : 'hover:bg-paper/60')}>
             {l.sign && <span className={cx('pl-3 py-1 font-bold select-none', l.sign === '-' ? 'text-fault-text' : 'text-clear-text')}>{l.sign}</span>}
             <span className={cx('relative flex items-center justify-end gap-1 pr-2 py-1 text-faint bg-paper/50 border-r border-rule3 text-[11px] select-none tabular-nums', canComment && 'cursor-pointer')}
               onClick={canComment ? () => onSelectLine(selected ? null : ln) : undefined}>

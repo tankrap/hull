@@ -63,12 +63,14 @@
 
 body { @apply font-sans text-ink bg-paper antialiased; text-wrap: pretty; }
 
-/* Diff line flash (jump target from "What changed here") — held longer, clearer colour. */
-@keyframes flash-line {
-  0%, 55% { background-color: var(--steel-wash); box-shadow: inset 4px 0 0 var(--steel); }
-  100% { background-color: transparent; box-shadow: inset 4px 0 0 transparent; }
+/* Diff jump target (from "What changed here"). Pulses once on arrival, then STAYS highlighted so
+   you can always find your place — it only moves when you jump to a different line. */
+@keyframes flash-in {
+  from { background-color: var(--steel); }
+  to   { background-color: var(--steel-wash); }
 }
-.flash-line, .flash-line > span { animation: flash-line 2.4s ease-out; }
+.line-highlight, .line-highlight > span { background-color: var(--steel-wash); }
+.line-highlight { box-shadow: inset 4px 0 0 var(--steel); animation: flash-in 0.9s ease-out; }
 a { @apply text-steel-text no-underline; }
 a:hover { @apply underline; text-underline-offset: 2px; text-decoration-thickness: 1px; }
 
