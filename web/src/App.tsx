@@ -333,7 +333,7 @@ function NewIssueModal({ repos, defaultRepo, actors, onClose, onCreate }: { repo
       <div className="grid gap-4">
         <Field label="Repository"><Picker block value={repo} onChange={setRepo} options={repos.map((r) => ({ value: `${r.tenant}/${r.repo}`, label: `${r.tenant}/${r.repo}` }))} placeholder="Choose a repository…" /></Field>
         <Field label="Title"><input autoFocus className={modalInput} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Something an agent (or human) should fix" /></Field>
-        <Field label="Description"><RichText value={body} onChange={setBody} rows={5} placeholder="What's wrong, where, and how you'd know it's fixed. Agents read this first." /></Field>
+        <Field label="Description"><RichText value={body} onChange={setBody} rows={5} mentions={actors.map((a) => ({ handle: a.handle, kind: a.kind }))} placeholder="What's wrong, where, and how you'd know it's fixed. Agents read this first." /></Field>
         <Field label="Labels" hint="comma-separated"><input className={modalInput} value={labels} onChange={(e) => setLabels(e.target.value)} placeholder="bug, area:auth" spellCheck={false} /></Field>
         <Field label="Assignees">
           <div className="flex flex-wrap items-center gap-1.5">
@@ -400,10 +400,10 @@ const StatusDot = ({ tone, size = 18 }: { tone: "ok" | "bad" | "warn" | "wait" |
 // The issue discussion thread + composer, as a STABLE top-level component so typing doesn't remount
 // it (which would steal focus on every keystroke). All state is passed in from App.
 type ThreadComment = { id: string; target: string; author: string; body: string; created_unix: number };
-function IssueThread({ target, comments, issues, commentDraft, setCommentDraft, issueMode, setIssueMode, runIssueMode, canAct, tenant, repo, handleOf, kindOf, boxRef }: {
+function IssueThread({ target, comments, issues, commentDraft, setCommentDraft, issueMode, setIssueMode, runIssueMode, canAct, tenant, repo, handleOf, kindOf, boxRef, mentions }: {
   target: string; comments: ThreadComment[]; issues: Issue[]; commentDraft: Record<string, string>; setCommentDraft: React.Dispatch<React.SetStateAction<Record<string, string>>>;
   issueMode: Record<string, string>; setIssueMode: React.Dispatch<React.SetStateAction<Record<string, string>>>; runIssueMode: (target: string, num: number, mode: string) => void;
-  canAct: boolean; tenant: string; repo: string; handleOf: (id: string) => string; kindOf: (id: string) => string | undefined; boxRef: React.MutableRefObject<HTMLDivElement | null>;
+  canAct: boolean; tenant: string; repo: string; handleOf: (id: string) => string; kindOf: (id: string) => string | undefined; boxRef: React.MutableRefObject<HTMLDivElement | null>; mentions: { handle: string; kind?: string }[];
 }) {
   const msgs = comments.filter((c) => c.target === target).sort((a, b) => a.created_unix - b.created_unix);
   const num = Number(target.split(":")[1]);
@@ -439,7 +439,7 @@ function IssueThread({ target, comments, issues, commentDraft, setCommentDraft, 
       ))}
       {msgs.length === 0 && <div className="text-[13px] text-muted">no comments yet</div>}
       <div className="mt-1 grid gap-2" ref={boxRef}>
-        {canAct ? <RichText value={commentDraft[target] ?? ""} onChange={(v) => setCommentDraft((d) => ({ ...d, [target]: v }))} rows={3} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} onSubmit={() => !disabled && runIssueMode(target, num, mode.id)} placeholder="Leave a comment…" />
+        {canAct ? <RichText value={commentDraft[target] ?? ""} onChange={(v) => setCommentDraft((d) => ({ ...d, [target]: v }))} rows={3} mentions={mentions} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} onSubmit={() => !disabled && runIssueMode(target, num, mode.id)} placeholder="Leave a comment…" />
           : <div className="border border-ctl rounded-ctl px-2.5 py-2 text-[13px] text-faint">sign in to comment</div>}
         <div className="flex justify-end">
           {canAct ? (
@@ -1207,7 +1207,7 @@ export function App() {
   // The issue discussion thread is a stable top-level component (IssueThread) so typing in its
   // composer doesn't remount and steal focus. This closure just binds the current App state to it.
   const commentBoxRef = useRef<HTMLDivElement | null>(null);
-  const threadProps = { comments, issues, commentDraft, setCommentDraft, issueMode, setIssueMode, runIssueMode, canAct, tenant, repo: issueRepo, handleOf, kindOf, boxRef: commentBoxRef };
+  const threadProps = { comments, issues, commentDraft, setCommentDraft, issueMode, setIssueMode, runIssueMode, canAct, tenant, repo: issueRepo, handleOf, kindOf, boxRef: commentBoxRef, mentions: actors.map((a) => ({ handle: a.handle, kind: a.kind })) };
   const [autoReviewing, setAutoReviewing] = useState<number | null>(null);
   const requestReviewer = async (prNumber: number, reviewer: string) => {
     if (!canAct || !reviewer) return;
@@ -2445,6 +2445,7 @@ function ReviewPage({
   type Claim = { id: string; text: string; source: string; status: string; evidence: Evidence[] };
   type Ledger = { change: string; claims: Claim[]; unclaimed?: string[] };
   const [change, setChange] = useState<ChangeInfo | null>(null);
+  const mentions = actors.map((a) => ({ handle: a.handle, kind: a.kind }));
   const [diff, setDiff] = useState<FileDiff[]>([]);
   type Semantic = { moves: { from: string; to: string; blob: string }[]; added: string[]; deleted: string[]; modified: string[]; whitespace_only: string[]; behavioral: string[]; pure_move: boolean; mechanical: boolean };
   const [semantic, setSemantic] = useState<Semantic | null>(null);
@@ -2889,7 +2890,7 @@ function ReviewPage({
           const composerNote = () => (
             <div className="px-4 py-3 bg-steel-wash/50 grid gap-2">
               <div className="text-[11.5px] text-muted">Commenting on <b className="text-body">{commenting!.path.split("/").pop()}:{commenting!.line}</b></div>
-              <RichText value={lineDraft} onChange={setLineDraft} rows={2} autoFocus minimal onSubmit={postLineComment} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} placeholder="Leave a comment on this line…  (⌘↵ to submit)" />
+              <RichText value={lineDraft} onChange={setLineDraft} rows={2} autoFocus minimal mentions={mentions} onSubmit={postLineComment} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} placeholder="Leave a comment on this line…  (⌘↵ to submit)" />
               <div className="flex gap-2">
                 <Button size="sm" disabled={!lineDraft.trim()} onClick={postLineComment}>Comment</Button>
                 <Button size="sm" variant="secondary" onClick={() => { setCommenting(null); setSelLine(null); }}>Cancel</Button>
@@ -3299,7 +3300,7 @@ function ReviewPage({
                 ));
               })()}
               <div className="mt-1 grid gap-2 scroll-mt-20" id="pr-composer">
-                {canAct ? <RichText value={draft} onChange={setDraft} rows={3} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} onSubmit={() => !composerDisabled && runMode(composerMode)} placeholder="Leave a comment…" />
+                {canAct ? <RichText value={draft} onChange={setDraft} rows={3} mentions={mentions} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} onSubmit={() => !composerDisabled && runMode(composerMode)} placeholder="Leave a comment…" />
                   : <div className="border border-ctl rounded-ctl px-2.5 py-2 text-[13px] text-faint">sign in to comment</div>}
                 <div className="flex justify-end">
                 {canAct ? (
