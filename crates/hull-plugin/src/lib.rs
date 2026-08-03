@@ -136,6 +136,22 @@ pub trait Mirror: Send + Sync {
     fn pull_in(&self, _repo: &str) -> MirrorResult {
         MirrorResult { ok: false, external_ref: None, detail: "inbound pull not supported by this mirror".into() }
     }
+    /// Verify a forge **connection** (e.g. a GitHub App installation id) and return the external
+    /// account login it grants access to, or `None` if it's invalid / unsupported. Used to let an org
+    /// admin explicitly connect their account to a forge before any import — so nothing is ever
+    /// importable without a deliberate, verified connection.
+    fn verify_connection(&self, _connection: &str) -> Option<String> {
+        None
+    }
+    /// External repos importable through `connection` (forge full-names). Default: none.
+    fn list_importable(&self, _connection: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// Import `source` (a forge full-name) through `connection` INTO hull's `dest` (`tenant/repo`).
+    /// Default: unsupported.
+    fn import_repo(&self, _connection: &str, _source: &str, _dest: &str) -> MirrorResult {
+        MirrorResult { ok: false, external_ref: None, detail: "import not supported by this mirror".into() }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -490,6 +506,13 @@ impl Registry {
     pub fn set_fixer(&mut self, f: Arc<dyn Fixer>) {
         self.fixer = Some(f);
     }
+    /// Whether an AI fixer / reviewer is installed — so the UI can hide AI actions it can't fulfill.
+    pub fn has_fixer(&self) -> bool {
+        self.fixer.is_some()
+    }
+    pub fn has_reviewer(&self) -> bool {
+        self.reviewer.is_some()
+    }
     /// Add a config/secret provider. Tried in registration order; a hosted plugin adds Infisical/Vault.
     pub fn add_config_provider(&mut self, c: Arc<dyn ConfigProvider>) {
         self.config_providers.push(c);
@@ -565,6 +588,21 @@ impl Registry {
             Some(m) => m.push(req),
             None => LogMirror.push(req),
         }
+    }
+    /// Verify a forge connection through the installed mirror; returns the external account login.
+    pub fn mirror_verify_connection(&self, connection: &str) -> Option<String> {
+        self.mirror.as_ref().and_then(|m| m.verify_connection(connection))
+    }
+    /// Import an external repo into hull through the installed mirror + a verified connection.
+    pub fn mirror_import(&self, connection: &str, source: &str, dest: &str) -> MirrorResult {
+        match &self.mirror {
+            Some(m) => m.import_repo(connection, source, dest),
+            None => MirrorResult { ok: false, external_ref: None, detail: "no mirror configured".into() },
+        }
+    }
+    /// External repos available to import through the installed mirror + a verified connection.
+    pub fn mirror_importable(&self, connection: &str) -> Vec<String> {
+        self.mirror.as_ref().map(|m| m.list_importable(connection)).unwrap_or_default()
     }
     pub fn mirror_pull_in(&self, repo: &str) -> MirrorResult {
         match &self.mirror {

@@ -52,3 +52,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tar = "0.4"
 # Content-address the review audit artifact (D8) — same hash family keel uses.
 blake3 = "1"
+# Passkey (WebAuthn) accounts: server-side registration/authentication ceremonies. Passwordless.
+webauthn-rs = "0.5"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"

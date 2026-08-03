@@ -1233,16 +1233,20 @@ export function App() {
     if (res.ok) loadPrs();
     else uiAlert(await res.text());
   };
-  const mergePr = async (number: number) => {
+  const mergePr = async (number: number, force = false) => {
     if (!canAct) return uiAlert("Sign in to act.");
+    if (force && !(await uiConfirm({ title: "Merge without a green gate?", body: "As an owner you can override the checks/approval gate. This bypasses a safety signal — use it only for a wedged or misconfigured check.", danger: true, confirmLabel: "Merge anyway" }))) return;
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/prs/${number}/merge`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ actor: actingAs }),
+      body: JSON.stringify({ actor: actingAs, force }),
     });
     if (res.ok) loadPrs();
     else uiAlert(await res.text());
   };
+  // What AI capabilities this instance can fulfill — hide AI actions it can't run.
+  const [caps, setCaps] = useState<{ ai_fix: boolean; ai_review: boolean }>({ ai_fix: true, ai_review: true });
+  useEffect(() => { fetch("/api/capabilities").then((r) => r.json()).then(setCaps).catch(() => {}); }, []);
 
   // Personalized home: the signed-in user's repos across every org they belong to, ranked by
   // activity. Not tied to a single tenant. `myAccounts` also scopes the live feed.
@@ -1914,6 +1918,7 @@ export function App() {
               <div className="px-4 py-3 bg-paper flex items-center gap-3 flex-wrap">
                 <Button size="sm" disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}>Merge</Button>
                 {!canLand && <span className="text-[12.5px] text-muted">Every check must pass before merging.</span>}
+                {!canLand && isTenantOwner && <LinkButton className="ml-auto" onClick={() => mergePr(p.number, true)}>Merge anyway (override)</LinkButton>}
                 {canAct && <LinkButton className="ml-auto" onClick={() => closePr(p.number, false)}>Close</LinkButton>}
               </div>
             </Card>
@@ -1923,7 +1928,7 @@ export function App() {
         // conversation composer's split button). Agent auto-review + request-a-reviewer only.
         const reviewTools = p.state === "open" ? (
           <div className="flex items-center gap-2 flex-wrap">
-            <Button size="sm" variant="secondary" disabled={autoReviewing === p.number} onClick={() => autoReview(p.number)}>{autoReviewing === p.number ? "agent reviewing…" : "⬡ Agent auto-review"}</Button>
+            {caps.ai_review && <Button size="sm" variant="secondary" disabled={autoReviewing === p.number} onClick={() => autoReview(p.number)}>{autoReviewing === p.number ? "agent reviewing…" : "⬡ Agent auto-review"}</Button>}
             {canAct && (
               <Picker size="sm" width={220} placeholder="Request a reviewer…" value="" onChange={(v) => requestReviewer(p.number, v)}
                 options={actors.filter((a) => a.id !== p.author && !p.reviewers?.includes(a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} />
@@ -1937,6 +1942,7 @@ export function App() {
             landGate={gate}
             reviewTools={reviewTools}
             onReviewsChanged={loadReviews}
+            canFix={caps.ai_fix}
             pr={p}
             actors={actors}
             tenant={tenant}
@@ -2366,6 +2372,7 @@ function ReviewPage({
   landGate,
   reviewTools,
   onReviewsChanged,
+  canFix = true,
   pr,
   actors,
   tenant,
@@ -2379,6 +2386,7 @@ function ReviewPage({
   landGate?: React.ReactNode;
   reviewTools?: React.ReactNode;
   onReviewsChanged?: () => void;
+  canFix?: boolean;
   pr: PR | null;
   actors: Actor[];
   tenant: string;
@@ -2621,11 +2629,13 @@ function ReviewPage({
   };
   type ComposerMode = "comment" | "approve" | "request_changes" | "reject";
   const [composerMode, setComposerMode] = useState<ComposerMode>("comment");
+  const composerHasDraft = draft.trim().length > 0;
+  // Labels reflect whether a comment is present: "Approve with comment" vs "Approve".
   const MODES: { id: ComposerMode; label: string; hint: string; color: string; icon: React.ReactNode }[] = [
     { id: "comment", label: "Comment", hint: "Leave a note, no verdict", color: "text-dim", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg> },
-    { id: "approve", label: "Approve", hint: "Good to merge", color: "text-clear-text", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg> },
-    { id: "request_changes", label: "Request changes", hint: "Needs work before merging", color: "text-brass-text", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7v6h6" /><path d="M21 17a9 9 0 0 0-15-6.7L3 13" /></svg> },
-    { id: "reject", label: "Reject", hint: "Do not merge", color: "text-fault-text", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="4.93" y1="4.93" x2="19.07" y2="19.07" /></svg> },
+    { id: "approve", label: composerHasDraft ? "Approve with comment" : "Approve", hint: "Good to merge", color: "text-clear-text", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg> },
+    { id: "request_changes", label: composerHasDraft ? "Request changes with comment" : "Request changes", hint: "Needs work before merging", color: "text-brass-text", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7v6h6" /><path d="M21 17a9 9 0 0 0-15-6.7L3 13" /></svg> },
+    { id: "reject", label: composerHasDraft ? "Reject with comment" : "Reject", hint: "Do not merge", color: "text-fault-text", icon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="4.93" y1="4.93" x2="19.07" y2="19.07" /></svg> },
   ];
   const runMode = (m: ComposerMode) => { if (m === "comment") postThreadComment(); else postReview(m); };
   const composerDisabled = composerBusy || (composerMode === "comment" && !draft.trim());
@@ -2814,7 +2824,7 @@ function ReviewPage({
                     </button>
                   </div>
                   <p className="text-[13px] text-body mt-1 leading-snug">{f.note}</p>
-                  {f.severity !== "info" && pr && f.path && (
+                  {f.severity !== "info" && pr && f.path && canFix && (
                     <div className="mt-2"><Button size="sm" variant="secondary" disabled={!canAct || fixing === idx} onClick={() => fixWithAI(idx, f)}>{fixing === idx ? "fixing…" : "✨ Fix with AI"}</Button></div>
                   )}
                 </div>
@@ -3071,11 +3081,11 @@ function ReviewPage({
                   <div className="flex items-center gap-2 mt-2.5 flex-wrap">
                     <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}>✓ I checked — verified</Button>
                     <Button size="sm" variant="destructive" disabled={!canAct} onClick={() => resolveClaim(c.id, "concern")}>⚑ Raise concern</Button>
-                    {pr && change && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
+                    {pr && change && canFix && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
                   </div>
                 ) : c.status === "contradicted" ? (
                   <div className="flex items-center gap-2 mt-2.5 flex-wrap">
-                    {pr && change && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
+                    {pr && change && canFix && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
                   </div>
                 ) : null}
               </div>
@@ -3141,7 +3151,7 @@ function ReviewPage({
                       <p className="text-[13.5px] text-body mt-1 leading-snug">{f.note}</p>
                       <div className="flex items-center gap-2 mt-2 flex-wrap">
                         <span className="inline-flex items-center gap-1.5 text-[11.5px] text-muted"><Avatar id={reviewer} handle={handleOf(reviewer)} kind={kindOf(reviewer)} size={16} />{handleOf(reviewer)}</span>
-                        {f.severity !== "info" && pr && f.path && (<><span className="text-faint">·</span><Button size="sm" variant="secondary" disabled={!canAct || fixing === idx} onClick={() => fixWithAI(idx, f)}>{fixing === idx ? "fixing…" : "✨ Fix with AI"}</Button></>)}
+                        {f.severity !== "info" && pr && f.path && canFix && (<><span className="text-faint">·</span><Button size="sm" variant="secondary" disabled={!canAct || fixing === idx} onClick={() => fixWithAI(idx, f)}>{fixing === idx ? "fixing…" : "✨ Fix with AI"}</Button></>)}
                       </div>
                     </div>
                   </div>
@@ -3165,13 +3175,16 @@ function ReviewPage({
                 ].sort((a, b) => a.ts - b.ts);
                 if (items.length === 0) return <div className="text-[13px] text-muted">no activity yet — add a review or comment below.</div>;
                 return items.map((e) => e.kind === "review" ? (
-                  <div key={`r${e.r.id}`} className="flex items-center gap-2.5 text-[13px] flex-wrap">
-                    <span className={`grid place-items-center w-[24px] h-[24px] rounded-full flex-none text-[12px] ${vcolor(e.r.verdict)}`}>{e.r.verdict === "approve" ? "✓" : e.r.verdict === "reject" || e.r.verdict === "request_changes" ? "!" : "◍"}</span>
-                    <Avatar id={e.r.reviewer} handle={handleOf(e.r.reviewer)} kind={kindOf(e.r.reviewer)} size={18} />
-                    <b className={kindOf(e.r.reviewer) === "agent" ? "text-steel-text" : ""}>{handleOf(e.r.reviewer)}</b>
-                    <span className="text-muted">{verb[e.r.verdict] ?? "reviewed"} this pull request</span>
-                    {e.r.findings.length > 0 && <button onClick={() => setActiveId(e.r.id)} className="cursor-pointer"><Tag>{e.r.findings.length} finding{e.r.findings.length > 1 ? "s" : ""}</Tag></button>}
-                    <span className="text-faint tabular-nums ml-auto" title={new Date(e.ts * 1000).toLocaleString()}>{timeAgo(e.ts)}</span>
+                  <div key={`r${e.r.id}`} className="grid gap-1.5">
+                    <div className="flex items-center gap-2.5 text-[13px] flex-wrap">
+                      <span className={`grid place-items-center w-[24px] h-[24px] rounded-full flex-none text-[12px] ${vcolor(e.r.verdict)}`}>{e.r.verdict === "approve" ? "✓" : e.r.verdict === "reject" || e.r.verdict === "request_changes" ? "!" : "◍"}</span>
+                      <Avatar id={e.r.reviewer} handle={handleOf(e.r.reviewer)} kind={kindOf(e.r.reviewer)} size={18} />
+                      <b className={kindOf(e.r.reviewer) === "agent" ? "text-steel-text" : ""}>{handleOf(e.r.reviewer)}</b>
+                      <span className="text-muted">{verb[e.r.verdict] ?? "reviewed"} this pull request</span>
+                      {e.r.findings.length > 0 && <button onClick={() => setActiveId(e.r.id)} className="cursor-pointer"><Tag>{e.r.findings.length} finding{e.r.findings.length > 1 ? "s" : ""}</Tag></button>}
+                      <span className="text-faint tabular-nums ml-auto" title={new Date(e.ts * 1000).toLocaleString()}>{timeAgo(e.ts)}</span>
+                    </div>
+                    {e.r.summary?.trim() && <div className="ml-[34px] border border-rule2 rounded-ctl px-3 py-2 bg-surface"><Markdown text={e.r.summary} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} className="text-[13.5px] text-body" /></div>}
                   </div>
                 ) : (
                   <div className="flex gap-2.5" key={`c${e.c.id}`}>

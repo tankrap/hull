@@ -281,6 +281,7 @@ fn make_router(app: App) -> Router {
         .route("/api/home", get(home))
         .route("/api/feed", get(feed))
         .route("/api/actors", get(actors_list).post(register_actor))
+        .route("/api/capabilities", get(capabilities))
         .route("/api/actors/:id/revoke", post(revoke_actor))
         .route("/api/actors/:id/renew", post(renew_delegation))
         .route("/api/actors/:id/nostr", post(set_nostr_key))
@@ -485,6 +486,12 @@ fn require_repo_read(app: &App, headers: &axum::http::HeaderMap, tenant: &str, r
     } else {
         Err((StatusCode::NOT_FOUND, "not found").into_response())
     }
+}
+
+/// What AI capabilities this instance can actually fulfill, so the UI hides actions it can't run
+/// (e.g. "Fix with AI" when no fixer is configured).
+async fn capabilities(State(app): State<App>) -> Json<Value> {
+    Json(json!({ "ai_fix": app.registry.has_fixer(), "ai_review": app.registry.has_reviewer() }))
 }
 
 /// The repos actually hosted on disk (the filesystem registry), plus the seeded domain repos.
@@ -2280,11 +2287,13 @@ async fn merge_pr(
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    match perform_merge(&app, &tenant, &repo, number, &actor).await {
+    let force = _body.get("force").and_then(Value::as_bool).unwrap_or(false);
+    match perform_merge(&app, &tenant, &repo, number, &actor, force).await {
         Ok((pr, closed)) => Json(json!({ "pr": pr, "closed_issues": closed })).into_response(),
         Err((code, msg)) => (code, msg).into_response(),
     }
 }
+
 
 /// The merge gate + merge, shared by the endpoint and the T3 auto-merge flow. Enforces: green
 /// keel-verify, an independent approval (human always counts; an agent's counts per the autonomy
@@ -2296,6 +2305,7 @@ async fn perform_merge(
     repo: &str,
     number: u64,
     actor: &hull_core::Actor,
+    force: bool,
 ) -> Result<(PullRequest, Vec<u64>), (StatusCode, String)> {
     let key = format!("{tenant}/{repo}");
     let Some(mut pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
@@ -2304,6 +2314,9 @@ async fn perform_merge(
     if pr.state == PrState::Merged {
         return Err((StatusCode::CONFLICT, "already merged".into()));
     }
+    // An owner/admin may override the gate (merge despite red/unrun checks or no approval) — the
+    // human-admin escape hatch for a wedged or misconfigured check.
+    let override_ok = force && is_repo_admin(app, tenant, repo, actor.id.as_str());
     // green keel verification of the proposed change
     let green = pr
         .changes
@@ -2311,7 +2324,7 @@ async fn perform_merge(
         .and_then(|c| app.repos.verification(tenant, repo, c))
         .map(|v| v == "green")
         .unwrap_or(false);
-    if !green {
+    if !green && !override_ok {
         return Err((StatusCode::CONFLICT, "cannot merge: change is not keel-verify green".into()));
     }
     // Independent approving reviews (approver != PR author), split by actor kind.
@@ -2347,7 +2360,7 @@ async fn perform_merge(
         hull_core::AutonomyTier::T3 => !protected, // protected paths ALWAYS need a human (D11)
     };
     let approved = human_approval || (agent_approval && agent_approve_counts);
-    if !approved {
+    if !approved && !override_ok {
         let why = if agent_approval && protected {
             "an agent approved, but this change touches a protected path — a human approval is required (D11)"
         } else if agent_approval {
@@ -3141,7 +3154,7 @@ async fn perform_auto_review(
     // agent merges it autonomously — the top of the autonomy ladder. The merge gate still runs, so a
     // protected path or a non-green change is refused even here (D11).
     if tier >= hull_core::AutonomyTier::T3 && review.verdict == Verdict::Approve {
-        match perform_merge(app, tenant, repo, number, reviewer).await {
+        match perform_merge(app, tenant, repo, number, reviewer, false).await {
             Ok((_, closed)) => {
                 app.registry.notify(&NotifyEvent {
                     kind: "auto_merged".into(),

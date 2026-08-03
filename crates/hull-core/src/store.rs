@@ -2,7 +2,7 @@
 //! (accounts/issues/projects as relational rows) that references keel objects by content address.
 //! Keeping this a trait means the server, tests, and the eventual SQL store all share one shape.
 
-use crate::{Account, Actor, Comment, Issue, OwnerRule, Project, PullRequest, Repo, Review, SessionRecord};
+use crate::{Account, Actor, Comment, Issue, OwnerRule, Project, PullRequest, Repo, Review, SessionRecord, Team, User};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,6 +38,17 @@ pub trait Store: Send + Sync {
     /// Set a repo's code-owner rules (replaces the existing set).
     fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>);
     fn owners(&self, repo: &str) -> Vec<OwnerRule>;
+    // ── hosted-account identities (passkey login) ──
+    fn put_user(&self, user: User);
+    fn user(&self, id: &str) -> Option<User>;
+    fn user_by_username(&self, username: &str) -> Option<User>;
+    fn user_by_actor(&self, actor: &str) -> Option<User>;
+    fn users(&self) -> Vec<User>;
+    // ── org teams ──
+    fn put_team(&self, team: Team);
+    fn team(&self, id: &str) -> Option<Team>;
+    fn teams(&self, account: &str) -> Vec<Team>;
+    fn delete_team(&self, id: &str);
 }
 
 /// Match a code-owner glob against a repo-relative path. Supports `dir/**` (prefix), `*.ext`
@@ -65,6 +76,8 @@ pub struct InMemory {
     sessions: RwLock<Vec<SessionRecord>>,
     owners: RwLock<HashMap<String, Vec<OwnerRule>>>,
     projects: RwLock<Vec<Project>>,
+    users: RwLock<HashMap<String, User>>,
+    teams: RwLock<HashMap<String, Team>>,
 }
 
 impl InMemory {
@@ -159,6 +172,33 @@ impl Store for InMemory {
     fn owners(&self, repo: &str) -> Vec<OwnerRule> {
         self.owners.read().unwrap().get(repo).cloned().unwrap_or_default()
     }
+    fn put_user(&self, user: User) {
+        self.users.write().unwrap().insert(user.id.clone(), user);
+    }
+    fn user(&self, id: &str) -> Option<User> {
+        self.users.read().unwrap().get(id).cloned()
+    }
+    fn user_by_username(&self, username: &str) -> Option<User> {
+        self.users.read().unwrap().values().find(|u| u.username.eq_ignore_ascii_case(username)).cloned()
+    }
+    fn user_by_actor(&self, actor: &str) -> Option<User> {
+        self.users.read().unwrap().values().find(|u| u.actor == actor).cloned()
+    }
+    fn users(&self) -> Vec<User> {
+        self.users.read().unwrap().values().cloned().collect()
+    }
+    fn put_team(&self, team: Team) {
+        self.teams.write().unwrap().insert(team.id.clone(), team);
+    }
+    fn team(&self, id: &str) -> Option<Team> {
+        self.teams.read().unwrap().get(id).cloned()
+    }
+    fn teams(&self, account: &str) -> Vec<Team> {
+        self.teams.read().unwrap().values().filter(|t| t.account == account).cloned().collect()
+    }
+    fn delete_team(&self, id: &str) {
+        self.teams.write().unwrap().remove(id);
+    }
 }
 
 /// The full domain state, serialized as one JSON snapshot — the on-disk form of [`FileStore`].
@@ -184,6 +224,10 @@ struct Snapshot {
     owners: HashMap<String, Vec<OwnerRule>>,
     #[serde(default)]
     projects: Vec<Project>,
+    #[serde(default)]
+    users: HashMap<String, User>,
+    #[serde(default)]
+    teams: HashMap<String, Team>,
 }
 
 /// A durable [`Store`] backed by a JSON snapshot on disk, so issues/accounts survive restarts.
@@ -347,6 +391,39 @@ impl Store for FileStore {
     }
     fn owners(&self, repo: &str) -> Vec<OwnerRule> {
         self.inner.read().unwrap().owners.get(repo).cloned().unwrap_or_default()
+    }
+    fn put_user(&self, user: User) {
+        self.mutate(|s| {
+            s.users.insert(user.id.clone(), user);
+        });
+    }
+    fn user(&self, id: &str) -> Option<User> {
+        self.inner.read().unwrap().users.get(id).cloned()
+    }
+    fn user_by_username(&self, username: &str) -> Option<User> {
+        self.inner.read().unwrap().users.values().find(|u| u.username.eq_ignore_ascii_case(username)).cloned()
+    }
+    fn user_by_actor(&self, actor: &str) -> Option<User> {
+        self.inner.read().unwrap().users.values().find(|u| u.actor == actor).cloned()
+    }
+    fn users(&self) -> Vec<User> {
+        self.inner.read().unwrap().users.values().cloned().collect()
+    }
+    fn put_team(&self, team: Team) {
+        self.mutate(|s| {
+            s.teams.insert(team.id.clone(), team);
+        });
+    }
+    fn team(&self, id: &str) -> Option<Team> {
+        self.inner.read().unwrap().teams.get(id).cloned()
+    }
+    fn teams(&self, account: &str) -> Vec<Team> {
+        self.inner.read().unwrap().teams.values().filter(|t| t.account == account).cloned().collect()
+    }
+    fn delete_team(&self, id: &str) {
+        self.mutate(|s| {
+            s.teams.remove(id);
+        });
     }
 }
 
