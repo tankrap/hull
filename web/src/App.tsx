@@ -942,6 +942,7 @@ export function App() {
   // GitHub connection is per-account (org). Import lives under an org you administer + have connected.
   type GhStatus = { connected: boolean; login?: string; provider?: string };
   const [ghStatus, setGhStatus] = useState<GhStatus | null>(null);
+  const [ghInstalls, setGhInstalls] = useState<{ id: string; login: string }[] | null>(null);
   const [importList, setImportList] = useState<string[] | null>(null);
   const [importBusy, setImportBusy] = useState("");
   const loadGh = (acctId: string) => {
@@ -950,11 +951,16 @@ export function App() {
       .then(setGhStatus)
       .catch(() => setGhStatus({ connected: false }));
   };
-  const connectGh = async (acctId: string) => {
-    const inst = (await uiPrompt({ title: "Connect GitHub", label: "App installation id", placeholder: "e.g. 147613000" })) ?? "";
-    if (!inst.trim()) return;
-    const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/github/connect`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ installation: inst.trim() }) });
+  // Discover the GitHub App's installations so the admin PICKS their org — no pasting an id.
+  const loadGhInstalls = async (acctId: string) => {
+    setGhInstalls(null);
+    const d = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/github/installations`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : { installations: [] })).catch(() => ({ installations: [] }));
+    setGhInstalls(d.installations ?? []);
+  };
+  const connectGh = async (acctId: string, installation: string) => {
+    const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/github/connect`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ installation }) });
     if (!res.ok) return uiAlert(await res.text());
+    setGhInstalls(null);
     loadGh(acctId);
   };
   const disconnectGh = async (acctId: string) => {
@@ -1393,7 +1399,7 @@ export function App() {
               ) : (
                 <>
                   <Field label="Organization" hint="you must be an admin">
-                    <Picker block value={importAcct} onChange={(v) => { setImportAcct(v); setImportList(null); loadGh(v); }} options={adminAccounts.map((a) => ({ value: a.id, label: a.handle }))} placeholder="Pick an organization…" />
+                    <Picker block value={importAcct} onChange={(v) => { setImportAcct(v); setImportList(null); setGhInstalls(null); loadGh(v); }} options={adminAccounts.map((a) => ({ value: a.id, label: a.handle }))} placeholder="Pick an organization…" />
                   </Field>
                   {importAcct && (ghStatus?.connected ? (
                     <>
@@ -1415,8 +1421,23 @@ export function App() {
                     </>
                   ) : (
                     <div className="grid gap-2">
-                      <p className="text-[12.5px] text-muted leading-[1.5]">Connect this org to a GitHub App installation to import its repositories. Only an admin can see or import them.</p>
-                      <div><Button size="sm" onClick={() => connectGh(importAcct)}>Connect GitHub</Button></div>
+                      <p className="text-[12.5px] text-muted leading-[1.5]">Connect this org to the hull GitHub App to import its repositories. Only an admin can see or import them.</p>
+                      {ghInstalls === null ? (
+                        <div><Button size="sm" onClick={() => loadGhInstalls(importAcct)}>Connect GitHub</Button></div>
+                      ) : ghInstalls.length === 0 ? (
+                        <div className="text-[12.5px] text-muted leading-[1.5]">No GitHub App installations were found. Install the hull app on your GitHub organization, then <LinkButton onClick={() => loadGhInstalls(importAcct)}>refresh</LinkButton>.</div>
+                      ) : (
+                        <div className="border border-rule2 rounded-ctl overflow-hidden">
+                          <div className="px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-muted bg-paper border-b border-rule2">Pick your GitHub organization</div>
+                          {ghInstalls.map((inst) => (
+                            <div key={inst.id} className="flex items-center gap-3 px-3 py-2 border-b border-rule3 last:border-0 text-[13px]">
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" className="text-dim flex-none"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.53-1.34-1.3-1.7-1.3-1.7-1.06-.72.08-.71.08-.71 1.17.08 1.79 1.2 1.79 1.2 1.04 1.79 2.73 1.27 3.4.97.1-.76.4-1.27.74-1.56-2.56-.29-5.26-1.28-5.26-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.8 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.7 5.4-5.28 5.69.42.36.79 1.07.79 2.16v3.2c0 .31.21.67.8.56A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z" /></svg>
+                              <span className="flex-1 truncate font-medium">{inst.login || `installation ${inst.id}`}</span>
+                              <Button size="sm" onClick={() => connectGh(importAcct, inst.id)}>Connect</Button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </>

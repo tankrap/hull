@@ -147,6 +147,12 @@ pub trait Mirror: Send + Sync {
     fn list_importable(&self, _connection: &str) -> Vec<String> {
         Vec::new()
     }
+    /// Every connection this forge already grants (e.g. GitHub App installations) as
+    /// `(connection_id, external_login)` — so an admin can PICK their org instead of pasting an id.
+    /// Default: none (a mirror with no discoverable connections).
+    fn list_installations(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
     /// Import `source` (a forge full-name) through `connection` INTO hull's `dest` (`tenant/repo`).
     /// Default: unsupported.
     fn import_repo(&self, _connection: &str, _source: &str, _dest: &str) -> MirrorResult {
@@ -603,6 +609,11 @@ impl Registry {
     /// External repos available to import through the installed mirror + a verified connection.
     pub fn mirror_importable(&self, connection: &str) -> Vec<String> {
         self.mirror.as_ref().map(|m| m.list_importable(connection)).unwrap_or_default()
+    }
+    /// Discoverable forge connections (e.g. GitHub App installations) as `(id, login)` — for the
+    /// "pick your org" connect flow that replaces pasting an installation id.
+    pub fn mirror_installations(&self) -> Vec<(String, String)> {
+        self.mirror.as_ref().map(|m| m.list_installations()).unwrap_or_default()
     }
     pub fn mirror_pull_in(&self, repo: &str) -> MirrorResult {
         match &self.mirror {

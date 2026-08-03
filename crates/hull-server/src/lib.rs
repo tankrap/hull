@@ -314,6 +314,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos", get(repos_list).post(create_repo_handler))
         .route("/api/accounts/:id/github", get(github_status).delete(github_disconnect))
         .route("/api/accounts/:id/github/connect", post(github_connect))
+        .route("/api/accounts/:id/github/installations", get(github_installations))
         .route("/api/accounts/:id/github/importable", get(github_importable))
         .route("/api/accounts/:id/repos/import", post(import_repo_handler))
         .route("/api/repos/:tenant/:repo/issues", get(issues).post(create_issue))
@@ -925,6 +926,18 @@ async fn github_status(State(app): State<App>, Path(id): Path<String>, headers: 
         Some(c) => Json(json!({ "connected": true, "provider": c.provider, "login": c.login, "connected_unix": c.connected_unix })).into_response(),
         None => Json(json!({ "connected": false })).into_response(),
     }
+}
+
+/// `GET /api/accounts/:id/github/installations` — the App's installations as `[{id, login}]`, so an
+/// admin can pick their org to connect instead of pasting an installation id. Admin only.
+async fn github_installations(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(resp) = require_account_admin_ref(&app, &headers, &id) {
+        return resp;
+    }
+    let reg = app.registry.clone();
+    let insts = tokio::task::spawn_blocking(move || reg.mirror_installations()).await.unwrap_or_default();
+    let items: Vec<Value> = insts.into_iter().map(|(id, login)| json!({ "id": id, "login": login })).collect();
+    Json(json!({ "installations": items })).into_response()
 }
 
 /// `POST /api/accounts/:id/github/connect` — `{installation}`. Verifies the App installation is real

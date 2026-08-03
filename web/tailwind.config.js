@@ -43,6 +43,9 @@ module.exports = {
       height: {
         ctl: '32px', 'ctl-sm': '26px', 'ctl-lg': '40px',
       },
+      width: {
+        ctl: '32px', 'ctl-sm': '26px', 'ctl-lg': '40px',
+      },
       boxShadow: {
         menu: '0 8px 24px -8px rgba(15,23,42,0.25)',
         modal: '0 16px 40px -12px rgba(15,23,42,0.4)',
