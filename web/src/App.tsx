@@ -128,24 +128,29 @@ type Issue = {
   linked_prs?: string[];
 };
 
-// Deterministic identicon: a gradient derived from the id, initial letter, shape by kind (humans
-// round, agents/orgs a rounded square). Gives every actor a stable, recognizable face.
-function avatarColors(seed: string): { from: string; to: string } {
-  let h = 2166136261;
-  for (let i = 0; i < seed.length; i++) { h ^= seed.charCodeAt(i); h = Math.imul(h, 16777619); }
-  const hue = (h >>> 0) % 360;
-  return { from: `hsl(${hue} 58% 55%)`, to: `hsl(${(hue + 42) % 360} 60% 42%)` };
-}
+// Deterministic GitHub-style identicon: a symmetric 5×5 pixel pattern (left half mirrored) in a hue
+// derived from the id, on a neutral tile. Shape by kind (humans round, agents/orgs a rounded square).
 const Avatar = ({ id, handle, kind, size = 22 }: { id?: string; handle?: string; kind?: string; size?: number }) => {
   const seed = id || handle || "?";
-  const { from, to } = avatarColors(seed);
-  const initial = ((handle || "?").replace(/[^a-zA-Z0-9]/g, "").charAt(0) || "?").toUpperCase();
-  const shape = kind === "agent" ? "rounded-[5px]" : kind === "organization" ? "rounded-[6px]" : "rounded-full";
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) { h ^= seed.charCodeAt(i); h = Math.imul(h, 16777619); }
+  const hash = h >>> 0;
+  const color = `hsl(${hash % 360} 58% ${kind === "agent" ? 52 : 46}%)`;
+  const radius = kind === "agent" ? size * 0.28 : kind === "organization" ? size * 0.22 : "50%";
+  const pad = size * 0.12;
+  const cell = (size - pad * 2) / 5;
+  const rects: React.ReactNode[] = [];
+  // 3 unique columns × 5 rows → 15 bits from the hash; columns 3,4 mirror columns 1,0.
+  for (let col = 0; col < 3; col++) for (let row = 0; row < 5; row++) {
+    if ((hash >> (col * 5 + row)) & 1) {
+      const y = pad + row * cell;
+      rects.push(<rect key={`${col}-${row}`} x={pad + col * cell} y={y} width={cell + 0.5} height={cell + 0.5} fill={color} />);
+      if (col < 2) rects.push(<rect key={`m${col}-${row}`} x={pad + (4 - col) * cell} y={y} width={cell + 0.5} height={cell + 0.5} fill={color} />);
+    }
+  }
   return (
-    <span className={`inline-grid place-items-center ${shape} text-white font-semibold shrink-0 select-none`}
-      style={{ width: size, height: size, background: `linear-gradient(135deg, ${from}, ${to})`, fontSize: Math.round(size * 0.46) }}
-      title={handle} aria-hidden>
-      {initial}
+    <span className="inline-block bg-rule2 shrink-0 select-none overflow-hidden align-middle" style={{ width: size, height: size, borderRadius: radius }} title={handle} aria-hidden>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>{rects}</svg>
     </span>
   );
 };
@@ -1791,39 +1796,63 @@ export function App() {
         const changesRequested = prReviews.some((r) => r.verdict === "request_changes" || r.verdict === "reject");
         const hasApproval = prReviews.some((r) => r.verdict === "approve" && r.reviewer !== p.author);
         const canLand = checksOk && hasApproval && !changesRequested;
-        const statusRow = (state: "ok" | "bad" | "pend", label: string, detail: string) => (
-          <div className="flex items-start gap-2.5">
-            <span className={`grid place-items-center w-[18px] h-[18px] rounded-full text-[11px] font-bold mt-px flex-none ${state === "ok" ? "bg-clear text-white" : state === "bad" ? "bg-fault text-white" : "border border-rule text-muted"}`}>{state === "ok" ? "✓" : state === "bad" ? "✕" : "•"}</span>
-            <div><div className="text-[13.5px] font-medium text-body">{label}</div><div className="text-[12px] text-muted leading-[1.45]">{detail}</div></div>
-          </div>
+        const blockers = prReviews.reduce((n, r) => n + (r.findings ?? []).filter((f) => f.severity === "blocker").length, 0);
+        const gateChecks: { tone: "ok" | "bad" | "wait"; label: string; detail: string }[] = [
+          { tone: checksOk ? "ok" : p.verification === "red" ? "bad" : "wait", label: "keel verify", detail: checksOk ? "Build & tests passed" : p.verification === "red" ? "Build or tests failed" : "Not run yet" },
+          { tone: blockers > 0 ? "bad" : "ok", label: "No blocking findings", detail: blockers > 0 ? `${blockers} blocker${blockers > 1 ? "s" : ""}` : "None raised" },
+          { tone: changesRequested ? "bad" : hasApproval ? "ok" : "wait", label: "Independent approval", detail: changesRequested ? "Changes requested" : hasApproval ? "Approved by a non-author" : "Awaiting review" },
+        ];
+        const okN = gateChecks.filter((c) => c.tone === "ok").length;
+        const badN = gateChecks.filter((c) => c.tone === "bad").length;
+        const overall = badN > 0 ? "bad" : okN === gateChecks.length ? "ok" : "wait";
+        const mergeGlyph = (
+          <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor"><path d="M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Z" /></svg>
         );
-        const gate = (
-          <div className="grid gap-4">
-            <Card>
-              {p.state === "merged" ? (
-                <div className="px-5 py-4 flex items-center gap-3">
-                  <span className="grid place-items-center w-7 h-7 rounded-full bg-clear text-white text-[14px] flex-none">✓</span>
-                  <div><div className="text-[14.5px] font-semibold text-clear-text">Merged</div><div className="text-[12.5px] text-muted tabular-nums">v{p.number} · ⬡ {(p.changes[0] ?? "").slice(0, 8)} · by {handleOf(p.author)}</div></div>
+        const gate = p.state === "merged" ? (
+          <div className="flex gap-3">
+            <div className="w-9 h-9 rounded-ctl bg-clear text-white grid place-items-center flex-none mt-0.5">{mergeGlyph}</div>
+            <Card className="flex-1"><div className="px-4 py-3.5"><div className="text-[14.5px] font-semibold text-clear-text">Merged</div><div className="text-[12.5px] text-muted tabular-nums mt-0.5">v{p.number} · ⬡ {(p.changes[0] ?? "").slice(0, 8)} · by {handleOf(p.author)}</div></div></Card>
+          </div>
+        ) : p.state === "closed" ? (
+          <div className="flex gap-3">
+            <div className="w-9 h-9 rounded-ctl bg-dim text-white grid place-items-center flex-none mt-0.5">{mergeGlyph}</div>
+            <Card className="flex-1"><div className="px-4 py-3.5 flex items-center gap-3"><div className="flex-1"><div className="text-[14.5px] font-semibold">Closed without merging</div><div className="text-[12.5px] text-muted tabular-nums mt-0.5">v{p.number} · by {handleOf(p.author)}</div></div>{canAct && <Button size="sm" variant="secondary" onClick={() => closePr(p.number, true)}>Reopen</Button>}</div></Card>
+          </div>
+        ) : (
+          <div className="flex gap-3">
+            <div className="w-9 h-9 rounded-ctl bg-ink text-surface grid place-items-center flex-none mt-0.5">{mergeGlyph}</div>
+            <Card className="flex-1">
+              {/* overall status header */}
+              <div className="px-4 py-3 flex items-center gap-3 border-b border-rule2">
+                {overall === "wait"
+                  ? <span className="w-[22px] h-[22px] rounded-full border-[3px] border-brass/30 border-t-brass flex-none" />
+                  : <StatusDot tone={overall === "ok" ? "ok" : "bad"} size={22} />}
+                <div className="flex-1 min-w-0">
+                  <div className="text-[14.5px] font-semibold">{overall === "ok" ? "All checks have passed" : overall === "bad" ? "Some checks did not pass" : "Some checks haven't completed yet"}</div>
+                  <div className="text-[12.5px] text-muted">{okN} passed{badN > 0 ? ` · ${badN} failing` : ""}{overall === "wait" ? ` · ${gateChecks.length - okN} pending` : ""}</div>
                 </div>
-              ) : p.state === "closed" ? (
-                <div className="px-5 py-4 flex items-center gap-3">
-                  <span className="grid place-items-center w-7 h-7 rounded-full bg-dim text-white text-[13px] flex-none">✕</span>
-                  <div className="flex-1"><div className="text-[14.5px] font-semibold">Closed without merging</div><div className="text-[12.5px] text-muted tabular-nums">v{p.number} · by {handleOf(p.author)}</div></div>
-                  {canAct && <Button size="sm" variant="secondary" onClick={() => closePr(p.number, true)}>Reopen</Button>}
-                </div>
-              ) : (
-                <>
-                  <div className="px-5 py-4 grid gap-3">
-                    {statusRow(checksOk ? "ok" : p.verification === "red" ? "bad" : "pend", checksOk ? "Checks passed" : p.verification === "red" ? "Checks failed" : "Checks not run", checksOk ? "keel verify is green" : p.verification === "red" ? "keel verify is red — fix and re-run" : "run the checks below")}
-                    {statusRow(changesRequested ? "bad" : hasApproval ? "ok" : "pend", changesRequested ? "Changes requested" : hasApproval ? "Approved" : "Review required", changesRequested ? "a reviewer requested changes" : hasApproval ? "approved by someone other than the author" : "needs an approving review from someone other than the author")}
+              </div>
+              {/* individual checks */}
+              <div className="border-b border-rule2">
+                {gateChecks.map((c, i) => (
+                  <div key={i} className="px-4 py-2.5 flex items-center gap-2.5 border-b border-rule3 last:border-0">
+                    <StatusDot tone={c.tone} size={16} />
+                    <span className="text-[13px] font-medium text-body flex-1 min-w-0 truncate">{c.label}</span>
+                    <span className="text-[12px] text-muted flex-none">{c.detail}</span>
                   </div>
-                  <div className="px-5 py-3.5 border-t border-rule2 bg-paper flex items-center gap-3 flex-wrap">
-                    <Button size="sm" disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}>Merge</Button>
-                    {!canLand && <span className="text-[12.5px] text-muted">Blocked until the checks above pass.</span>}
-                    {canAct && <LinkButton className="ml-auto" onClick={() => closePr(p.number, false)}>Close</LinkButton>}
-                  </div>
-                </>
-              )}
+                ))}
+              </div>
+              {/* conflicts */}
+              <div className="px-4 py-3 flex items-center gap-2.5 border-b border-rule2">
+                <StatusDot tone="ok" size={16} />
+                <div className="min-w-0"><div className="text-[13px] font-medium">No conflicts with the base branch</div><div className="text-[12px] text-muted">keel changes are content-addressed — merging is automatic.</div></div>
+              </div>
+              {/* action */}
+              <div className="px-4 py-3 bg-paper flex items-center gap-3 flex-wrap">
+                <Button size="sm" disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}>Merge voyage</Button>
+                {!canLand && <span className="text-[12.5px] text-muted">Every check must pass before merging.</span>}
+                {canAct && <LinkButton className="ml-auto" onClick={() => closePr(p.number, false)}>Close voyage</LinkButton>}
+              </div>
             </Card>
           </div>
         );
