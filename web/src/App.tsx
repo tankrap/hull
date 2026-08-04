@@ -2,13 +2,32 @@ import { Component, lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef,
 import { createPortal } from "react-dom";
 // Code-split the heavy Shiki-powered @pierre viewers into their own chunk (kept out of the initial bundle).
 const PierreFile = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.File })));
+const PierrePatch = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.PatchDiff })));
 const RepoTree = lazy(() => import("./RepoTree"));
+
+// Build a unified-diff patch string from our server's hunk model so @pierre/diffs can render a
+// proper syntax-highlighted diff (its PatchDiff takes a patch, not our internal shape).
+function hunksToPatch(path: string, hunks: { old_start: number; new_start: number; lines: { tag: string; text: string }[] }[]): string {
+  let out = `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n`;
+  for (const h of hunks) {
+    const oldCount = h.lines.filter((l) => l.tag !== "add").length;
+    const newCount = h.lines.filter((l) => l.tag !== "del").length;
+    out += `@@ -${h.old_start},${oldCount} +${h.new_start},${newCount} @@\n`;
+    for (const l of h.lines) {
+      const sign = l.tag === "add" ? "+" : l.tag === "del" ? "-" : " ";
+      out += sign + l.text + "\n";
+    }
+  }
+  return out;
+}
+// The @pierre/diffs theming, matched to hull tokens (same treatment as the Files-page viewer).
+const DIFF_VARS = { "--diffs-bg": "var(--surface)", "--diffs-fg-number": "var(--faint)", "--diffs-font-size": "12.5px", "--diffs-line-height": "1.65", "--diffs-min-number-column-width": "2.75rem" } as React.CSSProperties;
+const DIFF_GUTTER_CSS = "[data-gutter]{background:var(--paper);border-right:1px solid var(--rule2)}[data-line-number-content]{padding-right:12px;opacity:.85}";
 import * as ed from "@noble/ed25519";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
 import { SearchInput, Switch, Select } from "./ui/Field";
 import { StatusBadge, Tag } from "./ui/Badge";
-import { Alert } from "./ui/Alert";
 import { Drawer, Dialog, PromptModal } from "./ui/Overlay";
 import { SemanticDiff, CodePanel, LocationBar, OldTok, NewTok } from "./ui/SemanticDiff";
 import { createPasskey, getPasskey } from "./webauthn";
@@ -2317,6 +2336,10 @@ export function App() {
             reviewTools={reviewTools}
             onReviewsChanged={loadReviews}
             canFix={caps.ai_fix}
+            canReview={caps.ai_review}
+            onTriage={() => autoReview(p.number)}
+            triaging={autoReviewing === p.number}
+            theme={theme}
             pr={p}
             actors={actors}
             tenant={tenant}
@@ -3036,6 +3059,10 @@ function ReviewPage({
   reviewTools,
   onReviewsChanged,
   canFix = true,
+  canReview = false,
+  onTriage,
+  triaging = false,
+  theme = "light",
   pr,
   actors,
   tenant,
@@ -3050,6 +3077,10 @@ function ReviewPage({
   reviewTools?: React.ReactNode;
   onReviewsChanged?: () => void;
   canFix?: boolean;
+  canReview?: boolean;
+  onTriage?: () => void;
+  triaging?: boolean;
+  theme?: string;
   pr: PR | null;
   actors: Actor[];
   tenant: string;
@@ -3145,6 +3176,23 @@ function ReviewPage({
     });
     if (res.ok) loadResolutions();
     else uiAlert(await res.text());
+  };
+  // Bulk-verify the intent claims at once — the common case is "I read the diff, these all hold",
+  // which shouldn't be 20 separate clicks (and prompts).
+  const [verifyingAll, setVerifyingAll] = useState(false);
+  const verifyAllClaims = async (ids: string[]) => {
+    if (!canAct || ids.length === 0) return;
+    if (!(await uiConfirm({ title: `Verify ${ids.length} claim${ids.length > 1 ? "s" : ""} as read?`, body: "Marks these intent claims as checked by you — use it once you've read the diff and they hold up.", confirmLabel: "Verify all" }))) return;
+    setVerifyingAll(true);
+    try {
+      for (const id of ids) {
+        await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/claims/${id}/resolve`, {
+          method: "POST", headers: { "content-type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ judgment: "verified", note: "" }),
+        });
+      }
+      loadResolutions();
+    } finally { setVerifyingAll(false); }
   };
 
   // "Fix with AI": ask the fixer to propose a patch for a finding; it posts to the PR thread.
@@ -3258,7 +3306,6 @@ function ReviewPage({
   // are the exception: a claim the change's own facts contradict always deserves eyes, so auto-open.
   const [showChanges, setShowChanges] = useState(false);
   const [showClaims, setShowClaims] = useState(false);
-  useEffect(() => { if (contraN > 0) setShowClaims(true); }, [contraN]);
 
   // Discussion thread — the same PR thread as the compact view, followed into the deep review page.
   type Cmt = { id: string; target: string; author: string; body: string; created_unix: number; path?: string; line?: number };
@@ -3496,6 +3543,106 @@ function ReviewPage({
               </div>
               {briefClaims.length > 0 && <Toggle open={showClaims} onClick={() => setShowClaims((v) => !v)}>{claimsLine}</Toggle>}
               {(diff.length > 0 || (semantic?.moves.length ?? 0) > 0) && <Toggle open={showChanges} onClick={() => setShowChanges((v) => !v)}>Changes · {fileN} file{fileN === 1 ? "" : "s"} · <span className="text-clear-text tabular-nums">+{addN}</span> <span className="text-fault-text tabular-nums">−{delN}</span></Toggle>}
+            </Card>
+          );
+        })()}
+
+        {/* Needs attention — the real work, lifted out of the folds to the top. Two tiers so it never
+            becomes a wall: things that are likely wrong (a contradicted claim, a blocker/warning
+            finding) get their own row with fix actions; the many "we can't mechanically prove the
+            author's intent" claims collapse into ONE calm block with a bulk verify + agent triage,
+            expandable if you want to judge them one by one. */}
+        {(() => {
+          const contradictions = (shownLedger?.claims ?? []).filter((c) => c.status === "contradicted" && resolutions[c.id]?.judgment !== "verified");
+          const concerns = (shownLedger?.claims ?? []).filter((c) => resolutions[c.id]?.judgment === "concern");
+          const needs = (shownLedger?.claims ?? []).filter((c) => (c.status === "needs_judgment" || c.status === "self_attested") && !resolutions[c.id]);
+          const findAtt = findingRows.filter((x) => x.f.severity !== "info");
+          const hard = contradictions.length + concerns.length + findAtt.length;
+          if (hard === 0 && needs.length === 0) return null;
+          const kindLoz = "text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded flex-none";
+          const needsIds = needs.map((c) => c.id);
+          return (
+            <Card className="mb-6 ring-1 ring-brass/30">
+              <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
+                <div className="flex items-center gap-2">
+                  <span className="grid place-items-center w-5 h-5 rounded-full bg-brass-wash text-brass-text text-[12px]" aria-hidden>⚑</span>
+                  <span className="text-[13.5px] font-semibold text-ink">Needs your attention</span>
+                </div>
+                {canReview && onTriage && <Button size="sm" variant="secondary" disabled={triaging || !canAct} onClick={onTriage}>{triaging ? "agent triaging…" : "⌕ Let an agent triage"}</Button>}
+              </div>
+              {!canReview && (
+                <div className="px-5 py-2 bg-paper/40 border-b border-rule2 text-[12px] text-muted">Connect an AI reviewer (set <code className="text-body">OPENROUTER_API_KEY</code>) to have agents auto-fix or triage these.</div>
+              )}
+              {/* Tier 1 — likely-wrong: contradictions + findings, one row each with fix. */}
+              {contradictions.map((c) => (
+                <div key={c.id} className="px-5 py-3.5 border-b border-rule2 last:border-0 flex items-start gap-2.5">
+                  <StatusDot tone="bad" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13.5px] text-body leading-snug">{c.text}</div>
+                    <div className="text-[12px] mt-0.5 text-fault-text">The change's own facts contradict this claim — resolve before landing.</div>
+                    {c.evidence.slice(0, 2).map((e, i) => (
+                      <div key={i} className={`text-[12px] mt-1 flex gap-1.5 items-baseline ${e.supports ? "text-dim" : "text-fault-text"}`}>
+                        <span className={`${kindLoz} ${e.supports ? "bg-paper text-muted" : "bg-fault-wash text-fault-text"}`}>{e.kind}</span><span className="leading-snug">{e.detail}</span>
+                      </div>
+                    ))}
+                    <div className="flex items-center gap-2 mt-2.5 flex-wrap">
+                      <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}>✓ Actually fine</Button>
+                      {canFix && change && pr && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {concerns.map((c) => (
+                <div key={c.id} className="px-5 py-3.5 border-b border-rule2 last:border-0 flex items-start gap-2.5">
+                  <StatusDot tone="bad" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13.5px] text-body leading-snug">{c.text}</div>
+                    <div className="text-[12px] mt-0.5 text-fault-text">Concern raised by <b>{resolutions[c.id]?.by}</b>{resolutions[c.id]?.note ? ` — ${resolutions[c.id]?.note}` : ""}.</div>
+                    <div className="flex items-center gap-2 mt-2.5 flex-wrap">
+                      <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}>✓ Mark resolved</Button>
+                      {canFix && change && pr && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {findAtt.map((x) => (
+                <div key={x.key} className="px-5 py-3.5 border-b border-rule2 last:border-0 flex items-start gap-2.5">
+                  <StatusDot tone={x.f.severity === "blocker" ? "bad" : "warn"} />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-[13.5px] text-body leading-snug flex-1">{x.f.note}</span>
+                      <span className={`text-[11px] font-semibold flex-none ${x.f.severity === "blocker" ? "text-fault-text" : "text-brass-text"}`}>{x.f.severity === "blocker" ? "blocker" : "warning"}</span>
+                    </div>
+                    {x.f.path && <div className="text-[12px] text-muted mt-0.5 tabular-nums">{x.f.path}{x.f.line ? `:${x.f.line}` : ""}</div>}
+                    {canFix && pr && x.f.path && <div className="mt-2"><Button size="sm" variant="secondary" disabled={!canAct || fixing === x.idx} onClick={() => fixWithAI(x.idx, x.f)}>{fixing === x.idx ? "fixing…" : "✨ Fix with AI"}</Button></div>}
+                  </div>
+                </div>
+              ))}
+              {/* Tier 2 — the intent claims that can't be proven mechanically: one calm block, not a wall. */}
+              {needs.length > 0 && (
+                <details className="group">
+                  <summary className="px-5 py-3.5 flex items-start gap-2.5 cursor-pointer select-none list-none hover:bg-paper/40">
+                    <StatusDot tone="wait" />
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[13.5px] text-body leading-snug"><b>{needs.length} claim{needs.length > 1 ? "s" : ""} describe what the change intends</b>, but can't be checked mechanically — read the diff and confirm, or hand them to an agent.</div>
+                      <div className="flex items-center gap-2 mt-2.5 flex-wrap">
+                        <Button size="sm" variant="secondary" disabled={!canAct || verifyingAll} onClick={(e: React.MouseEvent) => { e.preventDefault(); verifyAllClaims(needsIds); }}>{verifyingAll ? "verifying…" : `✓ I read the diff — verify all ${needs.length}`}</Button>
+                        <span className="text-[12px] text-faint">or review individually ↓</span>
+                      </div>
+                    </div>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-faint mt-0.5 flex-none group-open:rotate-90 transition-transform"><polyline points="9 18 15 12 9 6" /></svg>
+                  </summary>
+                  <div className="border-t border-rule2">
+                    {needs.map((c) => (
+                      <div key={c.id} className="px-5 py-2.5 pl-[52px] border-b border-rule3 last:border-0 flex items-center gap-3">
+                        <span className="text-[13px] text-body flex-1 leading-snug min-w-0">{c.text}</span>
+                        <button disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")} className="text-[12px] text-clear-text hover:underline flex-none disabled:opacity-50">verify</button>
+                        <button disabled={!canAct} onClick={() => resolveClaim(c.id, "concern")} className="text-[12px] text-fault-text hover:underline flex-none disabled:opacity-50">concern</button>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
             </Card>
           );
         })()}
@@ -3741,7 +3888,8 @@ function ReviewPage({
             const focusedHunks = focusLine != null && !forceOpen ? indexed.filter(({ h }) => hunkHasLine(h, focusLine)) : [];
             const shownHunks = focusedHunks.length > 0 ? focusedHunks : indexed;
             const hiddenHunks = indexed.length - shownHunks.length;
-            const hunkNodes = isOpen ? (
+            // Our own line renderer — kept as the fallback if @pierre/diffs fails to load/render.
+            const customHunks = (
               <>
                 {hiddenHunks > 0 && (
                   <button onClick={() => setDiffFocus((s) => { const c = { ...s }; delete c[f.path]; return c; })}
@@ -3750,6 +3898,26 @@ function ReviewPage({
                   </button>
                 )}
                 {shownHunks.map(({ h, hi }) => renderHunk(h, hi))}
+              </>
+            );
+            // Primary: @pierre/diffs renders a proper Shiki-highlighted unified diff (github-light/dark,
+            // hull-tinted gutter). Falls back to our line renderer on error.
+            const hunkNodes = isOpen ? (
+              <>
+                {hiddenHunks > 0 && (
+                  <button onClick={() => setDiffFocus((s) => { const c = { ...s }; delete c[f.path]; return c; })}
+                    className="w-full mb-2 py-2 rounded-ctl border border-dashed border-rule text-[12.5px] font-medium text-steel-text hover:bg-steel-wash/50 hover:border-ctl transition-colors flex items-center justify-center gap-1.5">
+                    Showing 1 of {indexed.length} sections · show the whole file
+                  </button>
+                )}
+                <Boundary fallback={customHunks}>
+                  <Suspense fallback={<div className="px-3 py-6 text-[12.5px] text-muted">Loading diff…</div>}>
+                    <div className="rounded-ctl border border-rule2 overflow-hidden overflow-x-auto text-[13px]" style={DIFF_VARS}>
+                      <PierrePatch patch={hunksToPatch(f.path, shownHunks.map((x) => x.h))} disableWorkerPool
+                        options={{ theme: { light: "github-light", dark: "github-dark" }, themeType: theme === "dark" ? "dark" : "light", disableFileHeader: true, overflow: "scroll", tokenizeMaxLength: 400_000, unsafeCSS: DIFF_GUTTER_CSS }} />
+                    </div>
+                  </Suspense>
+                </Boundary>
               </>
             ) : null;
             // Drop punctuation/comment-only noise, then dedupe so a repeated edit isn't listed twice.
@@ -3790,8 +3958,9 @@ function ReviewPage({
                   const reviewBar = canAct && pr ? (
                     <div className="flex items-center gap-2 py-1.5">
                       {!forceOpen && <button onClick={() => setExpandedDiffs((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>}
-                      <button onClick={() => postReview("approve")} disabled={composerBusy} className="ml-auto inline-flex items-center gap-1.5 h-ctl-sm px-2.5 rounded-ctl-sm bg-clear-wash text-clear-text text-[12.5px] font-semibold hover:brightness-95 disabled:opacity-50"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>Approve</button>
-                      <button onClick={() => document.getElementById("pr-composer")?.scrollIntoView({ block: "center", behavior: "smooth" })} className="inline-flex items-center gap-1 h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl text-dim text-[12.5px] hover:text-ink hover:border-dim">Comment ↓</button>
+                      {/* No per-file "Approve" here — approval is PR-wide and belongs in the composer, not
+                          a per-file bar where it reads as "approve this file" but lands the whole review. */}
+                      <button onClick={() => document.getElementById("pr-composer")?.scrollIntoView({ block: "center", behavior: "smooth" })} className="ml-auto inline-flex items-center gap-1 h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl text-dim text-[12.5px] hover:text-ink hover:border-dim">Comment on this file ↓</button>
                     </div>
                   ) : (!forceOpen ? (
                     <div className="flex justify-end"><button onClick={() => setExpandedDiffs((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff</button></div>
@@ -3884,8 +4053,6 @@ function ReviewPage({
           const dotTone = (s: string): "ok" | "bad" | "warn" | "wait" => s === "contradicted" ? "bad" : s === "needs_judgment" ? "wait" : s === "self_attested" ? "warn" : "ok";
           const labelColor = (s: string) => s === "contradicted" ? "text-fault-text" : (s === "needs_judgment" || s === "self_attested") ? "text-brass-text" : "text-clear-text";
           const isVerified = (s: string) => s === "verified_mechanically" || s === "verified_read_only";
-          const order: Record<string, number> = { contradicted: 0, needs_judgment: 1, self_attested: 2 };
-          const attention = ledger.claims.filter((c) => !isVerified(c.status)).sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
           const verified = ledger.claims.filter((c) => isVerified(c.status));
           const Row = (c: Claim) => (
             <div key={c.id} className="px-5 py-3.5 border-b border-rule2 last:border-0 flex gap-3">
@@ -3929,18 +4096,14 @@ function ReviewPage({
             <Card>
               <SectionHeader label="Reconciliation" right={<span className="text-[12.5px] text-muted tabular-nums">{supported} supported{needs ? ` · ${needs} to judge` : ""}{contradicted ? ` · ${contradicted} contradicted` : ""}</span>} />
               <div className="px-5 py-2.5 bg-paper/40 border-b border-rule2 text-[12.5px] text-muted leading-snug">
-                {snapshot ? "The evidence this verdict was based on." : "Each claim the change makes, checked against what the code actually does."}
+                Each claim the change makes, checked against what the code actually does — the evidence
+                behind the verdict. Anything needing a human is lifted to “Needs your attention” above.
               </div>
-              {contradicted > 0 && (
-                <div className="px-5 pt-3.5">
-                  <Alert kind="error" lead={`${contradicted} claim${contradicted > 1 ? "s" : ""} the change's own facts contradict.`}>Don't land without resolving these.</Alert>
-                </div>
-              )}
               {(ledger.unclaimed?.length ?? 0) > 0 && (
-                <details className="group border-b border-rule2" open={(ledger.unclaimed!.length) <= 8}>
+                <details className="group border-b border-rule2">
                   <summary className="px-5 py-3.5 flex gap-3 cursor-pointer select-none list-none items-start hover:bg-paper/40">
                     <StatusDot tone="warn" />
-                    <div className="min-w-0 flex-1 text-[13.5px] text-body leading-snug"><b>{ledger.unclaimed!.length} unclaimed change{ledger.unclaimed!.length > 1 ? "s" : ""}</b> — work the narrative never mentions; account for it before landing.</div>
+                    <div className="min-w-0 flex-1 text-[13.5px] text-body leading-snug"><b>{ledger.unclaimed!.length} unclaimed change{ledger.unclaimed!.length > 1 ? "s" : ""}</b> — semantic edits the narrative never names (usually just a diff larger than the summary).</div>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-faint mt-0.5 flex-none group-open:rotate-90 transition-transform"><polyline points="9 18 15 12 9 6" /></svg>
                   </summary>
                   <div className="px-5 pb-3.5 pl-[52px]">
@@ -3949,18 +4112,8 @@ function ReviewPage({
                   </div>
                 </details>
               )}
-              {attention.length > 0 ? attention.map(Row) : (
-                <div className="px-5 py-4 text-[13px] text-dim flex items-center gap-2.5"><StatusDot tone="ok" /> Every claim is supported — nothing needs your judgment.</div>
-              )}
-              {verified.length > 0 && (
-                <details className="group border-t border-rule2">
-                  <summary className="px-5 py-3 text-[13px] cursor-pointer flex items-center gap-2 text-dim hover:text-ink select-none list-none">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="group-open:rotate-90 transition-transform text-faint"><polyline points="9 18 15 12 9 6" /></svg>
-                    <span className="font-semibold text-clear-text">{verified.length} verified claim{verified.length > 1 ? "s" : ""}</span>
-                    <span className="text-muted">— mechanically checked, no action needed</span>
-                  </summary>
-                  <div className="border-t border-rule2">{verified.map(Row)}</div>
-                </details>
+              {verified.length > 0 ? verified.map(Row) : (
+                <div className="px-5 py-4 text-[13px] text-dim flex items-center gap-2.5"><StatusDot tone="ok" /> No mechanically-verified claims.</div>
               )}
             </Card>
           );
