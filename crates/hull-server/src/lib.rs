@@ -311,6 +311,7 @@ fn make_router(app: App) -> Router {
         // account self-service (settings): username/email + passkey management
         .route("/api/account", get(account_get).put(account_update))
         .route("/api/profile", get(profile))
+        .route("/api/orgs/:handle/profile", get(org_profile))
         .route("/api/account/passkeys/start", post(account_passkey_start))
         .route("/api/account/passkeys/finish", post(account_passkey_finish))
         .route("/api/account/passkeys/:cred", axum::routing::delete(account_passkey_delete))
@@ -551,6 +552,59 @@ async fn profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Resp
     agents_v.sort_by(|a, b| b["count"].as_u64().unwrap_or(0).cmp(&a["count"].as_u64().unwrap_or(0)));
     let human_count = by_handle.get(&me.handle).copied().unwrap_or(0);
     Json(json!({ "handle": me.handle, "bio": bio, "total": total, "human_count": human_count, "days": days_v, "agents": agents_v,
+        "tokens": { "in": tok_in, "out": tok_out, "series": tok_v } })).into_response()
+}
+
+/// `GET /api/orgs/:handle/profile` — an organization's public profile: a year of contributions from
+/// **everyone** who works in its repos (humans and their agents), bucketed by day, plus token usage
+/// over time. The org page is public, so this needs no auth; it only reads repos the org owns.
+async fn org_profile(State(app): State<App>, axum::extract::Path(handle): axum::extract::Path<String>) -> Response {
+    let Some(acct) = app.store.accounts().into_iter().find(|a| a.handle == handle) else {
+        return (StatusCode::NOT_FOUND, "no such organization").into_response();
+    };
+    let since = now().saturating_sub(371 * 86_400);
+    // An author handle counts as an agent if any actor bearing that handle is an agent.
+    let mut agent_handles: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for a in app.store.actors() {
+        if a.kind == hull_core::ActorKind::Agent { agent_handles.insert(a.handle.clone()); }
+    }
+    let handle_of = |author: &str| -> String { author.split_once(" <").map(|(n, _)| n.trim().to_string()).unwrap_or_else(|| author.trim().to_string()) };
+    let mut days: HashMap<u64, (u64, u64)> = HashMap::new();
+    let mut by_handle: HashMap<String, u64> = HashMap::new();
+    let mut total = 0u64;
+    let mut tok_days: HashMap<u64, (u64, u64)> = HashMap::new();
+    let (mut tok_in, mut tok_out) = (0u64, 0u64);
+    for repo in app.store.repos().into_iter().filter(|r| r.owner == acct.id) {
+        let key = format!("{}/{}", acct.handle, repo.name);
+        let roots: Vec<String> = app.store.prs(&key).into_iter().flat_map(|p| p.changes).collect();
+        for (author, ts, id) in app.repos.history(&acct.handle, &repo.name, &roots, since) {
+            let h = handle_of(&author);
+            let e = days.entry(ts / 86_400).or_default();
+            if agent_handles.contains(&h) { e.1 += 1; } else { e.0 += 1; }
+            *by_handle.entry(h.clone()).or_default() += 1;
+            total += 1;
+            if let Some(sr) = app.store.session_record(&key, &id) {
+                let te = tok_days.entry(ts / 86_400).or_default();
+                te.0 += sr.tokens_in; te.1 += sr.tokens_out;
+                tok_in += sr.tokens_in; tok_out += sr.tokens_out;
+            }
+        }
+    }
+    let days_v: Vec<Value> = days.into_iter().map(|(d, (human, agent))| json!({ "day": d, "human": human, "agent": agent, "count": human + agent })).collect();
+    let mut tok_v: Vec<Value> = tok_days.into_iter().map(|(d, (i, o))| json!({ "day": d, "in": i, "out": o })).collect();
+    tok_v.sort_by_key(|v| v["day"].as_u64().unwrap_or(0));
+    // Top contributors (agents and humans alike), busiest first.
+    let mut contributors: Vec<Value> = by_handle
+        .iter()
+        .map(|(h, c)| json!({ "handle": h, "count": c, "agent": agent_handles.contains(h) }))
+        .collect();
+    contributors.sort_by(|a, b| b["count"].as_u64().unwrap_or(0).cmp(&a["count"].as_u64().unwrap_or(0)));
+    // Public repo names, so a signed-out visitor can still browse the org (private repos are omitted).
+    let repo_names: Vec<String> = app.store.repos().into_iter()
+        .filter(|r| r.owner == acct.id && !app.repo_settings.get(&format!("{}/{}", acct.handle, r.name)).private)
+        .map(|r| r.name).collect();
+    Json(json!({ "handle": acct.handle, "members": acct.members.len(), "repos": repo_names.len(), "repo_names": repo_names,
+        "total": total, "days": days_v, "contributors": contributors,
         "tokens": { "in": tok_in, "out": tok_out, "series": tok_v } })).into_response()
 }
 

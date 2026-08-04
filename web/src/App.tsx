@@ -1046,6 +1046,13 @@ export function App() {
   const [profileReadme, setProfileReadme] = useState<string | null>(null); // README of <me>/<me>, if any
   const [bioDraft, setBioDraft] = useState<string | null>(null); // non-null = editing
   const loadProfile = () => { if (token) fetch("/api/profile", { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then(setProfileStats).catch(() => {}); };
+  // The org page mirrors the user profile (banner, Overview/Repos tabs, contributions + tokens). It's
+  // public, so these load for any visitor.
+  type OrgStats = { handle: string; members: number; repos: number; repo_names: string[]; total: number; days: HeatDay[]; contributors: { handle: string; count: number; agent: boolean }[]; tokens?: { in: number; out: number; series: { day: number; in: number; out: number }[] } };
+  const [orgStats, setOrgStats] = useState<OrgStats | null>(null);
+  const [orgTab, setOrgTab] = useState<"overview" | "repos" | "people">("overview");
+  const [orgReadme, setOrgReadme] = useState<string | null>(null);
+  const [orgRepoQ, setOrgRepoQ] = useState("");
   useEffect(() => {
     if (authPage !== "profile" || !me) { setProfileReadme(null); return; }
     loadProfile();
@@ -1088,6 +1095,14 @@ export function App() {
 
   // ── org management (members + teams) + repo settings ──────────────────────
   const [orgHandle, setOrgHandle] = useState<string | null>(() => parseRoute(location.pathname).orgHandle);
+  useEffect(() => {
+    if (!orgHandle) { setOrgStats(null); setOrgReadme(null); return; }
+    setOrgTab("overview");
+    fetch(`/api/orgs/${encodeURIComponent(orgHandle)}/profile`).then((r) => (r.ok ? r.json() : null)).then(setOrgStats).catch(() => {});
+    fetch(`/api/repos/${encodeURIComponent(orgHandle)}/${encodeURIComponent(orgHandle)}/blob?path=README.md`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : null)).then((d) => setOrgReadme(d && !d.missing && !d.binary ? (d.text || "") : null)).catch(() => setOrgReadme(null));
+    /* eslint-disable-next-line */
+  }, [orgHandle]);
   type TeamT = { id: string; name: string; members: { actor: string; handle: string; role: string }[] };
   const [teams, setTeams] = useState<TeamT[]>([]);
   const [memberPick, setMemberPick] = useState({ actor: "", role: "write" });
@@ -2360,18 +2375,91 @@ export function App() {
       {/* ── ORG · members + teams ─────────────────────────────────────────── */}
       {orgHandle && (() => {
         const acct = orgAccount;
-        if (!acct) return <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-16 text-[13px] text-muted">no organization <b className="text-body">{orgHandle}</b></div>;
-        const amAdmin = !!me && acct.members.some((m) => m.actor === me.id && (m.role === "owner" || m.role === "admin"));
-        const candidates = actors.filter((a) => !acct.members.some((m) => m.actor === a.id));
+        // The org page is public: a member sees the full page (incl. People management); a signed-out
+        // visitor still gets Overview + Repositories, rendered from the public org-profile endpoint.
+        if (!acct && !orgStats) return <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-16 text-[13px] text-muted">no organization <b className="text-body">{orgHandle}</b></div>;
+        const amAdmin = !!me && !!acct && acct.members.some((m) => m.actor === me.id && (m.role === "owner" || m.role === "admin"));
+        const candidates = actors.filter((a) => !acct || !acct.members.some((m) => m.actor === a.id));
+        const oHandle = acct?.handle ?? orgStats?.handle ?? (orgHandle ?? "");
+        const oMembers = acct ? acct.members.length : (orgStats?.members ?? 0);
+        const oRepos: string[] = acct ? acct.repos : (orgStats?.repo_names ?? []);
         return (
-          <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
-            <div className="flex items-center gap-3 flex-wrap mb-1.5">
-              <Avatar id={acct.id} handle={acct.handle} kind="organization" size={32} />
-              <h1 className="text-[25px] font-semibold tracking-tight">{acct.handle}</h1>
-              <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge bg-rule2 text-dim">{acct.kind}</span>
-            </div>
-            <p className="text-[13px] text-muted mb-6">{acct.members.length} member{acct.members.length === 1 ? "" : "s"} · {teams.length} team{teams.length === 1 ? "" : "s"} · {acct.repos.length} repo{acct.repos.length === 1 ? "" : "s"}</p>
-            <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-12 gap-y-9">
+          <div className="grid gap-6">
+            {/* Full-bleed banner — the org page is public and mirrors the user profile. */}
+            <div className="relative left-1/2 right-1/2 -mx-[50vw] w-screen -mt-12 -z-0 h-[200px] bg-gradient-to-br from-brass-wash via-paper to-steel-wash pointer-events-none" aria-hidden />
+            <div className="max-w-[1180px] mx-auto w-full px-6 sm:px-8 grid gap-6">
+              <div className="-mt-[104px] relative">
+                <div className="flex items-end gap-4">
+                  <span className="rounded-2xl ring-4 ring-surface bg-surface shadow-modal"><Avatar id={acct?.id} handle={oHandle} kind="organization" size={104} /></span>
+                  <div className="flex-1 min-w-0 pb-1">
+                    <div className="text-[24px] font-semibold leading-tight">{oHandle}</div>
+                    <div className="text-[13px] text-muted">organization · {oMembers} member{oMembers === 1 ? "" : "s"}{acct ? ` · ${teams.length} team${teams.length === 1 ? "" : "s"}` : ""} · {oRepos.length} repo{oRepos.length === 1 ? "" : "s"}</div>
+                  </div>
+                  {amAdmin && <button onClick={() => setNewRepoOpen(true)} className="text-[13px] text-steel-text hover:underline flex-none pb-1">+ New repo</button>}
+                </div>
+              </div>
+
+              {/* Org tabs — same shape as the profile page. People is members-only. */}
+              <div className="border-b border-rule2 -mt-1">
+                <HTabs items={["Overview", `Repositories ${oRepos.length}`, ...(acct ? [`People ${oMembers}`] : [])]} value={orgTab === "overview" ? 0 : orgTab === "repos" ? 1 : 2} onChange={(i: number) => setOrgTab(i === 0 ? "overview" : i === 1 ? "repos" : "people")} />
+              </div>
+
+              {orgTab === "overview" && (
+                <div className="grid gap-6">
+                  {orgReadme !== null && (
+                    <Card>
+                      <SectionHeader label={`${oHandle} / ${oHandle}`} right={<span className="text-[12px] text-muted">README.md</span>} />
+                      <div className="px-6 py-5"><Markdown text={orgReadme || "_This README is empty._"} linkBase={`/${encodeURIComponent(oHandle)}/${encodeURIComponent(oHandle)}`} className="text-[14px] text-body leading-[1.6]" /></div>
+                    </Card>
+                  )}
+                  <Card>
+                    <SectionHeader label={`${orgStats?.total ?? 0} contribution${(orgStats?.total ?? 0) === 1 ? "" : "s"} in the last year`} />
+                    <div className="px-5 py-4">
+                      <ContributionHeatmap days={orgStats?.days ?? []} />
+                      {(orgStats?.contributors ?? []).length > 0 && (
+                        <div className="mt-4 grid gap-1.5 pt-3 border-t border-rule3">
+                          {(orgStats?.contributors ?? []).slice(0, 8).map((c) => (
+                            <div key={c.handle} className="flex items-center gap-2 text-[14px]">
+                              <Avatar handle={c.handle} kind={c.agent ? "agent" : "human"} size={18} />
+                              <span className={c.agent ? "text-steel-text" : "font-medium"}>{c.handle}</span>
+                              {c.agent && <span className="text-[11px] text-faint">agent</span>}
+                              <span className="ml-auto tabular-nums text-muted">{c.count}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </Card>
+                  <TokenKpis tokens={orgStats?.tokens} scope={`${oHandle}'s repos`} />
+                </div>
+              )}
+
+              {orgTab === "repos" && (() => {
+                const oq = orgRepoQ.trim().toLowerCase();
+                const list = oq ? oRepos.filter((rp: string) => rp.toLowerCase().includes(oq)) : oRepos;
+                return (
+                  <div className="grid gap-4">
+                    <div className="flex justify-end"><div className="w-[260px]"><SearchInput placeholder="Find a repository" shortcut="" value={orgRepoQ} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setOrgRepoQ(e.target.value)} /></div></div>
+                    {oRepos.length === 0 && <div className="py-8 text-[13px] text-muted">No repositories yet.</div>}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {list.map((rp: string) => (
+                        <button key={rp} onClick={() => navigate(`/${encodeURIComponent(oHandle)}/${encodeURIComponent(rp)}`)} className="group text-left bg-surface border border-rule rounded-card p-4 hover:border-ctl hover:shadow-[0_2px_10px_-4px_rgba(15,23,42,0.12)] transition-all">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-muted flex-none"><path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8ZM5 12.25a.25.25 0 0 1 .25-.25h3.5a.25.25 0 0 1 .25.25v3.25a.25.25 0 0 1-.4.2l-1.45-1.087a.25.25 0 0 0-.3 0L5.4 15.7a.25.25 0 0 1-.4-.2Z" /></svg>
+                            <span className="font-semibold text-[14.5px] truncate group-hover:text-steel-text transition-colors">{rp}</span>
+                          </div>
+                          <div className="text-[12px] text-faint mt-0.5 truncate">{oHandle}/{rp}</div>
+                        </button>
+                      ))}
+                    </div>
+                    {oq && list.length === 0 && <div className="py-6 text-[13px] text-muted">No repositories match “{orgRepoQ}”.</div>}
+                    {amAdmin && <div className="pt-1"><LinkButton onClick={() => setNewRepoOpen(true)}>+ new repo</LinkButton></div>}
+                  </div>
+                );
+              })()}
+
+              {acct && orgTab === "people" && (
+              <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-12 gap-y-9">
               <section className="min-w-0 grid gap-8">
                 {amAdmin && (
                   <div>
@@ -2449,15 +2537,11 @@ export function App() {
                 </div>
               </section>
               <aside className="grid gap-5 content-start">
-                <Module title="Repositories">
-                  {acct.repos.length === 0 && <span className="text-[13px] text-muted">none</span>}
-                  {acct.repos.map((rp: string) => (
-                    <button key={rp} className="text-left text-[13.5px] text-body hover:text-steel-text cursor-pointer" onClick={() => navigate(`/${encodeURIComponent(acct.handle)}/${encodeURIComponent(rp)}`)}>{rp} →</button>
-                  ))}
-                  {amAdmin && <div className="pt-1"><LinkButton onClick={() => setNewRepoOpen(true)}>+ new repo</LinkButton></div>}
-                </Module>
                 {!amAdmin && <Module title="Access"><span className="text-[12.5px] text-muted">You are viewing as a {me ? "member" : "guest"}. Owner/admin rights are needed to manage members and teams.</span></Module>}
+                <Module title="Quick links"><button className="text-left text-[13.5px] text-steel-text hover:underline cursor-pointer" onClick={() => setOrgTab("repos")}>Browse repositories →</button></Module>
               </aside>
+              </div>
+              )}
             </div>
           </div>
         );
@@ -3316,8 +3400,14 @@ function ReviewPage({
   const [showChanges, setShowChanges] = useState(false);
   const [showClaims, setShowClaims] = useState(false);
   // Opening a detail (Changes or Claims) enters "focus mode": everything else — session, attention,
-  // conversation — collapses so you're reading one thing, and comes back when you close it.
+  // conversation — COLLAPSES to a slim bar (not removed) so you're reading one thing but never lose
+  // track of what's there; clicking a bar (or closing the detail) brings it all back.
   const focusMode = showChanges || showClaims;
+  const collapsedBar = (label: string) => (
+    <button onClick={() => { setShowChanges(false); setShowClaims(false); }} className="w-full flex items-center gap-2 px-5 py-3 rounded-card border border-rule bg-surface text-[13px] font-medium text-dim hover:text-ink hover:bg-paper/40 transition-colors">
+      <Ico size={13} path={<polyline points="9 18 15 12 9 6" />} />{label}<span className="ml-auto text-[12px] text-faint">collapsed</span>
+    </button>
+  );
   const [attnIdx, setAttnIdx] = useState(0); // cursor into the one-by-one attention stepper
   const [taskModal, setTaskModal] = useState(false); // "view full task" overlay
   // When the big title scrolls out of view, condense it into the sticky top bar so the reviewer
@@ -3546,6 +3636,8 @@ function ReviewPage({
           </Popover>
         </div>
 
+        {/* One consistent 24px rhythm for every top-level section on the page. */}
+        <div className="grid gap-6">
         {/* Digest — the page's calm headline: a plain-English summary of the change (an agent
             reviewer's own words when one has reviewed, else the change's subject line), a one-line
             verdict, and what — if anything — needs a human. The claims + diff fold beneath it, so the
@@ -3628,7 +3720,7 @@ function ReviewPage({
 
         {/* Session — surfaced up here (was buried at the bottom): a summary of what the agent set out
             to do, with the full task one click away, its carried-forward lesson, and the run metrics. */}
-        {!focusMode && change?.session && (() => {
+        {change?.session && (focusMode ? collapsedBar("Session") : (() => {
           const task = change.session.task || "";
           const long = task.length > 240;
           return (
@@ -3661,13 +3753,13 @@ function ReviewPage({
               </div>
             </Card>
           );
-        })()}
+        })())}
 
         {/* Needs attention — a one-at-a-time stepper so review FLOWS: each item that wants a human
             (a contradicted claim, a raised concern, a blocker/warning finding, or an unverifiable
             intent claim) gets the full frame with big, obvious controls. Acting on it advances to the
             next; a bulk "verify all intent claims" clears the long tail without 20 clicks. */}
-        {!focusMode && (() => {
+        {(() => {
           const contradictions = (shownLedger?.claims ?? []).filter((c) => c.status === "contradicted" && resolutions[c.id]?.judgment !== "verified");
           const concerns = (shownLedger?.claims ?? []).filter((c) => resolutions[c.id]?.judgment === "concern");
           const needs = (shownLedger?.claims ?? []).filter((c) => (c.status === "needs_judgment" || c.status === "self_attested") && !resolutions[c.id]);
@@ -3680,6 +3772,7 @@ function ReviewPage({
             ...needs.map((c): Item => ({ kind: "needs", key: c.id, claim: c })),
           ];
           if (items.length === 0) return null;
+          if (focusMode) return collapsedBar("Needs your attention");
           const idx = Math.min(attnIdx, items.length - 1);
           const cur = items[idx];
           const kindLoz = "text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded flex-none";
@@ -3738,7 +3831,7 @@ function ReviewPage({
           );
         })()}
 
-        <div className="grid gap-6 mt-3">
+        <div className="grid gap-6">
           <div className="min-w-0 grid gap-6">
         {/* changes — the flagship semantic-diff surface, revealed (and scrolled to) from the digest. */}
         <div id="changes-section" className="scroll-mt-20" />
@@ -4184,7 +4277,7 @@ function ReviewPage({
 
         {/* Findings live inline in the diff now (at their line, collapsible). Only findings we can't
             anchor to a diff line get a residual card here. */}
-        {unmappedFindings.length > 0 && (() => {
+        {unmappedFindings.length > 0 && (focusMode ? collapsedBar("Other findings") : (() => {
           const sevColor = (s: string) => s === "blocker" ? "text-fault-text" : s === "warn" ? "text-brass-text" : "text-steel-text";
           return (
             <Card>
@@ -4209,10 +4302,10 @@ function ReviewPage({
               </div>
             </Card>
           );
-        })()}
+        })())}
 
         {/* conversation timeline — reviews + comments, one accountable thread */}
-        {!focusMode && pr && (
+        {pr && (focusMode ? collapsedBar("Conversation") : (
           <Card id="pr-conversation" className="scroll-mt-4">
             <SectionHeader label="Conversation" right={reviewTools ?? <span className="text-[12.5px] text-muted">reviews and comments, humans and agents</span>} />
             <div className="px-5 py-4 grid gap-3.5">
@@ -4293,9 +4386,10 @@ function ReviewPage({
               </div>
             </div>
           </Card>
-        )}
+        ))}
 
           </div>
+        </div>
         </div>
 
       </div>
