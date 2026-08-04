@@ -641,10 +641,14 @@ pub struct FileDiff {
     pub status: String,
     pub ops: Vec<String>,
     pub hunks: Vec<HunkOut>,
+    /// The file changed but is past [`MAX_BLOB_FOR_DIFF`], so no line hunks were computed. Lets the
+    /// UI say "too large to diff" instead of silently rendering an empty ("0 lines") diff.
+    #[serde(default)]
+    pub too_large: bool,
 }
 
 const MAX_DIFF_FILES: usize = 40;
-const MAX_BLOB_FOR_DIFF: usize = 256 * 1024; // skip huge/binary blobs
+const MAX_BLOB_FOR_DIFF: usize = 1024 * 1024; // skip only genuinely huge/binary blobs (line-diffing 1MB of text is cheap)
 
 /// A file relocated with byte-identical content — a **pure move**, detected exactly by content
 /// address (the blob id is unchanged), not guessed by similarity like git.
@@ -843,10 +847,12 @@ impl RepoHost {
                 flatten_tree(&store, pc.tree, "", &mut parent, 0);
             }
         }
-        let read = |id: &ObjectId| -> Option<String> {
+        // Read a blob as text; `too_large` distinguishes "over the diff cap" from "missing/non-blob".
+        let read = |id: &ObjectId| -> (Option<String>, bool) {
             match store.get(id).ok().flatten() {
-                Some(Object::Blob(b)) if b.len() <= MAX_BLOB_FOR_DIFF => Some(String::from_utf8_lossy(&b).into_owned()),
-                _ => None,
+                Some(Object::Blob(b)) if b.len() <= MAX_BLOB_FOR_DIFF => (Some(String::from_utf8_lossy(&b).into_owned()), false),
+                Some(Object::Blob(_)) => (None, true),
+                _ => (None, false),
             }
         };
         // union of paths, changed only
@@ -862,8 +868,17 @@ impl RepoHost {
                 (Some(a), Some(b)) if a != b => "modified",
                 _ => continue,
             };
-            let old = p.and_then(read).unwrap_or_default();
-            let new = h.and_then(read).unwrap_or_default();
+            let (old_txt, old_big) = p.map(&read).unwrap_or((None, false));
+            let (new_txt, new_big) = h.map(&read).unwrap_or((None, false));
+            // A changed file past the cap: report it as changed, but flag it instead of diffing.
+            if old_big || new_big {
+                out.push(FileDiff { path: path.clone(), status: status.to_string(), ops: Vec::new(), hunks: Vec::new(), too_large: true });
+                if out.len() >= MAX_DIFF_FILES {
+                    break;
+                }
+                continue;
+            }
+            let (old, new) = (old_txt.unwrap_or_default(), new_txt.unwrap_or_default());
             let hunks = diff_lines(&old, &new);
             let ops = semantic_ops(&hunks);
             let hunks_out = hunks
@@ -886,7 +901,7 @@ impl RepoHost {
                         .collect(),
                 })
                 .collect();
-            out.push(FileDiff { path: path.clone(), status: status.to_string(), ops, hunks: hunks_out });
+            out.push(FileDiff { path: path.clone(), status: status.to_string(), ops, hunks: hunks_out, too_large: false });
             if out.len() >= MAX_DIFF_FILES {
                 break;
             }

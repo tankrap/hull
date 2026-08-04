@@ -1232,8 +1232,9 @@ export function App() {
   const [issueMode, setIssueMode] = useState<Record<string, string>>({});
   const runIssueMode = async (target: string, num: number, mode: string) => {
     const hasDraft = (commentDraft[target] ?? "").trim().length > 0;
-    if (mode === "reopen") return issueAction(num, "reopen");
+    // Post the typed comment first regardless of the action — reopen used to drop it.
     if (hasDraft) await postComment(target);
+    if (mode === "reopen") return issueAction(num, "reopen");
     if (mode === "close") issueAction(num, "close", { reason: "completed" });
     else if (mode === "close_np") issueAction(num, "close", { reason: "not_planned" });
   };
@@ -1960,7 +1961,7 @@ export function App() {
     <Drawer open={showNotifs} onClose={() => setShowNotifs(false)} title={`inbox · ${handleOf(actingAs)}`}>
       {notifs.length === 0 && <div className="text-[13px] text-muted">nothing yet</div>}
       {notifs.slice(0, 20).map((n, i) => (
-        <div key={i} className="flex items-start gap-2 py-2 border-b border-rule3 last:border-0">
+        <div key={`${n.ts}-${n.kind}-${i}`} className="flex items-start gap-2 py-2 border-b border-rule3 last:border-0">
           <span className={`w-1.5 h-1.5 rounded-full mt-1.5 flex-none ${n.ts > seenTs ? "bg-steel" : "bg-rule"}`} />
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
@@ -2016,7 +2017,9 @@ export function App() {
         </div>
       )}
       {view === "home" && !orgHandle && me && (() => {
-        const activeRepos = repos.filter((r) => r.score > 0 && matchQ(`${r.tenant}/${r.repo}`));
+        // Home has no search box of its own — don't filter by the shared `q` (it's bound to the
+        // Issues/PRs filters and would otherwise hide repos here based on a term typed elsewhere).
+        const activeRepos = repos.filter((r) => r.score > 0);
         return (
         <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
           <div className="flex flex-wrap items-end justify-between gap-4 mb-8">
@@ -2233,8 +2236,9 @@ export function App() {
         const checksOk = p.verification === "green";
         const changesRequested = prReviews.some((r) => r.verdict === "request_changes" || r.verdict === "reject");
         const hasApproval = prReviews.some((r) => r.verdict === "approve" && r.reviewer !== p.author);
-        const canLand = checksOk && hasApproval && !changesRequested;
         const blockers = prReviews.reduce((n, r) => n + (r.findings ?? []).filter((f) => f.severity === "blocker").length, 0);
+        // The merge gate must agree with the checklist below: an unresolved blocker blocks landing.
+        const canLand = checksOk && hasApproval && !changesRequested && blockers === 0;
         const gateChecks: { tone: "ok" | "bad" | "wait"; label: string; detail: string }[] = [
           { tone: checksOk ? "ok" : p.verification === "red" ? "bad" : "wait", label: "keel verify", detail: checksOk ? "Build & tests passed" : p.verification === "red" ? "Build or tests failed" : "Not run yet" },
           { tone: blockers > 0 ? "bad" : "ok", label: "No blocking findings", detail: blockers > 0 ? `${blockers} blocker${blockers > 1 ? "s" : ""}` : "None raised" },
@@ -2875,18 +2879,14 @@ function RepoGraph({ tenant, repo, authHeaders }: { tenant: string; repo: string
 }
 
 // ── Files tab: a branch-aware file browser with fuzzy/full-text search ──────────────────────────
-type TreeItem = { name: string; path: string; dir: boolean; size: number };
 type SearchHit = { path: string; line: number; text: string; kind: "path" | "content" };
 function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo: string; authHeaders: () => Record<string, string>; theme: string }) {
   const base = `/api/repos/${encodeURIComponent(tenant)}/${repo}`;
   const [branches, setBranches] = useState<string[]>([]);
   const [branch, setBranch] = useState("main");
-  const [path, setPath] = useState("");
-  const [entries, setEntries] = useState<TreeItem[] | null>(null);
   const [file, setFile] = useState<{ path: string; text: string; binary: boolean; size: number } | null>(null);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchHit[] | null>(null);
-  const [loading, setLoading] = useState(false);
   const [allPaths, setAllPaths] = useState<string[] | null>(null);
 
   useEffect(() => {
@@ -2904,18 +2904,13 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
       .then((r) => r.json()).then((d) => setAllPaths(d.paths ?? [])).catch(() => setAllPaths([]));
   }, [branch, tenant, repo]);
 
-  const loadDir = (p: string) => {
-    setLoading(true); setFile(null);
-    fetch(`${base}/tree?ref=${encodeURIComponent(branch)}&path=${encodeURIComponent(p)}`, { headers: authHeaders() })
-      .then((r) => r.json()).then((d) => { setEntries(d.entries ?? []); setPath(p); }).catch(() => setEntries([])).finally(() => setLoading(false));
-  };
   const openFile = (p: string) => {
-    setLoading(true); setResults(null); setQuery("");
+    setResults(null); setQuery("");
     fetch(`${base}/blob?ref=${encodeURIComponent(branch)}&path=${encodeURIComponent(p)}`, { headers: authHeaders() })
-      .then((r) => r.json()).then((d) => setFile({ path: p, text: d.text ?? "", binary: !!d.binary, size: d.size ?? 0 })).finally(() => setLoading(false));
+      .then((r) => r.json()).then((d) => setFile({ path: p, text: d.text ?? "", binary: !!d.binary, size: d.size ?? 0 })).catch(() => {});
   };
-  // Reset to the branch root whenever the branch changes.
-  useEffect(() => { setResults(null); setQuery(""); loadDir(""); /* eslint-disable-next-line */ }, [branch]);
+  // Clear any open file / search when the branch changes (the tree reloads via the paths effect).
+  useEffect(() => { setResults(null); setQuery(""); setFile(null); /* eslint-disable-next-line */ }, [branch]);
   // Debounced fuzzy/full-text search.
   useEffect(() => {
     if (!query.trim()) { setResults(null); return; }
@@ -2926,10 +2921,8 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
     return () => clearTimeout(t);
   }, [query, branch]);
 
-  const Folder = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="text-steel-text flex-none"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg>;
   const FileIcon = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="text-muted flex-none"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /></svg>;
   const fmtSize = (n: number) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
-  const crumbs = path ? path.split("/") : [];
   const LINE_CAP = 1500;
   const lines = file ? file.text.replace(/\n$/, "").split("\n") : [];
 
@@ -2979,7 +2972,6 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
         <Card>
           <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
             <div className="flex items-center gap-1.5 text-[13px] min-w-0">
-              <button onClick={() => { setFile(null); loadDir(path); }} className="text-dim hover:text-ink inline-flex items-center gap-1 flex-none"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg></button>
               <FileIcon /><span className="font-medium truncate">{file.path}</span>
             </div>
             <span className="text-[12px] text-faint flex-none tabular-nums">{fmtSize(file.size)}</span>
@@ -3020,31 +3012,13 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
           )}
         </Card>
       ) : (
-        <Card>
-          <div className="flex items-center gap-1 px-5 py-2.5 border-b border-rule2 text-[13px] flex-wrap">
-            <button onClick={() => loadDir("")} className="font-medium text-steel-text hover:underline">{repo}</button>
-            {crumbs.map((c, i) => (
-              <span key={i} className="flex items-center gap-1">
-                <span className="text-faint">/</span>
-                <button onClick={() => loadDir(crumbs.slice(0, i + 1).join("/"))} className="text-body hover:text-ink hover:underline">{c}</button>
-              </span>
-            ))}
-          </div>
-          <div className="max-h-[560px] overflow-y-auto">
-            {loading && !entries && <div className="px-5 py-6 text-[13px] text-muted">Loading…</div>}
-            {entries && entries.length === 0 && <div className="px-5 py-6 text-[13px] text-muted">Empty directory.</div>}
-            {path && (
-              <button onClick={() => loadDir(crumbs.slice(0, -1).join("/"))} className="w-full text-left px-5 py-1.5 border-b border-rule3 hover:bg-paper/60 flex items-center gap-2.5 text-[13px] text-muted">
-                <span className="w-4 text-center">↑</span> ..
-              </button>
-            )}
-            {(entries ?? []).map((e) => (
-              <button key={e.path} onClick={() => (e.dir ? loadDir(e.path) : openFile(e.path))} className="w-full text-left px-5 py-1.5 border-b border-rule3 hover:bg-paper/60 flex items-center gap-2.5 text-[13px]">
-                {e.dir ? <Folder /> : <FileIcon />}
-                <span className={`flex-1 truncate ${e.dir ? "font-medium" : "text-body"}`}>{e.name}</span>
-                {!e.dir && <span className="text-[11.5px] text-faint tabular-nums flex-none">{fmtSize(e.size)}</span>}
-              </button>
-            ))}
+        <Card className="grid place-items-center min-h-[420px] text-center">
+          <div className="px-6 py-10 max-w-[320px]">
+            <div className="mx-auto w-11 h-11 grid place-items-center rounded-full bg-paper text-dim mb-3">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /></svg>
+            </div>
+            <div className="text-[14px] font-medium text-body">Select a file</div>
+            <div className="text-[12.5px] text-muted mt-1 leading-[1.5]">Pick a file from the tree on the left to view its contents, or search across the branch above.</div>
           </div>
         </Card>
       )}
@@ -3100,7 +3074,7 @@ function ReviewPage({
     session?: Session;
   };
   type DiffLine = { tag: string; text: string };
-  type FileDiff = { path: string; status: string; ops: string[]; hunks: { old_start: number; new_start: number; lines: DiffLine[] }[] };
+  type FileDiff = { path: string; status: string; ops: string[]; hunks: { old_start: number; new_start: number; lines: DiffLine[] }[]; too_large?: boolean };
   type Evidence = { kind: string; detail: string; supports: boolean };
   type Claim = { id: string; text: string; source: string; status: string; evidence: Evidence[] };
   type Ledger = { change: string; claims: Claim[]; unclaimed?: string[] };
@@ -3795,7 +3769,12 @@ function ReviewPage({
                       {reviewBar}
                     </>
                   );
-                })() : (
+                })() : f.too_large ? (
+                  <div className="w-full py-2.5 rounded-ctl border border-dashed border-rule text-[12.5px] text-muted flex items-center justify-center gap-2">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
+                    File too large to diff inline — open it in the Files tab to view.
+                  </div>
+                ) : (
                   <button onClick={() => revealDiff(f.path)} className="w-full py-2.5 rounded-ctl border border-dashed border-rule text-[12.5px] text-muted hover:text-ink hover:border-ctl hover:bg-paper/50 transition-colors flex items-center justify-center gap-2">
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
                     Show diff · {f.hunks.reduce((acc, h) => acc + h.lines.length, 0)} lines
