@@ -2,27 +2,7 @@ import { Component, lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef,
 import { createPortal } from "react-dom";
 // Code-split the heavy Shiki-powered @pierre viewers into their own chunk (kept out of the initial bundle).
 const PierreFile = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.File })));
-const PierrePatch = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.PatchDiff })));
 const RepoTree = lazy(() => import("./RepoTree"));
-
-// Build a unified-diff patch string from our server's hunk model so @pierre/diffs can render a
-// proper syntax-highlighted diff (its PatchDiff takes a patch, not our internal shape).
-function hunksToPatch(path: string, hunks: { old_start: number; new_start: number; lines: { tag: string; text: string }[] }[]): string {
-  let out = `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n`;
-  for (const h of hunks) {
-    const oldCount = h.lines.filter((l) => l.tag !== "add").length;
-    const newCount = h.lines.filter((l) => l.tag !== "del").length;
-    out += `@@ -${h.old_start},${oldCount} +${h.new_start},${newCount} @@\n`;
-    for (const l of h.lines) {
-      const sign = l.tag === "add" ? "+" : l.tag === "del" ? "-" : " ";
-      out += sign + l.text + "\n";
-    }
-  }
-  return out;
-}
-// The @pierre/diffs theming, matched to hull tokens (same treatment as the Files-page viewer).
-const DIFF_VARS = { "--diffs-bg": "var(--surface)", "--diffs-fg-number": "var(--faint)", "--diffs-font-size": "12.5px", "--diffs-line-height": "1.65", "--diffs-min-number-column-width": "2.75rem" } as React.CSSProperties;
-const DIFF_GUTTER_CSS = "[data-gutter]{background:var(--paper);border-right:1px solid var(--rule2)}[data-line-number-content]{padding-right:12px;opacity:.85}";
 import * as ed from "@noble/ed25519";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
@@ -580,6 +560,19 @@ const StatusDot = ({ tone, size = 18 }: { tone: "ok" | "bad" | "warn" | "wait" |
     </span>
   );
 };
+
+// Small stroked line-icons — used in place of emoji so the UI reads as a product, not a chat message.
+const Ico = ({ path, size = 14, fill = false }: { path: React.ReactNode; size?: number; fill?: boolean }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill={fill ? "currentColor" : "none"} stroke={fill ? "none" : "currentColor"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-none">{path}</svg>
+);
+const IcoCheck = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<polyline points="20 6 9 17 4 12" />} />;
+const IcoX = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></>} />;
+const IcoFlag = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z" /><line x1="4" y1="22" x2="4" y2="15" /></>} />;
+const IcoSparkle = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z" />} />;
+const IcoSearch = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><circle cx="11" cy="11" r="7" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></>} />;
+const IcoBulb = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><path d="M9 18h6" /><path d="M10 22h4" /><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1v.2h6v-.2c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z" /></>} />;
+const IcoGit = ({ size = 13 }: { size?: number }) => <Ico size={size} path={<><circle cx="6" cy="6" r="2.5" /><circle cx="6" cy="18" r="2.5" /><circle cx="18" cy="8" r="2.5" /><path d="M18 10.5c0 3-3 4-6 4H6M6 8.5v7" /></>} />;
+const IcoExpand = ({ size = 13 }: { size?: number }) => <Ico size={size} path={<><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></>} />;
 
 // The issue discussion thread + composer, as a STABLE top-level component so typing doesn't remount
 // it (which would steal focus on every keystroke). All state is passed in from App.
@@ -2332,7 +2325,6 @@ export function App() {
             canReview={caps.ai_review}
             onTriage={() => autoReview(p.number)}
             triaging={autoReviewing === p.number}
-            theme={theme}
             pr={p}
             actors={actors}
             tenant={tenant}
@@ -3055,7 +3047,6 @@ function ReviewPage({
   canReview = false,
   onTriage,
   triaging = false,
-  theme = "light",
   pr,
   actors,
   tenant,
@@ -3073,7 +3064,6 @@ function ReviewPage({
   canReview?: boolean;
   onTriage?: () => void;
   triaging?: boolean;
-  theme?: string;
   pr: PR | null;
   actors: Actor[];
   tenant: string;
@@ -3300,6 +3290,7 @@ function ReviewPage({
   const [showChanges, setShowChanges] = useState(false);
   const [showClaims, setShowClaims] = useState(false);
   const [attnIdx, setAttnIdx] = useState(0); // cursor into the one-by-one attention stepper
+  const [taskModal, setTaskModal] = useState(false); // "view full task" overlay
   // When the big title scrolls out of view, condense it into the sticky top bar so the reviewer
   // always knows which PR + verdict they're looking at.
   const titleSentinel = useRef<HTMLDivElement>(null);
@@ -3373,35 +3364,19 @@ function ReviewPage({
   // Reviews load async, so collapse each finding once when first seen (without undoing manual expands).
   // Raw diff bodies are minified (just the "What changed here" summary) until expanded — click a
   // summary line or the Show-diff toggle to reveal the lines.
-  // Diffs are OPEN by default (flow — no click just to see the code); "Hide diff" collapses one.
-  const [collapsedDiffs, setCollapsedDiffs] = useState<Set<string>>(() => new Set());
+  // Diffs open on demand — "Show diff" expands one; "Hide diff" collapses it again.
+  const [expandedDiffs, setExpandedDiffs] = useState<Set<string>>(() => new Set());
   // A big diff only ever RENDERS a bounded window (never thousands of rows). diffFocus[path] centres
   // the window on a line (set by a "What changed here" click); diffExpand[path] grows it on "show more".
   const [diffFocus, setDiffFocus] = useState<Record<string, number>>({});
   const [diffExpand, setDiffExpand] = useState<Record<string, number>>({});
-  // Scroll to (and briefly highlight) a line inside the always-open @pierre diff. The diff renders in
-  // a shadow DOM, so we reach into it, match the line number, centre it, and flash both sides so the
-  // reviewer's eye lands exactly where the edit is.
-  const flashDiffLine = (line: number): boolean => {
-    for (const c of Array.from(document.querySelectorAll("diffs-container"))) {
-      const root = c.shadowRoot;
-      if (!root) continue;
-      const nums = Array.from(root.querySelectorAll("[data-line-number-content]")).filter((el) => el.textContent?.trim() === String(line));
-      if (nums.length === 0) continue;
-      const rows = nums.map((el) => (el.closest("[data-line]") ?? el.parentElement) as HTMLElement | null).filter(Boolean) as HTMLElement[];
-      rows[rows.length - 1]?.scrollIntoView({ behavior: "smooth", block: "center" });
-      rows.forEach((r) => { r.style.transition = "background-color .25s ease"; r.style.backgroundColor = "color-mix(in oklch, var(--brass) 30%, transparent)"; setTimeout(() => { r.style.backgroundColor = ""; }, 1500); });
-      return true;
-    }
-    return false;
-  };
+  // Open a file's diff and jump to a line — the line stays highlighted (diffFocus drives CodePanel's
+  // persistent `highlightLine`) so you can see exactly which line the "What changed here" click meant.
   const revealDiff = (path: string, line?: number) => {
-    setCollapsedDiffs((s) => { if (!s.has(path)) return s; const n = new Set(s); n.delete(path); return n; });
+    setExpandedDiffs((s) => (s.has(path) ? s : new Set(s).add(path)));
     if (line != null) {
-      // Retry a few times so it works whether the diff is already rendered or still mounting.
-      let tries = 0;
-      const tick = () => { if (flashDiffLine(line) || tries++ > 12) return; setTimeout(tick, 120); };
-      setTimeout(tick, 60);
+      setDiffFocus((f) => ({ ...f, [path]: line }));
+      setTimeout(() => document.getElementById(`L-${path}-${line}`)?.scrollIntoView({ block: "center", behavior: "smooth" }), 180);
     }
   };
   const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => new Set());
@@ -3468,6 +3443,19 @@ function ReviewPage({
         )}
       </header>
 
+      {/* Full-task overlay — the session summary shows a clipped task; this is the whole thing. */}
+      {taskModal && change?.session && createPortal(
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={() => setTaskModal(false)}>
+          <div className="absolute inset-0 bg-ink/40" />
+          <div className="relative bg-surface border border-rule rounded-card shadow-modal max-w-[680px] w-full max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
+              <span className="text-[13.5px] font-semibold text-ink">Agent task</span>
+              <button onClick={() => setTaskModal(false)} className="text-dim hover:text-ink"><IcoX size={16} /></button>
+            </div>
+            <div className="px-5 py-4 overflow-y-auto text-[13.5px] text-body leading-[1.6] whitespace-pre-wrap">{change.session.task}</div>
+          </div>
+        </div>, document.body)}
+
       <div className="max-w-[1320px] mx-auto px-6 sm:px-8 py-8">
         <h1 className="text-[23px] font-semibold tracking-tight">{pr ? `${pr.title}` : active.target}</h1>
         <div ref={titleSentinel} aria-hidden />
@@ -3476,7 +3464,7 @@ function ReviewPage({
           <span className="text-faint">·</span>
           {pr && <><Avatar id={pr.author} handle={handleOf(pr.author)} kind={kindOf(pr.author)} size={16} /><span className={kindOf(pr.author) === "agent" ? "text-steel-text" : ""}>{handleOf(pr.author)}</span></>}
           <span className="text-faint">·</span>
-          <span className="text-steel-text" title={changeId}>⬡ {(changeId ?? "").slice(0, 8)}</span>
+          <span className="text-steel-text inline-flex items-center gap-1" title={changeId}><IcoGit size={12} />{(changeId ?? "").slice(0, 8)}</span>
           <span className="text-faint">·</span>
           <span>{changedFiles} file{changedFiles === 1 ? "" : "s"}</span>
           <span className="text-clear-text font-semibold">+{addN}</span>
@@ -3533,7 +3521,6 @@ function ReviewPage({
             reviewer meets a verdict, not a wall. */}
         {(() => {
           const loz = "inline-flex items-center text-[11px] font-bold uppercase tracking-[0.03em] leading-none px-1.5 py-[3px] rounded-badge";
-          const rc = riskLevel === "low" ? "bg-clear-wash text-clear-text" : riskLevel === "high" ? "bg-fault-wash text-fault-text" : "bg-brass-wash text-brass-text";
           // Prefer an agent reviewer's prose (the AI layer's own summary) over raw commit text; skip the
           // templated mechanical reconciliation line — we want a real summary, not "N claims supported".
           const aiSummary = [...reviews]
@@ -3583,20 +3570,65 @@ function ReviewPage({
                         })}
                       </div>
                     ) : check.t ? (
-                      <div className={`text-[13px] mt-2 flex items-center gap-1.5 ${check.c}`}>{needsN > 0 ? null : <span aria-hidden>✓</span>}{check.t}</div>
+                      <div className={`text-[13px] mt-2 flex items-center gap-1.5 ${check.c}`}>{needsN > 0 ? null : <IcoCheck size={13} />}{check.t}</div>
                     ) : null}
-                    <div className="flex flex-wrap gap-1.5 mt-3">
-                      {behN > 0 && <span className={`${loz} bg-fault-wash text-fault-text`}>{behN} behavioral change{behN > 1 ? "s" : ""}</span>}
-                      {semantic?.pure_move && <span className={`${loz} bg-clear-wash text-clear-text`}>pure move</span>}
+                    {/* Neutral metadata chips — no decorative color at the top of the page. */}
+                    <div className="flex flex-wrap gap-1.5 mt-3 text-dim">
+                      {behN > 0 && <span className={`${loz} bg-rule2 text-dim`}>{behN} behavioral change{behN > 1 ? "s" : ""}</span>}
+                      {semantic?.pure_move && <span className={`${loz} bg-rule2 text-dim`}>pure move</span>}
                       {!change?.session && <span className={`${loz} bg-rule2 text-dim`}>no plan captured</span>}
-                      {aiSummary && <span className={`${loz} bg-steel-wash text-steel-text`}>agent-summarized</span>}
+                      {aiSummary && <span className={`${loz} bg-rule2 text-dim inline-flex items-center gap-1`}><IcoSparkle size={11} />agent-summarized</span>}
                     </div>
                   </div>
-                  <span className={`${loz} flex-none ${rc}`}>{riskLevel} risk</span>
+                  {/* Risk as a quiet dot + label, not a saturated pill. */}
+                  <span className="flex-none inline-flex items-center gap-1.5 text-[11.5px] font-medium text-muted">
+                    <span className={`w-1.5 h-1.5 rounded-full ${riskLevel === "low" ? "bg-clear" : riskLevel === "high" ? "bg-fault" : "bg-brass"}`} />{riskLevel} risk
+                  </span>
                 </div>
               </div>
-              {briefClaims.length > 0 && <Toggle open={showClaims} onClick={() => setShowClaims((v) => !v)}>{claimsLine}</Toggle>}
-              {(diff.length > 0 || (semantic?.moves.length ?? 0) > 0) && <Toggle open={showChanges} onClick={() => setShowChanges((v) => !v)}>Changes · {fileN} file{fileN === 1 ? "" : "s"} · <span className="text-clear-text tabular-nums">+{addN}</span> <span className="text-fault-text tabular-nums">−{delN}</span></Toggle>}
+              {briefClaims.length > 0 && <Toggle open={showClaims} onClick={() => { const o = !showClaims; setShowClaims(o); if (o) setTimeout(() => document.getElementById("reconciliation-section")?.scrollIntoView({ behavior: "smooth", block: "start" }), 80); }}>{claimsLine}</Toggle>}
+              {(diff.length > 0 || (semantic?.moves.length ?? 0) > 0) && <Toggle open={showChanges} onClick={() => { const o = !showChanges; setShowChanges(o); if (o) setTimeout(() => document.getElementById("changes-section")?.scrollIntoView({ behavior: "smooth", block: "start" }), 80); }}>Changes · {fileN} file{fileN === 1 ? "" : "s"} · <span className="text-clear-text tabular-nums">+{addN}</span> <span className="text-fault-text tabular-nums">−{delN}</span></Toggle>}
+            </Card>
+          );
+        })()}
+
+        {/* Merge decision — at the TOP now (and it re-appears in the sticky bar on scroll), so the
+            reviewer never has to hunt to the bottom of the page to land. */}
+        <div className="mb-6">{landGate}</div>
+
+        {/* Session — surfaced up here (was buried at the bottom): a summary of what the agent set out
+            to do, with the full task one click away, its carried-forward lesson, and the run metrics. */}
+        {change?.session && (() => {
+          const task = change.session.task || "";
+          const long = task.length > 240;
+          return (
+            <Card className="mb-6">
+              <SectionHeader label="Session" right={pr && <span className="inline-flex items-center gap-1.5 text-[12.5px] text-muted"><Avatar id={pr.author} handle={handleOf(pr.author)} kind={kindOf(pr.author)} size={16} />{handleOf(pr.author)}</span>} />
+              <div className="px-5 py-4 grid gap-3.5">
+                <div>
+                  <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-muted mb-1">What the agent set out to do</div>
+                  <p className="text-[13.5px] text-body leading-[1.55]">{long ? task.slice(0, 240).trimEnd() + "…" : task}</p>
+                  {long && <button onClick={() => setTaskModal(true)} className="text-[12.5px] text-steel-text hover:underline mt-1.5 inline-flex items-center gap-1"><IcoExpand size={12} />View full task</button>}
+                </div>
+                {change.session.lesson && (
+                  <div className="rounded-ctl bg-paper/60 border border-rule2 px-3.5 py-2.5">
+                    <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-dim mb-1 flex items-center gap-1.5"><IcoBulb size={13} />Lesson carried forward</div>
+                    <p className="text-[13px] text-body leading-[1.5]">{change.session.lesson}</p>
+                  </div>
+                )}
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { k: "Model", v: change.session.model || "—" },
+                    ...(change.session.tool_calls > 0 ? [{ k: "Tool calls", v: String(change.session.tool_calls) }] : []),
+                    ...(change.session.tokens_out > 0 ? [{ k: "Tokens (in → out)", v: `${change.session.tokens_in.toLocaleString()} → ${change.session.tokens_out.toLocaleString()}` }] : []),
+                  ].map((m) => (
+                    <div key={m.k} className="rounded-ctl border border-rule2 bg-paper/40 px-3 py-2 min-w-[110px]">
+                      <div className="text-[10.5px] text-muted uppercase tracking-[0.04em]">{m.k}</div>
+                      <div className="text-[13.5px] font-semibold text-ink tabular-nums mt-0.5 break-all">{m.v}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </Card>
           );
         })()}
@@ -3625,39 +3657,35 @@ function ReviewPage({
           const label = cur.kind === "contra" ? "Contradicted claim" : cur.kind === "concern" ? "Concern raised" : cur.kind === "finding" ? (cur.row!.f.severity === "blocker" ? "Blocker" : "Warning") : "Intent — needs your eyes";
           const labelColor = tone === "bad" ? "text-fault-text" : tone === "warn" ? "text-brass-text" : "text-brass-text";
           const needsLeft = needs.length;
+          const lbl = (icon: React.ReactNode, text: string) => <span className="inline-flex items-center gap-1.5">{icon}{text}</span>;
           return (
             <div id="needs-attention" className="scroll-mt-4">
-            <Card className="mb-6 ring-1 ring-brass/30">
-              <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
-                <div className="flex items-center gap-2">
-                  <span className="grid place-items-center w-5 h-5 rounded-full bg-brass-wash text-brass-text text-[12px]" aria-hidden>⚑</span>
+            <Card className="mb-6">
+              <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule">
+                <div className="flex items-center gap-2.5">
+                  <span className="text-fault-text"><IcoFlag size={15} /></span>
                   <span className="text-[13.5px] font-semibold text-ink">Needs your attention</span>
-                  <span className="text-[12px] text-muted tabular-nums">· {idx + 1} of {items.length}</span>
+                  <span className="text-[12px] text-muted tabular-nums">{idx + 1} / {items.length}</span>
                 </div>
-                {canReview && onTriage && <Button size="sm" variant="secondary" disabled={triaging || !canAct} onClick={onTriage}>{triaging ? "agent triaging…" : "⌕ Let an agent triage all"}</Button>}
+                {canReview && onTriage && <Button size="sm" variant="secondary" disabled={triaging || !canAct} onClick={onTriage}>{triaging ? "agent triaging…" : lbl(<IcoSearch size={13} />, "Let an agent triage")}</Button>}
               </div>
-              {/* progress bar */}
-              <div className="h-[3px] bg-rule2"><div className="h-full bg-brass transition-all" style={{ width: `${((idx + 1) / items.length) * 100}%` }} /></div>
+              <div className="h-[2px] bg-rule2"><div className="h-full bg-dim/50 transition-all" style={{ width: `${((idx + 1) / items.length) * 100}%` }} /></div>
 
-              {/* the current item, given the whole frame */}
-              <div className="px-5 py-4 min-h-[132px]">
-                <div className="flex items-center gap-2 mb-1.5">
-                  <StatusDot tone={tone} />
-                  <span className={`text-[11px] font-bold uppercase tracking-[0.05em] ${labelColor}`}>{label}</span>
-                </div>
+              <div className="px-5 py-4 min-h-[128px]">
+                <div className={`text-[11px] font-bold uppercase tracking-[0.05em] mb-2 ${labelColor}`}>{label}</div>
                 {cur.kind === "finding" ? (
                   <>
                     <div className="text-[14px] text-body leading-snug">{cur.row!.f.note}</div>
                     {cur.row!.f.path && <div className="text-[12.5px] text-muted mt-1 tabular-nums">{cur.row!.f.path}{cur.row!.f.line ? `:${cur.row!.f.line}` : ""}</div>}
-                    <div className="flex items-center gap-2 mt-3 flex-wrap">
-                      {canFix && pr && cur.row!.f.path ? <Button size="sm" disabled={!canAct || fixing === cur.row!.idx} onClick={() => fixWithAI(cur.row!.idx, cur.row!.f)}>{fixing === cur.row!.idx ? "fixing…" : "✨ Fix with AI"}</Button>
+                    <div className="flex items-center gap-2 mt-3.5 flex-wrap">
+                      {canFix && pr && cur.row!.f.path ? <Button size="sm" disabled={!canAct || fixing === cur.row!.idx} onClick={() => fixWithAI(cur.row!.idx, cur.row!.f)}>{fixing === cur.row!.idx ? "fixing…" : lbl(<IcoSparkle size={13} />, "Fix with AI")}</Button>
                         : !canFix && <span className="text-[12px] text-muted">Set <code className="text-body">OPENROUTER_API_KEY</code> to auto-fix.</span>}
                     </div>
                   </>
                 ) : (
                   <>
                     <div className="text-[14px] text-body leading-snug">{cur.claim!.text}</div>
-                    <div className={`text-[12.5px] mt-1 ${cur.kind === "needs" ? "text-brass-text" : "text-fault-text"}`}>
+                    <div className={`text-[12.5px] mt-1 ${cur.kind === "needs" ? "text-muted" : "text-fault-text"}`}>
                       {cur.kind === "contra" ? "The change's own facts contradict this claim." : cur.kind === "concern" ? <>Concern raised by <b>{resolutions[cur.claim!.id]?.by}</b>{resolutions[cur.claim!.id]?.note ? ` — ${resolutions[cur.claim!.id]?.note}` : ""}.</> : "Can't be checked mechanically — read the diff and confirm."}
                     </div>
                     {(cur.claim!.evidence ?? []).slice(0, 2).map((e, i) => (
@@ -3665,20 +3693,19 @@ function ReviewPage({
                         <span className={`${kindLoz} ${e.supports ? "bg-paper text-muted" : "bg-fault-wash text-fault-text"}`}>{e.kind}</span><span className="leading-snug">{e.detail}</span>
                       </div>
                     ))}
-                    <div className="flex items-center gap-2 mt-3 flex-wrap">
-                      <Button size="sm" disabled={!canAct} onClick={() => resolveClaim(cur.claim!.id, "verified")}>{cur.kind === "needs" ? "✓ Verified" : "✓ Looks fine"}</Button>
-                      {cur.kind !== "concern" && <Button size="sm" variant="destructive" disabled={!canAct} onClick={() => resolveClaim(cur.claim!.id, "concern")}>⚑ Raise concern</Button>}
-                      {canFix && change && pr && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === cur.claim!.id} onClick={() => fixClaim(cur.claim!)}>{fixingClaim === cur.claim!.id ? "fixing…" : "✨ Fix with AI"}</Button>}
+                    <div className="flex items-center gap-2 mt-3.5 flex-wrap">
+                      <Button size="sm" disabled={!canAct} onClick={() => resolveClaim(cur.claim!.id, "verified")}>{lbl(<IcoCheck size={13} />, cur.kind === "needs" ? "Verified" : "Looks fine")}</Button>
+                      {cur.kind !== "concern" && <Button size="sm" variant="destructive" disabled={!canAct} onClick={() => resolveClaim(cur.claim!.id, "concern")}>{lbl(<IcoFlag size={13} />, "Raise concern")}</Button>}
+                      {canFix && change && pr && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === cur.claim!.id} onClick={() => fixClaim(cur.claim!)}>{fixingClaim === cur.claim!.id ? "fixing…" : lbl(<IcoSparkle size={13} />, "Fix with AI")}</Button>}
                     </div>
                   </>
                 )}
               </div>
 
-              {/* stepper controls */}
-              <div className="flex items-center justify-between gap-3 px-5 py-2.5 border-t border-rule2 bg-paper/40">
-                <button disabled={idx === 0} onClick={() => setAttnIdx(Math.max(0, idx - 1))} className="text-[13px] text-dim hover:text-ink disabled:opacity-40 inline-flex items-center gap-1"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6" /></svg>Prev</button>
-                {needsLeft > 1 && <Button size="sm" variant="secondary" disabled={!canAct || verifyingAll} onClick={() => verifyAllClaims(needs.map((c) => c.id))}>{verifyingAll ? "verifying…" : `✓ Verify all ${needsLeft} intent claims`}</Button>}
-                <button disabled={idx >= items.length - 1} onClick={() => setAttnIdx(Math.min(items.length - 1, idx + 1))} className="text-[13px] text-dim hover:text-ink disabled:opacity-40 inline-flex items-center gap-1">Skip<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg></button>
+              <div className="flex items-center justify-between gap-3 px-5 py-2.5 border-t border-rule bg-paper/40">
+                <button disabled={idx === 0} onClick={() => setAttnIdx(Math.max(0, idx - 1))} className="text-[13px] text-dim hover:text-ink disabled:opacity-40 inline-flex items-center gap-1"><Ico size={14} path={<polyline points="15 18 9 12 15 6" />} />Prev</button>
+                {needsLeft > 1 && <Button size="sm" variant="secondary" disabled={!canAct || verifyingAll} onClick={() => verifyAllClaims(needs.map((c) => c.id))}>{verifyingAll ? "verifying…" : lbl(<IcoCheck size={13} />, `Verify all ${needsLeft} intent claims`)}</Button>}
+                <button disabled={idx >= items.length - 1} onClick={() => setAttnIdx(Math.min(items.length - 1, idx + 1))} className="text-[13px] text-dim hover:text-ink disabled:opacity-40 inline-flex items-center gap-1">Skip<Ico size={14} path={<polyline points="9 18 15 12 9 6" />} /></button>
               </div>
             </Card>
             </div>
@@ -3687,8 +3714,8 @@ function ReviewPage({
 
         <div className="grid gap-6 mt-3">
           <div className="min-w-0 grid gap-6">
-        {/* changes — the flagship semantic-diff surface (Grouped ⇄ Line-by-line toggle built in),
-            folded away by default and revealed from the digest's "Changes" toggle. */}
+        {/* changes — the flagship semantic-diff surface, revealed (and scrolled to) from the digest. */}
+        <div id="changes-section" className="scroll-mt-20" />
         {showChanges && (() => {
           if (diff.length === 0 && !(semantic?.moves.length)) {
             return (
@@ -3834,7 +3861,7 @@ function ReviewPage({
               if (hi < rows.length) parts.push(expander(rows.length - hi, "below"));
               return parts;
             };
-            const isOpen = forceOpen || !collapsedDiffs.has(f.path);
+            const isOpen = expandedDiffs.has(f.path) || forceOpen;
             // Take the span from first-changed to last-changed token so inner spaces/punctuation are
             // preserved (otherwise "walk_all ()" → "slice ( task )" collapses to "slicetask").
             const span = (segs: Seg[]) => {
@@ -3913,43 +3940,10 @@ function ReviewPage({
                 </div>
               );
             };
-            // Always render the whole file's diff (no per-hunk focusing) — the "what changed here"
-            // index scrolls you to a line instead, so you never have to close/reopen to see another.
+            // Render the whole file's diff; the clicked "What changed here" line stays highlighted
+            // (diffFocus → highlightLine) and you can select/comment on any line.
             const indexed = f.hunks.map((h, hi) => ({ h, hi }));
-            const shownHunks = indexed;
-            const hiddenHunks = 0;
-            // Our own line renderer — kept as the fallback if @pierre/diffs fails to load/render.
-            const customHunks = (
-              <>
-                {hiddenHunks > 0 && (
-                  <button onClick={() => setDiffFocus((s) => { const c = { ...s }; delete c[f.path]; return c; })}
-                    className="w-full mb-2 py-2 rounded-ctl border border-dashed border-rule text-[12.5px] font-medium text-steel-text hover:bg-steel-wash/50 hover:border-ctl transition-colors flex items-center justify-center gap-1.5">
-                    Showing 1 of {indexed.length} sections · show the whole file
-                  </button>
-                )}
-                {shownHunks.map(({ h, hi }) => renderHunk(h, hi))}
-              </>
-            );
-            // Primary: @pierre/diffs renders a proper Shiki-highlighted unified diff (github-light/dark,
-            // hull-tinted gutter). Falls back to our line renderer on error.
-            const hunkNodes = isOpen ? (
-              <>
-                {hiddenHunks > 0 && (
-                  <button onClick={() => setDiffFocus((s) => { const c = { ...s }; delete c[f.path]; return c; })}
-                    className="w-full mb-2 py-2 rounded-ctl border border-dashed border-rule text-[12.5px] font-medium text-steel-text hover:bg-steel-wash/50 hover:border-ctl transition-colors flex items-center justify-center gap-1.5">
-                    Showing 1 of {indexed.length} sections · show the whole file
-                  </button>
-                )}
-                <Boundary fallback={customHunks}>
-                  <Suspense fallback={<div className="px-3 py-6 text-[12.5px] text-muted">Loading diff…</div>}>
-                    <div className="rounded-ctl border border-rule2 overflow-hidden overflow-x-auto text-[13px]" style={DIFF_VARS}>
-                      <PierrePatch patch={hunksToPatch(f.path, shownHunks.map((x) => x.h))} disableWorkerPool
-                        options={{ theme: { light: "github-light", dark: "github-dark" }, themeType: theme === "dark" ? "dark" : "light", disableFileHeader: true, overflow: "scroll", tokenizeMaxLength: 400_000, unsafeCSS: DIFF_GUTTER_CSS }} />
-                    </div>
-                  </Suspense>
-                </Boundary>
-              </>
-            ) : null;
+            const hunkNodes = isOpen ? <>{indexed.map(({ h, hi }) => renderHunk(h, hi))}</> : null;
             // Drop punctuation/comment-only noise, then dedupe so a repeated edit isn't listed twice.
             const seen = new Set<string>();
             const uniq = transforms
@@ -3959,16 +3953,15 @@ function ReviewPage({
               <>
                 {uniq.length > 0 && (() => {
                   const clip = (s: string) => (s.length > 52 ? s.slice(0, 51).trimEnd() + "…" : s);
-                  const SHOWN = 12;
                   return (
                     <div className="mb-3 rounded-ctl border border-rule2 overflow-hidden">
                       <div className="px-3.5 py-2 bg-paper border-b border-rule2 flex items-center justify-between">
                         <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">What changed here</span>
-                        <span className="text-[11px] text-faint tabular-nums">{uniq.length} edit{uniq.length > 1 ? "s" : ""} · click to open</span>
+                        <span className="text-[11px] text-faint tabular-nums">{uniq.length} edit{uniq.length > 1 ? "s" : ""} · click to jump</span>
                       </div>
-                      <div className="py-1">
-                        {uniq.slice(0, SHOWN).map((t, i) => (
-                          <button key={i} onClick={() => revealDiff(f.path, t.ln)} title={`Open line ${t.ln}`}
+                      <div className="py-1 max-h-[300px] overflow-y-auto">
+                        {uniq.map((t, i) => (
+                          <button key={i} onClick={() => revealDiff(f.path, t.ln)} title={`Jump to line ${t.ln}`}
                             className="group w-full grid grid-cols-[auto_1fr] items-center gap-x-2.5 text-[13px] text-left px-3.5 py-1.5 hover:bg-steel-wash/60 transition-colors">
                             <span className="inline-flex items-center h-[19px] px-1.5 rounded-[3px] bg-rule2 text-dim text-[11px] font-semibold tabular-nums group-hover:bg-steel group-hover:text-white transition-colors flex-none">L{t.ln}</span>
                             <span className="flex items-center gap-2 flex-wrap min-w-0 leading-relaxed">
@@ -3978,23 +3971,17 @@ function ReviewPage({
                             </span>
                           </button>
                         ))}
-                        {uniq.length > SHOWN && <div className="text-[12px] text-muted px-3.5 py-1.5">+{uniq.length - SHOWN} more edit{uniq.length - SHOWN > 1 ? "s" : ""} in this file — every one is shown in the full diff below.</div>}
                       </div>
                     </div>
                   );
                 })()}
                 {isOpen ? (() => {
                   // A compact review bar top + bottom of the open diff, so you can act right after reading.
-                  const reviewBar = canAct && pr ? (
-                    <div className="flex items-center gap-2 py-1.5">
-                      {!forceOpen && <button onClick={() => setCollapsedDiffs((s) => new Set(s).add(f.path))} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>}
-                      {/* No per-file "Approve" here — approval is PR-wide and belongs in the composer, not
-                          a per-file bar where it reads as "approve this file" but lands the whole review. */}
-                      <button onClick={() => document.getElementById("pr-composer")?.scrollIntoView({ block: "center", behavior: "smooth" })} className="ml-auto inline-flex items-center gap-1 h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl text-dim text-[12.5px] hover:text-ink hover:border-dim">Comment on this file ↓</button>
+                  const reviewBar = !forceOpen ? (
+                    <div className="flex justify-end py-1">
+                      <button onClick={() => setExpandedDiffs((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>
                     </div>
-                  ) : (!forceOpen ? (
-                    <div className="flex justify-end"><button onClick={() => setCollapsedDiffs((s) => new Set(s).add(f.path))} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff</button></div>
-                  ) : null);
+                  ) : null;
                   return (
                     <>
                       {reviewBar}
@@ -4070,8 +4057,8 @@ function ReviewPage({
           return <SemanticDiff voyage={voyage} ops={ops} rawDiff={rawDiff} showMerge={false} storageKey={changeId ? `hull_reviewed_${changeId}` : undefined} />;
         })()}
 
-        {/* reconciliation — does the change do what its author said? Folded away by default (the digest
-            summarizes it); revealed from the digest's claims toggle, or auto-opened on a contradiction. */}
+        {/* reconciliation — revealed (and scrolled to) from the digest's claims toggle. */}
+        <div id="reconciliation-section" className="scroll-mt-20" />
         {showClaims && shownLedger && shownLedger.claims.length > 0 && (() => {
           const ledger = shownLedger;
           const POSITIVE = ["verified_mechanically", "verified_read_only", "self_attested"];
@@ -4263,47 +4250,6 @@ function ReviewPage({
         )}
 
           </div>
-          {/* details — the agent session behind the change. Files live in the diff; checks in the gate. */}
-          <div>
-        <Card>
-          <SectionHeader label="Session" right={<span className="text-[12.5px] text-muted">the agent session behind this change</span>} />
-          <div className="px-5 py-4">
-            {change?.session ? (
-              <div className="grid gap-4">
-                <div>
-                  <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-muted mb-1">What the agent set out to do</div>
-                  <p className="text-[13.5px] text-body leading-[1.55]">{change.session.task}</p>
-                </div>
-                {change.session.lesson && (
-                  <div className="rounded-ctl bg-steel-wash/40 border border-steel/20 px-3.5 py-3">
-                    <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-steel-text mb-1 flex items-center gap-1.5"><span aria-hidden>💡</span>Lesson carried forward</div>
-                    <p className="text-[13px] text-body leading-[1.5]">{change.session.lesson}</p>
-                  </div>
-                )}
-                <div className="flex flex-wrap gap-2">
-                  {[
-                    { k: "Model", v: change.session.model || "—" },
-                    ...(change.session.tool_calls > 0 ? [{ k: "Tool calls", v: String(change.session.tool_calls) }] : []),
-                    ...(change.session.tokens_out > 0 ? [{ k: "Tokens (in → out)", v: `${change.session.tokens_in.toLocaleString()} → ${change.session.tokens_out.toLocaleString()}` }] : []),
-                  ].map((m) => (
-                    <div key={m.k} className="rounded-ctl border border-rule2 bg-paper/40 px-3 py-2 min-w-[110px]">
-                      <div className="text-[10.5px] text-muted uppercase tracking-[0.04em]">{m.k}</div>
-                      <div className="text-[13.5px] font-semibold text-ink tabular-nums mt-0.5 break-all">{m.v}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <p className="text-[13px] text-muted leading-[1.55]">
-                No keel session is linked to this change — it was pushed as a plain git commit. Commit with <code>keel commit --session</code> or <code>keel capture</code> and the task, reasoning, tool calls, and lesson show up here automatically.
-              </p>
-            )}
-          </div>
-        </Card>
-          </div>
-
-        {/* decision — placed last, after everything has been reviewed */}
-        {landGate}
         </div>
 
       </div>
