@@ -771,7 +771,6 @@ export function App() {
     memberships: { account: string; role: string }[];
   };
   const [profile, setProfile] = useState<Profile | null>(null);
-  const [showProfile, setShowProfile] = useState(false);
   useEffect(() => {
     if (!token) { setProfile(null); return; }
     fetch("/api/me", { headers: { authorization: `Bearer ${token}` } })
@@ -828,7 +827,6 @@ export function App() {
     localStorage.removeItem("hull_token");
     setToken("");
     setMe(null);
-    setShowProfile(false);
     sessionSecret.current = "";
   };
   // Mint an agent that cryptographically chains to you. The delegation hop is signed **client-side**
@@ -947,9 +945,19 @@ export function App() {
   type ProfileStats = { handle: string; bio: string; total: number; human_count: number; days: HeatDay[]; agents: { handle: string; count: number }[] };
   const [profileStats, setProfileStats] = useState<ProfileStats | null>(null);
   const [profileRepoQ, setProfileRepoQ] = useState("");
+  const [profileTab, setProfileTab] = useState<"overview" | "repos">("overview");
+  const [profileReadme, setProfileReadme] = useState<string | null>(null); // README of <me>/<me>, if any
   const [bioDraft, setBioDraft] = useState<string | null>(null); // non-null = editing
   const loadProfile = () => { if (token) fetch("/api/profile", { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then(setProfileStats).catch(() => {}); };
-  useEffect(() => { if (authPage === "profile") loadProfile(); /* eslint-disable-next-line */ }, [authPage, token]);
+  useEffect(() => {
+    if (authPage !== "profile" || !me) { setProfileReadme(null); return; }
+    loadProfile();
+    // GitHub-style "special repo": <username>/<username>. If it exists with a README.md, show it.
+    const h = me.handle;
+    fetch(`/api/repos/${encodeURIComponent(h)}/${encodeURIComponent(h)}/blob?path=README.md`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : null)).then((d) => setProfileReadme(d && !d.missing && !d.binary ? (d.text || "") : null)).catch(() => setProfileReadme(null));
+    /* eslint-disable-next-line */
+  }, [authPage, token, me?.handle]);
   const saveBio = async (bio: string) => {
     await fetch("/api/account", { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ bio }) });
     setBioDraft(null); loadProfile();
@@ -1627,7 +1635,6 @@ export function App() {
     if (authPage === "profile") {
       const ranked = [...repos].sort((a, b) => b.score - a.score);
       const q = profileRepoQ.trim().toLowerCase();
-      const shownRepos = q ? ranked.filter((r) => `${r.tenant}/${r.repo}`.toLowerCase().includes(q)) : ranked.slice(0, 6);
       return shell(me ? me.handle : "Profile", (
         <div className="grid gap-6">
           {/* Full-bleed banner behind the page — breaks out of the container to the viewport edges. */}
@@ -1657,51 +1664,76 @@ export function App() {
             </div>
           )}
 
-          {/* Contributions */}
-          <Card>
-            <SectionHeader label={`${profileStats?.total ?? 0} contribution${(profileStats?.total ?? 0) === 1 ? "" : "s"} in the last year`} />
-            <div className="px-5 py-4">
-              <ContributionHeatmap days={profileStats?.days ?? []} />
-              <div className="mt-4 grid gap-1.5 pt-3 border-t border-rule3">
-                <div className="flex items-center gap-2 text-[14px]">
-                  <Avatar id={me?.id} handle={me?.handle} kind="human" size={18} />
-                  <span className="font-medium">{me?.handle}</span>
-                  <span className="text-muted">directly</span>
-                  <span className="ml-auto tabular-nums text-body">{profileStats?.human_count ?? 0}</span>
-                </div>
-                {(profileStats?.agents ?? []).map((a) => (
-                  <div key={a.handle} className="flex items-center gap-2 text-[14px] pl-5">
-                    <span className="text-faint">↳</span>
-                    <Avatar handle={a.handle} kind="agent" size={16} />
-                    <span className="text-steel-text">{a.handle}</span>
-                    <span className="ml-auto tabular-nums text-muted">{a.count}</span>
-                  </div>
-                ))}
-                {(profileStats?.agents ?? []).length === 0 && <div className="text-[12.5px] text-faint pl-5">no agents accountable to you have contributed yet</div>}
-              </div>
-            </div>
-          </Card>
-
-          <div>
-            <div className="flex items-end justify-between gap-4 mb-2">
-              <Eyebrow label="Repositories" right={q ? `${shownRepos.length} of ${repos.length}` : `${Math.min(6, repos.length)} of ${repos.length}`} />
-              <div className="w-[220px] pb-1"><SearchInput placeholder="Find a repository" shortcut="" value={profileRepoQ} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setProfileRepoQ(e.target.value)} /></div>
-            </div>
-            {repos.length === 0 && <div className="py-8 text-[13px] text-muted">No repositories yet.</div>}
-            <div>
-              {shownRepos.map((r) => (
-                <button key={`${r.tenant}/${r.repo}`} onClick={() => navigate(`/${encodeURIComponent(r.tenant)}/${encodeURIComponent(r.repo)}`)} className="group w-full text-left block border-b border-rule2">
-                  <div className="flex items-center gap-3 py-3 -mx-3 px-3 rounded-ctl group-hover:bg-surface transition-colors">
-                    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-muted flex-none"><path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8ZM5 12.25a.25.25 0 0 1 .25-.25h3.5a.25.25 0 0 1 .25.25v3.25a.25.25 0 0 1-.4.2l-1.45-1.087a.25.25 0 0 0-.3 0L5.4 15.7a.25.25 0 0 1-.4-.2Z" /></svg>
-                    <span className="flex-1 text-[14px] font-medium group-hover:text-steel-text transition-colors truncate"><span className="text-faint font-normal">{r.tenant}/</span>{r.repo}</span>
-                    {r.score > 0 ? <StatusBadge kind="running">active</StatusBadge> : <span className="text-[12px] text-faint flex-none">quiet</span>}
-                  </div>
-                </button>
-              ))}
-              {q && shownRepos.length === 0 && <div className="py-6 text-[13px] text-muted">No repositories match “{profileRepoQ}”.</div>}
-              {!q && repos.length > 6 && <div className="pt-3 text-[12.5px] text-muted">Showing your 6 most active — search to find the rest.</div>}
-            </div>
+          {/* Profile tabs */}
+          <div className="border-b border-rule2 -mt-1">
+            <HTabs items={["Overview", `Repositories ${repos.length}`]} value={profileTab === "overview" ? 0 : 1} onChange={(i: number) => setProfileTab(i === 0 ? "overview" : "repos")} />
           </div>
+
+          {profileTab === "overview" && (
+            <div className="grid gap-6">
+              {profileReadme !== null && (
+                <Card>
+                  <SectionHeader label={`${me?.handle} / ${me?.handle}`} right={<span className="text-[12px] text-muted">README.md</span>} />
+                  <div className="px-6 py-5"><Markdown text={profileReadme || "_This README is empty._"} linkBase={`/${encodeURIComponent(me?.handle ?? "")}/${encodeURIComponent(me?.handle ?? "")}`} className="text-[14px] text-body leading-[1.6]" /></div>
+                </Card>
+              )}
+              <Card>
+                <SectionHeader label={`${profileStats?.total ?? 0} contribution${(profileStats?.total ?? 0) === 1 ? "" : "s"} in the last year`} />
+                <div className="px-5 py-4">
+                  <ContributionHeatmap days={profileStats?.days ?? []} />
+                  <div className="mt-4 grid gap-1.5 pt-3 border-t border-rule3">
+                    <div className="flex items-center gap-2 text-[14px]">
+                      <Avatar id={me?.id} handle={me?.handle} kind="human" size={18} />
+                      <span className="font-medium">{me?.handle}</span>
+                      <span className="text-muted">directly</span>
+                      <span className="ml-auto tabular-nums text-body">{profileStats?.human_count ?? 0}</span>
+                    </div>
+                    {(profileStats?.agents ?? []).map((a) => (
+                      <div key={a.handle} className="flex items-center gap-2 text-[14px] pl-5">
+                        <span className="text-faint">↳</span>
+                        <Avatar handle={a.handle} kind="agent" size={16} />
+                        <span className="text-steel-text">{a.handle}</span>
+                        <span className="ml-auto tabular-nums text-muted">{a.count}</span>
+                      </div>
+                    ))}
+                    {(profileStats?.agents ?? []).length === 0 && <div className="text-[12.5px] text-faint pl-5">no agents accountable to you have contributed yet</div>}
+                  </div>
+                </div>
+              </Card>
+            </div>
+          )}
+
+          {profileTab === "repos" && (() => {
+            const grid = q ? ranked.filter((r) => `${r.tenant}/${r.repo}`.toLowerCase().includes(q)) : ranked;
+            return (
+              <div className="grid gap-4">
+                <div className="flex justify-end"><div className="w-[260px]"><SearchInput placeholder="Find a repository" shortcut="" value={profileRepoQ} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setProfileRepoQ(e.target.value)} /></div></div>
+                {repos.length === 0 && <div className="py-8 text-[13px] text-muted">No repositories yet.</div>}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {grid.map((r) => (
+                    <button key={`${r.tenant}/${r.repo}`} onClick={() => navigate(`/${encodeURIComponent(r.tenant)}/${encodeURIComponent(r.repo)}`)} className="group text-left bg-surface border border-rule rounded-card p-4 hover:border-ctl hover:shadow-[0_2px_10px_-4px_rgba(15,23,42,0.12)] transition-all">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-muted flex-none"><path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8ZM5 12.25a.25.25 0 0 1 .25-.25h3.5a.25.25 0 0 1 .25.25v3.25a.25.25 0 0 1-.4.2l-1.45-1.087a.25.25 0 0 0-.3 0L5.4 15.7a.25.25 0 0 1-.4-.2Z" /></svg>
+                        <span className="font-semibold text-[14.5px] truncate group-hover:text-steel-text transition-colors">{r.repo}</span>
+                        {r.score > 0 && <span className="ml-auto flex-none w-2 h-2 rounded-full bg-clear" title="active" />}
+                      </div>
+                      <div className="text-[12px] text-faint mt-0.5 truncate">{r.tenant}/{r.repo}</div>
+                      <div className="mt-3 flex items-center gap-2 text-[12px] text-muted min-w-0">
+                        {r.active_actors.length > 0 ? (
+                          <>
+                            <span className="flex -space-x-1.5 flex-none">{r.active_actors.slice(0, 3).map((a) => <span key={a} className="ring-2 ring-surface rounded-full"><Avatar id={a} handle={actorLabel(a)} kind={kindOf(a)} size={16} /></span>)}</span>
+                            <span className="truncate">{r.active_actors.length} active</span>
+                          </>
+                        ) : <span className="text-faint">quiet</span>}
+                        {r.score > 0 && <span className="ml-auto tabular-nums flex-none" title="live activity">{r.score.toFixed(0)}</span>}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+                {q && grid.length === 0 && <div className="py-6 text-[13px] text-muted">No repositories match “{profileRepoQ}”.</div>}
+              </div>
+            );
+          })()}
         </div>
       ), true);
     }
@@ -1837,64 +1869,34 @@ export function App() {
         </button>
         <span className="w-px h-6 bg-rule2 mx-0.5" aria-hidden />
         {me ? (
-          <div className="relative">
-            <button
-              className="flex items-center gap-1.5 h-ctl px-2.5 rounded-ctl border border-ctl bg-surface hover:border-[oklch(0.6_0.015_250)] cursor-pointer text-[13px]"
-              onClick={() => setShowProfile((s) => !s)}
-              title="your identity & accountability"
-            >
+          <Popover align="right" width={240} trigger={(open) => (
+            <span className={`flex items-center gap-1.5 h-ctl px-2.5 rounded-ctl border bg-surface cursor-pointer text-[13px] transition-colors ${open ? "border-body" : "border-ctl hover:border-dim"}`} title={me.handle}>
               <Avatar id={me.id} handle={me.handle} kind={me.kind} size={18} />
               <span className="font-medium">{me.handle}</span>
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-muted"><polyline points="6 9 12 15 18 9" /></svg>
-            </button>
-            {showProfile && profile && (
-              <div className="absolute right-0 top-[calc(100%+8px)] w-[320px] z-50 bg-surface border border-rule rounded-[12px] shadow-menu p-4 grid gap-3">
-                <div className="flex items-center gap-2">
-                  <b className={profile.kind === "agent" ? "text-steel-text" : ""}>{profile.handle}</b>
-                  <span className="text-[12.5px] text-muted">{profile.kind}</span>
-                  {profile.accountable && <StatusBadge kind="verified">accountable</StatusBadge>}
-                </div>
-                <div className="grid gap-1">
-                  <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">actor id (public key)</span>
-                  <code className="text-[11.5px] text-body break-all tabular-nums" title="your Ed25519 public key — this IS your identity">{profile.id}</code>
-                </div>
-                {profile.kind === "agent" && profile.delegation.length > 0 && (
-                  <div className="grid gap-1">
-                    <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">accountability chain</span>
-                    <span className="text-[13px]">
-                      {profile.delegation.map((h, i) => (
-                        <span key={i}>
-                          <b className={h.kind === "agent" ? "text-steel-text" : ""}>{h.handle}</b>
-                          {i < profile.delegation.length - 1 && <span className="text-faint"> → </span>}
-                        </span>
-                      ))}
-                    </span>
-                  </div>
-                )}
-                <div className="grid gap-1">
-                  <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">memberships</span>
-                  {profile.memberships.length > 0 ? (
-                    <span className="flex flex-wrap gap-1.5">
-                      {profile.memberships.map((m, i) => (
-                        <span key={i} className="inline-flex items-center gap-1.5 text-xs px-2 py-1 rounded-chip bg-paper border border-rule">
-                          {m.account}<span className="text-muted">{m.role}</span>
-                        </span>
-                      ))}
-                    </span>
-                  ) : (
-                    <span className="text-[13px] text-muted">none</span>
-                  )}
-                </div>
-                <button className="text-left text-[13px] text-body hover:text-steel-text cursor-pointer" onClick={() => { setShowProfile(false); navigate("/settings"); }}>Account settings</button>
-                <div className="flex justify-between items-center pt-1 border-t border-rule2">
-                  {profile.kind === "human"
-                    ? <LinkButton onClick={createAgent}>+ delegate an agent</LinkButton>
-                    : <span />}
-                  <LinkButton onClick={signOut}>sign out</LinkButton>
-                </div>
-              </div>
-            )}
-          </div>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`text-muted transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
+            </span>
+          )}>
+            <div className="p-1.5 grid gap-0.5">
+              <button onClick={() => navigate("/me")} className="flex items-center gap-2.5 px-2.5 py-2 rounded-ctl hover:bg-paper text-left">
+                <Avatar id={me.id} handle={me.handle} kind={me.kind} size={34} />
+                <span className="min-w-0">
+                  <span className="block text-[13.5px] font-semibold truncate">{me.handle}</span>
+                  <span className="block text-[11.5px] text-muted">{me.kind}{profile?.accountable ? " · accountable" : ""}</span>
+                </span>
+              </button>
+              <div className="border-t border-rule2 my-1" />
+              <button onClick={() => navigate("/me")} className="flex items-center gap-2.5 px-2.5 py-1.5 rounded-ctl hover:bg-paper text-left text-[13px] text-body">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg>Your profile
+              </button>
+              <button onClick={() => navigate("/settings")} className="flex items-center gap-2.5 px-2.5 py-1.5 rounded-ctl hover:bg-paper text-left text-[13px] text-body">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>Settings
+              </button>
+              <div className="border-t border-rule2 my-1" />
+              <button onClick={signOut} className="flex items-center gap-2.5 px-2.5 py-1.5 rounded-ctl hover:bg-fault-wash text-left text-[13px] text-fault-text">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" /></svg>Sign out
+              </button>
+            </div>
+          </Popover>
         ) : (
           <div className="flex items-center gap-2">
             <Button size="sm" variant="secondary" onClick={() => navigate("/login")}>Log in</Button>
@@ -2702,8 +2704,9 @@ export function App() {
 // top-left = your own contributions, bottom-right = your agents' — each shaded by its own intensity.
 // Columns flex to fill the width, so there's never a scrollbar.
 type HeatDay = { day: number; human: number; agent: number };
-const HEAT_YOU = ["#ebedf0", "#9be9a8", "#40c463", "#30a14e", "#216e39"]; // green
-const HEAT_AGENT = ["#dfe3ea", "#a9c9f5", "#5a9bd4", "#2f6fb0", "#1b4d80"]; // blue
+const HEAT_EMPTY = "var(--rule2)"; // theme-aware neutral for days with no contributions
+const HEAT_YOU = [HEAT_EMPTY, "#9be9a8", "#40c463", "#30a14e", "#216e39"]; // green
+const HEAT_AGENT = [HEAT_EMPTY, "#a9c9f5", "#5a9bd4", "#2f6fb0", "#1b4d80"]; // blue
 function ContributionHeatmap({ days }: { days: HeatDay[] }) {
   const byDay = new Map(days.map((d) => [d.day, d]));
   const today = Math.floor(Date.now() / 86_400_000);
@@ -2728,7 +2731,7 @@ function ContributionHeatmap({ days }: { days: HeatDay[] }) {
             {col.map((e, j) => {
               if (e < 0) return <span key={j} className="aspect-square" />;
               const d = byDay.get(e); const h = d?.human ?? 0; const a = d?.agent ?? 0;
-              const bg = h === 0 && a === 0 ? "#ebedf0" : `linear-gradient(to bottom right, ${HEAT_YOU[lvl(h, maxH)]} 0 50%, ${HEAT_AGENT[lvl(a, maxA)]} 50% 100%)`;
+              const bg = h === 0 && a === 0 ? HEAT_EMPTY : `linear-gradient(to bottom right, ${HEAT_YOU[lvl(h, maxH)]} 0 50%, ${HEAT_AGENT[lvl(a, maxA)]} 50% 100%)`;
               return <span key={j} title={`${h + a} contribution${h + a === 1 ? "" : "s"} — ${h} you, ${a} agents · ${fmt(e)}`} className="aspect-square rounded-[2px]" style={{ background: bg }} />;
             })}
           </div>
