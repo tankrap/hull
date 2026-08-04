@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { Markdown } from "../markdown";
 
-export type Mention = { handle: string; kind?: string };
+export type Mention = { handle: string; kind?: string; email?: string; avatar?: React.ReactNode };
 
 // A markdown-aware text editor: a Write/Preview toggle + a formatting toolbar that inserts markdown,
 // matching the familiar comment-box pattern. Controlled via value/onChange. Typing "@" opens a
@@ -125,10 +125,12 @@ export function RichText({ value, onChange, placeholder, rows = 4, linkBase = nu
             <button key={m.handle} type="button"
               onMouseDown={(e) => { e.preventDefault(); pick(m); }}
               onMouseEnter={() => setMIdx(i)}
-              className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-[13px] ${i === mIdx ? "bg-steel-wash" : "hover:bg-paper/60"}`}>
-              <span className={`w-1.5 h-1.5 rounded-full flex-none ${m.kind === "agent" ? "bg-steel" : "bg-brass"}`} />
-              <span className="font-medium text-ink">@{m.handle}</span>
-              {m.kind === "agent" && <span className="text-[10px] font-bold uppercase tracking-[0.06em] text-steel-text bg-steel-wash rounded-[3px] px-1 py-px">agent</span>}
+              className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 text-left ${i === mIdx ? "bg-steel-wash" : "hover:bg-paper/60"}`}>
+              {m.avatar ? <span className="flex-none">{m.avatar}</span> : <span className={`w-1.5 h-1.5 rounded-full flex-none ${m.kind === "agent" ? "bg-steel" : "bg-brass"}`} />}
+              <span className="min-w-0 flex-1">
+                <span className="flex items-center gap-1.5"><span className="text-[13px] font-medium text-ink truncate">@{m.handle}</span>{m.kind === "agent" && <span className="text-[10px] font-bold uppercase tracking-[0.06em] text-steel-text bg-steel-wash rounded-[3px] px-1 py-px flex-none">agent</span>}</span>
+                {m.email && <span className="block text-[11.5px] text-muted truncate">{m.email}</span>}
+              </span>
             </button>
           ))}
         </div>

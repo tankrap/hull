@@ -1212,6 +1212,7 @@ async fn actors_list(State(app): State<App>) -> Json<Value> {
                 "id": a.id,
                 "handle": a.handle,
                 "kind": a.kind,
+                "email": app.store.user_by_actor(&a.id).map(|u| u.email).unwrap_or_default(),
                 // Reflect the real gate: cryptographic verification + revocation, not just structure.
                 "accountable": accountable(&app, &a).is_ok(),
                 "revoked": a.revoked,

@@ -111,7 +111,7 @@ type ActivityEvent =
   | { kind: "push"; actor: string; repo: string; change: string; ts: number }
   | { kind: "issue"; repo: string; number: number; action: string; actor: string; ts: number };
 
-type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable: boolean; human_root: string | null };
+type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable: boolean; human_root: string | null; email?: string };
 type PR = { number: number; title: string; author: string; changes: string[]; verification: string; state: string; reviewers: string[] };
 type Finding = { path: string; line?: number; severity: string; note: string };
 type ClaimEv = { kind: string; detail: string; supports: boolean };
@@ -157,6 +157,13 @@ const Avatar = ({ id, handle, kind, size = 22 }: { id?: string; handle?: string;
     </span>
   );
 };
+// A rich Picker option for a user/actor — avatar + username + email (or kind), so you pick the right person.
+const actorOption = (a: { id: string; handle: string; kind?: string; email?: string }) => ({
+  value: a.id,
+  label: a.handle,
+  sub: (a.email && a.email.trim()) || (a.kind === "agent" ? "agent" : "human"),
+  avatar: <Avatar id={a.id} handle={a.handle} kind={a.kind} size={24} />,
+});
 
 // An issue label rendered as a neutral tag (like the rest of the UI) with a small colour dot for
 // identity — hue deterministically derived from the label text.
@@ -191,7 +198,7 @@ function LabelEditor({ labels, onChange }: { labels: RepoLabel[]; onChange: (l: 
     <div className="grid gap-3">
       <div className="flex flex-wrap gap-1.5">
         {labels.map((l) => (
-          <span key={l.name} className="inline-flex items-center gap-1"><Label name={l.name} color={l.color} icon={l.icon} /><button className="text-muted hover:text-fault-text cursor-pointer" title="remove" onClick={() => onChange(labels.filter((x) => x.name !== l.name))}>×</button></span>
+          <span key={l.name} className="group inline-flex items-center gap-0.5"><Label name={l.name} color={l.color} icon={l.icon} /><button className="text-muted hover:text-fault-text cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity px-0.5" title="remove" onClick={() => onChange(labels.filter((x) => x.name !== l.name))}>×</button></span>
         ))}
         {labels.length === 0 && <span className="text-[12.5px] text-muted">none yet</span>}
       </div>
@@ -307,13 +314,15 @@ function Popover({ trigger, children, align = "left", width = 300, direction = "
 
 // Styled select (replaces native <select>). options: {value,label}[]. When value is "" it shows the
 // placeholder — used both for bound selects and "pick to act" menus.
-function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", block = false, direction = "down", className = "", searchable: searchableProp }: { value: string; onChange: (v: string) => void; options: { value: string; label: string }[]; placeholder?: string; width?: number; size?: "sm" | "md"; block?: boolean; direction?: "down" | "up"; className?: string; searchable?: boolean }) {
+type PickerOption = { value: string; label: string; sub?: string; avatar?: React.ReactNode };
+function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", block = false, direction = "down", className = "", searchable: searchableProp }: { value: string; onChange: (v: string) => void; options: PickerOption[]; placeholder?: string; width?: number; size?: "sm" | "md"; block?: boolean; direction?: "down" | "up"; className?: string; searchable?: boolean }) {
   const cur = options.find((o) => o.value === value);
   const h = size === "sm" ? "h-ctl-sm text-xs" : "h-ctl text-[13px]";
   const [q, setQ] = useState("");
   const searchable = searchableProp ?? options.length >= 8;
   const ql = q.trim().toLowerCase();
-  const filtered = ql ? options.filter((o) => o.label.toLowerCase().includes(ql)) : options;
+  const filtered = ql ? options.filter((o) => o.label.toLowerCase().includes(ql) || (o.sub ?? "").toLowerCase().includes(ql)) : options;
+  const rich = options.some((o) => o.avatar || o.sub);
   return (
     <Popover align="left" width={width} block={block} direction={direction} onToggle={(o) => { if (!o) setQ(""); }} trigger={(open) => (
       <span className={`inline-flex items-center justify-between gap-2 ${h} px-2.5 rounded-ctl border bg-surface transition-colors ${block ? "w-full" : ""} ${open ? "border-body" : "border-ctl hover:border-dim"} ${className}`}>
@@ -328,9 +337,18 @@ function Picker({ value, onChange, options, placeholder = "Select…", width = 2
       )}
       <div className="py-1 max-h-[280px] overflow-y-auto overflow-x-hidden">
         {filtered.length === 0 && <div className="px-3 py-1.5 text-[12.5px] text-muted">{ql ? "no matches" : "none available"}</div>}
-        {filtered.map((o) => (
+        {filtered.map((o) => (rich ? (
+          <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:bg-paper ${o.value === value ? "bg-paper" : ""}`}>
+            {o.avatar ? <span className="flex-none">{o.avatar}</span> : null}
+            <span className="min-w-0 flex-1">
+              <span className={`block text-[13px] truncate ${o.value === value ? "font-medium text-ink" : "text-body"}`}>{o.label}</span>
+              {o.sub && <span className="block text-[11.5px] text-muted truncate">{o.sub}</span>}
+            </span>
+            {o.value === value && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
+          </button>
+        ) : (
           <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-3 py-1.5 text-[13px] truncate hover:bg-paper ${o.value === value ? "bg-paper font-medium text-ink" : "text-body"}`}>{o.label}</button>
-        ))}
+        )))}
       </div>
     </Popover>
   );
@@ -460,7 +478,7 @@ function NewIssueModal({ repos, defaultRepo, actors, onClose, onCreate }: { repo
       <div className="grid gap-4">
         <Field label="Repository"><Picker block value={repo} onChange={setRepo} options={repos.map((r) => ({ value: `${r.tenant}/${r.repo}`, label: `${r.tenant}/${r.repo}` }))} placeholder="Choose a repository…" /></Field>
         <Field label="Title"><input autoFocus className={modalInput} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Something an agent (or human) should fix" /></Field>
-        <Field label="Description"><RichText value={body} onChange={setBody} rows={5} mentions={actors.map((a) => ({ handle: a.handle, kind: a.kind }))} placeholder="What's wrong, where, and how you'd know it's fixed. Agents read this first." /></Field>
+        <Field label="Description"><RichText value={body} onChange={setBody} rows={5} mentions={actors.map((a) => ({ handle: a.handle, kind: a.kind, email: a.email, avatar: <Avatar id={a.id} handle={a.handle} kind={a.kind} size={22} /> }))} placeholder="What's wrong, where, and how you'd know it's fixed. Agents read this first." /></Field>
         <Field label="Labels" hint="configured by the repo">
           {repoLabels.length === 0 ? (
             <div className="text-[12.5px] text-muted">This repo has no labels yet. A repo admin adds them in Settings → Labels.</div>
@@ -488,7 +506,7 @@ function NewIssueModal({ repos, defaultRepo, actors, onClose, onCreate }: { repo
               </span>
             ); })}
             <Picker size="sm" width={240} direction="up" value="" placeholder="Add assignee…" onChange={(v) => setAssignees((s) => s.includes(v) ? s : [...s, v])}
-              options={sorted.filter((a) => !assignees.includes(a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} />
+              options={sorted.filter((a) => !assignees.includes(a.id)).map(actorOption)} />
           </div>
         </Field>
         <div className="flex justify-end gap-2 pt-1">
@@ -945,7 +963,7 @@ export function App() {
   type ProfileStats = { handle: string; bio: string; total: number; human_count: number; days: HeatDay[]; agents: { handle: string; count: number }[] };
   const [profileStats, setProfileStats] = useState<ProfileStats | null>(null);
   const [profileRepoQ, setProfileRepoQ] = useState("");
-  const [profileTab, setProfileTab] = useState<"overview" | "repos">("overview");
+  const [profileTab, setProfileTab] = useState<"overview" | "repos" | "orgs">("overview");
   const [profileReadme, setProfileReadme] = useState<string | null>(null); // README of <me>/<me>, if any
   const [bioDraft, setBioDraft] = useState<string | null>(null); // non-null = editing
   const loadProfile = () => { if (token) fetch("/api/profile", { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then(setProfileStats).catch(() => {}); };
@@ -1357,7 +1375,7 @@ export function App() {
   // The issue discussion thread is a stable top-level component (IssueThread) so typing in its
   // composer doesn't remount and steal focus. This closure just binds the current App state to it.
   const commentBoxRef = useRef<HTMLDivElement | null>(null);
-  const threadProps = { comments, issues, commentDraft, setCommentDraft, issueMode, setIssueMode, runIssueMode, canAct, tenant, repo: issueRepo, handleOf, kindOf, boxRef: commentBoxRef, mentions: actors.map((a) => ({ handle: a.handle, kind: a.kind })) };
+  const threadProps = { comments, issues, commentDraft, setCommentDraft, issueMode, setIssueMode, runIssueMode, canAct, tenant, repo: issueRepo, handleOf, kindOf, boxRef: commentBoxRef, mentions: actors.map((a) => ({ handle: a.handle, kind: a.kind, email: a.email, avatar: <Avatar id={a.id} handle={a.handle} kind={a.kind} size={22} /> })) };
   const [autoReviewing, setAutoReviewing] = useState<number | null>(null);
   const requestReviewer = async (prNumber: number, reviewer: string) => {
     if (!canAct || !reviewer) return;
@@ -1573,7 +1591,7 @@ export function App() {
           </button>
         </header>
         <div className={`mx-auto px-6 py-12 ${wide ? "max-w-[720px]" : "max-w-[420px]"}`}>
-          <h1 className="text-[24px] font-semibold tracking-tight mb-6">{title}</h1>
+          {title && <h1 className="text-[24px] font-semibold tracking-tight mb-6">{title}</h1>}
           {children}
         </div>
       </div>
@@ -1635,7 +1653,7 @@ export function App() {
     if (authPage === "profile") {
       const ranked = [...repos].sort((a, b) => b.score - a.score);
       const q = profileRepoQ.trim().toLowerCase();
-      return shell(me ? me.handle : "Profile", (
+      return shell("", (
         <div className="grid gap-6">
           {/* Full-bleed banner behind the page — breaks out of the container to the viewport edges. */}
           <div className="relative left-1/2 right-1/2 -mx-[50vw] w-screen -mt-12 -z-0 h-[220px] bg-gradient-to-br from-steel-wash via-paper to-brass-wash pointer-events-none" aria-hidden />
@@ -1666,7 +1684,7 @@ export function App() {
 
           {/* Profile tabs */}
           <div className="border-b border-rule2 -mt-1">
-            <HTabs items={["Overview", `Repositories ${repos.length}`]} value={profileTab === "overview" ? 0 : 1} onChange={(i: number) => setProfileTab(i === 0 ? "overview" : "repos")} />
+            <HTabs items={["Overview", `Repositories ${repos.length}`, `Organizations ${myAccounts.length}`]} value={profileTab === "overview" ? 0 : profileTab === "repos" ? 1 : 2} onChange={(i: number) => setProfileTab(i === 0 ? "overview" : i === 1 ? "repos" : "orgs")} />
           </div>
 
           {profileTab === "overview" && (
@@ -1734,6 +1752,27 @@ export function App() {
               </div>
             );
           })()}
+
+          {profileTab === "orgs" && (
+            <div>
+              {myAccounts.length === 0 && <div className="py-8 text-[13px] text-muted">You're not a member of any organizations yet.</div>}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {myAccounts.map((h) => {
+                  const role = profile?.memberships.find((m) => m.account === h)?.role;
+                  return (
+                    <button key={h} onClick={() => navigate(`/orgs/${encodeURIComponent(h)}`)} className="group text-left bg-surface border border-rule rounded-card p-4 hover:border-ctl hover:shadow-[0_2px_10px_-4px_rgba(15,23,42,0.12)] transition-all flex items-center gap-3">
+                      <Avatar id={h} handle={h} kind="organization" size={40} />
+                      <div className="min-w-0 flex-1">
+                        <div className="font-semibold text-[14.5px] truncate group-hover:text-steel-text transition-colors">{h}</div>
+                        {role && <div className="text-[12px] text-muted capitalize">{role}</div>}
+                      </div>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-faint opacity-0 group-hover:opacity-100 -translate-x-1 group-hover:translate-x-0 transition-all flex-none"><polyline points="9 18 15 12 9 6" /></svg>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       ), true);
     }
@@ -2159,9 +2198,9 @@ export function App() {
                     <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">labels</span>
                     <div className="flex flex-wrap gap-1.5">
                       {it.labels.map((l) => (
-                        <span key={l} className="inline-flex items-center gap-1">
+                        <span key={l} className="group inline-flex items-center gap-0.5">
                           <Label name={l} color={labelColor(l)} />
-                          {canAct && <button className="text-muted hover:text-fault-text cursor-pointer text-xs" title="remove" onClick={() => issueAction(it.number, "unlabel", { label: l })}>×</button>}
+                          {canAct && <button className="text-muted hover:text-fault-text cursor-pointer text-xs opacity-0 group-hover:opacity-100 transition-opacity px-0.5" title="remove" onClick={() => issueAction(it.number, "unlabel", { label: l })}>×</button>}
                         </span>
                       ))}
                       {it.labels.length === 0 && <span className="text-[12.5px] text-muted">none</span>}
@@ -2257,7 +2296,7 @@ export function App() {
             {caps.ai_review && <Button size="sm" variant="secondary" disabled={autoReviewing === p.number} onClick={() => autoReview(p.number)}>{autoReviewing === p.number ? "agent reviewing…" : "⬡ Agent auto-review"}</Button>}
             {canAct && (
               <Picker size="sm" width={220} placeholder="Request a reviewer…" value="" onChange={(v) => requestReviewer(p.number, v)}
-                options={actors.filter((a) => a.id !== p.author && !p.reviewers?.includes(a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} />
+                options={actors.filter((a) => a.id !== p.author && !p.reviewers?.includes(a.id)).map(actorOption)} />
             )}
           </div>
         ) : null;
@@ -2334,7 +2373,7 @@ export function App() {
                     {amAdmin && (
                       <div className="px-5 py-3 flex gap-2 items-center bg-paper flex-wrap">
                         <div className="flex-1 min-w-[200px]"><Picker block value={memberPick.actor} placeholder="Add a member…" onChange={(v) => setMemberPick({ ...memberPick, actor: v })}
-                          options={candidates.map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}` }))} /></div>
+                          options={candidates.map(actorOption)} /></div>
                         <Picker width={140} value={memberPick.role} onChange={(v) => setMemberPick({ ...memberPick, role: v })}
                           options={["read", "write", "admin", "owner"].map((r) => ({ value: r, label: r }))} />
                         <Button size="sm" disabled={!memberPick.actor} onClick={() => { if (memberPick.actor) { addOrgMember(acct.id, { actor: memberPick.actor }, memberPick.role); setMemberPick({ actor: "", role: "write" }); } }}>Add</Button>
@@ -2614,7 +2653,7 @@ export function App() {
                   </div>
                   {isTenantOwner && (
                     <div className="max-w-[280px]"><Picker block value="" placeholder="Add a reviewer…" onChange={(v) => { if (v && s) saveRepoSettings({ default_reviewers: [...new Set([...s.default_reviewers.map((x) => x.actor), v])] }); }}
-                      options={reviewerCandidates.filter((a) => !(s?.default_reviewers ?? []).some((x) => x.actor === a.id)).map((a) => ({ value: a.id, label: `${a.handle} · ${a.kind}${isOwner(a.id) ? " · code owner" : ""}` }))} /></div>
+                      options={reviewerCandidates.filter((a) => !(s?.default_reviewers ?? []).some((x) => x.actor === a.id)).map((a) => ({ ...actorOption(a), sub: `${(a.email && a.email.trim()) || a.kind}${isOwner(a.id) ? " · code owner" : ""}` }))} /></div>
                   )}
                   {isTenantOwner && coOwners.length > 0 && (
                     <div className="text-[12px] text-muted pt-2 border-t border-rule3 flex flex-wrap items-center gap-x-1.5 gap-y-1">
@@ -3011,7 +3050,7 @@ function ReviewPage({
   type Claim = { id: string; text: string; source: string; status: string; evidence: Evidence[] };
   type Ledger = { change: string; claims: Claim[]; unclaimed?: string[] };
   const [change, setChange] = useState<ChangeInfo | null>(null);
-  const mentions = actors.map((a) => ({ handle: a.handle, kind: a.kind }));
+  const mentions = actors.map((a) => ({ handle: a.handle, kind: a.kind, email: a.email, avatar: <Avatar id={a.id} handle={a.handle} kind={a.kind} size={22} /> }));
   const [diff, setDiff] = useState<FileDiff[]>([]);
   type Semantic = { moves: { from: string; to: string; blob: string }[]; added: string[]; deleted: string[]; modified: string[]; whitespace_only: string[]; behavioral: string[]; pure_move: boolean; mechanical: boolean };
   const [semantic, setSemantic] = useState<Semantic | null>(null);
