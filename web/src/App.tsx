@@ -2256,7 +2256,7 @@ export function App() {
         ) : (
           <div className="flex items-center gap-2.5 flex-wrap justify-end">
             <Button disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}><span className="inline-flex items-center gap-1.5">{mergeGlyph}Merge</span></Button>
-            {!canLand && isTenantOwner && <Button size="sm" variant="secondary" className="!text-fault-text" onClick={() => mergePr(p.number, true)}>Merge without checks</Button>}
+            {!canLand && isTenantOwner && <Button size="sm" variant="secondary" onClick={() => mergePr(p.number, true)}>Merge without checks</Button>}
           </div>
         );
         // Secondary review actions (the primary comment/approve/request-changes flow lives in the
@@ -3033,7 +3033,10 @@ function ReviewPage({
   // Which verdict's lens we're viewing the package through (default: the primary review). The
   // synthesized package itself — diff, reconciliation, checks — is the page; verdicts are a strip.
   const [activeId, setActiveId] = useState<string | null>(null);
-  const active = reviews.find((r) => r.id === activeId) ?? review;
+  // Default to the NEWEST review that carries a ledger — so after a fresh agent review/triage the page
+  // reflects the current reconciliation (fewer claims), not a stale snapshot from an older review.
+  const latestLedgered = [...reviews].filter((r) => r.ledger).sort((a, b) => (b.created_unix ?? 0) - (a.created_unix ?? 0))[0];
+  const active = reviews.find((r) => r.id === activeId) ?? latestLedgered ?? review;
   type Session = { task: string; model: string; lesson: string; tool_calls: number; tokens_in: number; tokens_out: number };
   type ChangeInfo = {
     id: string;
@@ -3075,11 +3078,13 @@ function ReviewPage({
       .then((d) => setSemantic(d.semantic ?? null))
       .catch(() => {});
   }, [changeId, tenant, repo]);
-  // If this review carries an immutable ledger snapshot (an agent reconciliation review), show that
-  // — it's the evidence the verdict was actually based on. Otherwise reconcile live.
+  // Always load the LIVE ledger — it reflects the current reconcile AND any resolutions (e.g. an
+  // agent triage that just verified the intent claims). Prefer it over an older review's frozen
+  // snapshot so "cut down by AI" actually shows up; fall back to the snapshot only if the live one
+  // isn't available yet.
   const snapshot = active.ledger ?? null;
   const loadLedger = () => {
-    if (snapshot || !changeId) return;
+    if (!changeId) return;
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/ledger`, { headers: authHeaders() })
       .then((r) => r.json())
       .then((d) => setLedger(d.ledger))
@@ -3087,7 +3092,7 @@ function ReviewPage({
   };
   // Reconcile after verification is known, so a green/red signal is reflected in the claim statuses.
   useEffect(loadLedger, [changeId, tenant, repo, change?.verification]);
-  const shownLedger = snapshot ?? ledger;
+  const shownLedger = ledger ?? snapshot;
 
   // Human resolutions of claims (the needs-judgment action). Fetched from the live ledger (which
   // overlays them), keyed by claim id, so they show on the snapshot too.
@@ -3389,8 +3394,8 @@ function ReviewPage({
           <div className="flex items-center gap-2 min-w-0 flex-1">
             <span className="text-[13.5px] font-semibold text-ink truncate">{pr ? pr.title : active.target}</span>
             {pr && <span className="text-[12px] text-faint tabular-nums flex-none">#{pr.number}</span>}
-            <span className={`ml-auto flex-none inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge ${checksBad ? "bg-fault-wash text-fault-text" : checksPass === checks.length ? "bg-clear-wash text-clear-text" : "bg-brass-wash text-brass-text"}`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${checksBad ? "bg-fault" : checksPass === checks.length ? "bg-clear" : "bg-brass"}`} />
+            <span className={`ml-auto flex-none inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge ${checksBad ? "bg-brass-wash text-brass-text" : checksPass === checks.length ? "bg-clear-wash text-clear-text" : "bg-brass-wash text-brass-text"}`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${checksBad ? "bg-brass" : checksPass === checks.length ? "bg-clear" : "bg-brass"}`} />
               {checksBad ? "Not ready" : checksPass === checks.length ? "Ready to merge" : "Awaiting review"} · {checksPass}/{checks.length}
             </span>
           </div>
@@ -3424,12 +3429,12 @@ function ReviewPage({
           <span className="text-faint">·</span>
           <span>{changedFiles} file{changedFiles === 1 ? "" : "s"}</span>
           <span className="text-clear-text font-semibold">+{addN}</span>
-          <span className="text-fault-text font-semibold">−{delN}</span>
+          <span className="text-dim font-semibold">−{delN}</span>
           <span className="text-faint">·</span>
           {/* Checks — clickable, opens the full checklist so the gate is reachable from the top */}
           <Popover align="left" width={296} trigger={(open) => (
-            <span className={`inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge transition-colors ${checksBad ? "bg-fault-wash text-fault-text" : checksPass === checks.length ? "bg-clear-wash text-clear-text" : "bg-brass-wash text-brass-text"} ${open ? "ring-2 ring-steel/25" : ""}`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${checksBad ? "bg-fault" : checksPass === checks.length ? "bg-clear" : "bg-brass"}`} />
+            <span className={`inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge transition-colors ${checksBad ? "bg-brass-wash text-brass-text" : checksPass === checks.length ? "bg-clear-wash text-clear-text" : "bg-brass-wash text-brass-text"} ${open ? "ring-2 ring-steel/25" : ""}`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${checksBad ? "bg-brass" : checksPass === checks.length ? "bg-clear" : "bg-brass"}`} />
               {checksPass}/{checks.length} checks
               <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className={open ? "rotate-180 transition-transform" : "transition-transform"}><polyline points="6 9 12 15 18 9" /></svg>
             </span>
@@ -3488,7 +3493,7 @@ function ReviewPage({
           const delN = diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === "del").length, 0), 0);
           const fileN = change?.files.length ?? diff.length;
           const verdict = checksBad ? "Not ready to merge" : checks.length > 0 && checksPass === checks.length ? "Ready to merge" : "Awaiting review";
-          const vTone = checksBad ? "text-fault-text" : verdict === "Ready to merge" ? "text-clear-text" : "text-brass-text";
+          const vTone = checksBad ? "text-ink" : verdict === "Ready to merge" ? "text-clear-text" : "text-brass-text";
           const blocking = checks.filter((c) => c.tone === "bad");
           // Where does clicking a blocking reason take you? Claims/findings → the attention card;
           // approval → the conversation; a red build isn't jumpable (rerun lives in the top bar).
@@ -3514,13 +3519,13 @@ function ReviewPage({
                     <p className="text-[14px] text-body leading-[1.55]">{digestText.length > 260 ? digestText.slice(0, 260).trimEnd() + "…" : digestText}</p>
                     {checksBad ? (
                       <div className="mt-2.5 grid gap-1">
-                        <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-fault-text">Blocking the merge</div>
+                        <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-brass-text">Blocking the merge</div>
                         {blocking.map((c, i) => {
                           const target = jumpTarget(c.label);
                           return (
-                            <button key={i} disabled={!target} onClick={() => target && jumpTo(target)} className={`text-[13px] flex items-start gap-1.5 text-left text-fault-text ${target ? "hover:underline cursor-pointer" : "cursor-default"}`}>
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="mt-[3px] flex-none"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-                              <span><b>{c.label}</b> — {c.detail}{target ? " ↓" : ""}</span>
+                            <button key={i} disabled={!target} onClick={() => target && jumpTo(target)} className={`text-[13px] flex items-start gap-2 text-left text-body ${target ? "hover:text-ink cursor-pointer group" : "cursor-default"}`}>
+                              <span className="w-1.5 h-1.5 rounded-full bg-brass mt-1.5 flex-none" />
+                              <span><b>{c.label}</b> — {c.detail}{target && <span className="text-steel-text group-hover:underline"> ↓</span>}</span>
                             </button>
                           );
                         })}
@@ -3540,13 +3545,13 @@ function ReviewPage({
                   <div className="flex flex-col items-end gap-2.5 flex-none">
                     {landGate}
                     <span className="inline-flex items-center gap-1.5 text-[11.5px] font-medium text-muted">
-                      <span className={`w-1.5 h-1.5 rounded-full ${riskLevel === "low" ? "bg-clear" : riskLevel === "high" ? "bg-fault" : "bg-brass"}`} />{riskLevel} risk
+                      <span className={`w-1.5 h-1.5 rounded-full ${riskLevel === "low" ? "bg-clear" : "bg-brass"}`} />{riskLevel} risk
                     </span>
                   </div>
                 </div>
               </div>
               {briefClaims.length > 0 && <Toggle open={showClaims} onClick={() => { const o = !showClaims; setShowClaims(o); if (o) setTimeout(() => document.getElementById("reconciliation-section")?.scrollIntoView({ behavior: "smooth", block: "start" }), 80); }}>{claimsLine}</Toggle>}
-              {(diff.length > 0 || (semantic?.moves.length ?? 0) > 0) && <Toggle open={showChanges} onClick={() => { const o = !showChanges; setShowChanges(o); if (o) setTimeout(() => document.getElementById("changes-section")?.scrollIntoView({ behavior: "smooth", block: "start" }), 80); }}>Changes · {fileN} file{fileN === 1 ? "" : "s"} · <span className="text-clear-text tabular-nums">+{addN}</span> <span className="text-fault-text tabular-nums">−{delN}</span></Toggle>}
+              {(diff.length > 0 || (semantic?.moves.length ?? 0) > 0) && <Toggle open={showChanges} onClick={() => { const o = !showChanges; setShowChanges(o); if (o) setTimeout(() => document.getElementById("changes-section")?.scrollIntoView({ behavior: "smooth", block: "start" }), 80); }}>Changes · {fileN} file{fileN === 1 ? "" : "s"} · <span className="text-dim tabular-nums">+{addN} −{delN}</span></Toggle>}
             </Card>
           );
         })()}
@@ -3608,9 +3613,6 @@ function ReviewPage({
           const idx = Math.min(attnIdx, items.length - 1);
           const cur = items[idx];
           const kindLoz = "text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded flex-none";
-          const tone = cur.kind === "needs" ? "wait" : cur.kind === "finding" ? (cur.row!.f.severity === "blocker" ? "bad" : "warn") : "bad";
-          const label = cur.kind === "contra" ? "Contradicted claim" : cur.kind === "concern" ? "Concern raised" : cur.kind === "finding" ? (cur.row!.f.severity === "blocker" ? "Blocker" : "Warning") : "Intent — needs your eyes";
-          const labelColor = tone === "bad" ? "text-fault-text" : tone === "warn" ? "text-brass-text" : "text-brass-text";
           const needsLeft = needs.length;
           const lbl = (icon: React.ReactNode, text: string) => <span className="inline-flex items-center gap-1.5">{icon}{text}</span>;
           return (
@@ -3618,19 +3620,18 @@ function ReviewPage({
             <Card className="mb-6">
               <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule">
                 <div className="flex items-center gap-2.5">
-                  <span className="text-fault-text"><IcoFlag size={15} /></span>
+                  <span className="text-brass-text"><IcoFlag size={15} /></span>
                   <span className="text-[13.5px] font-semibold text-ink">Needs your attention</span>
                   <span className="text-[12px] text-muted tabular-nums">{idx + 1} / {items.length}</span>
                 </div>
-                {canReview && onTriage && <Button size="sm" variant="secondary" disabled={triaging || !canAct} onClick={onTriage}>{triaging ? "agent triaging…" : lbl(<IcoSearch size={13} />, "Let an agent triage")}</Button>}
+                {canReview && onTriage && <Button size="sm" variant="secondary" disabled={triaging || !canAct} onClick={async () => { await onTriage(); loadResolutions(); loadLedger(); }}>{triaging ? "agent triaging…" : lbl(<IcoSearch size={13} />, "Let an agent triage")}</Button>}
               </div>
               <div className="h-[2px] bg-rule2"><div className="h-full bg-dim/50 transition-all" style={{ width: `${((idx + 1) / items.length) * 100}%` }} /></div>
 
               <div className="px-5 py-4 min-h-[128px]">
-                <div className={`text-[11px] font-bold uppercase tracking-[0.05em] mb-2 ${labelColor}`}>{label}</div>
                 {cur.kind === "finding" ? (
                   <>
-                    <div className="text-[14px] text-body leading-snug">{cur.row!.f.note}</div>
+                    <div className="text-[15.5px] font-medium text-ink leading-snug">{cur.row!.f.note}</div>
                     {cur.row!.f.path && <div className="text-[12.5px] text-muted mt-1 tabular-nums">{cur.row!.f.path}{cur.row!.f.line ? `:${cur.row!.f.line}` : ""}</div>}
                     <div className="flex items-center gap-2 mt-3.5 flex-wrap">
                       {canFix && pr && cur.row!.f.path ? <Button size="sm" disabled={!canAct || fixing === cur.row!.idx} onClick={() => fixWithAI(cur.row!.idx, cur.row!.f)}>{fixing === cur.row!.idx ? "fixing…" : lbl(<IcoSparkle size={13} />, "Fix with AI")}</Button>
@@ -3639,8 +3640,8 @@ function ReviewPage({
                   </>
                 ) : (
                   <>
-                    <div className="text-[14px] text-body leading-snug">{cur.claim!.text}</div>
-                    <div className={`text-[12.5px] mt-1 ${cur.kind === "needs" ? "text-muted" : "text-fault-text"}`}>
+                    <div className="text-[15.5px] font-medium text-ink leading-snug">{cur.claim!.text}</div>
+                    <div className={`text-[12.5px] mt-1.5 ${cur.kind === "needs" ? "text-muted" : "text-brass-text"}`}>
                       {cur.kind === "contra" ? "The change's own facts contradict this claim." : cur.kind === "concern" ? <>Concern raised by <b>{resolutions[cur.claim!.id]?.by}</b>{resolutions[cur.claim!.id]?.note ? ` — ${resolutions[cur.claim!.id]?.note}` : ""}.</> : "Can't be checked mechanically — read the diff and confirm."}
                     </div>
                     {(cur.claim!.evidence ?? []).slice(0, 2).map((e, i) => (

@@ -3353,6 +3353,24 @@ async fn perform_auto_review(
         }
         }
     };
+    // "Put the claims through AI to cut down the numbers": an independent agent just read the diff
+    // (the AI reviewer). Every intent claim it did NOT contradict or ask changes on is no longer an
+    // open question for a human — resolve those needs-judgment claims as verified, attributed to the
+    // agent (accountable; a human can still override). A request-changes/reject verdict, or a
+    // contradicted claim, leaves the real problems standing. So after a triage the reviewer sees only
+    // what genuinely remains, not a wall of mechanically-extracted intent restatements.
+    if reviewer.kind == hull_core::ActorKind::Agent && !matches!(verdict, Verdict::RequestChanges | Verdict::Reject) {
+        if let Some(l) = &ledger {
+            for c in l.claims.iter().filter(|c| c.status == hull_core::reconcile::ClaimStatus::NeedsJudgment) {
+                app.claims.set(&key, &change, &c.id, claims::ClaimResolution {
+                    by: reviewer.id.clone(),
+                    judgment: "verified".into(),
+                    note: format!("verified by {}", reviewer.handle),
+                    ts: now(),
+                });
+            }
+        }
+    }
     let count = app.store.reviews(&key).len();
     let rid = format!("rv_{}_{}", key.replace('/', "_"), count + 1);
     // D8 — content-addressed audit artifact: the full record of why this verdict was reached.
