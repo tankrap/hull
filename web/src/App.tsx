@@ -178,17 +178,53 @@ const hexLum = (hex: string): number => {
 };
 const contrastText = (hex: string) => (hexLum(hex) > 0.6 ? "#111827" : "#ffffff");
 const randomHexColor = () => "#" + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, "0");
+// Named line-icons for labels — SVGs, not emoji. `icon` stores the NAME (e.g. "bug"); a legacy value
+// that isn't a known name (an old emoji) still renders as-is so existing labels don't break.
+const LABEL_ICON_PATHS: Record<string, React.ReactNode> = {
+  bug: <><path d="M8 2l1.5 2M16 2l-1.5 2" /><rect x="8" y="6" width="8" height="12" rx="4" /><path d="M8 10H4M8 14H4M8 18l-3 3M16 10h4M16 14h4M16 18l3 3M12 6V4" /></>,
+  sparkle: <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z" />,
+  note: <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /><line x1="8" y1="13" x2="16" y2="13" /><line x1="8" y1="17" x2="13" y2="17" /></>,
+  fire: <path d="M12 2c1 3-1 4-2 6-1 1.5-1 4 2 4s3-2.5 2-4c2 1.5 3 3.5 3 6a7 7 0 1 1-14 0c0-3 2-5 4-7 1 2 2 2 3 3 .5-3-1-5-1-8z" />,
+  warning: <><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></>,
+  rocket: <><path d="M4.5 16.5c-1.5 1.3-2 5-2 5s3.7-.5 5-2c.7-.8.7-2 0-2.8a2 2 0 0 0-3 0z" /><path d="M12 15l-3-3a12 12 0 0 1 3-7c2-2 5-3 7-3 0 2-1 5-3 7a12 12 0 0 1-4 6z" /><circle cx="15" cy="9" r="1" /></>,
+  broom: <><path d="M19 3l-6 6M14 8l2 2M10 12l-4 8 8-4M8 14l2 2" /></>,
+  lock: <><rect x="4" y="11" width="16" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></>,
+  bulb: <><path d="M9 18h6" /><path d="M10 22h4" /><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1v.2h6v-.2c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z" /></>,
+  box: <><path d="M21 8l-9-5-9 5v8l9 5 9-5z" /><path d="M3 8l9 5 9-5M12 13v8" /></>,
+  palette: <><path d="M12 3a9 9 0 1 0 0 18c1 0 1.5-.8 1.5-1.5 0-1 .8-1.5 1.5-1.5H17a4 4 0 0 0 4-4c0-5-4-8-9-8z" /><circle cx="7.5" cy="10.5" r="1" /><circle cx="12" cy="7.5" r="1" /><circle cx="16.5" cy="10.5" r="1" /></>,
+  bolt: <polygon points="13 2 3 14 12 14 11 22 21 10 12 10" />,
+  question: <><circle cx="12" cy="12" r="10" /><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></>,
+  cone: <><path d="M10 3h4l4 18H6z" /><line x1="7.5" y1="12" x2="16.5" y2="12" /><line x1="6" y1="21" x2="18" y2="21" /></>,
+};
+const LABEL_ICONS = Object.keys(LABEL_ICON_PATHS);
+const labelIco = (name: string | undefined, size = 11) => {
+  if (!name) return null;
+  const p = LABEL_ICON_PATHS[name];
+  if (!p) return <span className="leading-none">{name}</span>; // legacy emoji fallback
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-none">{p}</svg>;
+};
 const Label = ({ name, color, icon }: { name: string; color?: string; icon?: string }) => {
   const c = color || "#8b949e";
   return (
     <span className="inline-flex items-center gap-1 text-[12px] font-semibold px-1.5 py-[2px] rounded-badge" style={{ background: c, color: contrastText(c) }}>
-      {icon ? <span className="leading-none">{icon}</span> : null}{name}
+      {labelIco(icon)}{name}
     </span>
   );
 };
-// Presets + emoji icons for configuring labels; custom hex + a random roll are also offered.
 const LABEL_COLORS = ["#d73a4a", "#e99695", "#fbca04", "#0e8a16", "#006b75", "#1d76db", "#0052cc", "#5319e7", "#b60205", "#c5def5", "#bfdadc", "#8b949e"];
-const LABEL_ICONS = ["🐛", "✨", "📝", "🔥", "⚠️", "🚀", "🧹", "🔒", "💡", "📦", "🎨", "⚡", "❓", "🚧"];
+
+// Small stroked line-icons — used in place of emoji so the UI reads as a product, not a chat message.
+const Ico = ({ path, size = 14, fill = false }: { path: React.ReactNode; size?: number; fill?: boolean }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill={fill ? "currentColor" : "none"} stroke={fill ? "none" : "currentColor"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-none">{path}</svg>
+);
+const IcoCheck = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<polyline points="20 6 9 17 4 12" />} />;
+const IcoX = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></>} />;
+const IcoFlag = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z" /><line x1="4" y1="22" x2="4" y2="15" /></>} />;
+const IcoSparkle = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z" />} />;
+const IcoSearch = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><circle cx="11" cy="11" r="7" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></>} />;
+const IcoBulb = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><path d="M9 18h6" /><path d="M10 22h4" /><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1v.2h6v-.2c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z" /></>} />;
+const IcoGit = ({ size = 13 }: { size?: number }) => <Ico size={size} path={<><circle cx="6" cy="6" r="2.5" /><circle cx="6" cy="18" r="2.5" /><circle cx="18" cy="8" r="2.5" /><path d="M18 10.5c0 3-3 4-6 4H6M6 8.5v7" /></>} />;
+const IcoExpand = ({ size = 13 }: { size?: number }) => <Ico size={size} path={<><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></>} />;
 type RepoLabel = { name: string; color: string; icon?: string };
 // Shared label editor — used by BOTH repo settings and org defaults. Pick an emoji icon, a preset OR
 // custom OR random colour, name it, preview it live, add/remove.
@@ -208,13 +244,13 @@ function LabelEditor({ labels, onChange }: { labels: RepoLabel[]; onChange: (l: 
         <div className="flex items-center gap-1.5 flex-wrap">
           <span className="text-[11.5px] text-muted w-10 flex-none">Icon</span>
           <button type="button" title="no icon" onClick={() => setDraft((d) => ({ ...d, icon: "" }))} className={`${chip} text-[10px] ${draft.icon === "" ? "border-body text-ink" : "border-rule text-muted hover:border-dim"}`}>—</button>
-          {LABEL_ICONS.map((ic) => <button key={ic} type="button" onClick={() => setDraft((d) => ({ ...d, icon: ic }))} className={`${chip} ${draft.icon === ic ? "border-body bg-surface" : "border-rule hover:border-dim"}`}>{ic}</button>)}
+          {LABEL_ICONS.map((ic) => <button key={ic} type="button" title={ic} onClick={() => setDraft((d) => ({ ...d, icon: ic }))} className={`${chip} grid place-items-center text-dim ${draft.icon === ic ? "border-body bg-surface text-ink" : "border-rule hover:border-dim"}`}>{labelIco(ic, 15)}</button>)}
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
           <span className="text-[11.5px] text-muted w-10 flex-none">Color</span>
           {LABEL_COLORS.map((c) => <button key={c} type="button" onClick={() => setDraft((d) => ({ ...d, color: c }))} className={`w-6 h-6 rounded-full transition-transform ${draft.color.toLowerCase() === c ? "ring-2 ring-offset-1 ring-body scale-110" : "hover:scale-110"}`} style={{ background: c }} />)}
           <label className="w-7 h-7 rounded-ctl border border-rule overflow-hidden cursor-pointer relative" title="custom color" style={{ background: draft.color }}><input type="color" value={draft.color} onChange={(e) => setDraft((d) => ({ ...d, color: e.target.value }))} className="absolute inset-0 opacity-0 cursor-pointer" /></label>
-          <button type="button" onClick={() => setDraft((d) => ({ ...d, color: randomHexColor() }))} className="h-7 px-2 rounded-ctl border border-rule text-[12px] text-dim hover:text-ink hover:border-dim inline-flex items-center gap-1">🎲 random</button>
+          <button type="button" onClick={() => setDraft((d) => ({ ...d, color: randomHexColor() }))} className="h-7 px-2 rounded-ctl border border-rule text-[12px] text-dim hover:text-ink hover:border-dim inline-flex items-center gap-1.5"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="3" /><circle cx="8.5" cy="8.5" r="1" fill="currentColor" /><circle cx="15.5" cy="15.5" r="1" fill="currentColor" /><circle cx="15.5" cy="8.5" r="1" fill="currentColor" /><circle cx="8.5" cy="15.5" r="1" fill="currentColor" /></svg>random</button>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[180px]" placeholder="label name" value={draft.name} onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
@@ -390,7 +426,7 @@ function ModalShell({ title, onClose, children, width = 480 }: { title: string; 
       <div style={{ width }} className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-[93vw] max-h-[88vh] overflow-auto bg-surface rounded-card shadow-modal animate-ov-in">
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-rule2 sticky top-0 bg-surface">
           <h2 className="text-[15px] font-semibold">{title}</h2>
-          <button onClick={onClose} className="w-6 h-6 grid place-items-center rounded-ctl text-muted hover:text-ink hover:bg-paper" aria-label="close">✕</button>
+          <button onClick={onClose} className="w-6 h-6 grid place-items-center rounded-ctl text-muted hover:text-ink hover:bg-paper" aria-label="close"><IcoX size={15} /></button>
         </div>
         <div className="px-5 py-4">{children}</div>
       </div>
@@ -408,8 +444,9 @@ const modalInput = "w-full box-border h-ctl px-2.5 rounded-ctl border border-ctl
 
 // New repository modal: owner/name shown inline (owner ∕ name), a live name-availability check like
 // org handles, a Public/Unlisted/Private dropdown, and the default branch.
-function NewRepoModal({ accounts, onClose, onCreate }: { accounts: string[]; onClose: () => void; onCreate: (p: { account: string; name: string; visibility: "public" | "private" | "unlisted"; branch: string }) => Promise<boolean> }) {
-  const [account, setAccount] = useState(accounts[0] ?? "");
+function NewRepoModal({ accounts, defaultAccount, onClose, onCreate }: { accounts: string[]; defaultAccount?: string; onClose: () => void; onCreate: (p: { account: string; name: string; visibility: "public" | "private" | "unlisted"; branch: string }) => Promise<boolean> }) {
+  // Default the owner to the org whose page you launched from, else your first account.
+  const [account, setAccount] = useState((defaultAccount && accounts.includes(defaultAccount) ? defaultAccount : accounts[0]) ?? "");
   const [name, setName] = useState("");
   const [visibility, setVisibility] = useState<"public" | "private" | "unlisted">("public");
   const [branch, setBranch] = useState("main");
@@ -439,7 +476,7 @@ function NewRepoModal({ accounts, onClose, onCreate }: { accounts: string[]; onC
           </div>
           {name.trim() && (
             <div className={`text-[12px] mt-1.5 ${checking ? "text-muted" : avail ? "text-clear-text" : "text-fault-text"}`}>
-              {checking ? "checking…" : avail ? `✓ ${account}/${name.trim()} is available` : `✗ ${account}/${name.trim()} is taken`}
+              <span className="inline-flex items-center gap-1.5">{checking ? "checking…" : avail ? <><IcoCheck size={12} />{`${account}/${name.trim()} is available`}</> : <><IcoX size={12} />{`${account}/${name.trim()} is taken`}</>}</span>
             </div>
           )}
         </Field>
@@ -560,19 +597,6 @@ const StatusDot = ({ tone, size = 18 }: { tone: "ok" | "bad" | "warn" | "wait" |
     </span>
   );
 };
-
-// Small stroked line-icons — used in place of emoji so the UI reads as a product, not a chat message.
-const Ico = ({ path, size = 14, fill = false }: { path: React.ReactNode; size?: number; fill?: boolean }) => (
-  <svg width={size} height={size} viewBox="0 0 24 24" fill={fill ? "currentColor" : "none"} stroke={fill ? "none" : "currentColor"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-none">{path}</svg>
-);
-const IcoCheck = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<polyline points="20 6 9 17 4 12" />} />;
-const IcoX = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></>} />;
-const IcoFlag = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z" /><line x1="4" y1="22" x2="4" y2="15" /></>} />;
-const IcoSparkle = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z" />} />;
-const IcoSearch = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><circle cx="11" cy="11" r="7" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></>} />;
-const IcoBulb = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><path d="M9 18h6" /><path d="M10 22h4" /><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1v.2h6v-.2c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z" /></>} />;
-const IcoGit = ({ size = 13 }: { size?: number }) => <Ico size={size} path={<><circle cx="6" cy="6" r="2.5" /><circle cx="6" cy="18" r="2.5" /><circle cx="18" cy="8" r="2.5" /><path d="M18 10.5c0 3-3 4-6 4H6M6 8.5v7" /></>} />;
-const IcoExpand = ({ size = 13 }: { size?: number }) => <Ico size={size} path={<><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></>} />;
 
 // The issue discussion thread + composer, as a STABLE top-level component so typing doesn't remount
 // it (which would steal focus on every keystroke). All state is passed in from App.
@@ -1542,7 +1566,7 @@ export function App() {
   const cmdNode = <CommandPalette open={cmdOpen} items={cmdItems} onClose={() => setCmdOpen(false)} />;
   const createModalsNode = (
     <>
-      {newRepoOpen && <NewRepoModal accounts={myAccounts} onClose={() => setNewRepoOpen(false)} onCreate={doCreateRepo} />}
+      {newRepoOpen && <NewRepoModal accounts={myAccounts} defaultAccount={orgHandle ?? undefined} onClose={() => setNewRepoOpen(false)} onCreate={doCreateRepo} />}
       {newIssueOpen && <NewIssueModal repos={repos.map((r) => ({ tenant: r.tenant, repo: r.repo }))} defaultRepo={view === "repo" ? `${tenant}/${issueRepo}` : ""} actors={actors} onClose={() => setNewIssueOpen(false)} onCreate={doCreateIssue} />}
       {importOpen && (() => {
         const adminAccounts = accounts.filter((a) => me && a.members.some((m) => m.actor === me.id && (m.role === "owner" || m.role === "admin")));
@@ -1623,7 +1647,7 @@ export function App() {
               <label className="text-[12.5px] font-semibold text-body">username</label>
               <input className={`box-border h-ctl px-2.5 rounded-ctl border bg-surface font-sans text-[13.5px] text-ink outline-none placeholder:text-faint transition-colors ${usernameAvail && !usernameAvail.available ? "border-fault" : "border-ctl focus:border-body"}`} placeholder="e.g. mira" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} autoFocus />
               {authForm.username.trim() && usernameAvail && (
-                <div className={`text-[12px] ${usernameAvail.available ? "text-clear-text" : "text-fault-text"}`}>{usernameAvail.available ? `✓ ${authForm.username} is available` : "✗ that username is taken"}</div>
+                <div className={`text-[12px] ${usernameAvail.available ? "text-clear-text" : "text-fault-text"}`}><span className="inline-flex items-center gap-1.5">{usernameAvail.available ? <><IcoCheck size={12} />{`${authForm.username} is available`}</> : <><IcoX size={12} />that username is taken</>}</span></div>
               )}
             </div>
             <div className="grid gap-1.5">
@@ -1724,7 +1748,7 @@ export function App() {
                     </div>
                     {(profileStats?.agents ?? []).map((a) => (
                       <div key={a.handle} className="flex items-center gap-2 text-[14px] pl-5">
-                        <span className="text-faint">↳</span>
+                        <span className="text-faint"><Ico size={11} path={<polyline points="9 6 15 12 9 18" />} /></span>
                         <Avatar handle={a.handle} kind="agent" size={16} />
                         <span className="text-steel-text">{a.handle}</span>
                         <span className="ml-auto tabular-nums text-muted">{a.count}</span>
@@ -2159,8 +2183,8 @@ export function App() {
                         <div key={i} className="border border-rule2 rounded-ctl overflow-hidden">
                           <button className="w-full flex items-center gap-2 px-3 py-2.5 bg-paper hover:bg-surface transition-colors text-left" onClick={() => showWhy(key, c.path)}>
                             <code className="text-[12.5px] text-body flex-1">{c.path}:{c.line_start}{c.line_end ? `-${c.line_end}` : ""}</code>
-                            <span className="text-[11.5px] text-steel-text" title={`content-addressed → keel blob ${c.blob}`}>⬡ {c.blob.slice(0, 10)}</span>
-                            <span className="text-[12px] text-muted">{prov[key] ? "hide ▾" : "provenance ▸"}</span>
+                            <span className="text-[11.5px] text-steel-text" title={`content-addressed → keel blob ${c.blob}`}><IcoGit size={12} /> {c.blob.slice(0, 10)}</span>
+                            <span className="text-[12px] text-muted"><span className="inline-flex items-center gap-1">{prov[key] ? "hide" : "provenance"}<Ico size={11} path={<polyline points="6 9 12 15 18 9" />} /></span></span>
                           </button>
                           {prov[key] && (
                             <div className="border-t border-rule3">
@@ -2225,7 +2249,7 @@ export function App() {
                       <span className="text-[11.5px] text-faint">no labels configured — a repo admin can add them in Settings</span>
                     ) : null)}
                   </div>
-                  {it.resolved_by && <Stat k="resolved by" v={<code className="text-[12px] text-steel-text">⬡ {it.resolved_by.slice(0, 8)}</code>} />}
+                  {it.resolved_by && <Stat k="resolved by" v={<code className="text-[12px] text-steel-text"><IcoGit size={12} /> {it.resolved_by.slice(0, 8)}</code>} />}
                 </Module>
               </aside>
             </div>
@@ -2263,7 +2287,7 @@ export function App() {
         // conversation composer's split button). Agent auto-review + request-a-reviewer only.
         const reviewTools = p.state === "open" ? (
           <div className="flex items-center gap-2 flex-wrap">
-            {caps.ai_review && <Button size="sm" variant="secondary" disabled={autoReviewing === p.number} onClick={() => autoReview(p.number)}>{autoReviewing === p.number ? "agent reviewing…" : "⬡ Agent auto-review"}</Button>}
+            {caps.ai_review && <Button size="sm" variant="secondary" disabled={autoReviewing === p.number} onClick={() => autoReview(p.number)}>{autoReviewing === p.number ? "agent reviewing…" : <span className="inline-flex items-center gap-1.5"><IcoGit size={13} />Agent auto-review</span>}</Button>}
             {canAct && (
               <Picker size="sm" width={220} placeholder="Request a reviewer…" value="" onChange={(v) => requestReviewer(p.number, v)}
                 options={actors.filter((a) => a.id !== p.author && !p.reviewers?.includes(a.id)).map(actorOption)} />
@@ -2458,9 +2482,9 @@ export function App() {
                               <div className="flex-1 min-w-0">
                                 <div className="flex items-center gap-2 flex-wrap">
                                   <span className="text-[15px] font-semibold group-hover:text-steel-text transition-colors">{it.title}</span>
-                                  {it.code_refs.length > 0 && <span className="text-[11.5px] text-steel-text">⬡ {it.code_refs.length}</span>}
-                                  {it.resolved_by && <Tag>⬡ resolved</Tag>}
-                                  {!it.resolved_by && (it.linked_prs?.length ?? 0) > 0 && <Tag>⇄ {it.linked_prs!.length} PR{it.linked_prs!.length > 1 ? "s" : ""}</Tag>}
+                                  {it.code_refs.length > 0 && <span className="text-[11.5px] text-steel-text"><IcoGit size={12} /> {it.code_refs.length}</span>}
+                                  {it.resolved_by && <Tag><span className="inline-flex items-center gap-1"><IcoGit size={11} />resolved</span></Tag>}
+                                  {!it.resolved_by && (it.linked_prs?.length ?? 0) > 0 && <Tag><span className="inline-flex items-center gap-1"><IcoGit size={10} />{`${it.linked_prs!.length} PR${it.linked_prs!.length > 1 ? "s" : ""}`}</span></Tag>}
                                 </div>
                                 <div className="text-[12.5px] text-muted mt-1 flex items-center gap-1.5 flex-wrap tabular-nums">
                                   <span>#{it.number}</span>
@@ -2493,7 +2517,7 @@ export function App() {
                               <button key={it.number} className="text-left bg-surface border border-rule rounded-ctl p-3 cursor-pointer hover:border-ctl transition-colors" onClick={() => navigate(`${repoBase()}/issues/${it.number}`)}>
                                 <div className="text-xs text-faint tabular-nums">#{it.number}</div>
                                 <div className="text-[13.5px] font-medium mt-0.5 leading-snug">{it.title}</div>
-                                {it.assignees.length > 0 && <div className="text-[11.5px] text-muted mt-1.5">◎ {it.assignees.map((id) => handleOf(id)).join(", ")}</div>}
+                                {it.assignees.length > 0 && <div className="text-[11.5px] text-muted mt-1.5 inline-flex items-center gap-1.5"><Ico size={11} path={<><circle cx="12" cy="8" r="3.5" /><path d="M5 21a7 7 0 0 1 14 0" /></>} />{it.assignees.map((id) => handleOf(id)).join(", ")}</div>}
                               </button>
                             ))}
                           </div>
@@ -2550,7 +2574,7 @@ export function App() {
                               <div className="text-[12.5px] text-muted mt-1 flex items-center gap-1.5 flex-wrap tabular-nums">
                                 <span>v{p.number}</span>
                                 <span className="text-faint">·</span>
-                                <span className="text-steel-text" title={`proposes keel change ${p.changes[0]}`}>⬡ {(p.changes[0] ?? "").slice(0, 8)}</span>
+                                <span className="text-steel-text" title={`proposes keel change ${p.changes[0]}`}><IcoGit size={12} /> {(p.changes[0] ?? "").slice(0, 8)}</span>
                                 <span className="text-faint">·</span>
                                 <Avatar id={p.author} handle={handleOf(p.author)} kind={kindOf(p.author)} size={15} />
                                 <span className={kindOf(p.author) === "agent" ? "text-steel-text" : ""}>{handleOf(p.author)}</span>
@@ -3250,6 +3274,9 @@ function ReviewPage({
   // are the exception: a claim the change's own facts contradict always deserves eyes, so auto-open.
   const [showChanges, setShowChanges] = useState(false);
   const [showClaims, setShowClaims] = useState(false);
+  // Opening a detail (Changes or Claims) enters "focus mode": everything else — session, attention,
+  // conversation — collapses so you're reading one thing, and comes back when you close it.
+  const focusMode = showChanges || showClaims;
   const [attnIdx, setAttnIdx] = useState(0); // cursor into the one-by-one attention stepper
   const [taskModal, setTaskModal] = useState(false); // "view full task" overlay
   // When the big title scrolls out of view, condense it into the sticky top bar so the reviewer
@@ -3391,13 +3418,15 @@ function ReviewPage({
           <span className="hidden sm:inline">{repo} · pull requests</span>
         </button>
         {condensed ? (
-          <div className="flex items-center gap-2 min-w-0 flex-1">
+          <div className="flex items-center gap-2.5 min-w-0 flex-1">
             <span className="text-[13.5px] font-semibold text-ink truncate">{pr ? pr.title : active.target}</span>
             {pr && <span className="text-[12px] text-faint tabular-nums flex-none">#{pr.number}</span>}
             <span className={`ml-auto flex-none inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge ${checksBad ? "bg-brass-wash text-brass-text" : checksPass === checks.length ? "bg-clear-wash text-clear-text" : "bg-brass-wash text-brass-text"}`}>
               <span className={`w-1.5 h-1.5 rounded-full ${checksBad ? "bg-brass" : checksPass === checks.length ? "bg-clear" : "bg-brass"}`} />
               {checksBad ? "Not ready" : checksPass === checks.length ? "Ready to merge" : "Awaiting review"} · {checksPass}/{checks.length}
             </span>
+            {/* Merge travels up here on scroll, so it's always one click away. */}
+            <span className="flex-none">{landGate}</span>
           </div>
         ) : (
           <span className="text-[11.5px] font-semibold px-[9px] py-[3px] rounded-full border border-rule text-dim">review package</span>
@@ -3558,7 +3587,7 @@ function ReviewPage({
 
         {/* Session — surfaced up here (was buried at the bottom): a summary of what the agent set out
             to do, with the full task one click away, its carried-forward lesson, and the run metrics. */}
-        {change?.session && (() => {
+        {!focusMode && change?.session && (() => {
           const task = change.session.task || "";
           const long = task.length > 240;
           return (
@@ -3597,7 +3626,7 @@ function ReviewPage({
             (a contradicted claim, a raised concern, a blocker/warning finding, or an unverifiable
             intent claim) gets the full frame with big, obvious controls. Acting on it advances to the
             next; a bulk "verify all intent claims" clears the long tail without 20 clicks. */}
-        {(() => {
+        {!focusMode && (() => {
           const contradictions = (shownLedger?.claims ?? []).filter((c) => c.status === "contradicted" && resolutions[c.id]?.judgment !== "verified");
           const concerns = (shownLedger?.claims ?? []).filter((c) => resolutions[c.id]?.judgment === "concern");
           const needs = (shownLedger?.claims ?? []).filter((c) => (c.status === "needs_judgment" || c.status === "self_attested") && !resolutions[c.id]);
@@ -3727,7 +3756,7 @@ function ReviewPage({
                   </div>
                   <p className="text-[13px] text-body mt-1 leading-snug">{f.note}</p>
                   {f.severity !== "info" && pr && f.path && canFix && (
-                    <div className="mt-2"><Button size="sm" variant="secondary" disabled={!canAct || fixing === idx} onClick={() => fixWithAI(idx, f)}>{fixing === idx ? "fixing…" : "✨ Fix with AI"}</Button></div>
+                    <div className="mt-2"><Button size="sm" variant="secondary" disabled={!canAct || fixing === idx} onClick={() => fixWithAI(idx, f)}>{fixing === idx ? "fixing…" : <span className="inline-flex items-center gap-1.5"><IcoSparkle size={13} />Fix with AI</span>}</Button></div>
                   )}
                 </div>
               </div>
@@ -3988,7 +4017,7 @@ function ReviewPage({
           const moveOps = (semantic?.moves ?? []).map((m) => ({
             kind: "rename",
             title: `Move ${base(m.from)}`,
-            meta: `exact move · ⬡ ${m.blob.slice(0, 8)}`,
+            meta: `exact move · ${m.blob.slice(0, 8)}`,
             body: (
               <div className="text-[13px] text-body">
                 <div className="flex items-center gap-2 flex-wrap"><OldTok>{m.from}</OldTok><span className="text-muted">→</span><NewTok>{m.to}</NewTok></div>
@@ -4068,18 +4097,18 @@ function ReviewPage({
                 )}
                 {resolutions[c.id] ? (
                   <div className={`text-[12.5px] mt-2.5 ${resolutions[c.id].judgment === "verified" ? "text-clear-text" : "text-fault-text"}`}>
-                    {resolutions[c.id].judgment === "verified" ? "✓ verified by a human" : "⚑ concern raised"} · <b>{resolutions[c.id].by}</b>
+                    {resolutions[c.id].judgment === "verified" ? "verified by a human" : "concern raised"} · <b>{resolutions[c.id].by}</b>
                     {resolutions[c.id].note && <span className="text-muted"> — {resolutions[c.id].note}</span>}
                   </div>
                 ) : (c.status === "needs_judgment" || c.status === "self_attested") ? (
                   <div className="flex items-center gap-2 mt-2.5 flex-wrap">
-                    <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}>✓ I checked — verified</Button>
-                    <Button size="sm" variant="destructive" disabled={!canAct} onClick={() => resolveClaim(c.id, "concern")}>⚑ Raise concern</Button>
-                    {pr && change && canFix && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
+                    <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}><span className="inline-flex items-center gap-1.5"><IcoCheck size={13} />I checked — verified</span></Button>
+                    <Button size="sm" variant="destructive" disabled={!canAct} onClick={() => resolveClaim(c.id, "concern")}><span className="inline-flex items-center gap-1.5"><IcoFlag size={13} />Raise concern</span></Button>
+                    {pr && change && canFix && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : <span className="inline-flex items-center gap-1.5"><IcoSparkle size={13} />Fix with AI</span>}</Button>}
                   </div>
                 ) : c.status === "contradicted" ? (
                   <div className="flex items-center gap-2 mt-2.5 flex-wrap">
-                    {pr && change && canFix && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
+                    {pr && change && canFix && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : <span className="inline-flex items-center gap-1.5"><IcoSparkle size={13} />Fix with AI</span>}</Button>}
                   </div>
                 ) : null}
               </div>
@@ -4131,7 +4160,7 @@ function ReviewPage({
                       <p className="text-[13.5px] text-body mt-1 leading-snug">{f.note}</p>
                       <div className="flex items-center gap-2 mt-2 flex-wrap">
                         <span className="inline-flex items-center gap-1.5 text-[11.5px] text-muted"><Avatar id={reviewer} handle={handleOf(reviewer)} kind={kindOf(reviewer)} size={16} />{handleOf(reviewer)}</span>
-                        {f.severity !== "info" && pr && f.path && canFix && (<><span className="text-faint">·</span><Button size="sm" variant="secondary" disabled={!canAct || fixing === idx} onClick={() => fixWithAI(idx, f)}>{fixing === idx ? "fixing…" : "✨ Fix with AI"}</Button></>)}
+                        {f.severity !== "info" && pr && f.path && canFix && (<><span className="text-faint">·</span><Button size="sm" variant="secondary" disabled={!canAct || fixing === idx} onClick={() => fixWithAI(idx, f)}>{fixing === idx ? "fixing…" : <span className="inline-flex items-center gap-1.5"><IcoSparkle size={13} />Fix with AI</span>}</Button></>)}
                       </div>
                     </div>
                   </div>
@@ -4142,7 +4171,7 @@ function ReviewPage({
         })()}
 
         {/* conversation timeline — reviews + comments, one accountable thread */}
-        {pr && (
+        {!focusMode && pr && (
           <Card id="pr-conversation" className="scroll-mt-4">
             <SectionHeader label="Conversation" right={reviewTools ?? <span className="text-[12.5px] text-muted">reviews and comments, humans and agents</span>} />
             <div className="px-5 py-4 grid gap-3.5">
@@ -4157,7 +4186,7 @@ function ReviewPage({
                 return items.map((e) => e.kind === "review" ? (
                   <div key={`r${e.r.id}`} className="grid gap-1.5">
                     <div className="flex items-center gap-2.5 text-[13px] flex-wrap">
-                      <span className={`grid place-items-center w-[24px] h-[24px] rounded-full flex-none text-[12px] ${vcolor(e.r.verdict)}`}>{e.r.verdict === "approve" ? "✓" : e.r.verdict === "reject" || e.r.verdict === "request_changes" ? "!" : "◍"}</span>
+                      <span className={`grid place-items-center w-[24px] h-[24px] rounded-full flex-none text-[12px] ${vcolor(e.r.verdict)}`}>{e.r.verdict === "approve" ? <IcoCheck size={13} /> : e.r.verdict === "reject" || e.r.verdict === "request_changes" ? "!" : "·"}</span>
                       <Avatar id={e.r.reviewer} handle={handleOf(e.r.reviewer)} kind={kindOf(e.r.reviewer)} size={18} />
                       <b className={kindOf(e.r.reviewer) === "agent" ? "text-steel-text" : ""}>{handleOf(e.r.reviewer)}</b>
                       <span className="text-muted">{verb[e.r.verdict] ?? "reviewed"} this pull request</span>
