@@ -2244,63 +2244,19 @@ export function App() {
         const blockers = prReviews.reduce((n, r) => n + (r.findings ?? []).filter((f) => f.severity === "blocker").length, 0);
         // The merge gate must agree with the checklist below: an unresolved blocker blocks landing.
         const canLand = checksOk && hasApproval && !changesRequested && blockers === 0;
-        const gateChecks: { tone: "ok" | "bad" | "wait"; label: string; detail: string }[] = [
-          { tone: checksOk ? "ok" : p.verification === "red" ? "bad" : "wait", label: "keel verify", detail: checksOk ? "Build & tests passed" : p.verification === "red" ? "Build or tests failed" : "Not run yet" },
-          { tone: blockers > 0 ? "bad" : "ok", label: "No blocking findings", detail: blockers > 0 ? `${blockers} blocker${blockers > 1 ? "s" : ""}` : "None raised" },
-          { tone: changesRequested ? "bad" : hasApproval ? "ok" : "wait", label: "Independent approval", detail: changesRequested ? "Changes requested" : hasApproval ? "Approved by a non-author" : "Awaiting review" },
-        ];
-        const okN = gateChecks.filter((c) => c.tone === "ok").length;
-        const badN = gateChecks.filter((c) => c.tone === "bad").length;
-        const overall = badN > 0 ? "bad" : okN === gateChecks.length ? "ok" : "wait";
         const mergeGlyph = (
           <svg width="17" height="17" viewBox="0 0 16 16" fill="currentColor"><path d="M5.45 5.154A4.25 4.25 0 0 0 9.25 7.5h1.378a2.251 2.251 0 1 1 0 1.5H9.25A5.734 5.734 0 0 1 5 7.123v3.505a2.25 2.25 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.95-.218ZM4.25 13.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm8.5-4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5ZM5 3.25a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Z" /></svg>
         );
+        // Just the merge ACTION — no checks box (the digest already spells out the gate + what's
+        // blocking). Merged/closed collapse to a compact inline badge.
         const gate = p.state === "merged" ? (
-          <div className="flex gap-3">
-            <div className="w-9 h-9 rounded-ctl bg-clear text-white grid place-items-center flex-none mt-0.5">{mergeGlyph}</div>
-            <Card className="flex-1"><div className="px-4 py-3.5"><div className="text-[14.5px] font-semibold text-clear-text">Merged</div><div className="text-[12.5px] text-muted tabular-nums mt-0.5">v{p.number} · ⬡ {(p.changes[0] ?? "").slice(0, 8)} · by {handleOf(p.author)}</div></div></Card>
-          </div>
+          <span className="inline-flex items-center gap-1.5 text-[13px] font-semibold text-clear-text"><span className="w-5 h-5 rounded-full bg-clear text-white grid place-items-center">{mergeGlyph}</span>Merged · v{p.number}</span>
         ) : p.state === "closed" ? (
-          <div className="flex gap-3">
-            <div className="w-9 h-9 rounded-ctl bg-dim text-white grid place-items-center flex-none mt-0.5">{mergeGlyph}</div>
-            <Card className="flex-1"><div className="px-4 py-3.5 flex items-center gap-3"><div className="flex-1"><div className="text-[14.5px] font-semibold">Closed without merging</div><div className="text-[12.5px] text-muted tabular-nums mt-0.5">v{p.number} · by {handleOf(p.author)}</div></div>{canAct && <Button size="sm" variant="secondary" onClick={() => closePr(p.number, true)}>Reopen</Button>}</div></Card>
-          </div>
+          <div className="inline-flex items-center gap-3 text-[13px] text-muted"><span className="font-medium">Closed without merging</span>{canAct && <Button size="sm" variant="secondary" onClick={() => closePr(p.number, true)}>Reopen</Button>}</div>
         ) : (
-          <div className="flex gap-3">
-            <div className="w-9 h-9 rounded-ctl bg-ink text-surface grid place-items-center flex-none mt-0.5">{mergeGlyph}</div>
-            <Card className="flex-1">
-              {/* overall status header */}
-              <div className="px-4 py-3 flex items-center gap-3 border-b border-rule2">
-                {overall === "wait"
-                  ? <span className="w-[22px] h-[22px] rounded-full border-[3px] border-brass/30 border-t-brass flex-none" />
-                  : <StatusDot tone={overall === "ok" ? "ok" : "bad"} size={22} />}
-                <div className="flex-1 min-w-0">
-                  <div className="text-[14.5px] font-semibold">{overall === "ok" ? "All checks have passed" : overall === "bad" ? "Some checks did not pass" : "Some checks haven't completed yet"}</div>
-                  <div className="text-[12.5px] text-muted">{okN} passed{badN > 0 ? ` · ${badN} failing` : ""}{overall === "wait" ? ` · ${gateChecks.length - okN} pending` : ""}</div>
-                </div>
-              </div>
-              {/* individual checks */}
-              <div className="border-b border-rule2">
-                {gateChecks.map((c, i) => (
-                  <div key={i} className="px-4 py-2.5 flex items-center gap-2.5 border-b border-rule3 last:border-0">
-                    <StatusDot tone={c.tone} size={16} />
-                    <span className="text-[13px] font-medium text-body flex-1 min-w-0 truncate">{c.label}</span>
-                    <span className="text-[12px] text-muted flex-none">{c.detail}</span>
-                  </div>
-                ))}
-              </div>
-              {/* conflicts */}
-              <div className="px-4 py-3 flex items-center gap-2.5 border-b border-rule2">
-                <StatusDot tone="ok" size={16} />
-                <div className="min-w-0"><div className="text-[13px] font-medium">No conflicts with the base branch</div><div className="text-[12px] text-muted">keel changes are content-addressed — merging is automatic.</div></div>
-              </div>
-              {/* action */}
-              <div className="px-4 py-3 bg-paper flex items-center gap-3 flex-wrap">
-                <Button size="sm" disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}>Merge</Button>
-                {!canLand && <span className="text-[12.5px] text-muted">{isTenantOwner ? "Or override as an owner:" : "Every check must pass before merging."}</span>}
-                {!canLand && isTenantOwner && <Button size="sm" variant="secondary" className="ml-auto !text-fault-text" onClick={() => mergePr(p.number, true)}>Merge without checks</Button>}
-              </div>
-            </Card>
+          <div className="flex items-center gap-2.5 flex-wrap justify-end">
+            <Button disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}><span className="inline-flex items-center gap-1.5">{mergeGlyph}Merge</span></Button>
+            {!canLand && isTenantOwner && <Button size="sm" variant="secondary" className="!text-fault-text" onClick={() => mergePr(p.number, true)}>Merge without checks</Button>}
           </div>
         );
         // Secondary review actions (the primary comment/approve/request-changes flow lives in the
@@ -3580,10 +3536,13 @@ function ReviewPage({
                       {aiSummary && <span className={`${loz} bg-rule2 text-dim inline-flex items-center gap-1`}><IcoSparkle size={11} />agent-summarized</span>}
                     </div>
                   </div>
-                  {/* Risk as a quiet dot + label, not a saturated pill. */}
-                  <span className="flex-none inline-flex items-center gap-1.5 text-[11.5px] font-medium text-muted">
-                    <span className={`w-1.5 h-1.5 rounded-full ${riskLevel === "low" ? "bg-clear" : riskLevel === "high" ? "bg-fault" : "bg-brass"}`} />{riskLevel} risk
-                  </span>
+                  {/* Merge action lives here (not a box at the bottom); risk sits quietly beneath it. */}
+                  <div className="flex flex-col items-end gap-2.5 flex-none">
+                    {landGate}
+                    <span className="inline-flex items-center gap-1.5 text-[11.5px] font-medium text-muted">
+                      <span className={`w-1.5 h-1.5 rounded-full ${riskLevel === "low" ? "bg-clear" : riskLevel === "high" ? "bg-fault" : "bg-brass"}`} />{riskLevel} risk
+                    </span>
+                  </div>
                 </div>
               </div>
               {briefClaims.length > 0 && <Toggle open={showClaims} onClick={() => { const o = !showClaims; setShowClaims(o); if (o) setTimeout(() => document.getElementById("reconciliation-section")?.scrollIntoView({ behavior: "smooth", block: "start" }), 80); }}>{claimsLine}</Toggle>}
@@ -3591,10 +3550,6 @@ function ReviewPage({
             </Card>
           );
         })()}
-
-        {/* Merge decision — at the TOP now (and it re-appears in the sticky bar on scroll), so the
-            reviewer never has to hunt to the bottom of the page to land. */}
-        <div className="mb-6">{landGate}</div>
 
         {/* Session — surfaced up here (was buried at the bottom): a summary of what the agent set out
             to do, with the full task one click away, its carried-forward lesson, and the run metrics. */}
@@ -3940,10 +3895,30 @@ function ReviewPage({
                 </div>
               );
             };
-            // Render the whole file's diff; the clicked "What changed here" line stays highlighted
-            // (diffFocus → highlightLine) and you can select/comment on any line.
+            // A reference (a "What changed here" click, a code-ref) focuses ONE section: show only the
+            // hunk that holds that line and keep it highlighted (diffFocus → CodePanel highlightLine),
+            // rather than unfurling the whole file. "Show the whole file" reveals the rest.
+            const focusLine = diffFocus[f.path];
             const indexed = f.hunks.map((h, hi) => ({ h, hi }));
-            const hunkNodes = isOpen ? <>{indexed.map(({ h, hi }) => renderHunk(h, hi))}</> : null;
+            const hunkHasLine = (h: FileDiff["hunks"][number], line: number) => {
+              let n = h.new_start;
+              for (const l of h.lines) { if (l.tag !== "del") { if (n === line) return true; n++; } }
+              return false;
+            };
+            const focusedHunks = focusLine != null ? indexed.filter(({ h }) => hunkHasLine(h, focusLine)) : [];
+            const shownHunks = focusedHunks.length > 0 ? focusedHunks : indexed;
+            const hiddenHunks = indexed.length - shownHunks.length;
+            const hunkNodes = isOpen ? (
+              <>
+                {shownHunks.map(({ h, hi }) => renderHunk(h, hi))}
+                {hiddenHunks > 0 && (
+                  <button onClick={() => setDiffFocus((s) => { const c = { ...s }; delete c[f.path]; return c; })}
+                    className="w-full mt-2 py-2 rounded-ctl border border-dashed border-rule text-[12.5px] font-medium text-steel-text hover:bg-steel-wash/50 hover:border-ctl transition-colors flex items-center justify-center gap-1.5">
+                    Showing the referenced change · show the whole file ({indexed.length} sections)
+                  </button>
+                )}
+              </>
+            ) : null;
             // Drop punctuation/comment-only noise, then dedupe so a repeated edit isn't listed twice.
             const seen = new Set<string>();
             const uniq = transforms
