@@ -3208,15 +3208,12 @@ function ReviewPage({
   const addN = diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === "add").length, 0), 0);
   const delN = diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === "del").length, 0), 0);
   const behN = semantic?.behavioral.length ?? 0;
-  const moveN = semantic?.moves.length ?? 0;
-  const reformN = semantic?.whitespace_only.length ?? 0;
   const briefClaims = shownLedger?.claims ?? [];
   // A human resolution (verify / raise concern) overrides the raw ledger status, so the checks and
   // brief reflect what the reviewer actually decided — not "needs judgment" forever.
   const needsN = briefClaims.filter((c) => c.status === "needs_judgment" && !resolutions[c.id]).length;
   const contraN = briefClaims.filter((c) => c.status === "contradicted" && resolutions[c.id]?.judgment !== "verified").length;
   const concernN = briefClaims.filter((c) => resolutions[c.id]?.judgment === "concern").length;
-  const phantomN = shownLedger?.unclaimed?.length ?? 0;
   const allFindings = reviews.flatMap((r) => r.findings ?? []);
   const blockerN = allFindings.filter((f) => f.severity === "blocker").length;
   // Every finding flattened with its reviewer + a stable key + a global index (for the fix-with-AI
@@ -3231,18 +3228,18 @@ function ReviewPage({
   const unmappedFindings = findingRows.filter((x) => !x.f.line || !diffPaths.has(x.f.path));
   const sevTone = (s: string): "bad" | "warn" | "info" => (s === "blocker" ? "bad" : s === "warn" ? "warn" : "info");
   // Risk that reflects the whole picture, not just the check status: a green build with 4 unresolved
-  // claims is not "low risk".
+  // claims is not "low risk". Note phantom/unclaimed count is NOT a risk input — it's really just
+  // "the diff is bigger than the prose enumerates", which fires on almost every non-trivial change,
+  // so it would peg everything to "elevated" and drown the real signal.
   const riskLevel =
     contraN > 0 || blockerN > 0 || verification === "red" ? "high"
-      : needsN > 0 || phantomN > 0 || (change ? change.files.length > 8 : false) ? "elevated"
+      : needsN > 0 || (change ? change.files.length > 10 : false) ? "elevated"
         : verification === "green" ? "low"
           : "moderate";
   // "What's happening": prefer the change's own description (the why) over the title, which the
   // heading already shows.
   const intentFull = (change?.intent ?? pr?.title ?? active.target).trim();
   const intentLine = intentFull.split("\n")[0].trim();
-  const intentBody = intentFull.includes("\n") ? intentFull.slice(intentFull.indexOf("\n") + 1).trim().replace(/\s+/g, " ") : "";
-  const whatHappening = intentBody || intentLine;
 
   // ── landing checks: the gate, surfaced as a checklist reachable from the top badge ──
   const supportedN = briefClaims.filter((c) => ["verified_mechanically", "verified_read_only", "self_attested"].includes(c.status)).length;
@@ -3257,6 +3254,11 @@ function ReviewPage({
   ];
   const checksPass = checks.filter((c) => c.tone === "ok").length;
   const checksBad = checks.some((c) => c.tone === "bad");
+  // The page opens as a calm digest — the detail (claims, diff) is folded beneath it. Contradictions
+  // are the exception: a claim the change's own facts contradict always deserves eyes, so auto-open.
+  const [showChanges, setShowChanges] = useState(false);
+  const [showClaims, setShowClaims] = useState(false);
+  useEffect(() => { if (contraN > 0) setShowClaims(true); }, [contraN]);
 
   // Discussion thread — the same PR thread as the compact view, followed into the deep review page.
   type Cmt = { id: string; target: string; author: string; body: string; created_unix: number; path?: string; line?: number };
@@ -3443,34 +3445,66 @@ function ReviewPage({
           </Popover>
         </div>
 
-        {/* Review brief — a calm one-line summary of the change and its shape. It sets context; the
-            reviewer then flows straight into the diff, rather than being handed a to-do list. */}
+        {/* Digest — the page's calm headline: a plain-English summary of the change (an agent
+            reviewer's own words when one has reviewed, else the change's subject line), a one-line
+            verdict, and what — if anything — needs a human. The claims + diff fold beneath it, so the
+            reviewer meets a verdict, not a wall. */}
         {(() => {
           const loz = "inline-flex items-center text-[11px] font-bold uppercase tracking-[0.03em] leading-none px-1.5 py-[3px] rounded-badge";
           const rc = riskLevel === "low" ? "bg-clear-wash text-clear-text" : riskLevel === "high" ? "bg-fault-wash text-fault-text" : "bg-brass-wash text-brass-text";
+          // Prefer an agent reviewer's prose (the AI layer's own summary) over raw commit text; skip the
+          // templated mechanical reconciliation line — we want a real summary, not "N claims supported".
+          const aiSummary = [...reviews]
+            .filter((r) => actors.find((a) => a.id === r.reviewer)?.kind === "agent" && (r.summary ?? "").trim() && !/^reconciliation review:/i.test((r.summary ?? "").trim()))
+            .sort((a, b) => (b.created_unix ?? 0) - (a.created_unix ?? 0))[0]?.summary?.trim();
+          // Drop a leading conventional-commit prefix (feat:, fix(ui):, …) so the headline reads as prose.
+          const digestText = aiSummary || intentLine.replace(/^\w+(\([^)]+\))?!?:\s*/, "");
+          const addN = diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === "add").length, 0), 0);
+          const delN = diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === "del").length, 0), 0);
+          const fileN = change?.files.length ?? diff.length;
+          const verdict = checksBad ? "Not ready to merge" : checks.length > 0 && checksPass === checks.length ? "Ready to merge" : "Awaiting review";
+          const vTone = checksBad ? "text-fault-text" : verdict === "Ready to merge" ? "text-clear-text" : "text-brass-text";
+          const check = contraN > 0 ? { c: "text-fault-text", t: `${contraN} claim${contraN > 1 ? "s" : ""} the change's own facts contradict — resolve before landing.` }
+            : concernN > 0 ? { c: "text-fault-text", t: `${concernN} concern${concernN > 1 ? "s" : ""} raised — see below.` }
+            : needsN > 0 ? { c: "text-brass-text", t: `${needsN} claim${needsN > 1 ? "s" : ""} worth a spot-check.` }
+            : briefClaims.length > 0 ? { c: "text-clear-text", t: "Nothing needs your judgment." }
+            : { c: "text-muted", t: "" };
+          const claimsLine = contraN > 0 ? `${briefClaims.length} claims · ${contraN} contradicted`
+            : needsN > 0 ? `${briefClaims.length} claims · ${needsN} to judge`
+            : `${briefClaims.length} claims reconciled — all verified`;
+          const chev = (open: boolean) => <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`text-faint flex-none transition-transform ${open ? "rotate-90" : ""}`}><polyline points="9 18 15 12 9 6" /></svg>;
+          const Toggle = ({ open, onClick, children }: { open: boolean; onClick: () => void; children: React.ReactNode }) => (
+            <button onClick={onClick} className="w-full flex items-center gap-2 px-5 py-2.5 text-[13px] text-body hover:bg-paper/40 transition-colors border-t border-rule2 text-left">{chev(open)}{children}</button>
+          );
           return (
             <Card className="mb-6">
-              <div className="px-5 py-4 flex items-start gap-4">
-                <div className="min-w-0 flex-1">
-                  <p className="text-[14.5px] text-body leading-[1.55]">{whatHappening.length > 320 ? whatHappening.slice(0, 320).trimEnd() + "…" : whatHappening}</p>
-                  <div className="flex flex-wrap gap-1.5 mt-3">
-                    {behN > 0 && <span className={`${loz} bg-fault-wash text-fault-text`}>{behN} behavioral change{behN > 1 ? "s" : ""}</span>}
-                    {moveN > 0 && <span className={`${loz} bg-steel-wash text-steel-text`}>{moveN} moved</span>}
-                    {reformN > 0 && <span className={`${loz} bg-brass-wash text-brass-text`}>{reformN} reformatted</span>}
-                    {semantic?.pure_move && <span className={`${loz} bg-clear-wash text-clear-text`}>pure move</span>}
-                    {!change?.session && <span className={`${loz} bg-rule2 text-dim`}>no plan captured</span>}
+              <div className="px-5 py-4">
+                <div className="flex items-start gap-4">
+                  <div className="min-w-0 flex-1">
+                    <div className={`text-[15px] font-semibold ${vTone} mb-1`}>{verdict}</div>
+                    <p className="text-[14px] text-body leading-[1.55]">{digestText.length > 260 ? digestText.slice(0, 260).trimEnd() + "…" : digestText}</p>
+                    {check.t && <div className={`text-[13px] mt-2 flex items-center gap-1.5 ${check.c}`}>{contraN > 0 || concernN > 0 ? <span aria-hidden>⚑</span> : needsN > 0 ? null : <span aria-hidden>✓</span>}{check.t}</div>}
+                    <div className="flex flex-wrap gap-1.5 mt-3">
+                      {behN > 0 && <span className={`${loz} bg-fault-wash text-fault-text`}>{behN} behavioral change{behN > 1 ? "s" : ""}</span>}
+                      {semantic?.pure_move && <span className={`${loz} bg-clear-wash text-clear-text`}>pure move</span>}
+                      {!change?.session && <span className={`${loz} bg-rule2 text-dim`}>no plan captured</span>}
+                      {aiSummary && <span className={`${loz} bg-steel-wash text-steel-text`}>agent-summarized</span>}
+                    </div>
                   </div>
+                  <span className={`${loz} flex-none ${rc}`}>{riskLevel} risk</span>
                 </div>
-                <span className={`${loz} flex-none ${rc}`}>{riskLevel} risk</span>
               </div>
+              {briefClaims.length > 0 && <Toggle open={showClaims} onClick={() => setShowClaims((v) => !v)}>{claimsLine}</Toggle>}
+              {(diff.length > 0 || (semantic?.moves.length ?? 0) > 0) && <Toggle open={showChanges} onClick={() => setShowChanges((v) => !v)}>Changes · {fileN} file{fileN === 1 ? "" : "s"} · <span className="text-clear-text tabular-nums">+{addN}</span> <span className="text-fault-text tabular-nums">−{delN}</span></Toggle>}
             </Card>
           );
         })()}
 
         <div className="grid gap-6 mt-3">
           <div className="min-w-0 grid gap-6">
-        {/* changes — the flagship semantic-diff surface (Grouped ⇄ Line-by-line toggle built in) */}
-        {(() => {
+        {/* changes — the flagship semantic-diff surface (Grouped ⇄ Line-by-line toggle built in),
+            folded away by default and revealed from the digest's "Changes" toggle. */}
+        {showChanges && (() => {
           if (diff.length === 0 && !(semantic?.moves.length)) {
             return (
               <Card>
@@ -3837,9 +3871,9 @@ function ReviewPage({
           return <SemanticDiff voyage={voyage} ops={ops} rawDiff={rawDiff} showMerge={false} storageKey={changeId ? `hull_reviewed_${changeId}` : undefined} />;
         })()}
 
-        {/* reconciliation — does the change do what its author said? Claims that need a human come
-            first with inline actions; mechanically-verified ones tuck away. */}
-        {shownLedger && shownLedger.claims.length > 0 && (() => {
+        {/* reconciliation — does the change do what its author said? Folded away by default (the digest
+            summarizes it); revealed from the digest's claims toggle, or auto-opened on a contradiction. */}
+        {showClaims && shownLedger && shownLedger.claims.length > 0 && (() => {
           const ledger = shownLedger;
           const POSITIVE = ["verified_mechanically", "verified_read_only", "self_attested"];
           // Count against human resolutions: a resolved claim is no longer "to judge".
