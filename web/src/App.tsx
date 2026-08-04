@@ -225,6 +225,46 @@ const IcoSearch = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<
 const IcoBulb = ({ size = 14 }: { size?: number }) => <Ico size={size} path={<><path d="M9 18h6" /><path d="M10 22h4" /><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.3 1 2.1v.2h6v-.2c0-.8.4-1.6 1-2.1A7 7 0 0 0 12 2z" /></>} />;
 const IcoGit = ({ size = 13 }: { size?: number }) => <Ico size={size} path={<><circle cx="6" cy="6" r="2.5" /><circle cx="6" cy="18" r="2.5" /><circle cx="18" cy="8" r="2.5" /><path d="M18 10.5c0 3-3 4-6 4H6M6 8.5v7" /></>} />;
 const IcoExpand = ({ size = 13 }: { size?: number }) => <Ico size={size} path={<><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></>} />;
+
+// Compact large-number format for KPIs: 15021 → 15k, 9952890 → 9.95M.
+const fmtNum = (n: number) => (n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(Math.round(n)));
+// Tiny inline sparkline — a KPI trend line, no chart lib.
+const Sparkline = ({ points, color = "var(--steel)", w = 132, h = 34 }: { points: number[]; color?: string; w?: number; h?: number }) => {
+  if (points.length < 2) return <div style={{ width: w, height: h }} className="grid place-items-center text-[11px] text-faint border border-rule3 rounded-ctl-sm">not enough data yet</div>;
+  const max = Math.max(...points, 1);
+  const step = w / (points.length - 1);
+  const pts = points.map((v, i) => [i * step, h - (v / max) * (h - 4) - 2] as [number, number]);
+  const line = "M" + pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" L");
+  return (
+    <svg width="100%" height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" className="block">
+      <path d={`${line} L${w},${h} L0,${h} Z`} fill={color} opacity={0.09} />
+      <path d={line} fill="none" stroke={color} strokeWidth={1.6} strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+};
+// Token-usage KPIs + sparklines — shared by the profile and org Overview.
+const TokenKpis = ({ tokens, scope }: { tokens?: { in: number; out: number; series: { day: number; in: number; out: number }[] }; scope: string }) => {
+  if (!tokens || tokens.in + tokens.out === 0) return null;
+  const series = tokens.series ?? [];
+  const kpi = (label: string, value: number, pts: number[], color: string) => (
+    <div className="flex-1 min-w-[180px] rounded-ctl border border-rule2 bg-paper/30 px-4 py-3">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.05em] text-muted">{label}</span>
+        <span className="text-[20px] font-semibold tabular-nums" style={{ color }} title={value.toLocaleString()}>{fmtNum(value)}</span>
+      </div>
+      <div className="mt-2"><Sparkline points={pts} color={color} /></div>
+    </div>
+  );
+  return (
+    <Card>
+      <SectionHeader label="Token usage" right={<span className="text-[12px] text-muted">agent sessions behind {scope} · last year</span>} />
+      <div className="px-5 py-4 flex flex-wrap gap-3">
+        {kpi("Tokens in", tokens.in, series.map((s) => s.in), "var(--dim)")}
+        {kpi("Tokens out", tokens.out, series.map((s) => s.out), "var(--steel)")}
+      </div>
+    </Card>
+  );
+};
 type RepoLabel = { name: string; color: string; icon?: string };
 // Shared label editor — used by BOTH repo settings and org defaults. Pick an emoji icon, a preset OR
 // custom OR random colour, name it, preview it live, add/remove.
@@ -999,7 +1039,7 @@ export function App() {
   };
   useEffect(() => { if (authPage === "account") loadAccount(); }, [authPage, token]);
   // Profile page: bio + a year of contributions (mine + my agents'), for the heatmap.
-  type ProfileStats = { handle: string; bio: string; total: number; human_count: number; days: HeatDay[]; agents: { handle: string; count: number }[] };
+  type ProfileStats = { handle: string; bio: string; total: number; human_count: number; days: HeatDay[]; agents: { handle: string; count: number }[]; tokens?: { in: number; out: number; series: { day: number; in: number; out: number }[] } };
   const [profileStats, setProfileStats] = useState<ProfileStats | null>(null);
   const [profileRepoQ, setProfileRepoQ] = useState("");
   const [profileTab, setProfileTab] = useState<"overview" | "repos" | "orgs">("overview");
@@ -1758,6 +1798,7 @@ export function App() {
                   </div>
                 </div>
               </Card>
+              <TokenKpis tokens={profileStats?.tokens} scope="your changes" />
             </div>
           )}
 

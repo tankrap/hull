@@ -517,22 +517,32 @@ async fn profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Resp
     let mut days: HashMap<u64, (u64, u64)> = HashMap::new();
     let mut by_handle: HashMap<String, u64> = HashMap::new();
     let mut total = 0u64;
+    // Token usage over time: per day, sum tokens in / out of the sessions behind my changes.
+    let mut tok_days: HashMap<u64, (u64, u64)> = HashMap::new();
+    let (mut tok_in, mut tok_out) = (0u64, 0u64);
     for acct in member_accounts(&app, &me.id) {
         for repo in app.store.repos().into_iter().filter(|r| r.owner == acct.id) {
             let key = format!("{}/{}", acct.handle, repo.name);
             let roots: Vec<String> = app.store.prs(&key).into_iter().flat_map(|p| p.changes).collect();
-            for (author, ts) in app.repos.history(&acct.handle, &repo.name, &roots, since) {
+            for (author, ts, id) in app.repos.history(&acct.handle, &repo.name, &roots, since) {
                 let h = handle_of(&author);
                 if mine.contains(&h) {
                     let e = days.entry(ts / 86_400).or_default();
                     if agent_handles.contains(&h) { e.1 += 1; } else { e.0 += 1; }
                     *by_handle.entry(h).or_default() += 1;
                     total += 1;
+                    if let Some(sr) = app.store.session_record(&key, &id) {
+                        let te = tok_days.entry(ts / 86_400).or_default();
+                        te.0 += sr.tokens_in; te.1 += sr.tokens_out;
+                        tok_in += sr.tokens_in; tok_out += sr.tokens_out;
+                    }
                 }
             }
         }
     }
     let days_v: Vec<Value> = days.into_iter().map(|(d, (human, agent))| json!({ "day": d, "human": human, "agent": agent, "count": human + agent })).collect();
+    let mut tok_v: Vec<Value> = tok_days.into_iter().map(|(d, (i, o))| json!({ "day": d, "in": i, "out": o })).collect();
+    tok_v.sort_by_key(|v| v["day"].as_u64().unwrap_or(0));
     let mut agents_v: Vec<Value> = by_handle
         .iter()
         .filter(|(h, _)| agent_handles.contains(*h))
@@ -540,7 +550,8 @@ async fn profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Resp
         .collect();
     agents_v.sort_by(|a, b| b["count"].as_u64().unwrap_or(0).cmp(&a["count"].as_u64().unwrap_or(0)));
     let human_count = by_handle.get(&me.handle).copied().unwrap_or(0);
-    Json(json!({ "handle": me.handle, "bio": bio, "total": total, "human_count": human_count, "days": days_v, "agents": agents_v })).into_response()
+    Json(json!({ "handle": me.handle, "bio": bio, "total": total, "human_count": human_count, "days": days_v, "agents": agents_v,
+        "tokens": { "in": tok_in, "out": tok_out, "series": tok_v } })).into_response()
 }
 
 /// The accounts an actor is a member of.

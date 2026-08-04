@@ -237,7 +237,7 @@ impl RepoHost {
     /// `(author, unix)` for every change reachable from ANY ref (all branches) newer than `since` —
     /// the raw material for a contribution heatmap. Each change is counted once. Stops descending a
     /// branch once it predates `since` (parents are older still) and caps total work.
-    pub fn history(&self, tenant: &str, repo: &str, extra_roots: &[String], since: u64) -> Vec<(String, u64)> {
+    pub fn history(&self, tenant: &str, repo: &str, extra_roots: &[String], since: u64) -> Vec<(String, u64, String)> {
         let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return vec![] };
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -259,7 +259,7 @@ impl RepoHost {
             seen.insert(id);
             let Ok(Some(Object::Change(c))) = store.get(&id) else { continue };
             if c.timestamp >= since {
-                out.push((c.author.clone(), c.timestamp));
+                out.push((c.author.clone(), c.timestamp, id.to_hex()));
                 for p in c.parents {
                     stack.push(p);
                 }
