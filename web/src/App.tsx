@@ -43,13 +43,6 @@ const wdRender = (segs: Seg[], path: string, side: "old" | "new") =>
     ? <span key={i} className={side === "old" ? "bg-fault-wash text-fault-text rounded-[3px]" : "bg-clear-wash text-clear-text font-semibold rounded-[3px]"} style={{ padding: "1px 2px" }}>{s.text}</span>
     : <Hl key={i} text={s.text} path={path} />);
 
-// Scroll a diff line into view and flash it — the target of "What changed here" jumps.
-// Scroll a jump target to the centre. The persistent highlight itself is declarative (CodePanel's
-// highlightLine, driven by diffFocus), so it survives re-renders and never fades.
-const flashLine = (id: string) => {
-  document.getElementById(id)?.scrollIntoView({ block: "center", behavior: "smooth" });
-};
-
 const hexToBytes = (h: string) => Uint8Array.from((h.match(/../g) ?? []).map((x) => parseInt(x, 16)));
 const bytesToHex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 
@@ -254,8 +247,8 @@ function LabelEditor({ labels, onChange }: { labels: RepoLabel[]; onChange: (l: 
 }
 
 // ── small token-only layout atoms (not controls — controls come from ./ui) ──────────
-const Card = ({ children, className = "" }: { children: React.ReactNode; className?: string }) => (
-  <div className={`bg-surface border border-rule rounded-card overflow-hidden ${className}`}>{children}</div>
+const Card = ({ children, className = "", id }: { children: React.ReactNode; className?: string; id?: string }) => (
+  <div id={id} className={`bg-surface border border-rule rounded-card overflow-hidden ${className}`}>{children}</div>
 );
 const SectionHeader = ({ label, right }: { label: string; right?: React.ReactNode }) => (
   <div className="flex items-center justify-between gap-3 px-5 py-3.5 border-b border-rule2">
@@ -3306,6 +3299,18 @@ function ReviewPage({
   // are the exception: a claim the change's own facts contradict always deserves eyes, so auto-open.
   const [showChanges, setShowChanges] = useState(false);
   const [showClaims, setShowClaims] = useState(false);
+  const [attnIdx, setAttnIdx] = useState(0); // cursor into the one-by-one attention stepper
+  // When the big title scrolls out of view, condense it into the sticky top bar so the reviewer
+  // always knows which PR + verdict they're looking at.
+  const titleSentinel = useRef<HTMLDivElement>(null);
+  const [condensed, setCondensed] = useState(false);
+  useEffect(() => {
+    const el = titleSentinel.current;
+    if (!el) return;
+    const io = new IntersectionObserver(([e]) => setCondensed(!e.isIntersecting), { rootMargin: "-56px 0px 0px 0px" });
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
 
   // Discussion thread — the same PR thread as the compact view, followed into the deep review page.
   type Cmt = { id: string; target: string; author: string; body: string; created_unix: number; path?: string; line?: number };
@@ -3368,17 +3373,35 @@ function ReviewPage({
   // Reviews load async, so collapse each finding once when first seen (without undoing manual expands).
   // Raw diff bodies are minified (just the "What changed here" summary) until expanded — click a
   // summary line or the Show-diff toggle to reveal the lines.
-  const [expandedDiffs, setExpandedDiffs] = useState<Set<string>>(() => new Set());
+  // Diffs are OPEN by default (flow — no click just to see the code); "Hide diff" collapses one.
+  const [collapsedDiffs, setCollapsedDiffs] = useState<Set<string>>(() => new Set());
   // A big diff only ever RENDERS a bounded window (never thousands of rows). diffFocus[path] centres
   // the window on a line (set by a "What changed here" click); diffExpand[path] grows it on "show more".
   const [diffFocus, setDiffFocus] = useState<Record<string, number>>({});
   const [diffExpand, setDiffExpand] = useState<Record<string, number>>({});
+  // Scroll to (and briefly highlight) a line inside the always-open @pierre diff. The diff renders in
+  // a shadow DOM, so we reach into it, match the line number, centre it, and flash both sides so the
+  // reviewer's eye lands exactly where the edit is.
+  const flashDiffLine = (line: number): boolean => {
+    for (const c of Array.from(document.querySelectorAll("diffs-container"))) {
+      const root = c.shadowRoot;
+      if (!root) continue;
+      const nums = Array.from(root.querySelectorAll("[data-line-number-content]")).filter((el) => el.textContent?.trim() === String(line));
+      if (nums.length === 0) continue;
+      const rows = nums.map((el) => (el.closest("[data-line]") ?? el.parentElement) as HTMLElement | null).filter(Boolean) as HTMLElement[];
+      rows[rows.length - 1]?.scrollIntoView({ behavior: "smooth", block: "center" });
+      rows.forEach((r) => { r.style.transition = "background-color .25s ease"; r.style.backgroundColor = "color-mix(in oklch, var(--brass) 30%, transparent)"; setTimeout(() => { r.style.backgroundColor = ""; }, 1500); });
+      return true;
+    }
+    return false;
+  };
   const revealDiff = (path: string, line?: number) => {
-    setExpandedDiffs((s) => (s.has(path) ? s : new Set(s).add(path)));
+    setCollapsedDiffs((s) => { if (!s.has(path)) return s; const n = new Set(s); n.delete(path); return n; });
     if (line != null) {
-      setDiffFocus((f) => ({ ...f, [path]: line }));
-      setDiffExpand((e) => ({ ...e, [path]: 0 }));
-      setTimeout(() => flashLine(`L-${path}-${line}`), 140);
+      // Retry a few times so it works whether the diff is already rendered or still mounting.
+      let tries = 0;
+      const tick = () => { if (flashDiffLine(line) || tries++ > 12) return; setTimeout(tick, 120); };
+      setTimeout(tick, 60);
     }
   };
   const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => new Set());
@@ -3426,16 +3449,28 @@ function ReviewPage({
 
   return (
     <div className="bg-paper min-h-screen text-ink">
-      <header className="h-[52px] border-b border-rule2 bg-surface flex items-center gap-4 px-6 sticky top-0 z-20">
-        <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer" onClick={onBack}>
+      <header className="h-[52px] border-b border-rule2 bg-surface flex items-center gap-3 px-6 sticky top-14 z-20">
+        <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer flex-none" onClick={onBack}>
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
-          {repo} · pull requests
+          <span className="hidden sm:inline">{repo} · pull requests</span>
         </button>
-        <span className="text-[11.5px] font-semibold px-[9px] py-[3px] rounded-full border border-rule text-dim">review package</span>
+        {condensed ? (
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <span className="text-[13.5px] font-semibold text-ink truncate">{pr ? pr.title : active.target}</span>
+            {pr && <span className="text-[12px] text-faint tabular-nums flex-none">#{pr.number}</span>}
+            <span className={`ml-auto flex-none inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge ${checksBad ? "bg-fault-wash text-fault-text" : checksPass === checks.length ? "bg-clear-wash text-clear-text" : "bg-brass-wash text-brass-text"}`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${checksBad ? "bg-fault" : checksPass === checks.length ? "bg-clear" : "bg-brass"}`} />
+              {checksBad ? "Not ready" : checksPass === checks.length ? "Ready to merge" : "Awaiting review"} · {checksPass}/{checks.length}
+            </span>
+          </div>
+        ) : (
+          <span className="text-[11.5px] font-semibold px-[9px] py-[3px] rounded-full border border-rule text-dim">review package</span>
+        )}
       </header>
 
       <div className="max-w-[1320px] mx-auto px-6 sm:px-8 py-8">
         <h1 className="text-[23px] font-semibold tracking-tight">{pr ? `${pr.title}` : active.target}</h1>
+        <div ref={titleSentinel} aria-hidden />
         <div className="flex items-center gap-2 flex-wrap text-[12.5px] text-muted mt-2 mb-5 tabular-nums">
           {pr && <span className="font-medium text-body">PR #{pr.number}</span>}
           <span className="text-faint">·</span>
@@ -3511,9 +3546,13 @@ function ReviewPage({
           const fileN = change?.files.length ?? diff.length;
           const verdict = checksBad ? "Not ready to merge" : checks.length > 0 && checksPass === checks.length ? "Ready to merge" : "Awaiting review";
           const vTone = checksBad ? "text-fault-text" : verdict === "Ready to merge" ? "text-clear-text" : "text-brass-text";
-          const check = contraN > 0 ? { c: "text-fault-text", t: `${contraN} claim${contraN > 1 ? "s" : ""} the change's own facts contradict — resolve before landing.` }
-            : concernN > 0 ? { c: "text-fault-text", t: `${concernN} concern${concernN > 1 ? "s" : ""} raised — see below.` }
-            : needsN > 0 ? { c: "text-brass-text", t: `${needsN} claim${needsN > 1 ? "s" : ""} worth a spot-check.` }
+          const blocking = checks.filter((c) => c.tone === "bad");
+          // Where does clicking a blocking reason take you? Claims/findings → the attention card;
+          // approval → the conversation; a red build isn't jumpable (rerun lives in the top bar).
+          const jumpTarget = (label: string) => /approval/i.test(label) ? "pr-conversation" : /claim|finding/i.test(label) ? "needs-attention" : null;
+          const jumpTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+          // The non-blocking claims line (only shown when nothing is actually blocking the merge).
+          const check = needsN > 0 ? { c: "text-brass-text", t: `${needsN} claim${needsN > 1 ? "s" : ""} worth a spot-check.` }
             : briefClaims.length > 0 ? { c: "text-clear-text", t: "Nothing needs your judgment." }
             : { c: "text-muted", t: "" };
           const claimsLine = contraN > 0 ? `${briefClaims.length} claims · ${contraN} contradicted`
@@ -3530,7 +3569,22 @@ function ReviewPage({
                   <div className="min-w-0 flex-1">
                     <div className={`text-[15px] font-semibold ${vTone} mb-1`}>{verdict}</div>
                     <p className="text-[14px] text-body leading-[1.55]">{digestText.length > 260 ? digestText.slice(0, 260).trimEnd() + "…" : digestText}</p>
-                    {check.t && <div className={`text-[13px] mt-2 flex items-center gap-1.5 ${check.c}`}>{contraN > 0 || concernN > 0 ? <span aria-hidden>⚑</span> : needsN > 0 ? null : <span aria-hidden>✓</span>}{check.t}</div>}
+                    {checksBad ? (
+                      <div className="mt-2.5 grid gap-1">
+                        <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-fault-text">Blocking the merge</div>
+                        {blocking.map((c, i) => {
+                          const target = jumpTarget(c.label);
+                          return (
+                            <button key={i} disabled={!target} onClick={() => target && jumpTo(target)} className={`text-[13px] flex items-start gap-1.5 text-left text-fault-text ${target ? "hover:underline cursor-pointer" : "cursor-default"}`}>
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="mt-[3px] flex-none"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+                              <span><b>{c.label}</b> — {c.detail}{target ? " ↓" : ""}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : check.t ? (
+                      <div className={`text-[13px] mt-2 flex items-center gap-1.5 ${check.c}`}>{needsN > 0 ? null : <span aria-hidden>✓</span>}{check.t}</div>
+                    ) : null}
                     <div className="flex flex-wrap gap-1.5 mt-3">
                       {behN > 0 && <span className={`${loz} bg-fault-wash text-fault-text`}>{behN} behavioral change{behN > 1 ? "s" : ""}</span>}
                       {semantic?.pure_move && <span className={`${loz} bg-clear-wash text-clear-text`}>pure move</span>}
@@ -3547,103 +3601,87 @@ function ReviewPage({
           );
         })()}
 
-        {/* Needs attention — the real work, lifted out of the folds to the top. Two tiers so it never
-            becomes a wall: things that are likely wrong (a contradicted claim, a blocker/warning
-            finding) get their own row with fix actions; the many "we can't mechanically prove the
-            author's intent" claims collapse into ONE calm block with a bulk verify + agent triage,
-            expandable if you want to judge them one by one. */}
+        {/* Needs attention — a one-at-a-time stepper so review FLOWS: each item that wants a human
+            (a contradicted claim, a raised concern, a blocker/warning finding, or an unverifiable
+            intent claim) gets the full frame with big, obvious controls. Acting on it advances to the
+            next; a bulk "verify all intent claims" clears the long tail without 20 clicks. */}
         {(() => {
           const contradictions = (shownLedger?.claims ?? []).filter((c) => c.status === "contradicted" && resolutions[c.id]?.judgment !== "verified");
           const concerns = (shownLedger?.claims ?? []).filter((c) => resolutions[c.id]?.judgment === "concern");
           const needs = (shownLedger?.claims ?? []).filter((c) => (c.status === "needs_judgment" || c.status === "self_attested") && !resolutions[c.id]);
           const findAtt = findingRows.filter((x) => x.f.severity !== "info");
-          const hard = contradictions.length + concerns.length + findAtt.length;
-          if (hard === 0 && needs.length === 0) return null;
+          type Item = { kind: "contra" | "concern" | "finding" | "needs"; key: string; claim?: Claim; row?: FindingRow };
+          const items: Item[] = [
+            ...contradictions.map((c): Item => ({ kind: "contra", key: c.id, claim: c })),
+            ...concerns.map((c): Item => ({ kind: "concern", key: c.id, claim: c })),
+            ...findAtt.map((x): Item => ({ kind: "finding", key: x.key, row: x })),
+            ...needs.map((c): Item => ({ kind: "needs", key: c.id, claim: c })),
+          ];
+          if (items.length === 0) return null;
+          const idx = Math.min(attnIdx, items.length - 1);
+          const cur = items[idx];
           const kindLoz = "text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded flex-none";
-          const needsIds = needs.map((c) => c.id);
+          const tone = cur.kind === "needs" ? "wait" : cur.kind === "finding" ? (cur.row!.f.severity === "blocker" ? "bad" : "warn") : "bad";
+          const label = cur.kind === "contra" ? "Contradicted claim" : cur.kind === "concern" ? "Concern raised" : cur.kind === "finding" ? (cur.row!.f.severity === "blocker" ? "Blocker" : "Warning") : "Intent — needs your eyes";
+          const labelColor = tone === "bad" ? "text-fault-text" : tone === "warn" ? "text-brass-text" : "text-brass-text";
+          const needsLeft = needs.length;
           return (
+            <div id="needs-attention" className="scroll-mt-4">
             <Card className="mb-6 ring-1 ring-brass/30">
               <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
                 <div className="flex items-center gap-2">
                   <span className="grid place-items-center w-5 h-5 rounded-full bg-brass-wash text-brass-text text-[12px]" aria-hidden>⚑</span>
                   <span className="text-[13.5px] font-semibold text-ink">Needs your attention</span>
+                  <span className="text-[12px] text-muted tabular-nums">· {idx + 1} of {items.length}</span>
                 </div>
-                {canReview && onTriage && <Button size="sm" variant="secondary" disabled={triaging || !canAct} onClick={onTriage}>{triaging ? "agent triaging…" : "⌕ Let an agent triage"}</Button>}
+                {canReview && onTriage && <Button size="sm" variant="secondary" disabled={triaging || !canAct} onClick={onTriage}>{triaging ? "agent triaging…" : "⌕ Let an agent triage all"}</Button>}
               </div>
-              {!canReview && (
-                <div className="px-5 py-2 bg-paper/40 border-b border-rule2 text-[12px] text-muted">Connect an AI reviewer (set <code className="text-body">OPENROUTER_API_KEY</code>) to have agents auto-fix or triage these.</div>
-              )}
-              {/* Tier 1 — likely-wrong: contradictions + findings, one row each with fix. */}
-              {contradictions.map((c) => (
-                <div key={c.id} className="px-5 py-3.5 border-b border-rule2 last:border-0 flex items-start gap-2.5">
-                  <StatusDot tone="bad" />
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[13.5px] text-body leading-snug">{c.text}</div>
-                    <div className="text-[12px] mt-0.5 text-fault-text">The change's own facts contradict this claim — resolve before landing.</div>
-                    {c.evidence.slice(0, 2).map((e, i) => (
+              {/* progress bar */}
+              <div className="h-[3px] bg-rule2"><div className="h-full bg-brass transition-all" style={{ width: `${((idx + 1) / items.length) * 100}%` }} /></div>
+
+              {/* the current item, given the whole frame */}
+              <div className="px-5 py-4 min-h-[132px]">
+                <div className="flex items-center gap-2 mb-1.5">
+                  <StatusDot tone={tone} />
+                  <span className={`text-[11px] font-bold uppercase tracking-[0.05em] ${labelColor}`}>{label}</span>
+                </div>
+                {cur.kind === "finding" ? (
+                  <>
+                    <div className="text-[14px] text-body leading-snug">{cur.row!.f.note}</div>
+                    {cur.row!.f.path && <div className="text-[12.5px] text-muted mt-1 tabular-nums">{cur.row!.f.path}{cur.row!.f.line ? `:${cur.row!.f.line}` : ""}</div>}
+                    <div className="flex items-center gap-2 mt-3 flex-wrap">
+                      {canFix && pr && cur.row!.f.path ? <Button size="sm" disabled={!canAct || fixing === cur.row!.idx} onClick={() => fixWithAI(cur.row!.idx, cur.row!.f)}>{fixing === cur.row!.idx ? "fixing…" : "✨ Fix with AI"}</Button>
+                        : !canFix && <span className="text-[12px] text-muted">Set <code className="text-body">OPENROUTER_API_KEY</code> to auto-fix.</span>}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="text-[14px] text-body leading-snug">{cur.claim!.text}</div>
+                    <div className={`text-[12.5px] mt-1 ${cur.kind === "needs" ? "text-brass-text" : "text-fault-text"}`}>
+                      {cur.kind === "contra" ? "The change's own facts contradict this claim." : cur.kind === "concern" ? <>Concern raised by <b>{resolutions[cur.claim!.id]?.by}</b>{resolutions[cur.claim!.id]?.note ? ` — ${resolutions[cur.claim!.id]?.note}` : ""}.</> : "Can't be checked mechanically — read the diff and confirm."}
+                    </div>
+                    {(cur.claim!.evidence ?? []).slice(0, 2).map((e, i) => (
                       <div key={i} className={`text-[12px] mt-1 flex gap-1.5 items-baseline ${e.supports ? "text-dim" : "text-fault-text"}`}>
                         <span className={`${kindLoz} ${e.supports ? "bg-paper text-muted" : "bg-fault-wash text-fault-text"}`}>{e.kind}</span><span className="leading-snug">{e.detail}</span>
                       </div>
                     ))}
-                    <div className="flex items-center gap-2 mt-2.5 flex-wrap">
-                      <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}>✓ Actually fine</Button>
-                      {canFix && change && pr && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
+                    <div className="flex items-center gap-2 mt-3 flex-wrap">
+                      <Button size="sm" disabled={!canAct} onClick={() => resolveClaim(cur.claim!.id, "verified")}>{cur.kind === "needs" ? "✓ Verified" : "✓ Looks fine"}</Button>
+                      {cur.kind !== "concern" && <Button size="sm" variant="destructive" disabled={!canAct} onClick={() => resolveClaim(cur.claim!.id, "concern")}>⚑ Raise concern</Button>}
+                      {canFix && change && pr && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === cur.claim!.id} onClick={() => fixClaim(cur.claim!)}>{fixingClaim === cur.claim!.id ? "fixing…" : "✨ Fix with AI"}</Button>}
                     </div>
-                  </div>
-                </div>
-              ))}
-              {concerns.map((c) => (
-                <div key={c.id} className="px-5 py-3.5 border-b border-rule2 last:border-0 flex items-start gap-2.5">
-                  <StatusDot tone="bad" />
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[13.5px] text-body leading-snug">{c.text}</div>
-                    <div className="text-[12px] mt-0.5 text-fault-text">Concern raised by <b>{resolutions[c.id]?.by}</b>{resolutions[c.id]?.note ? ` — ${resolutions[c.id]?.note}` : ""}.</div>
-                    <div className="flex items-center gap-2 mt-2.5 flex-wrap">
-                      <Button size="sm" variant="secondary" disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")}>✓ Mark resolved</Button>
-                      {canFix && change && pr && <Button size="sm" variant="secondary" disabled={!canAct || fixingClaim === c.id} onClick={() => fixClaim(c)}>{fixingClaim === c.id ? "fixing…" : "✨ Fix with AI"}</Button>}
-                    </div>
-                  </div>
-                </div>
-              ))}
-              {findAtt.map((x) => (
-                <div key={x.key} className="px-5 py-3.5 border-b border-rule2 last:border-0 flex items-start gap-2.5">
-                  <StatusDot tone={x.f.severity === "blocker" ? "bad" : "warn"} />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-[13.5px] text-body leading-snug flex-1">{x.f.note}</span>
-                      <span className={`text-[11px] font-semibold flex-none ${x.f.severity === "blocker" ? "text-fault-text" : "text-brass-text"}`}>{x.f.severity === "blocker" ? "blocker" : "warning"}</span>
-                    </div>
-                    {x.f.path && <div className="text-[12px] text-muted mt-0.5 tabular-nums">{x.f.path}{x.f.line ? `:${x.f.line}` : ""}</div>}
-                    {canFix && pr && x.f.path && <div className="mt-2"><Button size="sm" variant="secondary" disabled={!canAct || fixing === x.idx} onClick={() => fixWithAI(x.idx, x.f)}>{fixing === x.idx ? "fixing…" : "✨ Fix with AI"}</Button></div>}
-                  </div>
-                </div>
-              ))}
-              {/* Tier 2 — the intent claims that can't be proven mechanically: one calm block, not a wall. */}
-              {needs.length > 0 && (
-                <details className="group">
-                  <summary className="px-5 py-3.5 flex items-start gap-2.5 cursor-pointer select-none list-none hover:bg-paper/40">
-                    <StatusDot tone="wait" />
-                    <div className="min-w-0 flex-1">
-                      <div className="text-[13.5px] text-body leading-snug"><b>{needs.length} claim{needs.length > 1 ? "s" : ""} describe what the change intends</b>, but can't be checked mechanically — read the diff and confirm, or hand them to an agent.</div>
-                      <div className="flex items-center gap-2 mt-2.5 flex-wrap">
-                        <Button size="sm" variant="secondary" disabled={!canAct || verifyingAll} onClick={(e: React.MouseEvent) => { e.preventDefault(); verifyAllClaims(needsIds); }}>{verifyingAll ? "verifying…" : `✓ I read the diff — verify all ${needs.length}`}</Button>
-                        <span className="text-[12px] text-faint">or review individually ↓</span>
-                      </div>
-                    </div>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-faint mt-0.5 flex-none group-open:rotate-90 transition-transform"><polyline points="9 18 15 12 9 6" /></svg>
-                  </summary>
-                  <div className="border-t border-rule2">
-                    {needs.map((c) => (
-                      <div key={c.id} className="px-5 py-2.5 pl-[52px] border-b border-rule3 last:border-0 flex items-center gap-3">
-                        <span className="text-[13px] text-body flex-1 leading-snug min-w-0">{c.text}</span>
-                        <button disabled={!canAct} onClick={() => resolveClaim(c.id, "verified")} className="text-[12px] text-clear-text hover:underline flex-none disabled:opacity-50">verify</button>
-                        <button disabled={!canAct} onClick={() => resolveClaim(c.id, "concern")} className="text-[12px] text-fault-text hover:underline flex-none disabled:opacity-50">concern</button>
-                      </div>
-                    ))}
-                  </div>
-                </details>
-              )}
+                  </>
+                )}
+              </div>
+
+              {/* stepper controls */}
+              <div className="flex items-center justify-between gap-3 px-5 py-2.5 border-t border-rule2 bg-paper/40">
+                <button disabled={idx === 0} onClick={() => setAttnIdx(Math.max(0, idx - 1))} className="text-[13px] text-dim hover:text-ink disabled:opacity-40 inline-flex items-center gap-1"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6" /></svg>Prev</button>
+                {needsLeft > 1 && <Button size="sm" variant="secondary" disabled={!canAct || verifyingAll} onClick={() => verifyAllClaims(needs.map((c) => c.id))}>{verifyingAll ? "verifying…" : `✓ Verify all ${needsLeft} intent claims`}</Button>}
+                <button disabled={idx >= items.length - 1} onClick={() => setAttnIdx(Math.min(items.length - 1, idx + 1))} className="text-[13px] text-dim hover:text-ink disabled:opacity-40 inline-flex items-center gap-1">Skip<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6" /></svg></button>
+              </div>
             </Card>
+            </div>
           );
         })()}
 
@@ -3796,7 +3834,7 @@ function ReviewPage({
               if (hi < rows.length) parts.push(expander(rows.length - hi, "below"));
               return parts;
             };
-            const isOpen = expandedDiffs.has(f.path) || forceOpen;
+            const isOpen = forceOpen || !collapsedDiffs.has(f.path);
             // Take the span from first-changed to last-changed token so inner spaces/punctuation are
             // preserved (otherwise "walk_all ()" → "slice ( task )" collapses to "slicetask").
             const span = (segs: Seg[]) => {
@@ -3843,13 +3881,6 @@ function ReviewPage({
                 } else { n++; k++; }
               }
             }
-            // Which new-line numbers a hunk covers — so a "What changed here" click can open ONLY the
-            // hunk holding that line instead of unfurling the whole file.
-            const hunkHasLine = (h: FileDiff["hunks"][number], line: number) => {
-              let n = h.new_start;
-              for (const l of h.lines) { if (l.tag !== "del") { if (n === line) return true; n++; } }
-              return false;
-            };
             const renderHunk = (h: FileDiff["hunks"][number], hi: number) => {
               let o = h.old_start, n = h.new_start;
               const L = h.lines;
@@ -3882,12 +3913,11 @@ function ReviewPage({
                 </div>
               );
             };
-            const focusLine = diffFocus[f.path];
+            // Always render the whole file's diff (no per-hunk focusing) — the "what changed here"
+            // index scrolls you to a line instead, so you never have to close/reopen to see another.
             const indexed = f.hunks.map((h, hi) => ({ h, hi }));
-            // A what-changed click focuses one line → show just that hunk; otherwise show the whole file.
-            const focusedHunks = focusLine != null && !forceOpen ? indexed.filter(({ h }) => hunkHasLine(h, focusLine)) : [];
-            const shownHunks = focusedHunks.length > 0 ? focusedHunks : indexed;
-            const hiddenHunks = indexed.length - shownHunks.length;
+            const shownHunks = indexed;
+            const hiddenHunks = 0;
             // Our own line renderer — kept as the fallback if @pierre/diffs fails to load/render.
             const customHunks = (
               <>
@@ -3948,7 +3978,7 @@ function ReviewPage({
                             </span>
                           </button>
                         ))}
-                        {uniq.length > SHOWN && <div className="text-[12px] text-muted px-3.5 py-1.5">+{uniq.length - SHOWN} more edit{uniq.length - SHOWN > 1 ? "s" : ""}</div>}
+                        {uniq.length > SHOWN && <div className="text-[12px] text-muted px-3.5 py-1.5">+{uniq.length - SHOWN} more edit{uniq.length - SHOWN > 1 ? "s" : ""} in this file — every one is shown in the full diff below.</div>}
                       </div>
                     </div>
                   );
@@ -3957,13 +3987,13 @@ function ReviewPage({
                   // A compact review bar top + bottom of the open diff, so you can act right after reading.
                   const reviewBar = canAct && pr ? (
                     <div className="flex items-center gap-2 py-1.5">
-                      {!forceOpen && <button onClick={() => setExpandedDiffs((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>}
+                      {!forceOpen && <button onClick={() => setCollapsedDiffs((s) => new Set(s).add(f.path))} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>}
                       {/* No per-file "Approve" here — approval is PR-wide and belongs in the composer, not
                           a per-file bar where it reads as "approve this file" but lands the whole review. */}
                       <button onClick={() => document.getElementById("pr-composer")?.scrollIntoView({ block: "center", behavior: "smooth" })} className="ml-auto inline-flex items-center gap-1 h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl text-dim text-[12.5px] hover:text-ink hover:border-dim">Comment on this file ↓</button>
                     </div>
                   ) : (!forceOpen ? (
-                    <div className="flex justify-end"><button onClick={() => setExpandedDiffs((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff</button></div>
+                    <div className="flex justify-end"><button onClick={() => setCollapsedDiffs((s) => new Set(s).add(f.path))} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff</button></div>
                   ) : null);
                   return (
                     <>
@@ -4150,7 +4180,7 @@ function ReviewPage({
 
         {/* conversation timeline — reviews + comments, one accountable thread */}
         {pr && (
-          <Card>
+          <Card id="pr-conversation" className="scroll-mt-4">
             <SectionHeader label="Conversation" right={reviewTools ?? <span className="text-[12.5px] text-muted">reviews and comments, humans and agents</span>} />
             <div className="px-5 py-4 grid gap-3.5">
               {(() => {
@@ -4239,12 +4269,29 @@ function ReviewPage({
           <SectionHeader label="Session" right={<span className="text-[12.5px] text-muted">the agent session behind this change</span>} />
           <div className="px-5 py-4">
             {change?.session ? (
-              <div className="grid gap-1.5 text-[13.5px] text-body">
-                <p><b>task:</b> {change.session.task}</p>
-                <p><b>model:</b> {change.session.model || "—"}{change.session.lesson && <> · <b>lesson:</b> <i>{change.session.lesson}</i></>}</p>
-                {(change.session.tool_calls > 0 || change.session.tokens_out > 0) && (
-                  <p className="text-[12.5px] text-muted">session totals: {change.session.tool_calls} tool calls · {change.session.tokens_in}/{change.session.tokens_out} tokens</p>
+              <div className="grid gap-4">
+                <div>
+                  <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-muted mb-1">What the agent set out to do</div>
+                  <p className="text-[13.5px] text-body leading-[1.55]">{change.session.task}</p>
+                </div>
+                {change.session.lesson && (
+                  <div className="rounded-ctl bg-steel-wash/40 border border-steel/20 px-3.5 py-3">
+                    <div className="text-[11px] font-bold uppercase tracking-[0.06em] text-steel-text mb-1 flex items-center gap-1.5"><span aria-hidden>💡</span>Lesson carried forward</div>
+                    <p className="text-[13px] text-body leading-[1.5]">{change.session.lesson}</p>
+                  </div>
                 )}
+                <div className="flex flex-wrap gap-2">
+                  {[
+                    { k: "Model", v: change.session.model || "—" },
+                    ...(change.session.tool_calls > 0 ? [{ k: "Tool calls", v: String(change.session.tool_calls) }] : []),
+                    ...(change.session.tokens_out > 0 ? [{ k: "Tokens (in → out)", v: `${change.session.tokens_in.toLocaleString()} → ${change.session.tokens_out.toLocaleString()}` }] : []),
+                  ].map((m) => (
+                    <div key={m.k} className="rounded-ctl border border-rule2 bg-paper/40 px-3 py-2 min-w-[110px]">
+                      <div className="text-[10.5px] text-muted uppercase tracking-[0.04em]">{m.k}</div>
+                      <div className="text-[13.5px] font-semibold text-ink tabular-nums mt-0.5 break-all">{m.v}</div>
+                    </div>
+                  ))}
+                </div>
               </div>
             ) : (
               <p className="text-[13px] text-muted leading-[1.55]">
