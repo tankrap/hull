@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { File as PierreFile } from "@pierre/diffs/react";
 import * as ed from "@noble/ed25519";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
@@ -157,6 +158,13 @@ const Avatar = ({ id, handle, kind, size = 22 }: { id?: string; handle?: string;
     </span>
   );
 };
+// Renders children; on any render error, shows `fallback` instead (used to guard the third-party
+// @pierre/diffs renderer so a failure degrades to our built-in viewer rather than crashing the page).
+class Boundary extends Component<{ fallback: React.ReactNode; children: React.ReactNode }, { err: boolean }> {
+  state = { err: false };
+  static getDerivedStateFromError() { return { err: true }; }
+  render() { return this.state.err ? this.props.fallback : this.props.children; }
+}
 // A rich Picker option for a user/actor — avatar + username + email (or kind), so you pick the right person.
 const actorOption = (a: { id: string; handle: string; kind?: string; email?: string }) => ({
   value: a.id,
@@ -2956,15 +2964,23 @@ function RepoFiles({ tenant, repo, authHeaders }: { tenant: string; repo: string
           {file.binary ? (
             <div className="px-5 py-8 text-[13px] text-muted">Binary file · {fmtSize(file.size)} — not shown.</div>
           ) : (
-            <div className="text-[12.5px] leading-[1.6] overflow-x-auto">
-              {lines.slice(0, LINE_CAP).map((ln, i) => (
-                <div key={i} className="grid grid-cols-[52px_1fr] hover:bg-paper/50">
-                  <span className="pr-3 py-0.5 text-right text-faint bg-paper/40 border-r border-rule3 select-none tabular-nums text-[11px]">{i + 1}</span>
-                  <span className="px-3 py-0.5 whitespace-pre-wrap break-words"><Hl text={ln} path={file.path} /></span>
-                </div>
-              ))}
-              {lines.length > LINE_CAP && <div className="px-5 py-3 text-[12.5px] text-muted border-t border-rule2">{lines.length - LINE_CAP} more lines not shown ({fmtSize(file.size)} file).</div>}
-            </div>
+            // Primary: Shiki-powered @pierre/diffs viewer. Falls back to our built-in line viewer.
+            <Boundary fallback={
+              <div className="text-[12.5px] leading-[1.6] overflow-x-auto">
+                {lines.slice(0, LINE_CAP).map((ln, i) => (
+                  <div key={i} className="grid grid-cols-[52px_1fr] hover:bg-paper/50">
+                    <span className="pr-3 py-0.5 text-right text-faint bg-paper/40 border-r border-rule3 select-none tabular-nums text-[11px]">{i + 1}</span>
+                    <span className="px-3 py-0.5 whitespace-pre-wrap break-words"><Hl text={ln} path={file.path} /></span>
+                  </div>
+                ))}
+                {lines.length > LINE_CAP && <div className="px-5 py-3 text-[12.5px] text-muted border-t border-rule2">{lines.length - LINE_CAP} more lines not shown ({fmtSize(file.size)} file).</div>}
+              </div>
+            }>
+              <div className="text-[13px] overflow-x-auto max-h-[70vh] overflow-y-auto">
+                <PierreFile file={{ name: file.path, contents: file.text }} disableWorkerPool
+                  options={{ theme: { light: "github-light", dark: "github-dark" }, overflow: "scroll", disableFileHeader: true, tokenizeMaxLength: 400_000 }} />
+              </div>
+            </Boundary>
           )}
         </Card>
       ) : (
