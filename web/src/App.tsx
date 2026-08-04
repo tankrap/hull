@@ -1666,9 +1666,9 @@ export function App() {
       return shell("", (
         <div className="grid gap-6">
           {/* Full-bleed banner behind the page — breaks out of the container to the viewport edges. */}
-          <div className="relative left-1/2 right-1/2 -mx-[50vw] w-screen -mt-12 -z-0 h-[220px] bg-gradient-to-br from-steel-wash via-paper to-brass-wash pointer-events-none" aria-hidden />
+          <div className="relative left-1/2 right-1/2 -mx-[50vw] w-screen -mt-12 -z-0 h-[200px] bg-gradient-to-br from-steel-wash via-paper to-brass-wash pointer-events-none" aria-hidden />
           {me && (
-            <div className="-mt-[150px] relative">
+            <div className="-mt-[104px] relative">
               <div className="flex items-end gap-4">
                 <span className="rounded-full ring-4 ring-surface bg-surface shadow-modal"><Avatar id={me.id} handle={me.handle} kind={me.kind} size={104} /></span>
                 <div className="flex-1 min-w-0 pb-1">
@@ -1677,7 +1677,7 @@ export function App() {
                 </div>
                 <button onClick={() => navigate("/settings")} className="text-[13px] text-steel-text hover:underline flex-none pb-1">Account settings →</button>
               </div>
-              <div className="mt-3 max-w-[560px]">
+              <div className="mt-4 max-w-[560px]">
                 {bioDraft !== null ? (
                   <div className="grid gap-2">
                     <textarea autoFocus value={bioDraft} onChange={(e) => setBioDraft(e.target.value.slice(0, 280))} rows={2} placeholder="Tell people what you work on…" className="w-full box-border px-2.5 py-2 rounded-ctl border border-ctl bg-surface font-sans text-[14px] text-ink outline-none focus:border-body resize-y" />
@@ -1975,16 +1975,11 @@ export function App() {
     </Drawer>
   );
 
-  // repo sidebar modules (shared by list + detail pages)
+  // repo sidebar — only surfaces when there's something worth flagging (e.g. leaked secrets); the
+  // former "About" metadata module was redundant with the header and has been removed.
+  const hasRepoSidebar = secrets.length > 0;
   const repoSidebar = (
     <aside className="grid gap-5 content-start">
-      <Module title="About">
-        <Stat k="repo" v={issueRepo} />
-        <Stat k="tenant" v={tenant} />
-        <Stat k="open issues" v={openIssues} />
-        <Stat k="pull requests" v={prs.length} />
-        {isTenantOwner && <div className="pt-1"><LinkButton onClick={() => navigate(`${repoBase()}/settings`)}>Settings ↗</LinkButton></div>}
-      </Module>
       {secrets.length > 0 && (
         <Module title="Security" tone="var(--fault)">
           <p className="text-[12.5px] text-fault-text font-medium">{secrets.length} secret{secrets.length > 1 ? "s" : ""} detected on push</p>
@@ -2452,25 +2447,23 @@ export function App() {
               items={[`Issues ${openIssues}`, `Pull requests ${prs.length}`, "Files", "Graph", ...(isTenantOwner ? ["Settings"] : [])]}
               value={tab === "issues" ? 0 : tab === "prs" ? 1 : tab === "files" ? 2 : tab === "graph" ? 3 : 4}
               onChange={(i: number) => navigate([repoBase(), `${repoBase()}/voyages`, `${repoBase()}/files`, `${repoBase()}/graph`, `${repoBase()}/settings`][i])} />
-            {(tab === "issues" || tab === "prs") && (
-              <div className="w-[240px] pb-1.5 hidden sm:block">
-                <SearchInput placeholder={tab === "issues" ? "Filter issues" : "Filter pull requests"} shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} />
-              </div>
-            )}
           </div>
 
           {(tab === "issues" || tab === "prs") && (
-          <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-12 gap-y-9">
+          <div className={`grid grid-cols-1 gap-x-12 gap-y-9 ${hasRepoSidebar ? "lg:grid-cols-[1fr_320px]" : ""}`}>
             <section className="min-w-0">
               {tab === "issues" && (
                 <>
                   <div className="flex items-center justify-between gap-3 mb-6 flex-wrap">
-                    <div className="inline-flex items-center gap-0.5 text-[13px] tabular-nums">
-                      {(["open", "closed", "all"] as const).map((fk) => (
-                        <button key={fk} onClick={() => setIssueFilter(fk)} className={`px-2.5 py-1 rounded-ctl-sm capitalize transition-colors ${issueFilter === fk ? "bg-rule2 text-ink font-medium" : "text-muted hover:text-ink"}`}>
-                          {fk === "open" ? `${openIssues} open` : fk === "closed" ? `${issues.length - openIssues} closed` : "all"}
-                        </button>
-                      ))}
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="inline-flex items-center gap-0.5 text-[13px] tabular-nums flex-none">
+                        {(["open", "closed", "all"] as const).map((fk) => (
+                          <button key={fk} onClick={() => setIssueFilter(fk)} className={`px-2.5 py-1 rounded-ctl-sm capitalize transition-colors ${issueFilter === fk ? "bg-rule2 text-ink font-medium" : "text-muted hover:text-ink"}`}>
+                            {fk === "open" ? `${openIssues} open` : fk === "closed" ? `${issues.length - openIssues} closed` : "all"}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="w-[240px] hidden sm:block"><SearchInput placeholder="Filter issues" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>
                     </div>
                     <div className="flex items-center gap-2.5">
                       <Segmented items={["List", "Board"]} value={issueView === "list" ? 0 : 1} onChange={(i: number) => setIssueView(i === 0 ? "list" : "board")} />
@@ -2545,11 +2538,14 @@ export function App() {
 
               {tab === "prs" && (
                 <>
-                  <div className="inline-flex items-center gap-0.5 text-[13px] tabular-nums mb-6">
-                    {(["open", "closed", "all"] as const).map((fk) => {
-                      const n = fk === "open" ? prs.filter((p) => p.state === "open").length : fk === "closed" ? prs.filter((p) => p.state !== "open").length : prs.length;
-                      return <button key={fk} onClick={() => setPrFilter(fk)} className={`px-2.5 py-1 rounded-ctl-sm capitalize transition-colors ${prFilter === fk ? "bg-rule2 text-ink font-medium" : "text-muted hover:text-ink"}`}>{fk === "all" ? `all ${n}` : `${n} ${fk}`}</button>;
-                    })}
+                  <div className="flex items-center gap-3 mb-6 flex-wrap">
+                    <div className="inline-flex items-center gap-0.5 text-[13px] tabular-nums flex-none">
+                      {(["open", "closed", "all"] as const).map((fk) => {
+                        const n = fk === "open" ? prs.filter((p) => p.state === "open").length : fk === "closed" ? prs.filter((p) => p.state !== "open").length : prs.length;
+                        return <button key={fk} onClick={() => setPrFilter(fk)} className={`px-2.5 py-1 rounded-ctl-sm capitalize transition-colors ${prFilter === fk ? "bg-rule2 text-ink font-medium" : "text-muted hover:text-ink"}`}>{fk === "all" ? `all ${n}` : `${n} ${fk}`}</button>;
+                      })}
+                    </div>
+                    <div className="w-[240px] hidden sm:block"><SearchInput placeholder="Filter pull requests" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>
                   </div>
                   <div>
                     {prs.length === 0 && <div className="py-8 text-[13px] text-muted">no pull requests yet — agents open these when they push a change for review</div>}
@@ -2602,7 +2598,7 @@ export function App() {
               )}
             </section>
 
-            {repoSidebar}
+            {hasRepoSidebar && repoSidebar}
           </div>
           )}
 
@@ -3004,9 +3000,20 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
               </div>
             }>
               <Suspense fallback={<div className="px-5 py-8 text-[13px] text-muted">Loading viewer…</div>}>
-                <div className="text-[13px] overflow-x-auto max-h-[70vh] overflow-y-auto">
+                {/* @pierre/diffs `--diffs-*` vars cascade into its shadow DOM — map them onto hull tokens so
+                    the gutter, separators and numbers read as native chrome and follow the theme toggle. */}
+                <div className="text-[13px] overflow-x-auto max-h-[72vh] overflow-y-auto" style={{
+                  "--diffs-bg": "var(--surface)",
+                  "--diffs-fg-number": "var(--faint)",
+                  "--diffs-font-size": "12.5px",
+                  "--diffs-line-height": "1.7",
+                  "--diffs-min-number-column-width": "2.75rem",
+                } as React.CSSProperties}>
                   <PierreFile file={{ name: file.path, contents: file.text }} disableWorkerPool
-                    options={{ theme: { light: "github-light", dark: "github-dark" }, themeType: theme === "dark" ? "dark" : "light", overflow: "scroll", disableFileHeader: true, tokenizeMaxLength: 400_000 }} />
+                    options={{ theme: { light: "github-light", dark: "github-dark" }, themeType: theme === "dark" ? "dark" : "light", overflow: "scroll", disableFileHeader: true, lineHoverHighlight: "line", tokenizeMaxLength: 400_000,
+                      // The gutter/number bg is a theme-computed var we can't override cleanly, so tint it
+                      // directly in the shadow DOM (inherited hull tokens resolve inside `unsafeCSS`).
+                      unsafeCSS: "[data-gutter]{background:var(--paper);border-right:1px solid var(--rule2)}[data-line-number-content]{padding-right:14px;opacity:.85}" }} />
                 </div>
               </Suspense>
             </Boundary>
