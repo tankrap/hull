@@ -1,6 +1,8 @@
-import { Component, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { File as PierreFile } from "@pierre/diffs/react";
+// Code-split the heavy Shiki-powered @pierre viewers into their own chunk (kept out of the initial bundle).
+const PierreFile = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.File })));
+const RepoTree = lazy(() => import("./RepoTree"));
 import * as ed from "@noble/ed25519";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
@@ -2605,7 +2607,7 @@ export function App() {
           )}
 
           {tab === "files" && (
-            <RepoFiles tenant={tenant} repo={issueRepo} authHeaders={authHeaders} />
+            <RepoFiles tenant={tenant} repo={issueRepo} authHeaders={authHeaders} theme={theme} />
           )}
 
           {tab === "graph" && (
@@ -2879,7 +2881,7 @@ function RepoGraph({ tenant, repo, authHeaders }: { tenant: string; repo: string
 // ── Files tab: a branch-aware file browser with fuzzy/full-text search ──────────────────────────
 type TreeItem = { name: string; path: string; dir: boolean; size: number };
 type SearchHit = { path: string; line: number; text: string; kind: "path" | "content" };
-function RepoFiles({ tenant, repo, authHeaders }: { tenant: string; repo: string; authHeaders: () => Record<string, string> }) {
+function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo: string; authHeaders: () => Record<string, string>; theme: string }) {
   const base = `/api/repos/${encodeURIComponent(tenant)}/${repo}`;
   const [branches, setBranches] = useState<string[]>([]);
   const [branch, setBranch] = useState("main");
@@ -2889,6 +2891,7 @@ function RepoFiles({ tenant, repo, authHeaders }: { tenant: string; repo: string
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchHit[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [allPaths, setAllPaths] = useState<string[] | null>(null);
 
   useEffect(() => {
     fetch(`${base}/branches`, { headers: authHeaders() }).then((r) => r.json()).then((d) => {
@@ -2897,6 +2900,13 @@ function RepoFiles({ tenant, repo, authHeaders }: { tenant: string; repo: string
       setBranch((b) => (bs.length && !bs.includes(b) ? bs[0] : b));
     }).catch(() => {});
   }, [tenant, repo]);
+
+  // Every file path in the branch — feeds the @pierre/trees sidebar.
+  useEffect(() => {
+    setAllPaths(null);
+    fetch(`${base}/tree?ref=${encodeURIComponent(branch)}&flat=1`, { headers: authHeaders() })
+      .then((r) => r.json()).then((d) => setAllPaths(d.paths ?? [])).catch(() => setAllPaths([]));
+  }, [branch, tenant, repo]);
 
   const loadDir = (p: string) => {
     setLoading(true); setFile(null);
@@ -2952,7 +2962,24 @@ function RepoFiles({ tenant, repo, authHeaders }: { tenant: string; repo: string
             ))}
           </div>
         </Card>
-      ) : file ? (
+      ) : (
+        <div className="grid grid-cols-[minmax(190px,270px)_1fr] gap-4 items-start">
+          <Card className="overflow-hidden">
+            <SectionHeader label="Files" right={<span className="text-[11.5px] text-faint truncate max-w-[110px]">{branch}</span>} />
+            <div className="py-1.5 pl-1.5 pr-1">
+              {allPaths === null ? (
+                <div className="px-3 py-4 text-[12.5px] text-muted">Loading…</div>
+              ) : allPaths.length === 0 ? (
+                <div className="px-3 py-4 text-[12.5px] text-muted">No files.</div>
+              ) : (
+                <Suspense fallback={<div className="px-3 py-4 text-[12.5px] text-muted">Loading tree…</div>}>
+                  <RepoTree paths={allPaths} selected={file?.path ?? null} onSelect={openFile} />
+                </Suspense>
+              )}
+            </div>
+          </Card>
+          <div className="min-w-0">
+      {file ? (
         <Card>
           <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
             <div className="flex items-center gap-1.5 text-[13px] min-w-0">
@@ -2976,10 +3003,12 @@ function RepoFiles({ tenant, repo, authHeaders }: { tenant: string; repo: string
                 {lines.length > LINE_CAP && <div className="px-5 py-3 text-[12.5px] text-muted border-t border-rule2">{lines.length - LINE_CAP} more lines not shown ({fmtSize(file.size)} file).</div>}
               </div>
             }>
-              <div className="text-[13px] overflow-x-auto max-h-[70vh] overflow-y-auto">
-                <PierreFile file={{ name: file.path, contents: file.text }} disableWorkerPool
-                  options={{ theme: { light: "github-light", dark: "github-dark" }, overflow: "scroll", disableFileHeader: true, tokenizeMaxLength: 400_000 }} />
-              </div>
+              <Suspense fallback={<div className="px-5 py-8 text-[13px] text-muted">Loading viewer…</div>}>
+                <div className="text-[13px] overflow-x-auto max-h-[70vh] overflow-y-auto">
+                  <PierreFile file={{ name: file.path, contents: file.text }} disableWorkerPool
+                    options={{ theme: { light: "github-light", dark: "github-dark" }, themeType: theme === "dark" ? "dark" : "light", overflow: "scroll", disableFileHeader: true, tokenizeMaxLength: 400_000 }} />
+                </div>
+              </Suspense>
             </Boundary>
           )}
         </Card>
@@ -3011,6 +3040,9 @@ function RepoFiles({ tenant, repo, authHeaders }: { tenant: string; repo: string
             ))}
           </div>
         </Card>
+      )}
+          </div>
+        </div>
       )}
     </div>
   );

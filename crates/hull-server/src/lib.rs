@@ -1829,6 +1829,10 @@ async fn repo_tree(
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
+    // `?flat=1` → every file path in the branch (for the full file-tree view).
+    if q.get("flat").is_some_and(|v| v == "1" || v == "true") {
+        return Json(json!({ "ref": ref_name, "paths": app.repos.all_paths(&tenant, &repo, ref_name) }));
+    }
     let path = q.get("path").map(String::as_str).unwrap_or("");
     Json(json!({ "ref": ref_name, "path": path, "entries": app.repos.list_tree(&tenant, &repo, ref_name, path) }))
 }

@@ -466,6 +466,30 @@ impl RepoHost {
         Some(out)
     }
 
+    /// Every file path in a branch's tree (recursive), for a full file-tree view. Capped.
+    pub fn all_paths(&self, tenant: &str, repo: &str, ref_name: &str) -> Vec<String> {
+        let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return vec![] };
+        let Some(root) = self.root_tree(&store, ref_name) else { return vec![] };
+        let mut out = Vec::new();
+        let mut stack = vec![(String::new(), root)];
+        while let Some((prefix, tid)) = stack.pop() {
+            if out.len() > 50_000 {
+                break;
+            }
+            let entries = match store.get(&tid) { Ok(Some(Object::Tree(t))) => t.entries, _ => continue };
+            for e in entries {
+                let full = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+                match store.get(&e.id) {
+                    Ok(Some(Object::Tree(_))) => stack.push((full, e.id)),
+                    Ok(Some(Object::Blob(_))) => out.push(full),
+                    _ => {}
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Read a file's bytes at a specific branch (`None` if repo/ref/path missing or not a blob).
     pub fn read_file_at(&self, tenant: &str, repo: &str, ref_name: &str, path: &str) -> Option<Vec<u8>> {
         let store = self.store(tenant, repo, false).ok()??;
