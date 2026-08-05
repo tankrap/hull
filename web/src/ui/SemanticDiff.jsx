@@ -43,10 +43,29 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [full]);
+  // j/k step through files while reviewing (GitHub-style). Ignored while typing a comment or with a
+  // modifier held, so it never fights the composer or a browser shortcut.
+  useEffect(() => {
+    if (view !== 'sem') return;
+    const onKey = (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.key === 'j') { setSel((s) => Math.min(ops.length - 1, s + 1)); e.preventDefault(); }
+      else if (e.key === 'k') { setSel((s) => Math.max(0, s - 1)); e.preventDefault(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [view, ops.length]);
 
+  // Marking a file reviewed advances to the next STILL-UNREVIEWED file (wrapping), so you're never
+  // dropped back onto something you already cleared — the flow always points at what's left.
   const markAndNext = () => {
-    setReviewed((r) => r.map((v, i) => (i === sel ? true : v)));
-    setSel((s) => Math.min(ops.length - 1, s + 1));
+    const next = reviewed.map((v, i) => (i === sel ? true : v));
+    setReviewed(next);
+    const order = Array.from({ length: ops.length }, (_, i) => i);
+    const nextIdx = [...order.slice(sel + 1), ...order.slice(0, sel)].find((i) => !next[i]);
+    if (nextIdx !== undefined) setSel(nextIdx);
   };
   const acceptProposal = (opIdx, pIdx) => {
     setAccepted((a) => {
@@ -141,9 +160,14 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
 
       {/* footer: review progress (+ merge gate when this surface owns landing) */}
       <div className="px-4 py-2.5 border-t border-rule2 bg-paper flex justify-between items-center gap-3 flex-wrap flex-none">
-        <span className="text-[12px] text-muted">{voyage.meta}</span>
+        <span className="text-[12px] text-muted flex items-center gap-2">{voyage.meta}<span className="hidden sm:inline text-faint">·</span><kbd className="hidden sm:inline text-[10.5px] text-faint border border-rule2 rounded px-1 py-px bg-surface">j</kbd><kbd className="hidden sm:inline text-[10.5px] text-faint border border-rule2 rounded px-1 py-px bg-surface">k</kbd><span className="hidden sm:inline text-faint">to move</span></span>
         <div className="flex items-center gap-3">
-          <span className="text-[12px] text-muted tabular-nums">{done} of {ops.length} reviewed</span>
+          <div className="flex items-center gap-2">
+            <div className="w-24 h-1.5 rounded-full bg-rule2 overflow-hidden" title={`${done} of ${ops.length} reviewed`}>
+              <div className={cx('h-full rounded-full transition-all duration-300', allDone ? 'bg-clear' : 'bg-steel')} style={{ width: `${ops.length ? (done / ops.length) * 100 : 0}%` }} />
+            </div>
+            <span className="text-[12px] text-muted tabular-nums">{done} of {ops.length} reviewed</span>
+          </div>
           {showMerge && <Button size="sm" disabled={!allDone} onClick={onMerge} className="font-semibold">Merge voyage</Button>}
         </div>
       </div>
@@ -192,11 +216,16 @@ export function CodePanel({ lines, filePath, selectedLine, onSelectLine, onComme
         <div key={i} className="border-y border-rule3">{l.note}</div>
       ) : (() => {
         const ln = typeof l.n === 'number' ? l.n : null;
-        const canComment = ln != null && l.sign !== '-' && onCommentLine;
-        const selected = ln != null && selectedLine === ln;
-        const highlighted = ln != null && highlightLine === ln;
+        // Focus/highlight/ids track the NEW side only: every "What changed here" jump references a
+        // new-side line number, and a removed line carries an OLD number that can collide with it.
+        // Anchoring removed rows too would make getElementById land on the removal (rendered first),
+        // which is exactly the "clicked an addition, jumped to a deletion" bug.
+        const focusable = ln != null && l.sign !== '-';
+        const canComment = focusable && onCommentLine;
+        const selected = focusable && selectedLine === ln;
+        const highlighted = focusable && highlightLine === ln;
         return (
-          <div key={i} id={filePath && ln != null ? `L-${filePath}-${ln}` : undefined}
+          <div key={i} id={filePath && focusable ? `L-${filePath}-${ln}` : undefined}
             className={cx('group grid items-stretch scroll-mt-20', l.sign ? 'grid-cols-[28px_54px_1fr]' : 'grid-cols-[54px_1fr]',
               highlighted ? 'line-highlight' : selected ? 'bg-steel-wash' : l.sign === '-' ? 'bg-fault-wash' : l.sign === '+' ? 'bg-clear-wash' : 'hover:bg-paper/60')}>
             {l.sign && <span className={cx('pl-3 py-1 font-bold select-none', l.sign === '-' ? 'text-fault-text' : 'text-clear-text')}>{l.sign}</span>}
