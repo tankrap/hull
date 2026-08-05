@@ -3222,7 +3222,7 @@ function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnot
   return (
     <Boundary fallback={<div className="px-4 py-4 text-[12.5px] text-muted rounded-ctl border border-rule2">Diff viewer unavailable — reload to retry.</div>}>
       <Suspense fallback={<div className="px-4 py-6 text-[13px] text-muted rounded-ctl border border-rule2">Loading diff…</div>}>
-        <div className="text-[13px] rounded-ctl border border-rule2 overflow-hidden" style={{
+        <div data-review-path={filePath} className="text-[13px] rounded-ctl border border-rule2 overflow-hidden" style={{
           "--diffs-bg": "var(--surface)",
           "--diffs-fg-number": "var(--faint)",
           "--diffs-font-size": "12.5px",
@@ -3239,9 +3239,8 @@ function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnot
               // review pane, and calmer to read than two cramped columns.
               diffStyle: "unified",
               overflow: "wrap", disableFileHeader: true, lineHoverHighlight: "line", tokenizeMaxLength: 400_000,
-              // Click a line number (or drag across several) to select; a bar then offers "Comment"
-              // (or press c). Selection drives commenting — a plain line-number click can't, because
-              // line selection intercepts it.
+              // Line selection: drag the gutter or click-then-shift-click to select a range of lines.
+              // The range is reported up so ReviewPage can offer a comment on it.
               enableLineSelection: true,
               onLineSelected: (r: { start: number; end: number } | null) => { onSelect?.(r ? { from: Math.min(r.start, r.end), to: Math.max(r.start, r.end) } : null); },
               // Clicking a "N unmodified lines" band fetches the full file so pierre can reveal the
@@ -3625,20 +3624,18 @@ function ReviewPage({
   // Line-level review comments over a line OR a selected range of lines. Click a line number for one
   // line; drag to select a chunk, then "Comment on lines X–Y". A comment can be sent to an AI agent,
   // which reads the code around it and replies inline.
-  // A highlight in the diff (drag-select) offers a comment — anchored where you released the mouse.
+  // Selecting a RANGE of lines in the diff (drag the gutter, or click a line then shift-click another)
+  // offers a comment via a small tooltip. A single-line click is ignored, so nothing pops just from
+  // clicking. Pierre reports the range; we anchor the tooltip on the range's last line.
   const [selRange, setSelRange] = useState<{ path: string; from: number; to: number; x: number; y: number } | null>(null);
   const [commenting, setCommenting] = useState<{ path: string; from: number; to: number } | null>(null);
-  // Track the pointer and whether the current gesture is a DRAG (a highlight) vs a plain click — so a
-  // single click on a line never pops the comment tooltip; only highlighting code does.
-  const pointerRef = useRef({ x: 0, y: 0 });
-  const dragRef = useRef({ x: 0, y: 0, dragged: false });
-  useEffect(() => {
-    const down = (e: PointerEvent) => { dragRef.current = { x: e.clientX, y: e.clientY, dragged: false }; };
-    const move = (e: PointerEvent) => { pointerRef.current = { x: e.clientX, y: e.clientY }; if (Math.hypot(e.clientX - dragRef.current.x, e.clientY - dragRef.current.y) > 4) dragRef.current.dragged = true; };
-    const up = (e: PointerEvent) => { pointerRef.current = { x: e.clientX, y: e.clientY }; };
-    document.addEventListener("pointerdown", down); document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
-    return () => { document.removeEventListener("pointerdown", down); document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); };
-  }, []);
+  const showSelectionTooltip = (path: string, from: number, to: number) => {
+    if (to <= from) return setSelRange(null); // single line — not a highlight
+    const root = (document.querySelector("[data-review-path] diffs-container") as (HTMLElement & { shadowRoot?: ShadowRoot }) | null)?.shadowRoot;
+    const cell = root?.querySelector(`[data-column-number="${to}"]`) as HTMLElement | null;
+    const r = cell?.getBoundingClientRect();
+    setSelRange({ path, from, to, x: r ? r.right + 90 : window.innerWidth / 2, y: r ? r.bottom + 6 : 240 });
+  };
   const [lineDraft, setLineDraft] = useState("");
   const [askingAI, setAskingAI] = useState(false);
   const postLineComment = async (askAI = false) => {
@@ -3680,7 +3677,7 @@ function ReviewPage({
       {/* Highlight-to-comment tooltip — a small pill at the selection with a comment button (or press c).
           Only shows for an actual highlight (a drag), never a plain line click. */}
       {selRange && !commenting && (
-        <div className="fixed z-[75] -translate-x-1/2 -translate-y-full animate-ov-in" style={{ left: selRange.x, top: selRange.y - 10 }}>
+        <div data-cmt-tooltip className="fixed z-[75] -translate-x-1/2 -translate-y-full animate-ov-in" style={{ left: selRange.x, top: selRange.y - 10 }}>
           <div className="flex items-center gap-1 rounded-ctl bg-ink text-surface shadow-modal pl-1 pr-1.5 py-1">
             <button onClick={() => openLineComment(selRange.path, selRange.from, selRange.to)} title={`Comment on line${selRange.to > selRange.from ? `s ${selRange.from}–${selRange.to}` : ` ${selRange.from}`}`}
               className="w-6 h-6 grid place-items-center rounded-ctl-sm hover:bg-surface/15 transition-colors">
@@ -4214,12 +4211,12 @@ function ReviewPage({
                     <div className="sticky top-0 z-[2] flex items-center justify-between gap-2 mb-1.5 px-3 py-1.5 rounded-ctl bg-paper border border-rule2">
                       {focused
                         ? <button onClick={() => setDiffFocus((s) => { const n = { ...s }; delete n[f.path]; return n; })} className="text-[12px] font-medium text-steel-text hover:underline inline-flex items-center gap-1"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>Showing one change · show all {f.hunks.length} in this file</button>
-                        : <span className="text-[12px] text-muted tabular-nums">{f.hunks.length} change{f.hunks.length === 1 ? "" : "s"} · highlight code to comment</span>}
+                        : <span className="text-[12px] text-muted tabular-nums">{f.hunks.length} change{f.hunks.length === 1 ? "" : "s"} · drag the line numbers to comment</span>}
                       <button onClick={() => { setOpenDiff((s) => { const n = new Set(s); n.delete(f.path); return n; }); setDiffFocus((s) => { const n = { ...s }; delete n[f.path]; return n; }); }} className="text-[12px] font-medium text-muted hover:text-ink inline-flex items-center gap-1">Hide diff<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>
                     </div>
                     <PierreReviewDiff patch={toPatch(f, focused ? selLn : undefined)} filePath={f.path} theme={theme}
                       lineAnnotations={annos} renderAnnotation={renderAnno}
-                      onSelect={(range) => setSelRange(range && dragRef.current.dragged ? { path: f.path, from: range.from, to: range.to, x: pointerRef.current.x, y: pointerRef.current.y } : null)}
+                      onSelect={(range) => range ? showSelectionTooltip(f.path, range.from, range.to) : setSelRange(null)}
                       loadFile={changeId ? async () => {
                         const ck = `${changeId}:${f.path}`;
                         if (fileCache.current[ck]) return fileCache.current[ck];
