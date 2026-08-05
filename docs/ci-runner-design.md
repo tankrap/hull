@@ -1178,6 +1178,34 @@ exactly one run can ever be counted.
 - **The one operator dashboard:** where is time going right now — queued / fetching / materializing /
   running / reporting, stacked. Mostly "fetching" → the internal store or affinity is misconfigured;
   mostly "queued" → we're short on capacity. Capacity decisions read off it.
+- **Lead with what is *not* enforced.** The operator panel's first element is the list of §14 clauses
+  this deployment does not satisfy (D§7.2's `unmet_clauses`). The most valuable thing an operator can
+  know about a CI runner is not what it is doing but what it is not protecting against, and that fact
+  is otherwise buried in a startup log nobody re-reads.
+
+### 11.1 What building the panel exposed
+
+Worth recording as a finding in its own right: **an observability surface is a test of the data
+model**, and this one failed three times on first contact. None of these were visible from the code —
+each became obvious the moment something had to *display* the state.
+
+1. **There is no "delivering" state.** `report_attempts` is only written once every retry has
+   finished, so a job that has decided but whose callback is being retried is indistinguishable from
+   one that has never tried — for up to the full retry budget (§10.1). An operator watching a stuck
+   deployment cannot tell "delivering, attempt 3 of 12" from "delivered nothing". The job state
+   machine (§4.3) needs delivery to be observable *while it is happening*, not only after it stops.
+2. **The scheduler cannot see the fleet it schedules for.** Admission control has per-tenant quotas
+   but no knowledge of total capacity, so it can only *offer* work in fair order and take the fleet's
+   refusal for an answer — it cannot hold a slot back from the wrong tenant. §4.5 assumed §5.1's node
+   roster; until that roster exists, fair *ordering* is real and fair *allocation* is not. Displaying
+   a null fleet capacity beside a node reporting its slots is what made the gap obvious.
+3. **Default quotas exceeded deployable capacity by an order of magnitude** — a default plan
+   permitting 16 concurrent steps on a deployment that can run one. Harmless in effect, but it means
+   the number an operator reads is not a number that constrains anything, which is worse than having
+   no number.
+
+The general lesson: **a design is not finished until something has to render its state.** Prose can
+describe a state machine that has no way to express a state anyone would want to look at.
 
 ---
 
