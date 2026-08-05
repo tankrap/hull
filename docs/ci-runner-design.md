@@ -228,8 +228,17 @@ key, a private-registry token they chose to set) is a different thing, and a CI 
 accept one is a toy. Suggested refinement: keep the absolute prohibition on platform-held credentials,
 and add that a runner **MAY** inject **tenant-declared** secrets into a job **only** when the job is
 authored by a principal the tenant vouches for — never a fork PR or unknown contributor, **independent
-of which isolation tier the job runs in** — the values are masked in all captured output, and they
-never touch the control host's request path or a node's disk. Drydock implements exactly this (§7.4).
+of which isolation tier the job runs in** — the values are **registered for redaction** in captured
+output, and they never touch the control host's request path or a node's disk. Drydock implements
+exactly this (§7.4).
+
+**Note the wording: "registered for redaction", not "masked".** An earlier draft of this clause said
+the value is "masked in all captured output", which is a guarantee no implementation can honour —
+redaction is exact-substring matching, and `base64`, splitting across two writes, or any encoding
+defeats it. Writing it as a MUST would put a promise in the spec that a one-line shell pipeline
+falsifies, and a normative clause that is routinely violated teaches readers to skim the normative
+clauses. The author-class gate is what actually protects a secret from hostile code — redaction only
+stops an accidental `echo` by code that was not trying.
 
 ---
 
@@ -930,6 +939,25 @@ lease-holder, that requested names ⊆ the job's declared set, and that the auth
 returns just those values. The node injects them as env vars into the single-use sandbox and holds
 them in memory **only for the spawn** — never written to disk, gone when the microVM is destroyed.
 
+> **Node binding is only as strong as the thing that authenticates the node, and that is a separate
+> component.** The broker binds a capability to a `node_id` and refuses a redemption presenting a
+> different one — but a `node_id` is just a string in a request. Unless the transport has already
+> proven *which node* is speaking, the field is self-asserted and the `WrongNode` refusal is
+> decorative: an attacker who has the capability token can simply claim the right id.
+>
+> So the binding is load-bearing **only** when the server seam verifies the node's Ed25519 identity
+> (§7.4's enrolment keypair) on the connection carrying the redemption, and derives `node_id` from
+> that verified identity rather than from the request body. Stated explicitly because the failure is
+> invisible: the code reads as though it enforces node binding either way, the tests pass either way,
+> and the control silently does nothing until the identity check exists. **Until then, treat the
+> capability token itself as the only real authenticator** — which is why it is single-use,
+> short-TTL, and scoped to one job's declared names, none of which depend on the node's claim.
+>
+> The same applies to the lease-holder check: "the broker verifies the node is the lease-holder"
+> requires the lease table, which lives in the control plane, not the broker. Both checks belong at
+> the seam where identity is already established, and the design should not imply the broker can do
+> them alone.
+
 *Rotation & revocation.* KEKs rotate by **versioning**: a new KEK version wraps new DEKs while old
 versions still unwrap existing ones, so rotation re-wraps small DEKs and **never re-encrypts the
 secrets themselves** ([AWS KMS rotation](https://docs.aws.amazon.com/kms/latest/developerguide/rotate-keys.html)).
@@ -1461,5 +1489,11 @@ be strictly conforming.** §14.2 reads as "no secrets"; it means "no *platform* 
 > when the job's **author** is a principal the tenant vouches for (never a fork PR or unknown
 > contributor) — a property of the actor, **not** of the sandbox's isolation strength, so a runner that
 > correctly puts *every* job in a microVM does not thereby lose the ability to serve secrets to its own
-> members. The value is masked in all captured
-> output, and it never touches the control host's request path or a node's disk.
+> members. The runner **MUST** register the value for
+> redaction in captured output on a best-effort basis, and the value **MUST NOT** touch the control
+> host's request path or a node's disk.
+>
+> Redaction is deliberately **not** stated as a guarantee. It is exact-substring matching, which
+> `base64`, splitting a value across two writes, or any transformation defeats; a runner cannot
+> promise it and a conforming one should not be asked to. It stops an accidental `echo`. The
+> author-class condition above is the control that protects a secret from code that is *trying*.
