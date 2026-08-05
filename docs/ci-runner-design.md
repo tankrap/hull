@@ -1047,6 +1047,21 @@ The one externally visible output, so it gets its own durable state and worker:
 - Uses `callback_url` **verbatim** (§5: opaque, never constructed), echoing `X-Hull-CI-Secret` (§8).
 - Idempotent by construction — Hull re-affirms the same verdict, and §9 makes duplicate delivery
   explicitly safe.
+- **Deduplicate the work, never the delivery.** This is a distinction an earlier draft did not draw,
+  and the implementation shipped the bug the omission invited. Jobs are keyed `(repo, tree_id)`, but
+  **two changes can share one tree** — a rebase, a cherry-pick, a revert of a revert; that sharing is
+  the entire premise of tree-keyed memoization — and each arrives with its *own* `callback_url`.
+  Treating the second dispatch as a pure duplicate and re-reporting to the *first* URL leaves the
+  second change unverified forever, waiting on an answer that was delivered somewhere else. It is a
+  silent failure: no error, no retry, no log line, nothing that looks broken enough to investigate.
+  A job therefore accumulates the **distinct callback URLs** that have asked about it and the verdict
+  fans out to all of them — de-duplicated by URL, so an ordinary retry of the same dispatch still
+  delivers once, and one unreachable Hull does not suppress the others.
+  This is reachable in normal operation precisely because §9 says Hull's in-flight de-dup is
+  best-effort and in-memory: a second dispatch for a tree we already know is expected after a Hull
+  restart, across replicas, or with `{"force": true}`. §9's own wording is the hint — be idempotent
+  "per `(tree_id)` **or** per `callback_url`". **The tree keys the work; the callback keys the
+  answer.**
 - Exhausted retries → job parks in `report_failed` and **alerts**. §10 of the spec says an undelivered
   verdict just leaves the tree unverified, so no heroics are required — but silent non-delivery looks
   exactly like "CI is broken" to a user, so the alert is not optional.
@@ -1210,6 +1225,23 @@ acceptable, and only because nothing is shared yet.
 
 **M2 — pipelines and the DAG.** `.hull/ci.star` (Starlark evaluation → DAG, §4.4), planner, step state,
 parallel independent steps, fail-fast cancel, sanitized summaries.
+
+> **M1 status: complete and signed off** (`tankrap/hull-ci`). The black-box conformance suite passes
+> **27/27** against the running service in keel-addressing mode — 14 §11 checklist tests, 7 adversarial,
+> 6 harness self-tests — including the two STRICT cases the spec's own `scripts/fake-ci.py` fails
+> (`tree_id` re-verification, and refusing an unknown contract major). What the milestone actually
+> taught, beyond "it runs":
+>
+> - **Three bugs in Hull's producer side**, all found only because a *verifying* consumer existed:
+>   the tree archiver followed symlinks (so affected trees could never re-hash to their own id), the
+>   archive scratch directory raced itself under concurrent fetches, and `fake-ci.py` returned no
+>   callback at all when the fetch failed. That is the case for G5.
+> - **Work-vs-delivery de-duplication** (§10.1 above) — a silent correctness bug the design's own
+>   wording invited.
+> - **A conformance checklist can be satisfied by a runner that refuses every job.** Every §11 test
+>   accepted any of the three statuses, so `errored` everywhere passed all of them. A checklist that
+>   cannot distinguish "conformant" from "inert" is not measuring conformance; the suite now asserts
+>   that a well-formed tree does not come back `errored`.
 
 **M3 — the multi-tenant untrusted core. This is where Drydock becomes what it is for.** Firecracker as
 the **default** tier with userfaultfd lazy snapshot restore (§7.2), the tenant model and **node
