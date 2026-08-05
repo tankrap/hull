@@ -163,28 +163,34 @@ pub struct AiConnection {
     pub created_unix: u64,
 }
 
-/// How an [`AiConnection`] authenticates: a static API key, or an OAuth token pair from a subscription
-/// sign-in (refreshed when it nears expiry).
+/// How an [`AiConnection`] authenticates. `Key` = a static API key. `AgentCli` = a locally-installed
+/// agent (Claude Code / Codex) that Hull runs with the user's OWN subscription login — no token is
+/// stored or reused; the CLI authenticates itself. (This is the ToS-compliant way to use a Pro/Max or
+/// ChatGPT subscription: the actual agent uses it, not a third-party app reusing an OAuth token.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AiAuth {
     Key { api_key: String },
-    OAuth { access_token: String, refresh_token: String, expires_unix: u64 },
+    AgentCli { command: String },
 }
 
 impl AiAuth {
-    /// The bearer token to send now (the API key, or the OAuth access token).
+    /// The bearer token to send now (an API key), or empty for an agent CLI (which self-authenticates).
     pub fn bearer(&self) -> &str {
         match self {
             AiAuth::Key { api_key } => api_key,
-            AiAuth::OAuth { access_token, .. } => access_token,
+            AiAuth::AgentCli { .. } => "",
         }
     }
-    /// A short, non-secret hint for the settings UI (last 3 chars).
+    /// A short, non-secret hint for the settings UI.
     pub fn hint(&self) -> String {
-        let s = self.bearer();
-        let tail: String = s.chars().rev().take(3).collect::<String>().chars().rev().collect();
-        format!("…{tail}")
+        match self {
+            AiAuth::AgentCli { command } => command.clone(),
+            AiAuth::Key { api_key } => {
+                let tail: String = api_key.chars().rev().take(3).collect::<String>().chars().rev().collect();
+                format!("…{tail}")
+            }
+        }
     }
 }
 

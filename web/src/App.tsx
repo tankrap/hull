@@ -342,21 +342,32 @@ function LabelEditor({ labels, onChange }: { labels: RepoLabel[]; onChange: (l: 
 // Connect several and toggle rotation; a repo's reviews use its org's connections (else the caller's).
 function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: string; authHeaders: () => Record<string, string>; scopeLabel?: string }) {
   type Conn = { id: string; provider: string; label: string; base_url: string; auth_kind: string; hint: string };
+  type AgentInfo = { kind: string; command: string; label: string; installed: boolean };
   const enc = encodeURIComponent;
   const [conns, setConns] = useState<Conn[]>([]);
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [rotate, setRotate] = useState(false);
   const [provider, setProvider] = useState("anthropic");
   const [label, setLabel] = useState("");
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
+  const [agentBusy, setAgentBusy] = useState("");
   const load = () => { fetch(`/api/accounts/${enc(accountId)}/ai`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) { setConns(d.connections || []); setRotate(!!d.rotate); } }).catch(() => {}); };
   useEffect(load, [accountId]); // eslint-disable-line
+  useEffect(() => { fetch(`/api/ai/agents`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) setAgents(d.agents || []); }).catch(() => {}); }, [accountId]); // eslint-disable-line
+  const post = (body: Record<string, unknown>) => fetch(`/api/accounts/${enc(accountId)}/ai`, { method: "POST", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify(body) });
   const add = async () => {
     if (!key.trim()) return;
     setBusy(true);
-    const r = await fetch(`/api/accounts/${enc(accountId)}/ai`, { method: "POST", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify({ provider, label: label.trim(), api_key: key.trim() }) });
+    const r = await post({ provider, label: label.trim(), api_key: key.trim() });
     setBusy(false);
     if (r.ok) { setKey(""); setLabel(""); load(); } else uiAlert(await r.text());
+  };
+  const connectAgent = async (kind: string) => {
+    setAgentBusy(kind);
+    const r = await post({ provider: kind });
+    setAgentBusy("");
+    if (r.ok) load(); else uiAlert(await r.text());
   };
   const remove = async (id: string) => {
     if (!(await uiConfirm({ title: "Remove connection", body: "Disconnect this AI backend from the account?", danger: true, confirmLabel: "Remove" }))) return;
@@ -365,32 +376,48 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
   };
   const toggleRotate = async (on: boolean) => { setRotate(on); await fetch(`/api/accounts/${enc(accountId)}/ai/rotate`, { method: "PUT", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify({ rotate: on }) }).catch(() => setRotate(!on)); };
   const PROVIDERS = [{ value: "anthropic", label: "Claude (Anthropic)" }, { value: "openai", label: "OpenAI" }, { value: "openrouter", label: "OpenRouter" }];
-  const dot = (p: string) => (p === "anthropic" ? "bg-brass" : p === "openai" ? "bg-clear" : "bg-steel");
+  const dot = (c: Conn) => (c.auth_kind === "agent" ? "bg-clear" : c.provider === "anthropic" ? "bg-brass" : c.provider === "openai" ? "bg-clear" : "bg-steel");
+  const installed = agents.filter((a) => a.installed);
   return (
     <div>
       <Eyebrow label="AI connections" right={conns.length > 1 ? <span className="inline-flex items-center gap-2 text-[12px] text-muted">rotate across them <Switch on={rotate} onChange={toggleRotate} /></span> : undefined} />
       <Card>
         <div className="px-5 py-4 grid gap-3">
-          <p className="text-[12.5px] text-muted leading-[1.5]">Bring OpenAI, Claude, or OpenRouter to {scopeLabel ?? "this account"} — AI reviews, fixes, and “ask agent”. Connect several and turn on rotate to spread load across them; without any, Hull uses its built-in reconciliation reviewer.</p>
+          <p className="text-[12.5px] text-muted leading-[1.5]">Power AI reviews, fixes, triage, and “ask agent” for {scopeLabel ?? "this account"}. Connect a coding agent to run on <b>your own Claude / ChatGPT subscription</b>, or add an API key. Connect several and turn on rotate to spread load; without any, Hull uses its built-in reconciliation reviewer.</p>
           {conns.length > 0 && (
             <div className="grid gap-1.5">
               {conns.map((c) => (
                 <div key={c.id} className="flex items-center gap-2.5 px-3 py-2 rounded-ctl border border-rule2 bg-paper/40">
-                  <span className={`w-2 h-2 rounded-full flex-none ${dot(c.provider)}`} />
+                  <span className={`w-2 h-2 rounded-full flex-none ${dot(c)}`} />
                   <span className="text-[13.5px] font-medium truncate">{c.label}</span>
-                  <span className="text-[11.5px] text-faint tabular-nums">{c.provider} · {c.auth_kind === "oauth" ? "subscription" : "key"} {c.hint}</span>
+                  <span className="text-[11.5px] text-faint tabular-nums">{c.auth_kind === "agent" ? <>agent CLI · <code className="text-dim">{c.hint}</code></> : <>{c.provider} · key {c.hint}</>}</span>
                   <button onClick={() => remove(c.id)} className="ml-auto text-[12px] text-muted hover:text-fault-text">Remove</button>
                 </div>
               ))}
             </div>
           )}
-          <div className="flex flex-wrap items-end gap-2 pt-1 border-t border-rule3">
-            <div className="w-[180px]"><Picker size="sm" block value={provider} onChange={setProvider} options={PROVIDERS} /></div>
-            <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="label (optional)" className="box-border h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[160px]" />
-            <input value={key} onChange={(e) => setKey(e.target.value)} type="password" placeholder="API key" className="box-border flex-1 min-w-[180px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" />
-            <Button size="sm" disabled={!key.trim() || busy} onClick={add}>{busy ? "Connecting…" : "Connect"}</Button>
+          {installed.length > 0 && (
+            <div className="grid gap-2 pt-1 border-t border-rule3">
+              <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">Coding agents on this host</span>
+              <div className="flex flex-wrap gap-2">
+                {installed.map((a) => (
+                  <Button key={a.kind} size="sm" variant="secondary" disabled={agentBusy === a.kind} onClick={() => connectAgent(a.kind)}>
+                    {agentBusy === a.kind ? "Connecting…" : `Connect ${a.label}`}
+                  </Button>
+                ))}
+              </div>
+              <p className="text-[11.5px] text-faint leading-[1.5]">Runs the agent’s own CLI under your subscription login — no API key, no token stored. (Consumer plans stay within their terms this way.)</p>
+            </div>
+          )}
+          <div className="grid gap-2 pt-1 border-t border-rule3">
+            <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">Or add an API key</span>
+            <div className="flex flex-wrap items-end gap-2">
+              <div className="w-[180px]"><Picker size="sm" block value={provider} onChange={setProvider} options={PROVIDERS} /></div>
+              <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="label (optional)" className="box-border h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[160px]" />
+              <input value={key} onChange={(e) => setKey(e.target.value)} type="password" placeholder="API key" className="box-border flex-1 min-w-[180px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" />
+              <Button size="sm" disabled={!key.trim() || busy} onClick={add}>{busy ? "Connecting…" : "Connect"}</Button>
+            </div>
           </div>
-          <p className="text-[11.5px] text-faint leading-[1.5]">To use a Claude or ChatGPT <b>subscription</b> instead of an API key, run <code className="px-1 rounded bg-rule2 text-dim">keel ai login {provider}</code> — a browser sign-in that stores the token here <span className="italic">(rolling out next)</span>.</p>
         </div>
       </Card>
     </div>

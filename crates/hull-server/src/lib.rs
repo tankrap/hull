@@ -322,6 +322,7 @@ fn make_router(app: App) -> Router {
         .route("/api/accounts/:id/ai", get(ai_connections_get).post(ai_connection_add))
         .route("/api/accounts/:id/ai/rotate", axum::routing::put(ai_rotate_set))
         .route("/api/accounts/:id/ai/:cid", axum::routing::delete(ai_connection_delete))
+        .route("/api/ai/agents", get(ai_agents_detect))
         .route("/api/accounts/:id/github", get(github_status).delete(github_disconnect))
         .route("/api/accounts/:id/github/connect", post(github_connect))
         .route("/api/accounts/:id/github/connect-url", post(github_connect_url))
@@ -1134,38 +1135,57 @@ async fn ai_connections_get(State(app): State<App>, Path(id): Path<String>, head
         Err(resp) => return resp,
     };
     let conns: Vec<Value> = app.store.ai_connections(&acct.id).into_iter().map(|c| {
-        let kind = match &c.auth { hull_core::AiAuth::Key { .. } => "key", hull_core::AiAuth::OAuth { .. } => "oauth" };
+        let kind = match &c.auth { hull_core::AiAuth::Key { .. } => "key", hull_core::AiAuth::AgentCli { .. } => "agent" };
         json!({ "id": c.id, "provider": c.provider, "label": c.label, "base_url": c.base_url, "auth_kind": kind, "hint": c.auth.hint(), "created_unix": c.created_unix })
     }).collect();
     Json(json!({ "connections": conns, "rotate": app.store.ai_rotate(&acct.id) })).into_response()
 }
 
-/// `POST /api/accounts/:id/ai` — connect a backend by API key: `{provider, api_key, label?, base_url?}`.
-/// (OAuth-token connections are created by `keel ai login`.) Owner/admin only.
+/// `POST /api/accounts/:id/ai` — connect a backend. Either an API key
+/// (`{provider: openai|anthropic|openrouter, api_key, label?, base_url?}`) or a locally-installed
+/// **agent CLI** run with the user's own subscription (`{provider: claude-code|codex, label?}`).
+/// Owner/admin only.
 async fn ai_connection_add(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
     let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
         Ok(x) => x,
         Err(resp) => return resp,
     };
     let provider = body.get("provider").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
-    let key = body.get("api_key").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    if key.is_empty() || !["openai", "anthropic", "openrouter"].contains(&provider.as_str()) {
-        return (StatusCode::BAD_REQUEST, "provider (openai|anthropic|openrouter) and api_key are required").into_response();
-    }
-    let base_url = body.get("base_url").and_then(Value::as_str).map(str::to_string).filter(|s| !s.is_empty()).unwrap_or_else(|| ai_default_base(&provider));
-    let label = body.get("label").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| format!("{provider} key"));
     let n = app.store.ai_connections(&acct.id).len();
-    let conn = hull_core::AiConnection {
-        id: format!("ai_{}_{}", acct.id, n + 1),
-        owner: acct.id.clone(),
-        provider,
-        label,
-        base_url,
-        auth: hull_core::AiAuth::Key { api_key: key },
-        created_unix: now(),
+    // Agent-CLI connection: uses the user's own Claude Code / Codex login, no key.
+    let (base_url, auth, def_label) = if let Some(cmd) = agent_command(&provider) {
+        let command = body.get("command").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or(cmd).to_string();
+        (String::new(), hull_core::AiAuth::AgentCli { command }, if provider == "codex" { "Codex (subscription)".into() } else { "Claude Code (subscription)".into() })
+    } else if ["openai", "anthropic", "openrouter"].contains(&provider.as_str()) {
+        let key = body.get("api_key").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        if key.is_empty() {
+            return (StatusCode::BAD_REQUEST, "api_key is required for a key connection").into_response();
+        }
+        let base = body.get("base_url").and_then(Value::as_str).map(str::to_string).filter(|s| !s.is_empty()).unwrap_or_else(|| ai_default_base(&provider));
+        (base, hull_core::AiAuth::Key { api_key: key }, format!("{provider} key"))
+    } else {
+        return (StatusCode::BAD_REQUEST, "provider must be openai|anthropic|openrouter (key) or claude-code|codex (agent)").into_response();
     };
+    let label = body.get("label").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(def_label);
+    let conn = hull_core::AiConnection { id: format!("ai_{}_{}", acct.id, n + 1), owner: acct.id.clone(), provider, label, base_url, auth, created_unix: now() };
     app.store.put_ai_connection(conn.clone());
     (StatusCode::CREATED, Json(json!({ "id": conn.id }))).into_response()
+}
+
+/// `GET /api/ai/agents` — which local agent CLIs are installed on this Hull host (so the settings UI
+/// only offers the ones present). Any signed-in actor may query.
+async fn ai_agents_detect(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    if authed_actor(&app, &headers).is_none() {
+        return (StatusCode::UNAUTHORIZED, "sign in required").into_response();
+    }
+    let agents: Vec<Value> = [("claude-code", "claude", "Claude Code"), ("codex", "codex", "Codex")]
+        .iter()
+        .map(|(kind, cmd, label)| {
+            let installed = std::process::Command::new(cmd).arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+            json!({ "kind": kind, "command": cmd, "label": label, "installed": installed })
+        })
+        .collect();
+    Json(json!({ "agents": agents })).into_response()
 }
 
 /// `DELETE /api/accounts/:id/ai/:cid` — remove a connection (owner/admin only).
@@ -3520,7 +3540,20 @@ fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&str>) ->
     let owner = owner?;
     let idx = if app.store.ai_rotate(&owner) { next_ai_index(&owner, conns.len()) } else { 0 };
     let c = &conns[idx % conns.len()];
-    Some(hull_plugin::AiCredential { provider: c.provider.clone(), base_url: c.base_url.clone(), token: c.auth.bearer().to_string() })
+    let agent_cli = match &c.auth {
+        hull_core::AiAuth::AgentCli { command } => Some(command.clone()),
+        _ => None,
+    };
+    Some(hull_plugin::AiCredential { provider: c.provider.clone(), base_url: c.base_url.clone(), token: c.auth.bearer().to_string(), agent_cli })
+}
+
+/// Default command for an agent kind.
+fn agent_command(kind: &str) -> Option<&'static str> {
+    match kind {
+        "claude-code" => Some("claude"),
+        "codex" => Some("codex"),
+        _ => None,
+    }
 }
 
 async fn perform_auto_review(

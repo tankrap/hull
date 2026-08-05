@@ -301,11 +301,14 @@ pub trait Fixer: Send + Sync {
 /// `None` on a request means "use the process-configured provider" (the `.env` default).
 #[derive(Debug, Clone)]
 pub struct AiCredential {
-    /// `openai` | `anthropic` | `openrouter`.
+    /// API provider (`openai`/`anthropic`/`openrouter`) OR an agent kind (`claude-code`/`codex`).
     pub provider: String,
     pub base_url: String,
-    /// The bearer token (an API key or an OAuth access token).
+    /// The bearer token (an API key). Empty when this is an agent CLI.
     pub token: String,
+    /// When set, this backend is a locally-installed **agent CLI** (the string is the command, e.g.
+    /// `claude`), run with the user's own subscription login — not an API call.
+    pub agent_cli: Option<String>,
 }
 
 #[derive(Debug, Clone)]
