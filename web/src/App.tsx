@@ -2,6 +2,7 @@ import { Component, lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef,
 import { createPortal } from "react-dom";
 // Code-split the heavy Shiki-powered @pierre viewers into their own chunk (kept out of the initial bundle).
 const PierreFile = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.File })));
+const PierrePatch = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.PatchDiff })));
 const RepoTree = lazy(() => import("./RepoTree"));
 import * as ed from "@noble/ed25519";
 import { Button, LinkButton } from "./ui/Button";
@@ -9,7 +10,7 @@ import { HTabs, Segmented } from "./ui/Tabs";
 import { SearchInput, Switch, Select } from "./ui/Field";
 import { StatusBadge, Tag } from "./ui/Badge";
 import { Drawer, Dialog, PromptModal } from "./ui/Overlay";
-import { SemanticDiff, CodePanel, LocationBar, OldTok, NewTok } from "./ui/SemanticDiff";
+import { SemanticDiff, OldTok, NewTok } from "./ui/SemanticDiff";
 import { createPasskey, getPasskey } from "./webauthn";
 import { hlToHtml, wordDiff, type Seg } from "./highlight";
 import { Markdown } from "./markdown";
@@ -17,11 +18,6 @@ import { RichText } from "./ui/RichText";
 
 // Syntax-highlighted code fragment (hljs HTML). Used across the diff viewer.
 const Hl = ({ text, path }: { text: string; path: string }) => <span dangerouslySetInnerHTML={{ __html: hlToHtml(text, path) }} />;
-// Render word-diff segments: unchanged parts syntax-highlighted, changed parts tinted (removed/added).
-const wdRender = (segs: Seg[], path: string, side: "old" | "new") =>
-  segs.map((s, i) => s.changed
-    ? <span key={i} className={side === "old" ? "bg-fault-wash text-fault-text rounded-[3px]" : "bg-clear-wash text-clear-text font-semibold rounded-[3px]"} style={{ padding: "1px 2px" }}>{s.text}</span>
-    : <Hl key={i} text={s.text} path={path} />);
 
 const hexToBytes = (h: string) => Uint8Array.from((h.match(/../g) ?? []).map((x) => parseInt(x, 16)));
 const bytesToHex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -2365,6 +2361,7 @@ export function App() {
             repo={issueRepo}
             token={token}
             me={me}
+            theme={theme}
             onBack={() => navigate(`${repoBase()}/voyages`)}
           />
         );
@@ -3159,6 +3156,52 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
     </div>
   );
 }
+// Annotation payload carried on a pierre diff line: an AI finding, a human line comment, or the open
+// composer. renderAnnotation switches on `kind` to draw the right thing inline in the diff.
+type DiffAnno =
+  | { kind: "finding"; kf: unknown }
+  | { kind: "comment"; c: unknown }
+  | { kind: "composer" };
+type PierreAnno = { side: "additions" | "deletions"; lineNumber: number; metadata: DiffAnno };
+
+// One file's diff, rendered by @pierre/diffs (Shiki, GitHub-style context collapse). Findings and
+// comments ride inline as line annotations; hovering a line reveals a gutter "+" that opens a comment
+// there. This is the whole diff surface — no bespoke hunk machinery on top of it.
+function PierreReviewDiff({ patch, theme, lineAnnotations, renderAnnotation, onComment, selectedLines }: {
+  patch: string;
+  theme: string;
+  lineAnnotations: PierreAnno[];
+  renderAnnotation: (a: PierreAnno) => React.ReactNode;
+  onComment: (line: number, side: "additions" | "deletions") => void;
+  selectedLines?: { start: number; end: number; side?: "additions" | "deletions" } | null;
+}) {
+  return (
+    <Boundary fallback={<div className="px-4 py-4 text-[12.5px] text-muted rounded-ctl border border-rule2">Diff viewer unavailable — reload to retry.</div>}>
+      <Suspense fallback={<div className="px-4 py-6 text-[13px] text-muted rounded-ctl border border-rule2">Loading diff…</div>}>
+        <div className="text-[13px] rounded-ctl border border-rule2 overflow-hidden" style={{
+          "--diffs-bg": "var(--surface)",
+          "--diffs-fg-number": "var(--faint)",
+          "--diffs-font-size": "12.5px",
+          "--diffs-line-height": "1.7",
+          "--diffs-min-number-column-width": "2.75rem",
+        } as React.CSSProperties}>
+          <PierrePatch patch={patch} disableWorkerPool
+            lineAnnotations={lineAnnotations as never}
+            renderAnnotation={renderAnnotation as never}
+            selectedLines={(selectedLines ?? null) as never}
+            options={{
+              theme: { light: "github-light", dark: "github-dark" }, themeType: theme === "dark" ? "dark" : "light",
+              overflow: "wrap", disableFileHeader: true, lineHoverHighlight: "line", tokenizeMaxLength: 400_000,
+              // Click a line number to comment on that line — the composer opens inline right there.
+              onLineNumberClick: (p: { lineNumber: number; annotationSide: "additions" | "deletions" }) => onComment(p.lineNumber, p.annotationSide),
+              unsafeCSS: "[data-gutter]{background:var(--paper);border-right:1px solid var(--rule2)}[data-line-number-content]{padding-right:14px;opacity:.85;cursor:pointer}[data-line-number-content]:hover{color:var(--steel);text-decoration:underline}",
+            } as never} />
+        </div>
+      </Suspense>
+    </Boundary>
+  );
+}
+
 /** The review "package" — a dedicated page synthesizing what a reviewer needs, not a one-liner. */
 function ReviewPage({
   review,
@@ -3176,6 +3219,7 @@ function ReviewPage({
   repo,
   token,
   me,
+  theme,
   onBack,
 }: {
   review: Review;
@@ -3193,6 +3237,7 @@ function ReviewPage({
   repo: string;
   token: string;
   me: { id: string; handle: string; kind: string } | null;
+  theme: string;
   onBack: () => void;
 }) {
   const authHeaders = (): Record<string, string> => (token ? { authorization: `Bearer ${token}` } : {});
@@ -3501,37 +3546,17 @@ function ReviewPage({
   // Reviews load async, so collapse each finding once when first seen (without undoing manual expands).
   // Raw diff bodies are minified (just the "What changed here" summary) until expanded — click a
   // summary line or the Show-diff toggle to reveal the lines.
-  // Diffs open on demand — "Show diff" expands one; "Hide diff" collapses it again.
-  const [expandedDiffs, setExpandedDiffs] = useState<Set<string>>(() => new Set());
-  // A big diff only ever RENDERS a bounded window (never thousands of rows). diffFocus[path] centres
-  // the window on a line (set by a "What changed here" click); diffExpand[path] grows it on "show more".
+  // diffFocus[path] = the line a "What changed here" click selected; it becomes pierre's highlighted
+  // `selectedLines` in that file's diff so the reader sees exactly which line the summary meant.
   const [diffFocus, setDiffFocus] = useState<Record<string, number>>({});
-  const [diffExpand, setDiffExpand] = useState<Record<string, number>>({});
   // "What changed here" defaults to the handful of edits that carry the most signal; the long tail of
   // trivial token tweaks stays folded until you ask for it (per file).
   const [allEdits, setAllEdits] = useState<Set<string>>(() => new Set());
-  // Open a file's diff and jump to a line — the line stays highlighted (diffFocus drives CodePanel's
-  // persistent `highlightLine`) so you can see exactly which line the "What changed here" click meant.
+  // Select (highlight) a line in a file's pierre diff and bring the diff into view.
   const revealDiff = (path: string, line?: number) => {
-    setExpandedDiffs((s) => (s.has(path) ? s : new Set(s).add(path)));
-    if (line != null) {
-      setDiffFocus((f) => ({ ...f, [path]: line }));
-      setTimeout(() => document.getElementById(`L-${path}-${line}`)?.scrollIntoView({ block: "center", behavior: "smooth" }), 180);
-    }
+    if (line != null) setDiffFocus((f) => ({ ...f, [path]: line }));
+    setTimeout(() => document.getElementById("changes-section")?.scrollIntoView({ block: "start", behavior: "smooth" }), 60);
   };
-  const [collapsedFindings, setCollapsedFindings] = useState<Set<string>>(() => new Set());
-  const seenFindingsRef = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    setCollapsedFindings((prev) => {
-      const n = new Set(prev);
-      reviews.forEach((r, ri) => (r.findings ?? []).forEach((_, fi) => {
-        const k = `${ri}:${fi}`;
-        if (!seenFindingsRef.current.has(k)) { seenFindingsRef.current.add(k); n.add(k); }
-      }));
-      return n;
-    });
-  }, [reviews]);
-  const toggleFinding = (key: string) => setCollapsedFindings((s) => { const n = new Set(s); n.has(key) ? n.delete(key) : n.add(key); return n; });
   // Line-level review comments: select a diff line, press C (or click the gutter ✎) to comment on it.
   const [selLine, setSelLine] = useState<{ path: string; line: number } | null>(null);
   const [commenting, setCommenting] = useState<{ path: string; line: number } | null>(null);
@@ -3894,20 +3919,17 @@ function ReviewPage({
           }
           const foldNote = (hidden: number) => <span className="text-faint italic text-[12px]">⋯ {hidden} unchanged {hidden === 1 ? "line" : "lines"}</span>;
 
-          // The inline finding annotation shown right under its line in the diff (collapsible).
+          // The inline finding annotation shown right under its line in the pierre diff.
           const findingNote = (x: FindingRow) => {
-            const { f, reviewer, key, idx } = x;
+            const { f, reviewer, idx } = x;
             const sevColor = f.severity === "blocker" ? "text-fault-text" : f.severity === "warn" ? "text-brass-text" : "text-steel-text";
             return (
-              <div className="flex gap-2.5 px-4 py-3 bg-brass-wash/25">
+              <div className="flex gap-2.5 px-4 py-3 bg-brass-wash/25 border-l-2 border-brass">
                 <StatusDot tone={sevTone(f.severity)} size={16} />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className={`text-[11px] font-bold uppercase tracking-[0.03em] ${sevColor}`}>{f.severity}</span>
                     <span className="inline-flex items-center gap-1 text-[11.5px] text-muted"><Avatar id={reviewer} handle={handleOf(reviewer)} kind={kindOf(reviewer)} size={14} />{handleOf(reviewer)}</span>
-                    <button onClick={() => toggleFinding(key)} className="ml-auto text-[11.5px] text-muted hover:text-ink inline-flex items-center gap-1" title="collapse this finding out of the diff">
-                      collapse <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg>
-                    </button>
                   </div>
                   <p className="text-[13px] text-body mt-1 leading-snug">{f.note}</p>
                   {f.severity !== "info" && pr && f.path && canFix && (
@@ -3942,66 +3964,23 @@ function ReviewPage({
               </div>
             </div>
           );
-          type Row = { n: number | string; sign?: string; code: React.ReactNode; note?: React.ReactNode; marker?: { tone: string; onClick: () => void; title: string } };
-          // Interleave findings, line comments, and the open composer under their lines.
-          const annotate = (rows: Row[], f: FileDiff): Row[] => {
-            const fs = findingsByFile.get(f.path) ?? [];
-            const lcs = lineCommentsByFile.get(f.path) ?? [];
-            const res: Row[] = [];
-            for (const row of rows) {
-              if (row.sign !== "-" && typeof row.n === "number") {
-                const ln = row.n;
-                const here = fs.filter((x) => x.f.line === ln);
-                const collapsed = here.filter((x) => collapsedFindings.has(x.key));
-                res.push(collapsed.length ? { ...row, marker: { tone: sevTone(collapsed[0].f.severity), onClick: () => toggleFinding(collapsed[0].key), title: `reopen ${collapsed[0].f.severity} finding` } } : row);
-                for (const x of here) if (!collapsedFindings.has(x.key)) res.push({ n: "", code: null, note: findingNote(x) });
-                for (const c of lcs.filter((c) => c.line === ln)) res.push({ n: "", code: null, note: lineCommentNote(c) });
-                if (commenting && commenting.path === f.path && commenting.line === ln) res.push({ n: "", code: null, note: composerNote() });
-                continue;
-              }
-              res.push(row);
-            }
-            return res;
-          };
 
           // Grouped (semantic) ops: behavioral/changed files first, then renames, then reformatted.
+          // Convert a file's hunks into a unified patch for @pierre/diffs: sign each line and compute
+          // the hunk counts pierre's parser expects from the add/del tags.
+          const toPatch = (f: FileDiff): string => {
+            const head = `diff --git a/${f.path} b/${f.path}\n--- a/${f.path}\n+++ b/${f.path}\n`;
+            const body = f.hunks.map((h) => {
+              const oldN = h.lines.filter((l) => l.tag !== "add").length;
+              const newN = h.lines.filter((l) => l.tag !== "del").length;
+              const rows = h.lines.map((l) => (l.tag === "add" ? "+" : l.tag === "del" ? "-" : " ") + l.text).join("\n");
+              return `@@ -${h.old_start},${oldN} +${h.new_start},${newN} @@\n${rows}`;
+            }).join("\n");
+            return head + body + "\n";
+          };
           const codeBody = (f: FileDiff) => {
             const fs = findingsByFile.get(f.path) ?? [];
             const lcs = lineCommentsByFile.get(f.path) ?? [];
-            // Keep the diff open when it carries comments/an active composer, so they're never hidden.
-            const forceOpen = lcs.length > 0 || commenting?.path === f.path;
-            const anchoredLines = new Set<number>([...fs.map((x) => x.f.line ?? -1), ...lcs.map((c) => c.line ?? -1)]);
-            if (commenting?.path === f.path) anchoredLines.add(commenting.line);
-            const keepAnchored = (r: Row) => typeof r.n === "number" && anchoredLines.has(r.n);
-            // A huge diff only ever RENDERS a bounded window of rows, so one enormous file can never
-            // swamp the page. The window centres on diffFocus[path] (set by a "What changed here"
-            // click) and grows by diffExpand[path] on "show more". Annotated files render in full.
-            const expander = (hidden: number, where: "above" | "below"): Row => ({
-              n: "", code: null, note: (
-                <button onClick={() => setDiffExpand((e) => ({ ...e, [f.path]: (e[f.path] ?? 0) + 200 }))}
-                  className="w-full py-2 text-[12.5px] font-medium text-steel-text hover:bg-steel-wash/50 flex items-center justify-center gap-1.5 bg-paper/40">
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
-                  Show {Math.min(hidden, 200)} more {where} · {hidden} line{hidden > 1 ? "s" : ""} hidden
-                </button>
-              ),
-            });
-            const capRows = (rows: Row[]): Row[] => {
-              if (forceOpen) return rows;
-              const grow = diffExpand[f.path] ?? 0;
-              const RAD = 24 + grow;
-              if (rows.length <= RAD * 2 + 8) return rows;
-              const focus = diffFocus[f.path];
-              const idx = focus != null ? rows.findIndex((r) => typeof r.n === "number" && r.n === focus) : -1;
-              let lo: number, hi: number;
-              if (idx >= 0) { lo = Math.max(0, idx - RAD); hi = Math.min(rows.length, idx + RAD + 1); }
-              else { lo = 0; hi = Math.min(rows.length, RAD * 2 + 1); }
-              const parts: Row[] = [];
-              if (lo > 0) parts.push(expander(lo, "above"));
-              parts.push(...rows.slice(lo, hi));
-              if (hi < rows.length) parts.push(expander(rows.length - hi, "below"));
-              return parts;
-            };
-            const isOpen = expandedDiffs.has(f.path) || forceOpen;
             // Take the span from first-changed to last-changed token so inner spaces/punctuation are
             // preserved (otherwise "walk_all ()" → "slice ( task )" collapses to "slicetask").
             const span = (segs: Seg[]) => {
@@ -4048,62 +4027,14 @@ function ReviewPage({
                 } else { n++; k++; }
               }
             }
-            const renderHunk = (h: FileDiff["hunks"][number], hi: number) => {
-              let o = h.old_start, n = h.new_start;
-              const L = h.lines;
-              const out: Row[] = [];
-              for (let k = 0; k < L.length;) {
-                const l = L[k];
-                if (l.tag === "del") {
-                  let d = k; while (L[d] && L[d].tag === "del") d++;
-                  let a = d; while (L[a] && L[a].tag === "add") a++;
-                  const dels = L.slice(k, d), adds = L.slice(d, a);
-                  const pairs = Math.min(dels.length, adds.length);
-                  const wds = Array.from({ length: pairs }, (_, p) => wordDiff(dels[p].text, adds[p].text));
-                  dels.forEach((dl, p) => { out.push({ n: o, sign: "-", code: p < pairs ? <>{wdRender(wds[p].old, f.path, "old")}</> : <Hl text={dl.text} path={f.path} /> }); o++; });
-                  adds.forEach((al, p) => { out.push({ n, sign: "+", code: p < pairs ? <>{wdRender(wds[p].next, f.path, "new")}</> : <Hl text={al.text} path={f.path} /> }); n++; });
-                  k = a;
-                } else if (l.tag === "add") {
-                  out.push({ n, sign: "+", code: <Hl text={l.text} path={f.path} /> }); n++; k++;
-                } else {
-                  out.push({ n, sign: undefined, code: <Hl text={l.text} path={f.path} /> }); o++; n++; k++;
-                }
-              }
-              return (
-                <div key={hi}>
-                  <LocationBar crumbs={f.path.split("/")} right={`@@ -${h.old_start} +${h.new_start} @@`} />
-                  <CodePanel lines={capRows(annotate(fold(out, (hidden) => ({ n: "⋯", code: foldNote(hidden) }), keepAnchored), f))}
-                    filePath={f.path} selectedLine={selLine?.path === f.path ? selLine.line : null}
-                    highlightLine={diffFocus[f.path] ?? null}
-                    onSelectLine={(ln: number | null) => setSelLine(ln == null ? null : { path: f.path, line: ln })}
-                    onCommentLine={(ln: number) => openLineComment(f.path, ln)} />
-                </div>
-              );
-            };
-            // A reference (a "What changed here" click, a code-ref) focuses ONE section: show only the
-            // hunk that holds that line and keep it highlighted (diffFocus → CodePanel highlightLine),
-            // rather than unfurling the whole file. "Show the whole file" reveals the rest.
-            const focusLine = diffFocus[f.path];
-            const indexed = f.hunks.map((h, hi) => ({ h, hi }));
-            const hunkHasLine = (h: FileDiff["hunks"][number], line: number) => {
-              let n = h.new_start;
-              for (const l of h.lines) { if (l.tag !== "del") { if (n === line) return true; n++; } }
-              return false;
-            };
-            const focusedHunks = focusLine != null ? indexed.filter(({ h }) => hunkHasLine(h, focusLine)) : [];
-            const shownHunks = focusedHunks.length > 0 ? focusedHunks : indexed;
-            const hiddenHunks = indexed.length - shownHunks.length;
-            const hunkNodes = isOpen ? (
-              <>
-                {shownHunks.map(({ h, hi }) => renderHunk(h, hi))}
-                {hiddenHunks > 0 && (
-                  <button onClick={() => setDiffFocus((s) => { const c = { ...s }; delete c[f.path]; return c; })}
-                    className="w-full mt-2 py-2 rounded-ctl border border-dashed border-rule text-[12.5px] font-medium text-steel-text hover:bg-steel-wash/50 hover:border-ctl transition-colors flex items-center justify-center gap-1.5">
-                    Showing the referenced change · show the whole file ({indexed.length} sections)
-                  </button>
-                )}
-              </>
-            ) : null;
+            // Inline annotations that ride the pierre diff: AI findings and human line comments at
+            // their line, plus the open composer. renderAnno draws each with the existing note UIs.
+            const annos: PierreAnno[] = [];
+            for (const x of fs) if (x.f.line) annos.push({ side: "additions", lineNumber: x.f.line, metadata: { kind: "finding", kf: x } });
+            for (const c of lcs) if (c.line) annos.push({ side: "additions", lineNumber: c.line, metadata: { kind: "comment", c } });
+            if (commenting?.path === f.path) annos.push({ side: "additions", lineNumber: commenting.line, metadata: { kind: "composer" } });
+            const renderAnno = (a: PierreAnno) => a.metadata.kind === "finding" ? findingNote(a.metadata.kf as FindingRow) : a.metadata.kind === "comment" ? lineCommentNote(a.metadata.c as Cmt) : composerNote();
+            const selLn = diffFocus[f.path];
             // Drop punctuation/comment-only noise, then dedupe so a repeated edit isn't listed twice.
             const seen = new Set<string>();
             const uniq = transforms
@@ -4159,59 +4090,29 @@ function ReviewPage({
                     </div>
                   );
                 })()}
-                {isOpen ? (() => {
-                  // A compact review bar top + bottom of the open diff, so you can act right after reading.
-                  const reviewBar = !forceOpen ? (
-                    <div className="flex justify-end py-1">
-                      <button onClick={() => setExpandedDiffs((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>
-                    </div>
-                  ) : null;
-                  return (
-                    <>
-                      {reviewBar}
-                      {hunkNodes}
-                      {reviewBar}
-                    </>
-                  );
-                })() : f.too_large ? (
+                {f.too_large ? (
                   <div className="w-full py-2.5 rounded-ctl border border-dashed border-rule text-[12.5px] text-muted flex items-center justify-center gap-2">
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
                     File too large to diff inline — open it in the Files tab to view.
                   </div>
                 ) : (
-                  <button onClick={() => revealDiff(f.path)} className="w-full py-2.5 rounded-ctl border border-dashed border-rule text-[12.5px] text-muted hover:text-ink hover:border-ctl hover:bg-paper/50 transition-colors flex items-center justify-center gap-2">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
-                    Show diff · {f.hunks.reduce((acc, h) => acc + h.lines.length, 0)} lines
-                  </button>
+                  <PierreReviewDiff patch={toPatch(f)} theme={theme}
+                    lineAnnotations={annos} renderAnnotation={renderAnno}
+                    onComment={(line) => openLineComment(f.path, line)}
+                    selectedLines={selLn != null ? { start: selLn, end: selLn, side: "additions" } : null} />
                 )}
               </>
             );
           };
-          const fileOps = ordered.filter((f) => cls(f.path) !== "reformatted").map((f) => ({
+          // One op per changed file — a clean pierre diff, behavioral files first. No move/reformat
+          // grouping: every file is just its diff, in order of what matters.
+          const fileOps = ordered.map((f) => ({
             kind: opKind(f),
             title: base(f.path),
             meta: `${f.path}  ·  +${count(f, "add")} −${count(f, "del")}`,
             body: codeBody(f),
           }));
-          const moveOps = (semantic?.moves ?? []).map((m) => ({
-            kind: "rename",
-            title: `Move ${base(m.from)}`,
-            meta: `exact move · ${m.blob.slice(0, 8)}`,
-            body: (
-              <div className="text-[13px] text-body">
-                <div className="flex items-center gap-2 flex-wrap"><OldTok>{m.from}</OldTok><span className="text-muted">→</span><NewTok>{m.to}</NewTok></div>
-                <p className="text-[12.5px] text-muted mt-2.5">Byte-identical relocation (proven by content address). Behavior-preserving.</p>
-              </div>
-            ),
-          }));
-          const reformatOps = (semantic?.whitespace_only ?? []).map((p) => ({
-            kind: "chart",
-            title: base(p),
-            meta: `${p} · whitespace only`,
-            body: <p className="text-[13px] text-muted">Reformatted only — no semantic change (whitespace/layout). Low risk.</p>,
-          }));
-          const ops = [...fileOps, ...moveOps, ...reformatOps];
-          if (ops.length === 0) ops.push({ kind: "behavior", title: "changes", meta: "", body: <p className="text-[13px] text-muted">no semantic operations detected — see line-by-line.</p> });
+          const ops = fileOps.length ? fileOps : [{ kind: "behavior", title: "changes", meta: "", body: <p className="text-[13px] text-muted">no textual changes.</p> }];
 
           // Line-by-line (raw) view with computed old/new line numbers.
           const rawFiles = ordered.map((f) => ({

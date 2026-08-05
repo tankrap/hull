@@ -3,14 +3,17 @@ import React, { useEffect, useRef, useState } from 'react';
 
 const cx = (...a) => a.filter(Boolean).join(' ');
 
-const PRESS = 'transition-[transform,background-color,border-color,color] duration-150 active:translate-y-px active:scale-[0.99]';
+// Every button: centered content, consistent icon spacing, a soft press, and a smooth hover.
+const BASE = 'inline-flex items-center justify-center gap-1.5 font-medium cursor-pointer select-none whitespace-nowrap';
+const PRESS = 'transition-[transform,box-shadow,background-color,border-color,color,filter] duration-150 active:translate-y-px active:scale-[0.99]';
 
 const VARIANT = {
-  primary: 'bg-ink text-surface border border-ink hover:opacity-90 active:opacity-100',
-  // ADS default button: subtle translucent-neutral fill, no border.
-  secondary: 'bg-ink/[0.06] text-body border border-transparent hover:bg-ink/[0.12] active:bg-ink/[0.16]',
-  ghost: 'bg-transparent text-steel-text border border-transparent hover:bg-steel-wash active:bg-steel-wash',
-  destructive: 'bg-fault/[0.08] text-fault-text border border-transparent hover:bg-fault/[0.16] active:bg-fault/20',
+  // Solid ink with a little lift — a subtle shadow gives it presence; hover brightens, press flattens.
+  primary: 'bg-ink text-surface border border-ink font-semibold shadow-[0_1px_2px_rgba(15,23,42,0.14)] hover:brightness-[1.12] hover:shadow-[0_3px_10px_-3px_rgba(15,23,42,0.32)] active:shadow-none',
+  // ADS default: translucent-neutral fill with a hairline for crispness.
+  secondary: 'bg-ink/[0.05] text-body border border-ink/[0.07] hover:bg-ink/[0.09] hover:border-ink/[0.11] active:bg-ink/[0.15]',
+  ghost: 'bg-transparent text-steel-text border border-transparent hover:bg-steel-wash active:bg-steel-wash/80',
+  destructive: 'bg-fault/[0.08] text-fault-text border border-fault/[0.12] hover:bg-fault/[0.15] hover:border-fault/20 active:bg-fault/20',
 };
 
 const SIZE = {
@@ -22,13 +25,13 @@ const SIZE = {
 export function Button({ variant = 'primary', size = 'md', className, disabled, children, ...rest }) {
   if (disabled) {
     return (
-      <button disabled className={cx('font-medium bg-ink/[0.07] text-dim border border-transparent cursor-not-allowed', SIZE[size], className)} {...rest}>
+      <button disabled className={cx(BASE, 'bg-ink/[0.05] text-faint border border-ink/[0.05] cursor-not-allowed shadow-none', SIZE[size], className)} {...rest}>
         {children}
       </button>
     );
   }
   return (
-    <button className={cx('font-medium cursor-pointer', PRESS, VARIANT[variant], SIZE[size], className)} {...rest}>
+    <button className={cx(BASE, PRESS, VARIANT[variant], SIZE[size], className)} {...rest}>
       {children}
     </button>
   );
