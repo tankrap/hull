@@ -337,6 +337,24 @@ pub struct FixResult {
 /// green + an independent human/agent approval).
 pub trait Reviewer: Send + Sync {
     fn review(&self, req: &ReviewRequest) -> ReviewPackage;
+    /// Answer a reviewer's free-form question about a specific span of code (a line or range). Used by
+    /// the "comment & ask agent" action. Default: unsupported (the OSS reconciliation reviewer has no
+    /// model to answer with); the hosted AI reviewer overrides it.
+    fn answer(&self, _req: &AskRequest) -> Option<String> {
+        None
+    }
+}
+
+/// A reviewer's question about a code span: the human's `question`, the `path`, the `code` around the
+/// referenced lines, and the anchor `line`. The reviewer reads the code and replies in prose.
+#[derive(Debug, Clone)]
+pub struct AskRequest {
+    pub repo: String,
+    pub path: String,
+    pub line: u32,
+    pub line_end: u32,
+    pub code: String,
+    pub question: String,
 }
 
 /// What a reviewer judges: the change's narrative (intent + session lesson), its author, the
@@ -581,6 +599,12 @@ impl Registry {
             Some(r) => r.review(req),
             None => default_review(req),
         }
+    }
+
+    /// Ask the installed reviewer a question about a code span. `None` when no reviewer is installed
+    /// or it declines to answer.
+    pub fn answer(&self, req: &AskRequest) -> Option<String> {
+        self.reviewer.as_ref().and_then(|r| r.answer(req))
     }
 
     /// The external target this repo mirrors to, if any (installed mirror, else the dry-run default).

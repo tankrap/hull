@@ -3115,6 +3115,8 @@ async fn create_comment(
     let count = app.store.comments(&key).len();
     let path = body.get("path").and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let line = body.get("line").and_then(Value::as_u64).map(|n| n as u32);
+    let line_end = body.get("line_end").and_then(Value::as_u64).map(|n| n as u32).unwrap_or(line.unwrap_or(0));
+    let ask_ai = body.get("ask_ai").and_then(Value::as_bool).unwrap_or(false);
     let comment = Comment {
         id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
         repo: key.clone(),
@@ -3191,7 +3193,64 @@ async fn create_comment(
             }
         }
     }
+    // "Comment & ask agent": hand the code around this comment to the AI reviewer and post its reply
+    // inline, authored by the agent reviewer. Best-effort — a failure never fails the human comment.
+    if ask_ai && app.registry.has_reviewer() {
+        if let (Some(p), Some(ln)) = (comment.path.clone(), line) {
+            if let Some(num) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
+                if let Some(reply) = ai_answer_comment(&app, &key, num, &p, ln, line_end, &comment.body).await {
+                    app.store.put_comment(reply);
+                }
+            }
+        }
+    }
     (StatusCode::CREATED, Json(json!({ "comment": comment }))).into_response()
+}
+
+/// Build the code context around a commented line, ask the AI reviewer, and return its reply as a
+/// [`Comment`] authored by the agent reviewer (anchored to the same line). `None` if anything is
+/// missing (no change, no reviewer actor, model declined).
+async fn ai_answer_comment(app: &App, key: &str, pr_num: u64, path: &str, line: u32, line_end: u32, question: &str) -> Option<Comment> {
+    let (tenant, repo) = key.split_once('/')?;
+    let pr = app.store.prs(key).into_iter().find(|p| p.number == pr_num)?;
+    let change = pr.changes.first().cloned()?;
+    // An accountable agent to author the reply — the org's reviewer, never the PR author.
+    let reviewer = app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.handle == "agent:reviewer" && a.id != pr.author)
+        .or_else(|| app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.id != pr.author && accountable(app, a).is_ok()))?;
+    // Code context from the change's diff hunks (the change is content-addressed, not a git ref):
+    // walk the file's hunks tracking the NEW line number and keep the referenced span plus ~13 lines
+    // of surrounding context, marking added lines with '+'.
+    let (lo, hi) = (line.saturating_sub(13), line_end.max(line) + 13);
+    let file = app.repos.diff(tenant, repo, &change).into_iter().find(|f| f.path == path)?;
+    let mut code = String::new();
+    for h in &file.hunks {
+        let mut n = h.new_start as u32;
+        for l in &h.lines {
+            if l.tag == "del" { continue; }
+            if n >= lo && n <= hi {
+                let sign = if l.tag == "add" { "+" } else { " " };
+                code.push_str(&format!("{n:>5} {sign} {}\n", l.text));
+            }
+            n += 1;
+        }
+    }
+    if code.trim().is_empty() { return None; }
+    let req = hull_plugin::AskRequest {
+        repo: key.to_string(), path: path.to_string(), line, line_end: line_end.max(line), code, question: question.to_string(),
+    };
+    let app2 = app.clone();
+    let answer = tokio::task::spawn_blocking(move || app2.registry.answer(&req)).await.ok().flatten()?;
+    let count = app.store.comments(key).len();
+    Some(Comment {
+        id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
+        repo: key.to_string(),
+        target: format!("pr:{pr_num}"),
+        author: reviewer.id,
+        body: answer,
+        created_unix: now(),
+        path: Some(path.to_string()),
+        line: Some(line),
+    })
 }
 
 /// Post a review (`POST /api/repos/:tenant/:repo/reviews`) — `{target, reviewer, verdict, summary}`.
