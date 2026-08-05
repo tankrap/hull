@@ -1263,7 +1263,8 @@ async fn ai_agent_login_complete(State(app): State<App>, Path(id): Path<String>,
         // creds, and killing that must not discard a login that actually completed.
         let fin = agentlogin::finish(&sess, &code);
         match agent_auth_identity(&cmd, &agentsession::dir_for(&sess)) {
-            Ok(idy) => Ok(idy),
+            // Login landed — seal the plaintext staging dir into the encrypted at-rest bundle.
+            Ok(idy) => agentsession::seal(&sess).map(|_| idy),
             Err(e) => Err(fin.err().unwrap_or(e)),
         }
     })
@@ -3504,11 +3505,13 @@ async fn ai_answer_comment(app: &App, key: &str, pr_num: u64, path: &str, line: 
         }
     }
     if code.trim().is_empty() { return None; }
+    let (cred, _bundle) = resolve_ai_credential(app, key, None);
     let req = hull_plugin::AskRequest {
         repo: key.to_string(), path: path.to_string(), line, line_end: line_end.max(line), code, question: question.to_string(),
-        ai_credential: resolve_ai_credential(app, key, None),
+        ai_credential: cred,
     };
     let app2 = app.clone();
+    // `_bundle` (the decrypted per-user bundle, if any) stays alive across the call, then wipes.
     let answer = tokio::task::spawn_blocking(move || app2.registry.answer(&req)).await.ok().flatten()?;
     let count = app.store.comments(key).len();
     Some(Comment {
@@ -3655,7 +3658,7 @@ fn next_ai_index(owner: &str, n: usize) -> usize {
 /// Resolve which AI backend to use for a request touching `repo`: the repo's owning org's connected
 /// credentials first, else the `fallback_actor`'s personal-account connections. With rotation on for
 /// the owner, cycle across its connections; else use the first. `None` → the process-configured default.
-fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&str>) -> Option<hull_plugin::AiCredential> {
+fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&str>) -> (Option<hull_plugin::AiCredential>, Option<agentsession::BundleGuard>) {
     let tenant = repo.split_once('/').map(|(t, _)| t).unwrap_or(repo);
     let mut owner: Option<String> = None;
     let mut conns: Vec<hull_core::AiConnection> = Vec::new();
@@ -3671,19 +3674,27 @@ fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&str>) ->
             }
         }
     }
-    let owner = owner?;
+    let Some(owner) = owner else { return (None, None) };
     let idx = if app.store.ai_rotate(&owner) { next_ai_index(&owner, conns.len()) } else { 0 };
     let c = &conns[idx % conns.len()];
-    let (agent_cli, agent_config_dir) = match &c.auth {
-        // Per-user session ⇒ point the CLI at this user's own credential bundle; empty session ⇒
-        // host login (no CLAUDE_CONFIG_DIR override).
-        hull_core::AiAuth::AgentCli { command, session, .. } => {
-            let dir = (!session.is_empty()).then(|| agentsession::dir_for(session).to_string_lossy().into_owned());
-            (Some(command.clone()), dir)
+    let (agent_cli, agent_config_dir, guard) = match &c.auth {
+        hull_core::AiAuth::AgentCli { command, session, .. } if !session.is_empty() => {
+            // Per-user session: decrypt this user's bundle into a throwaway dir the CLI runs against;
+            // the guard wipes it after. If it won't open, run no agent (degrade to the default
+            // reviewer) rather than silently using the wrong identity (the host login).
+            match agentsession::open(session) {
+                Ok(g) => { let d = g.dir_string(); (Some(command.clone()), Some(d), Some(g)) }
+                Err(e) => {
+                    eprintln!("hull: agent bundle for session {session} won't open ({e}); skipping agent backend");
+                    return (None, None);
+                }
+            }
         }
-        _ => (None, None),
+        // Host-login agent (empty session): no CLAUDE_CONFIG_DIR override.
+        hull_core::AiAuth::AgentCli { command, .. } => (Some(command.clone()), None, None),
+        _ => (None, None, None),
     };
-    Some(hull_plugin::AiCredential { provider: c.provider.clone(), base_url: c.base_url.clone(), token: c.auth.bearer().to_string(), agent_cli, agent_config_dir })
+    (Some(hull_plugin::AiCredential { provider: c.provider.clone(), base_url: c.base_url.clone(), token: c.auth.bearer().to_string(), agent_cli, agent_config_dir }), guard)
 }
 
 /// Default command for an agent kind.
@@ -3769,6 +3780,7 @@ async fn perform_auto_review(
         let n = semantic.moves.len();
         (Verdict::Approve, Vec::new(), Some(ledger), format!("pure move — {n} file{} relocated with byte-identical content (verified by content address); no behavioral review needed", if n == 1 { "" } else { "s" }), false)
     } else {
+    let (cred, _bundle) = resolve_ai_credential(&app, &key, Some(&pr.author));
     let review_req = hull_plugin::ReviewRequest {
         repo: key.clone(),
         change: change.clone(),
@@ -3778,7 +3790,7 @@ async fn perform_auto_review(
         author_model,
         source_url,
         facts,
-        ai_credential: resolve_ai_credential(&app, &key, Some(&pr.author)),
+        ai_credential: cred,
     };
     // D9 — incremental re-review: reuse the cached verdict when nothing that feeds it changed. The
     // key is tree **+ verification** (a review's inputs are the diff AND the green/red signal), so a
@@ -3979,6 +3991,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
     let change = pr.changes.first().cloned()?;
     let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
     let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
+    let (cred, _bundle) = resolve_ai_credential(&app, &key, Some(&pr.author));
     let req = hull_plugin::FixRequest {
         repo: key.clone(),
         change,
@@ -3986,10 +3999,11 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
         path: path.to_string(),
         note: note.to_string(),
         severity: severity.to_string(),
-        ai_credential: resolve_ai_credential(&app, &key, Some(&pr.author)),
+        ai_credential: cred,
     };
     let change = req.change.clone();
     let registry = app.registry.clone();
+    // `_bundle` (decrypted per-user bundle, if any) stays alive across the fixer call, then wipes.
     let res = tokio::task::spawn_blocking(move || registry.fix(&req)).await.ok()??;
     if res.ok && !res.edits.is_empty() {
         let intent = format!("fix: {}", res.explanation);

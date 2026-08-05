@@ -2,17 +2,23 @@
 //! subscription login, populated by the web-relayed `setup-token` flow and pointed at by the CLI's
 //! `CLAUDE_CONFIG_DIR` / `CODEX_HOME` at review time.
 //!
-//! Each connected user gets an isolated bundle directory (verified: a fresh config dir reports
-//! `loggedIn: false`, so credentials are dir-scoped). The CLI reads, refreshes, and rewrites its own
-//! credentials in place, so the directory IS the durable store — no token is parsed or reused by Hull.
+//! Each connected user gets an isolated bundle (verified: a fresh config dir reports
+//! `loggedIn: false`, so credentials are dir-scoped). The CLI writes/refreshes its own credentials, so
+//! the bundle IS the durable store — no token is parsed or reused by Hull.
 //!
-//! NOTE (Phase 1): bundles are stored as `0700` directories under the Hull data root. App-level
-//! encryption-at-rest (decrypt-to-tmp per use, keyed by the server secret) is the immediate follow-up
-//! (Phase 1b) that wraps this module; until then, protect the data root with volume encryption.
+//! **At rest the bundle is encrypted** (Phase 1b): it lives as a single AEAD-sealed tar.gz
+//! (`<session>.enc`, ChaCha20-Poly1305 under the server key). It is only ever plaintext transiently:
+//!   - during **login**, in `dir_for(session)` while `setup-token` writes into it, then [`seal`]ed;
+//!   - during a **run**, [`open`]ed into a throwaway dir that is wiped when the [`BundleGuard`] drops.
+//! `setup-token` mints a *long-lived* token, so runs are read-only against the bundle — we decrypt,
+//! run, and discard, never re-sealing (no per-run mutation to persist, so no lock/race).
 
-use std::path::PathBuf;
+use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
+use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-/// Root holding every user's bundle dir: `HULL_AGENT_SESSIONS` or `<HULL_DATA_DIR|~/.hull>/agent-sessions`.
+/// Root holding every user's bundle: `HULL_AGENT_SESSIONS` or `<HULL_DATA_DIR|~/.hull>/agent-sessions`.
 pub fn sessions_root() -> PathBuf {
     if let Ok(p) = std::env::var("HULL_AGENT_SESSIONS") {
         return PathBuf::from(p);
@@ -21,16 +27,21 @@ pub fn sessions_root() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         PathBuf::from(home).join(".hull").join("data")
     });
-    // Sibling of the domain store dir, so all Hull state lives under one root.
     base.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("agent-sessions")
 }
 
-/// The bundle directory for a session id (not guaranteed to exist).
+/// The **plaintext** login-staging directory for a session (exists only between provision and seal).
 pub fn dir_for(session: &str) -> PathBuf {
     sessions_root().join(session)
 }
 
-/// Create a fresh, private (`0700`) bundle directory and return `(session_id, path)`.
+/// The **encrypted** at-rest bundle path.
+fn enc_path(session: &str) -> PathBuf {
+    sessions_root().join(format!("{session}.enc"))
+}
+
+/// Create a fresh, private (`0700`) staging directory and return `(session_id, path)` for a login to
+/// write credentials into (sealed afterwards by [`seal`]).
 pub fn provision() -> std::io::Result<(String, PathBuf)> {
     let session = uuid::Uuid::new_v4().simple().to_string();
     let dir = dir_for(&session);
@@ -40,7 +51,7 @@ pub fn provision() -> std::io::Result<(String, PathBuf)> {
 }
 
 /// Best-effort tighten to owner-only (`0700`). Credentials must never be group/world-readable.
-pub fn harden(dir: &std::path::Path) {
+pub fn harden(dir: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -52,16 +63,190 @@ pub fn harden(dir: &std::path::Path) {
     }
 }
 
-/// Does this session have a populated bundle (i.e. a login landed)?
+/// A session has a populated (sealed) bundle iff its `.enc` exists.
 pub fn exists(session: &str) -> bool {
-    let d = dir_for(session);
-    d.is_dir() && std::fs::read_dir(&d).map(|mut it| it.next().is_some()).unwrap_or(false)
+    enc_path(session).is_file()
 }
 
-/// Delete a session's bundle (on connection removal). Best-effort.
+/// Delete a session's bundle — both the sealed `.enc` and any leftover plaintext staging dir.
 pub fn remove(session: &str) {
     if session.is_empty() {
         return;
     }
+    let _ = std::fs::remove_file(enc_path(session));
     let _ = std::fs::remove_dir_all(dir_for(session));
+}
+
+/// Seal the plaintext staging dir into the encrypted at-rest bundle, then wipe the plaintext. Called
+/// once a login has written credentials into `dir_for(session)`.
+pub fn seal(session: &str) -> Result<(), String> {
+    let dir = dir_for(session);
+    if !dir.is_dir() {
+        return Err("nothing to seal (no staging dir)".into());
+    }
+    let tar_gz = pack(&dir).map_err(|e| format!("pack bundle: {e}"))?;
+    let sealed = encrypt(&tar_gz).map_err(|e| format!("encrypt bundle: {e}"))?;
+    let path = enc_path(session);
+    let tmp = path.with_extension("enc.tmp");
+    std::fs::write(&tmp, &sealed).map_err(|e| format!("write bundle: {e}"))?;
+    harden_file(&tmp);
+    std::fs::rename(&tmp, &path).map_err(|e| format!("commit bundle: {e}"))?;
+    let _ = std::fs::remove_dir_all(&dir); // drop the plaintext staging copy
+    Ok(())
+}
+
+/// Decrypt a sealed bundle into a throwaway private directory for use as the CLI's config home. The
+/// returned guard wipes that directory when dropped, so plaintext credentials never outlive the run.
+pub fn open(session: &str) -> Result<BundleGuard, String> {
+    let sealed = std::fs::read(enc_path(session)).map_err(|e| format!("read bundle: {e}"))?;
+    let tar_gz = decrypt(&sealed).map_err(|e| format!("decrypt bundle: {e}"))?;
+    let dir = sessions_root().join(".open").join(uuid::Uuid::new_v4().simple().to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("open dir: {e}"))?;
+    harden(&dir);
+    unpack(&tar_gz, &dir).map_err(|e| format!("unpack bundle: {e}"))?;
+    Ok(BundleGuard { dir })
+}
+
+/// A live, decrypted bundle directory; wiped from disk on drop.
+pub struct BundleGuard {
+    dir: PathBuf,
+}
+
+impl BundleGuard {
+    pub fn dir_string(&self) -> String {
+        self.dir.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for BundleGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+// ── crypto + archive helpers ─────────────────────────────────────────────────────────
+
+/// The 32-byte AEAD key. From `HULL_SESSION_KEY` (64 hex chars) if set, else a per-install key file
+/// (`<root>/.bundle-key`, `0600`) generated once so restarts can still decrypt. For production, set
+/// `HULL_SESSION_KEY` from a secret manager rather than relying on the on-disk key.
+fn key() -> &'static Key {
+    static KEY: OnceLock<Key> = OnceLock::new();
+    KEY.get_or_init(|| {
+        if let Ok(hex) = std::env::var("HULL_SESSION_KEY") {
+            if let Ok(bytes) = hex_decode(hex.trim()) {
+                if bytes.len() == 32 {
+                    return *Key::from_slice(&bytes);
+                }
+            }
+            eprintln!("hull: HULL_SESSION_KEY must be 64 hex chars (32 bytes) — falling back to the key file");
+        }
+        let path = sessions_root().join(".bundle-key");
+        if let Ok(bytes) = std::fs::read(&path) {
+            if bytes.len() == 32 {
+                return *Key::from_slice(&bytes);
+            }
+        }
+        // Generate once and persist (0600).
+        let k = ChaCha20Poly1305::generate_key(&mut OsRng);
+        let _ = std::fs::create_dir_all(sessions_root());
+        if std::fs::write(&path, k.as_slice()).is_ok() {
+            harden_file(&path);
+        }
+        k
+    })
+}
+
+/// Encrypt: `[12-byte nonce][ciphertext+tag]`.
+fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = ChaCha20Poly1305::new(key());
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let ct = cipher.encrypt(&nonce, plain).map_err(|_| "aead encrypt".to_string())?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(nonce.as_slice());
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+fn decrypt(sealed: &[u8]) -> Result<Vec<u8>, String> {
+    if sealed.len() < 12 {
+        return Err("sealed bundle too short".into());
+    }
+    let cipher = ChaCha20Poly1305::new(key());
+    let nonce = Nonce::from_slice(&sealed[..12]);
+    cipher.decrypt(nonce, &sealed[12..]).map_err(|_| "aead decrypt (wrong key or corrupt bundle)".into())
+}
+
+/// tar.gz the *contents* of `dir` (paths relative to it).
+fn pack(dir: &Path) -> std::io::Result<Vec<u8>> {
+    let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut tar = tar::Builder::new(enc);
+    tar.append_dir_all(".", dir)?;
+    let enc = tar.into_inner()?;
+    enc.finish()
+}
+
+fn unpack(tar_gz: &[u8], dir: &Path) -> std::io::Result<()> {
+    let dec = flate2::read::GzDecoder::new(tar_gz);
+    let mut ar = tar::Archive::new(dec);
+    ar.set_preserve_permissions(true);
+    ar.unpack(dir)
+}
+
+fn harden_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
+    if s.len() % 2 != 0 {
+        return Err(());
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ())).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seal_open_roundtrip_wipes_plaintext() {
+        let root = std::env::temp_dir().join(format!("hull-agent-test-{}", uuid::Uuid::new_v4().simple()));
+        std::env::set_var("HULL_AGENT_SESSIONS", &root);
+        std::env::set_var("HULL_SESSION_KEY", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+
+        // A login writes a credential file into the staging dir…
+        let (session, dir) = provision().unwrap();
+        std::fs::write(dir.join(".credentials.json"), b"{\"token\":\"secret-xyz\"}").unwrap();
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/state"), b"deep").unwrap();
+
+        // …then it's sealed: encrypted blob appears, plaintext staging is gone, and the raw bytes
+        // on disk do NOT contain the secret.
+        seal(&session).unwrap();
+        assert!(exists(&session));
+        assert!(!dir.exists(), "plaintext staging dir must be wiped after seal");
+        let raw = std::fs::read(sessions_root().join(format!("{session}.enc"))).unwrap();
+        assert!(!raw.windows(10).any(|w| w == b"secret-xyz"), "secret must not appear in the sealed bytes");
+
+        // Opening decrypts into a throwaway dir with identical contents; dropping the guard wipes it.
+        let open_dir;
+        {
+            let g = open(&session).unwrap();
+            open_dir = g.dir_string();
+            assert_eq!(std::fs::read(PathBuf::from(&open_dir).join(".credentials.json")).unwrap(), b"{\"token\":\"secret-xyz\"}");
+            assert_eq!(std::fs::read(PathBuf::from(&open_dir).join("nested/state")).unwrap(), b"deep");
+        }
+        assert!(!PathBuf::from(&open_dir).exists(), "decrypted dir must be wiped when the guard drops");
+
+        remove(&session);
+        assert!(!exists(&session));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
