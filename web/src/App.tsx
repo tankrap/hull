@@ -2438,7 +2438,7 @@ export function App() {
 
               {/* Org tabs — same shape as the profile page. People is members-only. */}
               <div className="border-b border-rule2 -mt-1">
-                <HTabs items={["Overview", `Repositories ${oRepos.length}`, ...(acct ? [`People ${oMembers}`] : [])]} value={orgTab === "overview" ? 0 : orgTab === "repos" ? 1 : 2} onChange={(i: number) => setOrgTab(i === 0 ? "overview" : i === 1 ? "repos" : "people")} />
+                <HTabs items={["Overview", `Repositories ${oRepos.length}`, ...(acct ? ["Settings"] : [])]} value={orgTab === "overview" ? 0 : orgTab === "repos" ? 1 : 2} onChange={(i: number) => setOrgTab(i === 0 ? "overview" : i === 1 ? "repos" : "people")} />
               </div>
 
               {orgTab === "overview" && (
