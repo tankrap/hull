@@ -3191,6 +3191,9 @@ function PierreReviewDiff({ patch, theme, lineAnnotations, renderAnnotation, onC
             selectedLines={(selectedLines ?? null) as never}
             options={{
               theme: { light: "github-light", dark: "github-dark" }, themeType: theme === "dark" ? "dark" : "light",
+              // Unified (single-column, inline +/−) rather than split — far more room per line in the
+              // review pane, and calmer to read than two cramped columns.
+              diffStyle: "unified",
               overflow: "wrap", disableFileHeader: true, lineHoverHighlight: "line", tokenizeMaxLength: 400_000,
               // Click a line number to comment on that line — the composer opens inline right there.
               onLineNumberClick: (p: { lineNumber: number; annotationSide: "additions" | "deletions" }) => onComment(p.lineNumber, p.annotationSide),
@@ -3897,28 +3900,6 @@ function ReviewPage({
           const base = (p: string) => p.split("/").pop() ?? p;
           const opKind = (f: FileDiff): string => (f.ops.some((o) => /fn |struct |enum |signature|impl /.test(o)) ? "signature" : "behavior");
 
-          // Collapse long runs of unchanged context so the eye lands on what actually changed.
-          // Keeps 3 lines of context on each side of a change; folds the middle into one marker row.
-          const CTX = 3;
-          function fold<T extends { sign?: string }>(rows: T[], marker: (hidden: number) => T, keep?: (r: T) => boolean): T[] {
-            const isCtx = (r: T) => r.sign === undefined && !(keep?.(r));
-            const out: T[] = [];
-            for (let i = 0; i < rows.length;) {
-              if (isCtx(rows[i])) {
-                let j = i; while (j < rows.length && isCtx(rows[j])) j++;
-                const head = i === 0 ? 0 : CTX, tail = j === rows.length ? 0 : CTX;
-                if (j - i > head + tail + 1) {
-                  for (let k = i; k < i + head; k++) out.push(rows[k]);
-                  out.push(marker(j - i - head - tail));
-                  for (let k = j - tail; k < j; k++) out.push(rows[k]);
-                } else for (let k = i; k < j; k++) out.push(rows[k]);
-                i = j;
-              } else { out.push(rows[i]); i++; }
-            }
-            return out;
-          }
-          const foldNote = (hidden: number) => <span className="text-faint italic text-[12px]">⋯ {hidden} unchanged {hidden === 1 ? "line" : "lines"}</span>;
-
           // The inline finding annotation shown right under its line in the pierre diff.
           const findingNote = (x: FindingRow) => {
             const { f, reviewer, idx } = x;
@@ -4105,41 +4086,21 @@ function ReviewPage({
             );
           };
           // One op per changed file — a clean pierre diff, behavioral files first. No move/reformat
-          // grouping: every file is just its diff, in order of what matters.
+          // grouping. `body` is a THUNK so only the file you're actually looking at builds its diff
+          // (and mounts pierre) — clicking around never constructs every file's diff at once.
           const fileOps = ordered.map((f) => ({
             kind: opKind(f),
             title: base(f.path),
             meta: `${f.path}  ·  +${count(f, "add")} −${count(f, "del")}`,
-            body: codeBody(f),
+            body: () => codeBody(f),
           }));
           const ops = fileOps.length ? fileOps : [{ kind: "behavior", title: "changes", meta: "", body: <p className="text-[13px] text-muted">no textual changes.</p> }];
-
-          // Line-by-line (raw) view with computed old/new line numbers.
-          const rawFiles = ordered.map((f) => ({
-            name: f.path,
-            add: count(f, "add"),
-            del: count(f, "del"),
-            hunks: f.hunks.map((h) => {
-              let o = h.old_start, n = h.new_start;
-              const lines = h.lines.map((l) => {
-                const code = <Hl text={l.text} path={f.path} />;
-                let row: { o: number | string; n: number | string; sign?: string; code: React.ReactNode };
-                if (l.tag === "add") { row = { o: "", n, sign: "+", code }; n++; }
-                else if (l.tag === "del") { row = { o, n: "", sign: "-", code }; o++; }
-                else { row = { o, n, code }; o++; n++; }
-                return row;
-              });
-              return { header: `@@ -${h.old_start} +${h.new_start} @@`, lines: fold(lines, (hidden) => ({ o: "", n: "⋯", code: foldNote(hidden) })) };
-            }),
-          }));
-          const mechanical = (semantic?.moves.length ?? 0) + (semantic?.whitespace_only.length ?? 0);
-          const rawDiff = { files: rawFiles, hiddenNote: mechanical > 0 ? `${semantic!.moves.length} move${semantic!.moves.length === 1 ? "" : "s"} + ${semantic!.whitespace_only.length} reformatted (mechanical) are grouped in the semantic view.` : undefined };
 
           const voyageMeta = semantic
             ? `${semantic.behavioral.length} behavior change${semantic.behavioral.length === 1 ? "" : "s"} · ${semantic.moves.length} moved · ${semantic.whitespace_only.length} reformatted`
             : `${diff.length} file${diff.length === 1 ? "" : "s"} changed`;
           const voyage = { title: change?.intent ? change.intent.split("\n")[0] : (pr ? pr.title : "changes"), id: (changeId ?? "").slice(0, 8), meta: voyageMeta };
-          return <SemanticDiff voyage={voyage} ops={ops} rawDiff={rawDiff} showMerge={false} storageKey={changeId ? `hull_reviewed_${changeId}` : undefined} />;
+          return <SemanticDiff voyage={voyage} ops={ops} showMerge={false} storageKey={changeId ? `hull_reviewed_${changeId}` : undefined} />;
         })()}
 
         {/* reconciliation — revealed (and scrolled to) from the digest's claims toggle. */}

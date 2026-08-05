@@ -14,9 +14,8 @@ const loadReviewed = (key, n) => {
 };
 
 // op: { kind, title, meta, body: ReactNode | (ctx)=>ReactNode, proposals?: [...] }
-export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, storageKey }) {
+export function SemanticDiff({ voyage, ops, onMerge, showMerge = true, storageKey }) {
   const [sel, setSel] = useState(0);
-  const [view, setView] = useState('sem');
   const [full, setFull] = useState(false);
   const [railW, setRailW] = useState(236);
   // Drag the divider to resize the file/findings rail.
@@ -46,7 +45,6 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
   // j/k step through files while reviewing (GitHub-style). Ignored while typing a comment or with a
   // modifier held, so it never fights the composer or a browser shortcut.
   useEffect(() => {
-    if (view !== 'sem') return;
     const onKey = (e) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       const t = e.target;
@@ -56,7 +54,7 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [view, ops.length]);
+  }, [ops.length]);
 
   // Marking a file reviewed advances to the next STILL-UNREVIEWED file (wrapping), so you're never
   // dropped back onto something you already cleared — the flow always points at what's left.
@@ -76,7 +74,7 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
     });
   };
 
-  const body = view === 'sem' ? (
+  const body = (
     <div className={cx('grid', full && 'flex-1 min-h-0')} style={{ gridTemplateColumns: `${railW}px 7px 1fr` }}>
       {/* rail */}
       <div className={cx('border-r border-rule2 bg-paper px-2 py-2.5 grid gap-0.5 content-start overflow-x-hidden', full && 'overflow-y-auto')}>
@@ -120,10 +118,6 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
         </div>
       </div>
     </div>
-  ) : (
-    <div className={cx(full && 'flex-1 min-h-0 overflow-auto')}>
-      <RawDiff diff={rawDiff} onJump={(opIdx) => { setView('sem'); setSel(opIdx); }} />
-    </div>
   );
 
   const card = (
@@ -136,14 +130,6 @@ export function SemanticDiff({ voyage, ops, rawDiff, onMerge, showMerge = true, 
           <span className="text-[12px] text-muted tabular-nums flex-none">{voyage.id}</span>
         </div>
         <div className="flex gap-2 items-center">
-          <div className="inline-flex border border-ctl rounded-ctl overflow-hidden">
-            {[['sem', 'Semantic'], ['raw', 'Unified']].map(([id, label], i) => (
-              <button key={id} onClick={() => setView(id)}
-                className={cx('text-xs font-semibold px-2.5 py-[5px] transition-colors duration-150',
-                  i && 'border-l border-ctl',
-                  view === id ? 'bg-ink text-surface' : 'text-dim hover:text-ink')}>{label}</button>
-            ))}
-          </div>
           <span className="text-[11.5px] font-semibold text-muted tabular-nums">{allDone ? 'all reviewed' : `${ops.length - done} left`}</span>
           <button onClick={() => setFull((f) => !f)} title={full ? 'Exit full screen (Esc)' : 'Full screen'}
             className="w-8 h-8 grid place-items-center rounded-ctl border border-ctl text-dim hover:text-ink hover:bg-paper transition-colors">
@@ -278,40 +264,3 @@ export function ProposalRow({ file, before, arg, accepted, onAccept, first }) {
   );
 }
 
-// ---- raw view -------------------------------------------------------------
-// diff: { files: [{ name, add, del, hunks: [{ header, lines: [{ o, n, sign, code, opIdx?, opTag? }] }] }], hiddenNote? }
-function RawDiff({ diff, onJump }) {
-  const gut = 'px-2 py-0.5 text-right text-faint text-[11px] bg-paper/50 border-r border-rule3 self-stretch flex items-center justify-end tabular-nums select-none';
-  return (
-    <div className="text-[12.5px] leading-[1.6]">
-      {diff.files.map((f, fi) => (
-        <React.Fragment key={f.name}>
-          <div className={cx('flex items-center gap-2.5 px-4 py-2 bg-paper border-b border-rule2 sticky top-0 z-[1]', fi && 'border-t')}>
-            <span className="text-[12px] font-bold">{f.name}</span>
-            <span className="text-[11.5px] font-semibold text-clear-text tabular-nums">+{f.add}</span>
-            <span className="text-[11.5px] font-semibold text-fault-text tabular-nums">−{f.del}</span>
-          </div>
-          {f.hunks.map((h) => (
-            <React.Fragment key={h.header}>
-              <div className="px-4 py-[3px] text-[11px] font-semibold text-steel-text bg-steel-wash border-b border-rule3 tabular-nums">{h.header}</div>
-              {h.lines.map((l, li) => (
-                <div key={li} className={cx('grid grid-cols-[44px_44px_20px_1fr_auto] items-stretch',
-                  l.sign === '-' ? 'bg-fault-wash' : l.sign === '+' ? 'bg-clear-wash' : 'hover:bg-paper/50')}>
-                  <span className={gut}>{l.o}</span><span className={gut}>{l.n}</span>
-                  <span className={cx('pl-2 py-0.5 font-bold select-none', l.sign === '-' ? 'text-fault-text' : l.sign === '+' ? 'text-clear-text' : 'text-transparent')}>{l.sign || ' '}</span>
-                  <span className="px-3 py-0.5 text-body whitespace-pre-wrap break-words">{l.code}</span>
-                  {l.opIdx != null ? (
-                    <button onClick={() => onJump(l.opIdx)}
-                      className="text-[10.5px] font-bold px-2 py-0.5 rounded-full mr-3 my-0.5 whitespace-nowrap bg-steel-wash text-steel-text hover:underline self-center">
-                      {l.opTag} →</button>
-                  ) : <span />}
-                </div>
-              ))}
-            </React.Fragment>
-          ))}
-        </React.Fragment>
-      ))}
-      {diff.hiddenNote && <div className="px-4 py-2.5 text-xs text-muted border-t border-rule3">{diff.hiddenNote}</div>}
-    </div>
-  );
-}
