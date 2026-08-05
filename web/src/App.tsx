@@ -352,10 +352,15 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [agentBusy, setAgentBusy] = useState("");
+  // An in-flight per-user subscription login (setup-token relay): the browser opens `url`, then the
+  // user pastes the code back to complete it.
+  const [login, setLogin] = useState<{ provider: string; label: string; session: string; url: string } | null>(null);
+  const [code, setCode] = useState("");
   const load = () => { fetch(`/api/accounts/${enc(accountId)}/ai`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) { setConns(d.connections || []); setRotate(!!d.rotate); } }).catch(() => {}); };
   useEffect(load, [accountId]); // eslint-disable-line
   useEffect(() => { fetch(`/api/ai/agents`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) setAgents(d.agents || []); }).catch(() => {}); }, [accountId]); // eslint-disable-line
   const post = (body: Record<string, unknown>) => fetch(`/api/accounts/${enc(accountId)}/ai`, { method: "POST", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify(body) });
+  const postPath = (path: string, body: Record<string, unknown>) => fetch(`/api/accounts/${enc(accountId)}/ai/${path}`, { method: "POST", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify(body) });
   const add = async () => {
     if (!key.trim()) return;
     setBusy(true);
@@ -363,11 +368,27 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
     setBusy(false);
     if (r.ok) { setKey(""); setLabel(""); load(); } else uiAlert(await r.text());
   };
-  const connectAgent = async (kind: string) => {
+  // Begin a per-user subscription login: provision the bundle + drive setup-token, then hand the user
+  // the sign-in URL. The connection is only created once they paste the code (completeAgentLogin).
+  const startAgentLogin = async (kind: string, agentLabel: string) => {
     setAgentBusy(kind);
-    const r = await post({ provider: kind });
+    const r = await postPath("agent/start", { provider: kind });
     setAgentBusy("");
-    if (r.ok) load(); else uiAlert(await r.text());
+    if (!r.ok) { uiAlert(await r.text()); return; }
+    const d = await r.json();
+    setCode("");
+    setLogin({ provider: kind, label: agentLabel, session: d.session, url: d.login_url });
+  };
+  const completeAgentLogin = async () => {
+    if (!login || !code.trim()) return;
+    setBusy(true);
+    const r = await postPath("agent/complete", { provider: login.provider, session: login.session, code: code.trim() });
+    setBusy(false);
+    if (r.ok) { setLogin(null); setCode(""); load(); } else uiAlert(await r.text());
+  };
+  const cancelAgentLogin = async () => {
+    if (login) await postPath("agent/cancel", { session: login.session }).catch(() => {});
+    setLogin(null); setCode("");
   };
   const remove = async (id: string) => {
     if (!(await uiConfirm({ title: "Remove connection", body: "Disconnect this AI backend from the account?", danger: true, confirmLabel: "Remove" }))) return;
@@ -390,23 +411,41 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
                 <div key={c.id} className="flex items-center gap-2.5 px-3 py-2 rounded-ctl border border-rule2 bg-paper/40">
                   <span className={`w-2 h-2 rounded-full flex-none ${dot(c)}`} />
                   <span className="text-[13.5px] font-medium truncate">{c.label}</span>
-                  <span className="text-[11.5px] text-faint tabular-nums">{c.auth_kind === "agent" ? <>agent CLI · <code className="text-dim">{c.hint}</code></> : <>{c.provider} · key {c.hint}</>}</span>
+                  <span className="text-[11.5px] text-faint">{c.auth_kind === "agent" ? <>{c.provider} · {c.hint}</> : <>{c.provider} · key {c.hint}</>}</span>
                   <button onClick={() => remove(c.id)} className="ml-auto text-[12px] text-muted hover:text-fault-text">Remove</button>
                 </div>
               ))}
             </div>
           )}
-          {installed.length > 0 && (
+          {installed.length > 0 && !login && (
             <div className="grid gap-2 pt-1 border-t border-rule3">
-              <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">Coding agents on this host</span>
+              <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">Connect a subscription</span>
               <div className="flex flex-wrap gap-2">
                 {installed.map((a) => (
-                  <Button key={a.kind} size="sm" variant="secondary" disabled={agentBusy === a.kind} onClick={() => connectAgent(a.kind)}>
-                    {agentBusy === a.kind ? "Connecting…" : `Connect ${a.label}`}
+                  <Button key={a.kind} size="sm" variant="secondary" disabled={!!agentBusy} onClick={() => startAgentLogin(a.kind, a.label)}>
+                    {agentBusy === a.kind ? "Starting…" : `Connect ${a.label}`}
                   </Button>
                 ))}
               </div>
-              <p className="text-[11.5px] text-faint leading-[1.5]">Runs the agent’s own CLI under your subscription login — no API key, no token stored. (Consumer plans stay within their terms this way.)</p>
+              <p className="text-[11.5px] text-faint leading-[1.5]">Sign in with your own Claude / ChatGPT subscription. The agent runs under your login — no API key, and Hull never sees your token (only the CLI’s own credentials, kept for this account).</p>
+            </div>
+          )}
+          {login && (
+            <div className="grid gap-3 pt-3 border-t border-rule3">
+              <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">Sign in to {login.label}</span>
+              <ol className="grid gap-2.5 text-[13px] text-body">
+                <li className="flex items-center gap-2.5">
+                  <span className="w-5 h-5 flex-none grid place-items-center rounded-full bg-rule2 text-[11px] font-semibold text-muted tabular-nums">1</span>
+                  <a href={login.url} target="_blank" rel="noreferrer"><Button size="sm">Open sign-in page ↗</Button></a>
+                  <span className="text-[12px] text-muted">approve access, then copy the code shown</span>
+                </li>
+                <li className="flex items-center gap-2.5">
+                  <span className="w-5 h-5 flex-none grid place-items-center rounded-full bg-rule2 text-[11px] font-semibold text-muted tabular-nums">2</span>
+                  <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="paste code here" autoFocus className="box-border flex-1 min-w-[200px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" onKeyDown={(e) => { if (e.key === "Enter") completeAgentLogin(); }} />
+                  <Button size="sm" disabled={!code.trim() || busy} onClick={completeAgentLogin}>{busy ? "Verifying…" : "Finish"}</Button>
+                  <button onClick={cancelAgentLogin} className="text-[12px] text-muted hover:text-fault-text">Cancel</button>
+                </li>
+              </ol>
             </div>
           )}
           <div className="grid gap-2 pt-1 border-t border-rule3">

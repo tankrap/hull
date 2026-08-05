@@ -309,6 +309,9 @@ pub struct AiCredential {
     /// When set, this backend is a locally-installed **agent CLI** (the string is the command, e.g.
     /// `claude`), run with the user's own subscription login — not an API call.
     pub agent_cli: Option<String>,
+    /// For a per-user agent session, the credential-bundle directory to point the CLI at (its
+    /// `CLAUDE_CONFIG_DIR` / `CODEX_HOME`). `None` ⇒ the agent uses the Hull host's own login.
+    pub agent_config_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]

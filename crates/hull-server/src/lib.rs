@@ -8,6 +8,8 @@
 //! `/api/repos/:repo/issues` · `/api/scan` · `/api/plugins`.
 
 pub mod activity;
+pub mod agentlogin;
+pub mod agentsession;
 pub mod artifacts;
 pub mod autonomy;
 pub mod ci;
@@ -322,6 +324,9 @@ fn make_router(app: App) -> Router {
         .route("/api/accounts/:id/ai", get(ai_connections_get).post(ai_connection_add))
         .route("/api/accounts/:id/ai/rotate", axum::routing::put(ai_rotate_set))
         .route("/api/accounts/:id/ai/:cid", axum::routing::delete(ai_connection_delete))
+        .route("/api/accounts/:id/ai/agent/start", post(ai_agent_login_start))
+        .route("/api/accounts/:id/ai/agent/complete", post(ai_agent_login_complete))
+        .route("/api/accounts/:id/ai/agent/cancel", post(ai_agent_login_cancel))
         .route("/api/ai/agents", get(ai_agents_detect))
         .route("/api/accounts/:id/github", get(github_status).delete(github_disconnect))
         .route("/api/accounts/:id/github/connect", post(github_connect))
@@ -1155,7 +1160,10 @@ async fn ai_connection_add(State(app): State<App>, Path(id): Path<String>, heade
     // Agent-CLI connection: uses the user's own Claude Code / Codex login, no key.
     let (base_url, auth, def_label) = if let Some(cmd) = agent_command(&provider) {
         let command = body.get("command").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or(cmd).to_string();
-        (String::new(), hull_core::AiAuth::AgentCli { command }, if provider == "codex" { "Codex (subscription)".into() } else { "Claude Code (subscription)".into() })
+        // A key-less agent connection created via this endpoint uses THIS Hull host's own CLI login
+        // (self-hosted / single-tenant). Per-user subscription logins go through the relay endpoints
+        // below, which populate `session` + identity.
+        (String::new(), hull_core::AiAuth::AgentCli { command, session: String::new(), account_email: String::new(), plan: String::new() }, if provider == "codex" { "Codex (this host)".into() } else { "Claude Code (this host)".into() })
     } else if ["openai", "anthropic", "openrouter"].contains(&provider.as_str()) {
         let key = body.get("api_key").and_then(Value::as_str).unwrap_or("").trim().to_string();
         if key.is_empty() {
@@ -1194,7 +1202,133 @@ async fn ai_connection_delete(State(app): State<App>, Path((id, cid)): Path<(Str
         Ok(x) => x,
         Err(resp) => return resp,
     };
+    // Wipe the per-user credential bundle for an agent session, if this connection had one.
+    if let Some(hull_core::AiAuth::AgentCli { session, .. }) = app.store.ai_connections(&acct.id).into_iter().find(|c| c.id == cid).map(|c| c.auth) {
+        agentsession::remove(&session);
+    }
     Json(json!({ "deleted": app.store.remove_ai_connection(&acct.id, &cid) })).into_response()
+}
+
+/// `POST /api/accounts/:id/ai/agent/start` — `{provider: claude-code|codex}`: begin a per-user
+/// subscription login. Provisions the user's bundle, drives `<cli> setup-token` under a PTY, and
+/// returns `{session, login_url}` — the browser opens `login_url`, the user approves and pastes the
+/// code back to `/complete`. Owner/admin only. Runs the PTY work off the async runtime.
+async fn ai_agent_login_start(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let provider = body.get("provider").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+    let Some(command) = agent_command(&provider).map(str::to_string) else {
+        return (StatusCode::BAD_REQUEST, "provider must be claude-code or codex").into_response();
+    };
+    let (session, dir) = match agentsession::provision() {
+        Ok(x) => x,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("could not provision bundle: {e}")).into_response(),
+    };
+    let acct_id = acct.id.clone();
+    let res = tokio::task::spawn_blocking(move || agentlogin::begin(&command, &session, &dir).map(|url| (session, url))).await;
+    match res {
+        Ok(Ok((session, url))) => Json(json!({ "session": session, "login_url": url, "provider": provider })).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(_) => {
+            let _ = acct_id;
+            (StatusCode::INTERNAL_SERVER_ERROR, "login task panicked").into_response()
+        }
+    }
+}
+
+/// `POST /api/accounts/:id/ai/agent/complete` — `{provider, session, code}`: finish the login by
+/// feeding the pasted code to the parked CLI, then verify with `<cli> auth status --json` and persist
+/// the connection with the introspected identity. Owner/admin only.
+async fn ai_agent_login_complete(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let provider = body.get("provider").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+    let session = body.get("session").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let code = body.get("code").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let Some(command) = agent_command(&provider).map(str::to_string) else {
+        return (StatusCode::BAD_REQUEST, "provider must be claude-code or codex").into_response();
+    };
+    if session.is_empty() || code.is_empty() {
+        return (StatusCode::BAD_REQUEST, "session and code are required").into_response();
+    }
+    let sess = session.clone();
+    let cmd = command.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        // Feed the code; the CLI exchanges it and writes credentials. Then judge success by the
+        // *bundle's* auth state, not the CLI's exit — some CLIs hang on a success screen after writing
+        // creds, and killing that must not discard a login that actually completed.
+        let fin = agentlogin::finish(&sess, &code);
+        match agent_auth_identity(&cmd, &agentsession::dir_for(&sess)) {
+            Ok(idy) => Ok(idy),
+            Err(e) => Err(fin.err().unwrap_or(e)),
+        }
+    })
+    .await;
+    let identity = match out {
+        Ok(Ok(idy)) => idy,
+        Ok(Err(e)) => {
+            agentsession::remove(&session);
+            return (StatusCode::BAD_GATEWAY, e).into_response();
+        }
+        Err(_) => {
+            agentsession::remove(&session);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "login task panicked").into_response();
+        }
+    };
+    let n = app.store.ai_connections(&acct.id).len();
+    let email = identity.get("email").and_then(Value::as_str).unwrap_or("").to_string();
+    let plan = identity.get("plan").and_then(Value::as_str).unwrap_or("").to_string();
+    let label = body.get("label").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| {
+        if email.is_empty() { format!("{provider} (subscription)") } else { email.clone() }
+    });
+    let conn = hull_core::AiConnection {
+        id: format!("ai_{}_{}", acct.id, n + 1),
+        owner: acct.id.clone(),
+        provider,
+        label,
+        base_url: String::new(),
+        auth: hull_core::AiAuth::AgentCli { command, session: session.clone(), account_email: email, plan },
+        created_unix: now(),
+    };
+    app.store.put_ai_connection(conn.clone());
+    (StatusCode::CREATED, Json(json!({ "id": conn.id, "identity": identity }))).into_response()
+}
+
+/// `POST /api/accounts/:id/ai/agent/cancel` — `{session}`: discard an in-flight login (owner/admin).
+async fn ai_agent_login_cancel(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    if let Err(resp) = require_account_admin_ref(&app, &headers, &id) {
+        return resp;
+    }
+    let session = body.get("session").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if !session.is_empty() {
+        agentlogin::abort(&session);
+        agentsession::remove(&session);
+    }
+    Json(json!({ "cancelled": true })).into_response()
+}
+
+/// Run `<command> auth status --json` against a bundle dir → `{loggedIn, email, plan}`. Errors if the
+/// bundle isn't actually logged in (so a failed login never persists a dead connection).
+fn agent_auth_identity(command: &str, dir: &std::path::Path) -> Result<Value, String> {
+    let env = if command == "codex" { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
+    let out = std::process::Command::new(command)
+        .args(["auth", "status", "--json"])
+        .env(env, dir)
+        .output()
+        .map_err(|e| format!("{command} auth status: {e}"))?;
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| format!("{command} auth status returned no JSON"))?;
+    if !v.get("loggedIn").and_then(Value::as_bool).unwrap_or(false) {
+        return Err("login did not complete — the bundle is not authenticated".into());
+    }
+    Ok(json!({
+        "loggedIn": true,
+        "email": v.get("email").and_then(Value::as_str).unwrap_or(""),
+        "plan": v.get("subscriptionType").and_then(Value::as_str).unwrap_or(""),
+    }))
 }
 
 /// `PUT /api/accounts/:id/ai/rotate` — `{rotate: bool}`: cycle across the account's connections per
@@ -3540,11 +3674,16 @@ fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&str>) ->
     let owner = owner?;
     let idx = if app.store.ai_rotate(&owner) { next_ai_index(&owner, conns.len()) } else { 0 };
     let c = &conns[idx % conns.len()];
-    let agent_cli = match &c.auth {
-        hull_core::AiAuth::AgentCli { command } => Some(command.clone()),
-        _ => None,
+    let (agent_cli, agent_config_dir) = match &c.auth {
+        // Per-user session ⇒ point the CLI at this user's own credential bundle; empty session ⇒
+        // host login (no CLAUDE_CONFIG_DIR override).
+        hull_core::AiAuth::AgentCli { command, session, .. } => {
+            let dir = (!session.is_empty()).then(|| agentsession::dir_for(session).to_string_lossy().into_owned());
+            (Some(command.clone()), dir)
+        }
+        _ => (None, None),
     };
-    Some(hull_plugin::AiCredential { provider: c.provider.clone(), base_url: c.base_url.clone(), token: c.auth.bearer().to_string(), agent_cli })
+    Some(hull_plugin::AiCredential { provider: c.provider.clone(), base_url: c.base_url.clone(), token: c.auth.bearer().to_string(), agent_cli, agent_config_dir })
 }
 
 /// Default command for an agent kind.

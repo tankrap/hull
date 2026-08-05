@@ -56,3 +56,6 @@ blake3 = "1"
 webauthn-rs = "0.5"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+# Per-user agent login relay: `claude setup-token` needs a real terminal to emit the authorize URL
+# and read the paste-back code, so we drive it under a pseudo-terminal.
+portable-pty = "0.8"

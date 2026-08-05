@@ -171,7 +171,20 @@ pub struct AiConnection {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AiAuth {
     Key { api_key: String },
-    AgentCli { command: String },
+    AgentCli {
+        command: String,
+        /// Storage key for this user's own credential bundle (the CLI's `CLAUDE_CONFIG_DIR` /
+        /// `CODEX_HOME` contents, populated by a web-relayed subscription login). Empty ⇒ fall back to
+        /// the Hull host's own agent login (single-tenant / self-hosted).
+        #[serde(default)]
+        session: String,
+        /// Introspected identity for the settings UI (from `<cli> auth status`). Non-secret.
+        #[serde(default)]
+        account_email: String,
+        /// e.g. `max`, `pro`, `plus`. Non-secret.
+        #[serde(default)]
+        plan: String,
+    },
 }
 
 impl AiAuth {
@@ -182,10 +195,17 @@ impl AiAuth {
             AiAuth::AgentCli { .. } => "",
         }
     }
-    /// A short, non-secret hint for the settings UI.
+    /// A short, non-secret hint for the settings UI: the connected account/plan for a per-user
+    /// session, else the bare command (host login), else the key's last chars.
     pub fn hint(&self) -> String {
         match self {
-            AiAuth::AgentCli { command } => command.clone(),
+            AiAuth::AgentCli { command, account_email, plan, .. } => {
+                if !account_email.is_empty() {
+                    if plan.is_empty() { account_email.clone() } else { format!("{account_email} · {plan}") }
+                } else {
+                    command.clone()
+                }
+            }
             AiAuth::Key { api_key } => {
                 let tail: String = api_key.chars().rev().take(3).collect::<String>().chars().rev().collect();
                 format!("…{tail}")
