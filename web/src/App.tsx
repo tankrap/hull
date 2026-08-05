@@ -3209,13 +3209,13 @@ type PierreAnno = { side: "additions" | "deletions"; lineNumber: number; metadat
 // One file's diff, rendered by @pierre/diffs (Shiki, GitHub-style context collapse). Findings and
 // comments ride inline as line annotations; hovering a line reveals a gutter "+" that opens a comment
 // there. This is the whole diff surface — no bespoke hunk machinery on top of it.
-function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnotation, onSelectRange, loadFile, selectedLines }: {
+function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnotation, onSelect, loadFile, selectedLines }: {
   patch: string;
   filePath: string;
   theme: string;
   lineAnnotations: PierreAnno[];
   renderAnnotation: (a: PierreAnno) => React.ReactNode;
-  onSelectRange?: (from: number, to: number) => void;
+  onSelect?: (range: { from: number; to: number } | null) => void;
   loadFile?: () => Promise<{ old: string | null; new: string | null }>;
   selectedLines?: { start: number; end: number; side?: "additions" | "deletions" } | null;
 }) {
@@ -3243,7 +3243,7 @@ function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnot
               // (or press c). Selection drives commenting — a plain line-number click can't, because
               // line selection intercepts it.
               enableLineSelection: true,
-              onLineSelected: (r: { start: number; end: number } | null) => { if (r && onSelectRange) onSelectRange(Math.min(r.start, r.end), Math.max(r.start, r.end)); },
+              onLineSelected: (r: { start: number; end: number } | null) => { onSelect?.(r ? { from: Math.min(r.start, r.end), to: Math.max(r.start, r.end) } : null); },
               // Clicking a "N unmodified lines" band fetches the full file so pierre can reveal the
               // hidden context (the patch only carries the hunks' few lines).
               ...(loadFile ? { loadDiffFiles: async () => {
@@ -3625,8 +3625,20 @@ function ReviewPage({
   // Line-level review comments over a line OR a selected range of lines. Click a line number for one
   // line; drag to select a chunk, then "Comment on lines X–Y". A comment can be sent to an AI agent,
   // which reads the code around it and replies inline.
-  const [selRange, setSelRange] = useState<{ path: string; from: number; to: number } | null>(null);
+  // A highlight in the diff (drag-select) offers a comment — anchored where you released the mouse.
+  const [selRange, setSelRange] = useState<{ path: string; from: number; to: number; x: number; y: number } | null>(null);
   const [commenting, setCommenting] = useState<{ path: string; from: number; to: number } | null>(null);
+  // Track the pointer and whether the current gesture is a DRAG (a highlight) vs a plain click — so a
+  // single click on a line never pops the comment tooltip; only highlighting code does.
+  const pointerRef = useRef({ x: 0, y: 0 });
+  const dragRef = useRef({ x: 0, y: 0, dragged: false });
+  useEffect(() => {
+    const down = (e: PointerEvent) => { dragRef.current = { x: e.clientX, y: e.clientY, dragged: false }; };
+    const move = (e: PointerEvent) => { pointerRef.current = { x: e.clientX, y: e.clientY }; if (Math.hypot(e.clientX - dragRef.current.x, e.clientY - dragRef.current.y) > 4) dragRef.current.dragged = true; };
+    const up = (e: PointerEvent) => { pointerRef.current = { x: e.clientX, y: e.clientY }; };
+    document.addEventListener("pointerdown", down); document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
+    return () => { document.removeEventListener("pointerdown", down); document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); };
+  }, []);
   const [lineDraft, setLineDraft] = useState("");
   const [askingAI, setAskingAI] = useState(false);
   const postLineComment = async (askAI = false) => {
@@ -3665,6 +3677,19 @@ function ReviewPage({
 
   return (
     <div className="bg-paper min-h-screen text-ink">
+      {/* Highlight-to-comment tooltip — a small pill at the selection with a comment button (or press c).
+          Only shows for an actual highlight (a drag), never a plain line click. */}
+      {selRange && !commenting && (
+        <div className="fixed z-[75] -translate-x-1/2 -translate-y-full animate-ov-in" style={{ left: selRange.x, top: selRange.y - 10 }}>
+          <div className="flex items-center gap-1 rounded-ctl bg-ink text-surface shadow-modal pl-1 pr-1.5 py-1">
+            <button onClick={() => openLineComment(selRange.path, selRange.from, selRange.to)} title={`Comment on line${selRange.to > selRange.from ? `s ${selRange.from}–${selRange.to}` : ` ${selRange.from}`}`}
+              className="w-6 h-6 grid place-items-center rounded-ctl-sm hover:bg-surface/15 transition-colors">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg>
+            </button>
+            <span className="text-[10.5px] font-medium opacity-70 pr-0.5">or press <kbd className="font-semibold">C</kbd></span>
+          </div>
+        </div>
+      )}
       <header className="h-[52px] border-b border-rule2 bg-surface flex items-center gap-3 px-6 sticky top-14 z-20">
         <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer flex-none" onClick={onBack}>
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
@@ -3674,10 +3699,16 @@ function ReviewPage({
           <div className="flex items-center gap-2.5 min-w-0 flex-1">
             <span className="text-[13.5px] font-semibold text-ink truncate">{pr ? pr.title : active.target}</span>
             {pr && <span className="text-[12px] text-faint tabular-nums flex-none">#{pr.number}</span>}
-            <span className={`ml-auto flex-none inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge ${checksBad ? "bg-brass-wash text-brass-text" : checksPass === checks.length ? "bg-clear-wash text-clear-text" : "bg-brass-wash text-brass-text"}`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${checksBad ? "bg-brass" : checksPass === checks.length ? "bg-clear" : "bg-brass"}`} />
-              {checksBad ? "Not ready" : checksPass === checks.length ? "Ready to merge" : "Awaiting review"} · {checksPass}/{checks.length}
-            </span>
+            {pr?.state === "merged" ? (
+              <span className="ml-auto flex-none inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge bg-clear-wash text-clear-text"><span className="w-1.5 h-1.5 rounded-full bg-clear" />Merged</span>
+            ) : pr?.state === "closed" ? (
+              <span className="ml-auto flex-none inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge bg-rule2 text-dim"><span className="w-1.5 h-1.5 rounded-full bg-muted" />Closed</span>
+            ) : (
+              <span className={`ml-auto flex-none inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-2 py-[3px] rounded-badge ${checksBad ? "bg-brass-wash text-brass-text" : checksPass === checks.length ? "bg-clear-wash text-clear-text" : "bg-brass-wash text-brass-text"}`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${checksBad ? "bg-brass" : checksPass === checks.length ? "bg-clear" : "bg-brass"}`} />
+                {checksBad ? "Not ready" : checksPass === checks.length ? "Ready to merge" : "Awaiting review"} · {checksPass}/{checks.length}
+              </span>
+            )}
             {/* Merge travels up here on scroll, so it's always one click away. */}
             <span className="flex-none">{landGate}</span>
           </div>
@@ -3776,8 +3807,8 @@ function ReviewPage({
           const addN = diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === "add").length, 0), 0);
           const delN = diff.reduce((s, f) => s + f.hunks.reduce((x, h) => x + h.lines.filter((l) => l.tag === "del").length, 0), 0);
           const fileN = change?.files.length ?? diff.length;
-          const verdict = checksBad ? "Not ready to merge" : checks.length > 0 && checksPass === checks.length ? "Ready to merge" : "Awaiting review";
-          const vTone = checksBad ? "text-ink" : verdict === "Ready to merge" ? "text-clear-text" : "text-brass-text";
+          const verdict = pr?.state === "merged" ? "Merged" : pr?.state === "closed" ? "Closed" : checksBad ? "Not ready to merge" : checks.length > 0 && checksPass === checks.length ? "Ready to merge" : "Awaiting review";
+          const vTone = pr?.state === "merged" ? "text-clear-text" : pr?.state === "closed" ? "text-muted" : checksBad ? "text-ink" : verdict === "Ready to merge" ? "text-clear-text" : "text-brass-text";
           const blocking = checks.filter((c) => c.tone === "bad");
           // Where does clicking a blocking reason take you? Claims/findings → the attention card;
           // approval → the conversation; a red build isn't jumpable (rerun lives in the top bar).
@@ -4183,21 +4214,12 @@ function ReviewPage({
                     <div className="sticky top-0 z-[2] flex items-center justify-between gap-2 mb-1.5 px-3 py-1.5 rounded-ctl bg-paper border border-rule2">
                       {focused
                         ? <button onClick={() => setDiffFocus((s) => { const n = { ...s }; delete n[f.path]; return n; })} className="text-[12px] font-medium text-steel-text hover:underline inline-flex items-center gap-1"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>Showing one change · show all {f.hunks.length} in this file</button>
-                        : <span className="text-[12px] text-muted tabular-nums">{f.hunks.length} change{f.hunks.length === 1 ? "" : "s"} · drag line numbers to select a chunk</span>}
+                        : <span className="text-[12px] text-muted tabular-nums">{f.hunks.length} change{f.hunks.length === 1 ? "" : "s"} · highlight code to comment</span>}
                       <button onClick={() => { setOpenDiff((s) => { const n = new Set(s); n.delete(f.path); return n; }); setDiffFocus((s) => { const n = { ...s }; delete n[f.path]; return n; }); }} className="text-[12px] font-medium text-muted hover:text-ink inline-flex items-center gap-1">Hide diff<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>
                     </div>
-                    {selRange?.path === f.path && !commenting && (
-                      <div className="sticky top-[38px] z-[2] mb-1.5 flex items-center justify-between gap-2 px-3 py-1.5 rounded-ctl bg-steel-wash border border-steel/25 shadow-sm">
-                        <span className="text-[12px] text-body">{selRange.to > selRange.from ? <>Lines <b className="tabular-nums">{selRange.from}–{selRange.to}</b> selected</> : <>Line <b className="tabular-nums">{selRange.from}</b> selected</>} <span className="text-faint">· press c</span></span>
-                        <div className="flex gap-1.5">
-                          <Button size="sm" onClick={() => openLineComment(f.path, selRange.from, selRange.to)}>Comment</Button>
-                          <Button size="sm" variant="ghost" onClick={() => setSelRange(null)}>Clear</Button>
-                        </div>
-                      </div>
-                    )}
                     <PierreReviewDiff patch={toPatch(f, focused ? selLn : undefined)} filePath={f.path} theme={theme}
                       lineAnnotations={annos} renderAnnotation={renderAnno}
-                      onSelectRange={(from, to) => setSelRange({ path: f.path, from, to })}
+                      onSelect={(range) => setSelRange(range && dragRef.current.dragged ? { path: f.path, from: range.from, to: range.to, x: pointerRef.current.x, y: pointerRef.current.y } : null)}
                       loadFile={changeId ? async () => {
                         const ck = `${changeId}:${f.path}`;
                         if (fileCache.current[ck]) return fileCache.current[ck];
