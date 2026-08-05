@@ -3167,12 +3167,13 @@ type PierreAnno = { side: "additions" | "deletions"; lineNumber: number; metadat
 // One file's diff, rendered by @pierre/diffs (Shiki, GitHub-style context collapse). Findings and
 // comments ride inline as line annotations; hovering a line reveals a gutter "+" that opens a comment
 // there. This is the whole diff surface — no bespoke hunk machinery on top of it.
-function PierreReviewDiff({ patch, theme, lineAnnotations, renderAnnotation, onComment, selectedLines }: {
+function PierreReviewDiff({ patch, theme, lineAnnotations, renderAnnotation, onComment, onSelectRange, selectedLines }: {
   patch: string;
   theme: string;
   lineAnnotations: PierreAnno[];
   renderAnnotation: (a: PierreAnno) => React.ReactNode;
-  onComment: (line: number, side: "additions" | "deletions") => void;
+  onComment: (from: number, to?: number) => void;
+  onSelectRange?: (from: number, to: number) => void;
   selectedLines?: { start: number; end: number; side?: "additions" | "deletions" } | null;
 }) {
   return (
@@ -3195,8 +3196,11 @@ function PierreReviewDiff({ patch, theme, lineAnnotations, renderAnnotation, onC
               // review pane, and calmer to read than two cramped columns.
               diffStyle: "unified",
               overflow: "wrap", disableFileHeader: true, lineHoverHighlight: "line", tokenizeMaxLength: 400_000,
-              // Click a line number to comment on that line — the composer opens inline right there.
-              onLineNumberClick: (p: { lineNumber: number; annotationSide: "additions" | "deletions" }) => onComment(p.lineNumber, p.annotationSide),
+              // Click a line number to comment on that single line; drag over the numbers to select a
+              // chunk (onLineSelected fires with the range) and comment on all of it.
+              onLineNumberClick: (p: { lineNumber: number }) => onComment(p.lineNumber),
+              enableLineSelection: true,
+              onLineSelected: (r: { start: number; end: number } | null) => { if (r && onSelectRange) onSelectRange(Math.min(r.start, r.end), Math.max(r.start, r.end)); },
               unsafeCSS: "[data-gutter]{background:var(--paper);border-right:1px solid var(--rule2)}[data-line-number-content]{padding-right:14px;opacity:.85;cursor:pointer}[data-line-number-content]:hover{color:var(--steel);text-decoration:underline}",
             } as never} />
         </div>
@@ -3463,17 +3467,10 @@ function ReviewPage({
   const checksBad = checks.some((c) => c.tone === "bad");
   // The page opens as a calm digest — the detail (claims, diff) is folded beneath it. Contradictions
   // are the exception: a claim the change's own facts contradict always deserves eyes, so auto-open.
+  // Changes and Claims are independent detail panels that open in place; opening one never hides the
+  // rest of the page (session, attention, conversation all stay put).
   const [showChanges, setShowChanges] = useState(false);
   const [showClaims, setShowClaims] = useState(false);
-  // Opening a detail (Changes or Claims) enters "focus mode": everything else — session, attention,
-  // conversation — COLLAPSES to a slim bar (not removed) so you're reading one thing but never lose
-  // track of what's there; clicking a bar (or closing the detail) brings it all back.
-  const focusMode = showChanges || showClaims;
-  const collapsedBar = (label: string) => (
-    <button onClick={() => { setShowChanges(false); setShowClaims(false); }} className="w-full flex items-center gap-2 px-5 py-3 rounded-card border border-rule bg-surface text-[13px] font-medium text-dim hover:text-ink hover:bg-paper/40 transition-colors">
-      <Ico size={13} path={<polyline points="9 18 15 12 9 6" />} />{label}<span className="ml-auto text-[12px] text-faint">collapsed</span>
-    </button>
-  );
   const [attnIdx, setAttnIdx] = useState(0); // cursor into the one-by-one attention stepper
   const [taskModal, setTaskModal] = useState(false); // "view full task" overlay
   // When the big title scrolls out of view, condense it into the sticky top bar so the reviewer
@@ -3552,37 +3549,57 @@ function ReviewPage({
   // diffFocus[path] = the line a "What changed here" click selected; it becomes pierre's highlighted
   // `selectedLines` in that file's diff so the reader sees exactly which line the summary meant.
   const [diffFocus, setDiffFocus] = useState<Record<string, number>>({});
+  // A file's full diff stays closed until you ask for it: click a "What changed" row (jumps to that
+  // line) or "Show diff". Keeps the page light — never a wall of code you didn't open.
+  const [openDiff, setOpenDiff] = useState<Set<string>>(() => new Set());
   // "What changed here" defaults to the handful of edits that carry the most signal; the long tail of
   // trivial token tweaks stays folded until you ask for it (per file).
   const [allEdits, setAllEdits] = useState<Set<string>>(() => new Set());
-  // Select (highlight) a line in a file's pierre diff and bring the diff into view.
-  const revealDiff = (path: string, line?: number) => {
-    if (line != null) setDiffFocus((f) => ({ ...f, [path]: line }));
-    setTimeout(() => document.getElementById("changes-section")?.scrollIntoView({ block: "start", behavior: "smooth" }), 60);
+  // Open a file's diff and pinpoint-scroll to a line, highlighted. Pierre renders into a shadow DOM
+  // and (for a just-opened diff) tokenizes async, so we poll briefly for the line's number cell.
+  const scrollToDiffLine = (line: number, tries = 0) => {
+    const host = document.querySelector("#changes-section ~ * diffs-container, diffs-container");
+    const root = (host as HTMLElement & { shadowRoot?: ShadowRoot })?.shadowRoot;
+    const cell = root && Array.from(root.querySelectorAll("[data-line-number-content]")).find((c) => (c.textContent ?? "").trim() === String(line));
+    if (cell) { cell.scrollIntoView({ block: "center", behavior: "smooth" }); return; }
+    if (tries < 12) setTimeout(() => scrollToDiffLine(line, tries + 1), 120);
+    else document.getElementById("changes-section")?.scrollIntoView({ block: "start", behavior: "smooth" });
   };
-  // Line-level review comments: select a diff line, press C (or click the gutter ✎) to comment on it.
+  const revealDiff = (path: string, line?: number) => {
+    setOpenDiff((s) => (s.has(path) ? s : new Set(s).add(path)));
+    if (line != null) { setDiffFocus((f) => ({ ...f, [path]: line })); setTimeout(() => scrollToDiffLine(line), 80); }
+    else setTimeout(() => document.getElementById("changes-section")?.scrollIntoView({ block: "start", behavior: "smooth" }), 60);
+  };
+  // Line-level review comments over a line OR a selected range of lines. Click a line number for one
+  // line; drag to select a chunk, then "Comment on lines X–Y". A comment can be sent to an AI agent,
+  // which reads the code around it and replies inline.
   const [selLine, setSelLine] = useState<{ path: string; line: number } | null>(null);
-  const [commenting, setCommenting] = useState<{ path: string; line: number } | null>(null);
+  const [selRange, setSelRange] = useState<{ path: string; from: number; to: number } | null>(null);
+  const [commenting, setCommenting] = useState<{ path: string; from: number; to: number } | null>(null);
   const [lineDraft, setLineDraft] = useState("");
-  const postLineComment = async () => {
+  const [askingAI, setAskingAI] = useState(false);
+  const postLineComment = async (askAI = false) => {
     if (!canAct || !pr || !commenting || !lineDraft.trim()) return;
+    if (askAI) setAskingAI(true);
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/comments`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ target: `pr:${pr.number}`, body: lineDraft.trim(), path: commenting.path, line: commenting.line }),
+      body: JSON.stringify({ target: `pr:${pr.number}`, body: lineDraft.trim(), path: commenting.path, line: commenting.from, line_end: commenting.to, ask_ai: askAI }),
     });
-    if (res.ok) { setLineDraft(""); setCommenting(null); loadThread(); }
+    setAskingAI(false);
+    if (res.ok) { setLineDraft(""); setCommenting(null); setSelRange(null); loadThread(); }
     else uiAlert(await res.text());
   };
-  const openLineComment = (path: string, line: number) => { setSelLine({ path, line }); setCommenting({ path, line }); setLineDraft(""); };
+  const openLineComment = (path: string, from: number, to?: number) => { const t = to ?? from; setSelLine({ path, line: from }); setCommenting({ path, from, to: t }); setLineDraft(""); };
   // Press "c" to comment on the currently-selected line.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement;
-      if ((e.key === "c" || e.key === "C") && selLine && !commenting && !/^(INPUT|TEXTAREA)$/.test(t.tagName)) { e.preventDefault(); setCommenting(selLine); setLineDraft(""); }
+      if ((e.key === "c" || e.key === "C") && selLine && !commenting && !/^(INPUT|TEXTAREA)$/.test(t.tagName)) { e.preventDefault(); openLineComment(selLine.path, selLine.line); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line
   }, [selLine, commenting]);
   // Line-anchored comments render in the diff; general comments render in the conversation.
   const lineCommentsByFile = new Map<string, Cmt[]>();
@@ -3769,7 +3786,7 @@ function ReviewPage({
 
         {/* Session — surfaced up here (was buried at the bottom): a summary of what the agent set out
             to do, with the full task one click away, its carried-forward lesson, and the run metrics. */}
-        {change?.session && (focusMode ? collapsedBar("Session") : (() => {
+        {change?.session && (() => {
           const task = change.session.task || "";
           const long = task.length > 240;
           return (
@@ -3802,7 +3819,7 @@ function ReviewPage({
               </div>
             </Card>
           );
-        })())}
+        })()}
 
         {/* Needs attention — a one-at-a-time stepper so review FLOWS: each item that wants a human
             (a contradicted claim, a raised concern, a blocker/warning finding, or an unverifiable
@@ -3821,7 +3838,6 @@ function ReviewPage({
             ...needs.map((c): Item => ({ kind: "needs", key: c.id, claim: c })),
           ];
           if (items.length === 0) return null;
-          if (focusMode) return collapsedBar("Needs your attention");
           const idx = Math.min(attnIdx, items.length - 1);
           const cur = items[idx];
           const kindLoz = "text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded flex-none";
@@ -3934,17 +3950,22 @@ function ReviewPage({
               </div>
             </div>
           );
-          // The inline composer that opens when you comment on a line.
-          const composerNote = () => (
-            <div className="px-4 py-3 bg-steel-wash/50 grid gap-2">
-              <div className="text-[11.5px] text-muted">Commenting on <b className="text-body">{commenting!.path.split("/").pop()}:{commenting!.line}</b></div>
-              <RichText value={lineDraft} onChange={setLineDraft} rows={2} autoFocus minimal mentions={mentions} onSubmit={postLineComment} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} placeholder="Leave a comment on this line…  (⌘↵ to submit)" />
-              <div className="flex gap-2">
-                <Button size="sm" disabled={!lineDraft.trim()} onClick={postLineComment}>Comment</Button>
-                <Button size="sm" variant="secondary" onClick={() => { setCommenting(null); setSelLine(null); }}>Cancel</Button>
+          // The inline composer that opens when you comment on a line or a selected range. "Ask agent"
+          // posts the comment and hands the code + your question to an AI agent, which replies inline.
+          const composerNote = () => {
+            const span = commenting && commenting.to > commenting.from ? `${commenting.from}–${commenting.to}` : `${commenting?.from}`;
+            return (
+              <div className="px-4 py-3 bg-steel-wash/50 grid gap-2">
+                <div className="text-[11.5px] text-muted">Commenting on <b className="text-body">{commenting!.path.split("/").pop()}:{span}</b>{commenting!.to > commenting!.from ? <span className="text-faint"> · {commenting!.to - commenting!.from + 1} lines</span> : null}</div>
+                <RichText value={lineDraft} onChange={setLineDraft} rows={2} autoFocus minimal mentions={mentions} onSubmit={() => postLineComment(false)} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} placeholder="Comment on this code…  (⌘↵ to submit)" />
+                <div className="flex gap-2 flex-wrap">
+                  <Button size="sm" disabled={!lineDraft.trim() || askingAI} onClick={() => postLineComment(false)}>Comment</Button>
+                  {canReview && <Button size="sm" variant="secondary" disabled={!lineDraft.trim() || askingAI} onClick={() => postLineComment(true)}><span className="inline-flex items-center gap-1.5"><IcoSparkle size={13} />{askingAI ? "Asking agent…" : "Comment & ask agent"}</span></Button>}
+                  <Button size="sm" variant="ghost" onClick={() => { setCommenting(null); setSelLine(null); setSelRange(null); }}>Cancel</Button>
+                </div>
               </div>
-            </div>
-          );
+            );
+          };
 
           // Grouped (semantic) ops: behavioral/changed files first, then renames, then reformatted.
           // Convert a file's hunks into a unified patch for @pierre/diffs: sign each line and compute
@@ -3970,14 +3991,21 @@ function ReviewPage({
               let last = segs.length - 1; while (last >= 0 && !segs[last].changed) last--;
               return segs.slice(first, last + 1).map((s) => s.text).join("").trim();
             };
-            // A "What changed here" row is noise if its content is only punctuation/brackets (e.g. "};",
-            // "})", ",") or a comment — those aren't behaviourally interesting, so keep them out of the
-            // summary. A transform is dropped only when BOTH sides are noise.
+            // A "What changed here" row is *noise* — structural churn a reviewer doesn't need called
+            // out — when it's only brackets/operators, a bare markup tag (</div>, <div>, <br/>), a lone
+            // keyword (return, else, break), a comment, or a stray import. A transform is dropped only
+            // when BOTH its old and new side are noise, so a real edit is never hidden.
             const noise = (s: string) => {
               const t = s.trim();
               if (!t) return true;
-              if (/^[\s{}()[\];,.:<>+\-|&?*]+$/.test(t)) return true;
-              if (/^(\/\/|\/\*|\*\/|\*|#|--|<!--)/.test(t)) return true;
+              if (t.length <= 2) return true;                                  // }, ), ;, =>, {}
+              if (/^[\s{}()[\]<>;,.:+\-|&?*=/`'"]+$/.test(t)) return true;      // punctuation/operators only
+              if (/^<\/?[A-Za-z][\w.-]*\s*\/?>$/.test(t)) return true;         // a bare markup tag, no attributes
+              if (/^<\/?>$/.test(t)) return true;                              // <> </> fragments
+              if (/^[)\]}]+[;,]?$/.test(t) || /^[({[]+$/.test(t)) return true; // lone close/open runs
+              if (/^(\/\/|\/\*|\*\/|\*|#|--|<!--|-->)/.test(t)) return true;   // comments
+              if (/^(return|break|continue|else|then|do|end|fi|done|\}|\{)[\s;{}()]*$/.test(t)) return true; // bare keyword
+              if (/^(use|import|from|require|pub use)\b/.test(t)) return true; // import churn — rarely the point
               return false;
             };
             // Cheap always-on pass: extract the "What changed here" summary WITHOUT building any React
@@ -4013,7 +4041,7 @@ function ReviewPage({
             const annos: PierreAnno[] = [];
             for (const x of fs) if (x.f.line) annos.push({ side: "additions", lineNumber: x.f.line, metadata: { kind: "finding", kf: x } });
             for (const c of lcs) if (c.line) annos.push({ side: "additions", lineNumber: c.line, metadata: { kind: "comment", c } });
-            if (commenting?.path === f.path) annos.push({ side: "additions", lineNumber: commenting.line, metadata: { kind: "composer" } });
+            if (commenting?.path === f.path) annos.push({ side: "additions", lineNumber: commenting.to, metadata: { kind: "composer" } });
             const renderAnno = (a: PierreAnno) => a.metadata.kind === "finding" ? findingNote(a.metadata.kf as FindingRow) : a.metadata.kind === "comment" ? lineCommentNote(a.metadata.c as Cmt) : composerNote();
             const selLn = diffFocus[f.path];
             // Drop punctuation/comment-only noise, then dedupe so a repeated edit isn't listed twice.
@@ -4076,11 +4104,32 @@ function ReviewPage({
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
                     File too large to diff inline — open it in the Files tab to view.
                   </div>
+                ) : openDiff.has(f.path) ? (
+                  <div>
+                    {selRange?.path === f.path && selRange.to > selRange.from && !commenting && (
+                      <div className="mb-1.5 flex items-center justify-between gap-2 px-3 py-1.5 rounded-ctl bg-steel-wash/60 border border-steel/20">
+                        <span className="text-[12px] text-body">Selected lines <b className="tabular-nums">{selRange.from}–{selRange.to}</b></span>
+                        <div className="flex gap-1.5">
+                          <Button size="sm" onClick={() => openLineComment(f.path, selRange.from, selRange.to)}>Comment on selection</Button>
+                          <Button size="sm" variant="ghost" onClick={() => setSelRange(null)}>Clear</Button>
+                        </div>
+                      </div>
+                    )}
+                    <PierreReviewDiff patch={toPatch(f)} theme={theme}
+                      lineAnnotations={annos} renderAnnotation={renderAnno}
+                      onComment={(from, to) => openLineComment(f.path, from, to)}
+                      onSelectRange={(from, to) => setSelRange({ path: f.path, from, to })}
+                      selectedLines={selLn != null ? { start: selLn, end: selLn, side: "additions" } : null} />
+                    <div className="flex justify-end pt-1.5">
+                      <button onClick={() => setOpenDiff((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>
+                    </div>
+                  </div>
                 ) : (
-                  <PierreReviewDiff patch={toPatch(f)} theme={theme}
-                    lineAnnotations={annos} renderAnnotation={renderAnno}
-                    onComment={(line) => openLineComment(f.path, line)}
-                    selectedLines={selLn != null ? { start: selLn, end: selLn, side: "additions" } : null} />
+                  <button onClick={() => revealDiff(f.path)} className="w-full py-2.5 rounded-ctl border border-dashed border-rule text-[12.5px] font-medium text-muted hover:text-ink hover:border-ctl hover:bg-paper/50 transition-colors flex items-center justify-center gap-2">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
+                    Show full diff · {f.hunks.reduce((a, h) => a + h.lines.length, 0)} lines
+                    {(fs.length > 0 || lcs.length > 0) && <span className="text-steel-text">· {[fs.length && `${fs.length} finding${fs.length > 1 ? "s" : ""}`, lcs.length && `${lcs.length} comment${lcs.length > 1 ? "s" : ""}`].filter(Boolean).join(", ")}</span>}
+                  </button>
                 )}
               </>
             );
@@ -4184,7 +4233,7 @@ function ReviewPage({
 
         {/* Findings live inline in the diff now (at their line, collapsible). Only findings we can't
             anchor to a diff line get a residual card here. */}
-        {unmappedFindings.length > 0 && (focusMode ? collapsedBar("Other findings") : (() => {
+        {unmappedFindings.length > 0 && (() => {
           const sevColor = (s: string) => s === "blocker" ? "text-fault-text" : s === "warn" ? "text-brass-text" : "text-steel-text";
           return (
             <Card>
@@ -4209,10 +4258,10 @@ function ReviewPage({
               </div>
             </Card>
           );
-        })())}
+        })()}
 
         {/* conversation timeline — reviews + comments, one accountable thread */}
-        {pr && (focusMode ? collapsedBar("Conversation") : (
+        {pr && (
           <Card id="pr-conversation" className="scroll-mt-4">
             <SectionHeader label="Conversation" right={reviewTools ?? <span className="text-[12.5px] text-muted">reviews and comments, humans and agents</span>} />
             <div className="px-5 py-4 grid gap-3.5">
@@ -4293,7 +4342,7 @@ function ReviewPage({
               </div>
             </div>
           </Card>
-        ))}
+        )}
 
           </div>
         </div>
