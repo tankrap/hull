@@ -242,12 +242,13 @@ const Sparkline = ({ points, color = "var(--steel)", w = 132, h = 34 }: { points
     </svg>
   );
 };
-// Token-usage KPIs + sparklines — shared by the profile and org Overview.
-const TokenKpis = ({ tokens, scope }: { tokens?: { in: number; out: number; series: { day: number; in: number; out: number }[] }; scope: string }) => {
+// Token-usage KPIs + sparklines — shared by the profile and org Overview. No outer box: the two
+// in/out tiles stand on their own.
+const TokenKpis = ({ tokens }: { tokens?: { in: number; out: number; series: { day: number; in: number; out: number }[] } }) => {
   if (!tokens || tokens.in + tokens.out === 0) return null;
   const series = tokens.series ?? [];
   const kpi = (label: string, value: number, pts: number[], color: string) => (
-    <div className="flex-1 min-w-[160px] rounded-ctl border border-rule2 bg-paper/30 px-3.5 py-2.5">
+    <div className="flex-1 min-w-[160px] rounded-card border border-rule bg-surface px-3.5 py-2.5">
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-[11px] font-semibold uppercase tracking-[0.05em] text-muted">{label}</span>
         <span className="text-[17px] font-semibold tabular-nums" style={{ color }} title={value.toLocaleString()}>{fmtNum(value)}</span>
@@ -256,13 +257,10 @@ const TokenKpis = ({ tokens, scope }: { tokens?: { in: number; out: number; seri
     </div>
   );
   return (
-    <Card>
-      <SectionHeader label="Token usage" right={<span className="text-[12px] text-muted">agent sessions behind {scope} · last year</span>} />
-      <div className="px-5 py-3.5 flex flex-wrap gap-3">
-        {kpi("in", tokens.in, series.map((s) => s.in), "var(--dim)")}
-        {kpi("out", tokens.out, series.map((s) => s.out), "var(--steel)")}
-      </div>
-    </Card>
+    <div className="flex flex-wrap gap-4">
+      {kpi("in", tokens.in, series.map((s) => s.in), "var(--dim)")}
+      {kpi("out", tokens.out, series.map((s) => s.out), "var(--steel)")}
+    </div>
   );
 };
 type RepoLabel = { name: string; color: string; icon?: string };
@@ -1790,7 +1788,7 @@ export function App() {
                   <div className="px-6 py-5"><Markdown text={profileReadme || "_This README is empty._"} linkBase={`/${encodeURIComponent(me?.handle ?? "")}/${encodeURIComponent(me?.handle ?? "")}`} className="text-[14px] text-body leading-[1.6]" /></div>
                 </Card>
               )}
-              <TokenKpis tokens={profileStats?.tokens} scope="your changes" />
+              <TokenKpis tokens={profileStats?.tokens} />
               <Card>
                 <SectionHeader label={`${profileStats?.total ?? 0} contribution${(profileStats?.total ?? 0) === 1 ? "" : "s"} in the last year`} />
                 <div className="px-5 py-4">
@@ -2412,7 +2410,7 @@ export function App() {
                       <div className="px-6 py-5"><Markdown text={orgReadme || "_This README is empty._"} linkBase={`/${encodeURIComponent(oHandle)}/${encodeURIComponent(oHandle)}`} className="text-[14px] text-body leading-[1.6]" /></div>
                     </Card>
                   )}
-                  <TokenKpis tokens={orgStats?.tokens} scope={`${oHandle}'s repos`} />
+                  <TokenKpis tokens={orgStats?.tokens} />
                   <Card>
                     <SectionHeader label={`${orgStats?.total ?? 0} contribution${(orgStats?.total ?? 0) === 1 ? "" : "s"} in the last year`} />
                     <div className="px-5 py-4">
@@ -2884,7 +2882,9 @@ function ContributionHeatmap({ days }: { days: HeatDay[] }) {
     for (let d = 0; d < 7; d++) { const e = gridStart + w * 7 + d; col.push(e >= start && e <= today ? e : -1); }
     weeks.push(col);
   }
-  const fmt = (e: number) => new Date(e * 86_400_000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  const fmtFull = (e: number) => new Date(e * 86_400_000).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+  // Hover reveals that day's specifics in a small cursor-anchored tooltip.
+  const [hover, setHover] = useState<{ x: number; y: number; e: number; h: number; a: number } | null>(null);
   return (
     <div className="grid gap-2">
       <div className="flex gap-[2px] w-full">
@@ -2894,7 +2894,11 @@ function ContributionHeatmap({ days }: { days: HeatDay[] }) {
               if (e < 0) return <span key={j} className="aspect-square" />;
               const d = byDay.get(e); const h = d?.human ?? 0; const a = d?.agent ?? 0;
               const bg = h === 0 && a === 0 ? HEAT_EMPTY : `linear-gradient(to bottom right, ${HEAT_YOU[lvl(h, maxH)]} 0 50%, ${HEAT_AGENT[lvl(a, maxA)]} 50% 100%)`;
-              return <span key={j} title={`${h + a} contribution${h + a === 1 ? "" : "s"} — ${h} you, ${a} agents · ${fmt(e)}`} className="aspect-square rounded-[2px]" style={{ background: bg }} />;
+              return <span key={j}
+                onMouseEnter={(ev) => setHover({ x: ev.clientX, y: ev.clientY, e, h, a })}
+                onMouseMove={(ev) => setHover((prev) => (prev && prev.e === e ? { ...prev, x: ev.clientX, y: ev.clientY } : { x: ev.clientX, y: ev.clientY, e, h, a }))}
+                onMouseLeave={() => setHover((prev) => (prev && prev.e === e ? null : prev))}
+                className="aspect-square rounded-[2px] hover:ring-2 hover:ring-ink/25 transition-shadow" style={{ background: bg }} />;
             })}
           </div>
         ))}
@@ -2903,6 +2907,20 @@ function ContributionHeatmap({ days }: { days: HeatDay[] }) {
         <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />you</span>
         <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_AGENT[3] }} />agents</span>
       </div>
+      {hover && (
+        <div className="fixed z-[80] pointer-events-none -translate-x-1/2 -translate-y-full" style={{ left: hover.x, top: hover.y - 10 }}>
+          <div className="rounded-ctl-sm bg-surface border border-rule2 shadow-modal px-2.5 py-1.5 text-[11.5px] whitespace-nowrap">
+            <div className="font-semibold text-body">{hover.h + hover.a === 0 ? "No contributions" : `${hover.h + hover.a} contribution${hover.h + hover.a === 1 ? "" : "s"}`}</div>
+            {hover.h + hover.a > 0 && (
+              <div className="mt-0.5 flex items-center gap-2 text-muted">
+                <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />{hover.h} you</span>
+                <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-[2px]" style={{ background: HEAT_AGENT[3] }} />{hover.a} agents</span>
+              </div>
+            )}
+            <div className={`text-faint ${hover.h + hover.a > 0 ? "mt-0.5" : "mt-0.5"}`}>{fmtFull(hover.e)}</div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
