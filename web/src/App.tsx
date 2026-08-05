@@ -3167,13 +3167,12 @@ type PierreAnno = { side: "additions" | "deletions"; lineNumber: number; metadat
 // One file's diff, rendered by @pierre/diffs (Shiki, GitHub-style context collapse). Findings and
 // comments ride inline as line annotations; hovering a line reveals a gutter "+" that opens a comment
 // there. This is the whole diff surface — no bespoke hunk machinery on top of it.
-function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnotation, onComment, onSelectRange, loadFile, selectedLines }: {
+function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnotation, onSelectRange, loadFile, selectedLines }: {
   patch: string;
   filePath: string;
   theme: string;
   lineAnnotations: PierreAnno[];
   renderAnnotation: (a: PierreAnno) => React.ReactNode;
-  onComment: (from: number, to?: number) => void;
   onSelectRange?: (from: number, to: number) => void;
   loadFile?: () => Promise<{ old: string | null; new: string | null }>;
   selectedLines?: { start: number; end: number; side?: "additions" | "deletions" } | null;
@@ -3198,9 +3197,9 @@ function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnot
               // review pane, and calmer to read than two cramped columns.
               diffStyle: "unified",
               overflow: "wrap", disableFileHeader: true, lineHoverHighlight: "line", tokenizeMaxLength: 400_000,
-              // Click a line number to comment on that single line; drag over the numbers to select a
-              // chunk (onLineSelected fires with the range) and comment on all of it.
-              onLineNumberClick: (p: { lineNumber: number }) => onComment(p.lineNumber),
+              // Click a line number (or drag across several) to select; a bar then offers "Comment"
+              // (or press c). Selection drives commenting — a plain line-number click can't, because
+              // line selection intercepts it.
               enableLineSelection: true,
               onLineSelected: (r: { start: number; end: number } | null) => { if (r && onSelectRange) onSelectRange(Math.min(r.start, r.end), Math.max(r.start, r.end)); },
               // Clicking a "N unmodified lines" band fetches the full file so pierre can reveal the
@@ -3560,6 +3559,9 @@ function ReviewPage({
   // A file's full diff stays closed until you ask for it: click a "What changed" row (jumps to that
   // line) or "Show diff". Keeps the page light — never a wall of code you didn't open.
   const [openDiff, setOpenDiff] = useState<Set<string>>(() => new Set());
+  // Cache each file's full old/new text (fetched for "expand unmodified lines") so re-expanding never
+  // re-hits the network.
+  const fileCache = useRef<Record<string, { old: string | null; new: string | null }>>({});
   // "What changed here" defaults to the handful of edits that carry the most signal; the long tail of
   // trivial token tweaks stays folded until you ask for it (per file).
   const [allEdits, setAllEdits] = useState<Set<string>>(() => new Set());
@@ -3581,7 +3583,6 @@ function ReviewPage({
   // Line-level review comments over a line OR a selected range of lines. Click a line number for one
   // line; drag to select a chunk, then "Comment on lines X–Y". A comment can be sent to an AI agent,
   // which reads the code around it and replies inline.
-  const [selLine, setSelLine] = useState<{ path: string; line: number } | null>(null);
   const [selRange, setSelRange] = useState<{ path: string; from: number; to: number } | null>(null);
   const [commenting, setCommenting] = useState<{ path: string; from: number; to: number } | null>(null);
   const [lineDraft, setLineDraft] = useState("");
@@ -3598,17 +3599,17 @@ function ReviewPage({
     if (res.ok) { setLineDraft(""); setCommenting(null); setSelRange(null); loadThread(); }
     else uiAlert(await res.text());
   };
-  const openLineComment = (path: string, from: number, to?: number) => { const t = to ?? from; setSelLine({ path, line: from }); setCommenting({ path, from, to: t }); setLineDraft(""); };
-  // Press "c" to comment on the currently-selected line.
+  const openLineComment = (path: string, from: number, to?: number) => { const t = to ?? from; setCommenting({ path, from, to: t }); setLineDraft(""); };
+  // Press "c" to comment on the currently-selected line(s) — the pierre selection drives it.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement;
-      if ((e.key === "c" || e.key === "C") && selLine && !commenting && !/^(INPUT|TEXTAREA)$/.test(t.tagName)) { e.preventDefault(); openLineComment(selLine.path, selLine.line); }
+      if ((e.key === "c" || e.key === "C") && selRange && !commenting && !/^(INPUT|TEXTAREA)$/.test(t.tagName)) { e.preventDefault(); openLineComment(selRange.path, selRange.from, selRange.to); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line
-  }, [selLine, commenting]);
+  }, [selRange, commenting]);
   // Line-anchored comments render in the diff; general comments render in the conversation.
   const lineCommentsByFile = new Map<string, Cmt[]>();
   for (const c of thread) { if (c.path && c.line) { const arr = lineCommentsByFile.get(c.path) ?? []; arr.push(c); lineCommentsByFile.set(c.path, arr); } }
@@ -3969,7 +3970,7 @@ function ReviewPage({
                 <div className="flex gap-2 flex-wrap">
                   <Button size="sm" disabled={!lineDraft.trim() || askingAI} onClick={() => postLineComment(false)}>Comment</Button>
                   {canReview && <Button size="sm" variant="secondary" disabled={!lineDraft.trim() || askingAI} onClick={() => postLineComment(true)}><span className="inline-flex items-center gap-1.5"><IcoSparkle size={13} />{askingAI ? "Asking agent…" : "Comment & ask agent"}</span></Button>}
-                  <Button size="sm" variant="ghost" onClick={() => { setCommenting(null); setSelLine(null); setSelRange(null); }}>Cancel</Button>
+                  <Button size="sm" variant="ghost" onClick={() => { setCommenting(null); setSelRange(null); }}>Cancel</Button>
                 </div>
               </div>
             );
@@ -3978,9 +3979,22 @@ function ReviewPage({
           // Grouped (semantic) ops: behavioral/changed files first, then renames, then reformatted.
           // Convert a file's hunks into a unified patch for @pierre/diffs: sign each line and compute
           // the hunk counts pierre's parser expects from the add/del tags.
-          const toPatch = (f: FileDiff): string => {
+          // When `focusLine` is given (a "What changed" jump), render ONLY the hunk that holds it —
+          // the reviewer lands on the change and a few lines of context, not the whole file. The rest
+          // is one click away ("show all changes"), and pierre's expand still fills in context.
+          const hunkHasNewLine = (h: FileDiff["hunks"][number], line: number) => {
+            let n = h.new_start;
+            for (const l of h.lines) { if (l.tag !== "del") { if (n === line) return true; n++; } }
+            return false;
+          };
+          const toPatch = (f: FileDiff, focusLine?: number): string => {
             const head = `diff --git a/${f.path} b/${f.path}\n--- a/${f.path}\n+++ b/${f.path}\n`;
-            const body = f.hunks.map((h) => {
+            let hunks = f.hunks;
+            if (focusLine != null) {
+              const one = f.hunks.filter((h) => hunkHasNewLine(h, focusLine));
+              if (one.length) hunks = one;
+            }
+            const body = hunks.map((h) => {
               const oldN = h.lines.filter((l) => l.tag !== "add").length;
               const newN = h.lines.filter((l) => l.tag !== "del").length;
               const rows = h.lines.map((l) => (l.tag === "add" ? "+" : l.tag === "del" ? "-" : " ") + l.text).join("\n");
@@ -4052,6 +4066,8 @@ function ReviewPage({
             if (commenting?.path === f.path) annos.push({ side: "additions", lineNumber: commenting.to, metadata: { kind: "composer" } });
             const renderAnno = (a: PierreAnno) => a.metadata.kind === "finding" ? findingNote(a.metadata.kf as FindingRow) : a.metadata.kind === "comment" ? lineCommentNote(a.metadata.c as Cmt) : composerNote();
             const selLn = diffFocus[f.path];
+            // A "What changed" jump focuses one hunk (selLn set); "show all changes" clears it.
+            const focused = selLn != null && f.hunks.length > 1;
             // Drop punctuation/comment-only noise, then dedupe so a repeated edit isn't listed twice.
             const seen = new Set<string>();
             const uniq = transforms
@@ -4117,27 +4133,32 @@ function ReviewPage({
                     {/* Always-reachable hide bar — sticks to the top of the diff so you can collapse it
                         without scrolling to the bottom of a long file. */}
                     <div className="sticky top-0 z-[2] flex items-center justify-between gap-2 mb-1.5 px-3 py-1.5 rounded-ctl bg-paper border border-rule2">
-                      <span className="text-[12px] text-muted tabular-nums">{f.hunks.reduce((a, h) => a + h.lines.length, 0)} lines · drag line numbers to select a chunk</span>
-                      <button onClick={() => setOpenDiff((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] font-medium text-muted hover:text-ink inline-flex items-center gap-1">Hide diff<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>
+                      {focused
+                        ? <button onClick={() => setDiffFocus((s) => { const n = { ...s }; delete n[f.path]; return n; })} className="text-[12px] font-medium text-steel-text hover:underline inline-flex items-center gap-1"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>Showing one change · show all {f.hunks.length} in this file</button>
+                        : <span className="text-[12px] text-muted tabular-nums">{f.hunks.length} change{f.hunks.length === 1 ? "" : "s"} · drag line numbers to select a chunk</span>}
+                      <button onClick={() => { setOpenDiff((s) => { const n = new Set(s); n.delete(f.path); return n; }); setDiffFocus((s) => { const n = { ...s }; delete n[f.path]; return n; }); }} className="text-[12px] font-medium text-muted hover:text-ink inline-flex items-center gap-1">Hide diff<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>
                     </div>
-                    {selRange?.path === f.path && selRange.to > selRange.from && !commenting && (
-                      <div className="mb-1.5 flex items-center justify-between gap-2 px-3 py-1.5 rounded-ctl bg-steel-wash/60 border border-steel/20">
-                        <span className="text-[12px] text-body">Selected lines <b className="tabular-nums">{selRange.from}–{selRange.to}</b></span>
+                    {selRange?.path === f.path && !commenting && (
+                      <div className="sticky top-[38px] z-[2] mb-1.5 flex items-center justify-between gap-2 px-3 py-1.5 rounded-ctl bg-steel-wash border border-steel/25 shadow-sm">
+                        <span className="text-[12px] text-body">{selRange.to > selRange.from ? <>Lines <b className="tabular-nums">{selRange.from}–{selRange.to}</b> selected</> : <>Line <b className="tabular-nums">{selRange.from}</b> selected</>} <span className="text-faint">· press c</span></span>
                         <div className="flex gap-1.5">
-                          <Button size="sm" onClick={() => openLineComment(f.path, selRange.from, selRange.to)}>Comment on selection</Button>
+                          <Button size="sm" onClick={() => openLineComment(f.path, selRange.from, selRange.to)}>Comment</Button>
                           <Button size="sm" variant="ghost" onClick={() => setSelRange(null)}>Clear</Button>
                         </div>
                       </div>
                     )}
-                    <PierreReviewDiff patch={toPatch(f)} filePath={f.path} theme={theme}
+                    <PierreReviewDiff patch={toPatch(f, focused ? selLn : undefined)} filePath={f.path} theme={theme}
                       lineAnnotations={annos} renderAnnotation={renderAnno}
-                      onComment={(from, to) => openLineComment(f.path, from, to)}
                       onSelectRange={(from, to) => setSelRange({ path: f.path, from, to })}
                       loadFile={changeId ? async () => {
+                        const ck = `${changeId}:${f.path}`;
+                        if (fileCache.current[ck]) return fileCache.current[ck];
                         const r = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/file?path=${encodeURIComponent(f.path)}`, { headers: authHeaders() });
                         if (!r.ok) throw new Error("could not load full file");
                         const d = await r.json();
-                        return { old: d.old ?? null, new: d.new ?? null };
+                        const res = { old: d.old ?? null, new: d.new ?? null };
+                        fileCache.current[ck] = res;
+                        return res;
                       } : undefined}
                       selectedLines={selLn != null ? { start: selLn, end: selLn, side: "additions" } : null} />
                     <div className="flex justify-end pt-1.5">
