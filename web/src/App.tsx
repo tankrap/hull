@@ -3209,13 +3209,12 @@ type PierreAnno = { side: "additions" | "deletions"; lineNumber: number; metadat
 // One file's diff, rendered by @pierre/diffs (Shiki, GitHub-style context collapse). Findings and
 // comments ride inline as line annotations; hovering a line reveals a gutter "+" that opens a comment
 // there. This is the whole diff surface — no bespoke hunk machinery on top of it.
-function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnotation, onSelect, loadFile, selectedLines }: {
+function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnotation, loadFile, selectedLines }: {
   patch: string;
   filePath: string;
   theme: string;
   lineAnnotations: PierreAnno[];
   renderAnnotation: (a: PierreAnno) => React.ReactNode;
-  onSelect?: (range: { from: number; to: number } | null) => void;
   loadFile?: () => Promise<{ old: string | null; new: string | null }>;
   selectedLines?: { start: number; end: number; side?: "additions" | "deletions" } | null;
 }) {
@@ -3239,17 +3238,16 @@ function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnot
               // review pane, and calmer to read than two cramped columns.
               diffStyle: "unified",
               overflow: "wrap", disableFileHeader: true, lineHoverHighlight: "line", tokenizeMaxLength: 400_000,
-              // Line selection: drag the gutter or click-then-shift-click to select a range of lines.
-              // The range is reported up so ReviewPage can offer a comment on it.
-              enableLineSelection: true,
-              onLineSelected: (r: { start: number; end: number } | null) => { onSelect?.(r ? { from: Math.min(r.start, r.end), to: Math.max(r.start, r.end) } : null); },
+              // Line selection stays OFF so the code is normal selectable text — highlighting it (a real
+              // browser selection) is what offers a comment (handled in ReviewPage's mouseup).
               // Clicking a "N unmodified lines" band fetches the full file so pierre can reveal the
               // hidden context (the patch only carries the hunks' few lines).
               ...(loadFile ? { loadDiffFiles: async () => {
                 const { old, new: nw } = await loadFile();
                 return { oldFile: old != null ? { name: filePath, contents: old } : null, newFile: nw != null ? { name: filePath, contents: nw } : null };
               } } : {}),
-              unsafeCSS: "[data-gutter]{background:var(--paper);border-right:1px solid var(--rule2)}[data-line-number-content]{padding-right:14px;opacity:.85;cursor:pointer}[data-line-number-content]:hover{color:var(--steel);text-decoration:underline}",
+              // Override pierre's user-select:none on code so a reviewer can highlight code text.
+              unsafeCSS: "[data-gutter]{background:var(--paper);border-right:1px solid var(--rule2)}[data-line-number-content]{padding-right:14px;opacity:.85}[data-code],[data-code] *{user-select:text!important;-webkit-user-select:text!important;cursor:text}",
             } as never} />
         </div>
       </Suspense>
@@ -3624,18 +3622,32 @@ function ReviewPage({
   // Line-level review comments over a line OR a selected range of lines. Click a line number for one
   // line; drag to select a chunk, then "Comment on lines X–Y". A comment can be sent to an AI agent,
   // which reads the code around it and replies inline.
-  // Selecting a RANGE of lines in the diff (drag the gutter, or click a line then shift-click another)
-  // offers a comment via a small tooltip. A single-line click is ignored, so nothing pops just from
-  // clicking. Pierre reports the range; we anchor the tooltip on the range's last line.
+  // Highlighting code TEXT in the diff offers a comment. We map the selection's vertical span onto the
+  // line-number cells (`data-column-number`) to get the line range, and anchor a small tooltip at the
+  // selection. A plain click makes a collapsed selection, so nothing pops just from clicking.
   const [selRange, setSelRange] = useState<{ path: string; from: number; to: number; x: number; y: number } | null>(null);
   const [commenting, setCommenting] = useState<{ path: string; from: number; to: number } | null>(null);
-  const showSelectionTooltip = (path: string, from: number, to: number) => {
-    if (to <= from) return setSelRange(null); // single line — not a highlight
-    const root = (document.querySelector("[data-review-path] diffs-container") as (HTMLElement & { shadowRoot?: ShadowRoot }) | null)?.shadowRoot;
-    const cell = root?.querySelector(`[data-column-number="${to}"]`) as HTMLElement | null;
-    const r = cell?.getBoundingClientRect();
-    setSelRange({ path, from, to, x: r ? r.right + 90 : window.innerWidth / 2, y: r ? r.bottom + 6 : 240 });
-  };
+  useEffect(() => {
+    const onUp = (e: MouseEvent) => {
+      if ((e.target as HTMLElement)?.closest?.("[data-cmt-tooltip]")) return; // don't clear on tooltip clicks
+      const wrap = document.querySelector("[data-review-path]") as HTMLElement | null;
+      const host = wrap?.querySelector("diffs-container") as (HTMLElement & { shadowRoot?: ShadowRoot }) | null;
+      const root = host?.shadowRoot as (ShadowRoot & { getSelection?: () => Selection | null }) | undefined;
+      if (!wrap || !root) return;
+      const sel = root.getSelection?.() ?? window.getSelection();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return setSelRange(null);
+      const rect = sel.getRangeAt(0).getBoundingClientRect();
+      if (rect.width < 1 && rect.height < 1) return setSelRange(null);
+      const within = (Array.from(root.querySelectorAll("[data-column-number]")) as HTMLElement[])
+        .map((c) => ({ n: Number(c.getAttribute("data-column-number")), r: c.getBoundingClientRect() }))
+        .filter((x) => Number.isFinite(x.n) && x.r.bottom > rect.top + 2 && x.r.top < rect.bottom - 2);
+      if (!within.length) return setSelRange(null);
+      const from = Math.min(...within.map((x) => x.n)), to = Math.max(...within.map((x) => x.n));
+      setSelRange({ path: wrap.getAttribute("data-review-path") || "", from, to, x: Math.max(120, rect.left + rect.width / 2), y: Math.max(96, rect.top) });
+    };
+    document.addEventListener("mouseup", onUp);
+    return () => document.removeEventListener("mouseup", onUp);
+  }, []);
   const [lineDraft, setLineDraft] = useState("");
   const [askingAI, setAskingAI] = useState(false);
   const postLineComment = async (askAI = false) => {
@@ -4211,12 +4223,11 @@ function ReviewPage({
                     <div className="sticky top-0 z-[2] flex items-center justify-between gap-2 mb-1.5 px-3 py-1.5 rounded-ctl bg-paper border border-rule2">
                       {focused
                         ? <button onClick={() => setDiffFocus((s) => { const n = { ...s }; delete n[f.path]; return n; })} className="text-[12px] font-medium text-steel-text hover:underline inline-flex items-center gap-1"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>Showing one change · show all {f.hunks.length} in this file</button>
-                        : <span className="text-[12px] text-muted tabular-nums">{f.hunks.length} change{f.hunks.length === 1 ? "" : "s"} · drag the line numbers to comment</span>}
+                        : <span className="text-[12px] text-muted tabular-nums">{f.hunks.length} change{f.hunks.length === 1 ? "" : "s"} · highlight code to comment</span>}
                       <button onClick={() => { setOpenDiff((s) => { const n = new Set(s); n.delete(f.path); return n; }); setDiffFocus((s) => { const n = { ...s }; delete n[f.path]; return n; }); }} className="text-[12px] font-medium text-muted hover:text-ink inline-flex items-center gap-1">Hide diff<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>
                     </div>
                     <PierreReviewDiff patch={toPatch(f, focused ? selLn : undefined)} filePath={f.path} theme={theme}
                       lineAnnotations={annos} renderAnnotation={renderAnno}
-                      onSelect={(range) => range ? showSelectionTooltip(f.path, range.from, range.to) : setSelRange(null)}
                       loadFile={changeId ? async () => {
                         const ck = `${changeId}:${f.path}`;
                         if (fileCache.current[ck]) return fileCache.current[ck];
