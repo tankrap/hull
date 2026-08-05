@@ -2066,7 +2066,18 @@ async fn change_semantic(State(app): State<App>, Path((tenant, repo, id)): Path<
 /// smart-HTTP endpoints exist only for interop/mirroring, never as the runner fetch path.) The
 /// archive is verifiable: re-hashing the tree reproduces `tree`.
 async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(String, String, String)>) -> Response {
-    let dir = std::env::temp_dir().join(format!("hull-tree-{}-{}", &tree[..tree.len().min(16)], std::process::id()));
+    // The scratch path must be unique **per request**, not per (tree, pid): two concurrent fetches of
+    // the same tree — an ordinary occurrence once a CI shards a job or a re-check races a first
+    // dispatch — would otherwise share a directory and `remove_dir_all` each other's checkout out
+    // from under the tar writer. A process-local counter is enough and stays deterministic (this
+    // runtime has no RNG).
+    static ARCHIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = ARCHIVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "hull-tree-{}-{}-{seq}",
+        &tree[..tree.len().min(16)],
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     if !app.repos.checkout_tree(&tenant, &repo, &tree, &dir) {
         return (StatusCode::NOT_FOUND, "no such tree").into_response();
@@ -2078,6 +2089,14 @@ async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(
             {
                 let mut ar = tar::Builder::new(&mut buf);
                 ar.mode(tar::HeaderMode::Deterministic);
+                // **Must be false.** `tar::Builder` follows symlinks by default, which would pack a
+                // link as a *copy of its target's contents*. keel addresses a symlink as
+                // `MODE_SYMLINK` over a blob holding the target path, so a followed link changes the
+                // tree's content address: the archive could never re-hash to `tree`, and every change
+                // touching a symlink would fail verification — permanently, since `errored` is not
+                // memoized and each re-check would fail the same way. A dangling link is worse still:
+                // `append_dir_all` errors outright and the endpoint 500s.
+                ar.follow_symlinks(false);
                 ar.append_dir_all(".", &dir)?;
                 ar.finish()?;
             }
