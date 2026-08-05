@@ -144,6 +144,50 @@ pub struct Account {
     pub members: Vec<Membership>,
 }
 
+/// A configured AI backend an account (personal or org) can lend to Hull's AI functions — reviews,
+/// fixes, "ask agent". Several can be connected and rotated across; a repo's reviews use its owning
+/// org's connections, falling back to the triggering user's own. The credential is an API key OR an
+/// OAuth token from a `keel ai login` (a subscription sign-in).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConnection {
+    pub id: String,
+    /// Owning account id (a personal account or an org).
+    pub owner: String,
+    /// `openai` | `anthropic` | `openrouter`.
+    pub provider: String,
+    /// Human label shown in settings (e.g. "Claude Pro (justin)").
+    pub label: String,
+    /// API root, e.g. `https://api.anthropic.com/v1`.
+    pub base_url: String,
+    pub auth: AiAuth,
+    pub created_unix: u64,
+}
+
+/// How an [`AiConnection`] authenticates: a static API key, or an OAuth token pair from a subscription
+/// sign-in (refreshed when it nears expiry).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AiAuth {
+    Key { api_key: String },
+    OAuth { access_token: String, refresh_token: String, expires_unix: u64 },
+}
+
+impl AiAuth {
+    /// The bearer token to send now (the API key, or the OAuth access token).
+    pub fn bearer(&self) -> &str {
+        match self {
+            AiAuth::Key { api_key } => api_key,
+            AiAuth::OAuth { access_token, .. } => access_token,
+        }
+    }
+    /// A short, non-secret hint for the settings UI (last 3 chars).
+    pub fn hint(&self) -> String {
+        let s = self.bearer();
+        let tail: String = s.chars().rev().take(3).collect::<String>().chars().rev().collect();
+        format!("…{tail}")
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountKind {

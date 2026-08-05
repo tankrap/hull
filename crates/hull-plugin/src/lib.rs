@@ -296,6 +296,18 @@ pub trait Fixer: Send + Sync {
     fn fix(&self, req: &FixRequest) -> FixResult;
 }
 
+/// An AI backend resolved for one request — the provider + base URL + bearer token the hosted reviewer
+/// should call, chosen (and rotated) by the core from the owning account/org's connected credentials.
+/// `None` on a request means "use the process-configured provider" (the `.env` default).
+#[derive(Debug, Clone)]
+pub struct AiCredential {
+    /// `openai` | `anthropic` | `openrouter`.
+    pub provider: String,
+    pub base_url: String,
+    /// The bearer token (an API key or an OAuth access token).
+    pub token: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct FixRequest {
     pub repo: String,
@@ -305,6 +317,8 @@ pub struct FixRequest {
     pub path: String,
     pub note: String,
     pub severity: String,
+    /// Resolved AI backend for this request (from the owner's connections), or None for the default.
+    pub ai_credential: Option<AiCredential>,
 }
 
 /// One edit as a **search/replace** on a file — `search` is the exact existing code, `replace` is
@@ -355,6 +369,7 @@ pub struct AskRequest {
     pub line_end: u32,
     pub code: String,
     pub question: String,
+    pub ai_credential: Option<AiCredential>,
 }
 
 /// What a reviewer judges: the change's narrative (intent + session lesson), its author, the
@@ -373,6 +388,8 @@ pub struct ReviewRequest {
     /// keel-native content-addressed source (a `…/tree/:tree_id/tar` URL). NOT git.
     pub source_url: String,
     pub facts: hull_core::reconcile::ChangeFacts,
+    /// Resolved AI backend for this request (from the owner's connections), or None for the default.
+    pub ai_credential: Option<AiCredential>,
 }
 
 /// The "family" of a model id for independence checks — vendor + line, with the trailing version and

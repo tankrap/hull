@@ -319,6 +319,9 @@ fn make_router(app: App) -> Router {
         .route("/api/notifications", get(notifications_list))
         .route("/api/repos", get(repos_list).post(create_repo_handler))
         .route("/api/accounts/:id/repo-defaults", get(repo_defaults_get).put(repo_defaults_set))
+        .route("/api/accounts/:id/ai", get(ai_connections_get).post(ai_connection_add))
+        .route("/api/accounts/:id/ai/rotate", axum::routing::put(ai_rotate_set))
+        .route("/api/accounts/:id/ai/:cid", axum::routing::delete(ai_connection_delete))
         .route("/api/accounts/:id/github", get(github_status).delete(github_disconnect))
         .route("/api/accounts/:id/github/connect", post(github_connect))
         .route("/api/accounts/:id/github/connect-url", post(github_connect_url))
@@ -1109,6 +1112,81 @@ async fn repo_defaults_set(State(app): State<App>, Path(id): Path<String>, heade
     apply_settings_patch(&app, &mut s, &body);
     app.repo_settings.set(&key, s.clone());
     Json(settings_value(&app, &s)).into_response()
+}
+
+/// Default API base for a provider.
+fn ai_default_base(provider: &str) -> String {
+    match provider {
+        "openai" => "https://api.openai.com/v1",
+        "anthropic" => "https://api.anthropic.com/v1",
+        _ => "https://openrouter.ai/api/v1",
+    }
+    .to_string()
+}
+
+/// `GET /api/accounts/:id/ai` — the account's connected AI backends (credentials redacted to a hint)
+/// plus the rotation flag. Account owner/admin only. These lend the account's OpenAI/Claude/OpenRouter
+/// access to Hull's AI functions; a repo's reviews use its owning org's connections (else the
+/// triggerer's own), rotating when enabled.
+async fn ai_connections_get(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let conns: Vec<Value> = app.store.ai_connections(&acct.id).into_iter().map(|c| {
+        let kind = match &c.auth { hull_core::AiAuth::Key { .. } => "key", hull_core::AiAuth::OAuth { .. } => "oauth" };
+        json!({ "id": c.id, "provider": c.provider, "label": c.label, "base_url": c.base_url, "auth_kind": kind, "hint": c.auth.hint(), "created_unix": c.created_unix })
+    }).collect();
+    Json(json!({ "connections": conns, "rotate": app.store.ai_rotate(&acct.id) })).into_response()
+}
+
+/// `POST /api/accounts/:id/ai` — connect a backend by API key: `{provider, api_key, label?, base_url?}`.
+/// (OAuth-token connections are created by `keel ai login`.) Owner/admin only.
+async fn ai_connection_add(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let provider = body.get("provider").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+    let key = body.get("api_key").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if key.is_empty() || !["openai", "anthropic", "openrouter"].contains(&provider.as_str()) {
+        return (StatusCode::BAD_REQUEST, "provider (openai|anthropic|openrouter) and api_key are required").into_response();
+    }
+    let base_url = body.get("base_url").and_then(Value::as_str).map(str::to_string).filter(|s| !s.is_empty()).unwrap_or_else(|| ai_default_base(&provider));
+    let label = body.get("label").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| format!("{provider} key"));
+    let n = app.store.ai_connections(&acct.id).len();
+    let conn = hull_core::AiConnection {
+        id: format!("ai_{}_{}", acct.id, n + 1),
+        owner: acct.id.clone(),
+        provider,
+        label,
+        base_url,
+        auth: hull_core::AiAuth::Key { api_key: key },
+        created_unix: now(),
+    };
+    app.store.put_ai_connection(conn.clone());
+    (StatusCode::CREATED, Json(json!({ "id": conn.id }))).into_response()
+}
+
+/// `DELETE /api/accounts/:id/ai/:cid` — remove a connection (owner/admin only).
+async fn ai_connection_delete(State(app): State<App>, Path((id, cid)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    Json(json!({ "deleted": app.store.remove_ai_connection(&acct.id, &cid) })).into_response()
+}
+
+/// `PUT /api/accounts/:id/ai/rotate` — `{rotate: bool}`: cycle across the account's connections per
+/// request instead of always using the first. Owner/admin only.
+async fn ai_rotate_set(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+    let on = body.get("rotate").and_then(Value::as_bool).unwrap_or(false);
+    app.store.set_ai_rotate(&acct.id, on);
+    Json(json!({ "rotate": on })).into_response()
 }
 
 /// `GET /api/accounts/:id/github` — the account's GitHub connection status (admin only). Never
@@ -3274,6 +3352,7 @@ async fn ai_answer_comment(app: &App, key: &str, pr_num: u64, path: &str, line: 
     if code.trim().is_empty() { return None; }
     let req = hull_plugin::AskRequest {
         repo: key.to_string(), path: path.to_string(), line, line_end: line_end.max(line), code, question: question.to_string(),
+        ai_credential: resolve_ai_credential(app, key, None),
     };
     let app2 = app.clone();
     let answer = tokio::task::spawn_blocking(move || app2.registry.answer(&req)).await.ok().flatten()?;
@@ -3406,6 +3485,44 @@ async fn auto_review(
 /// Max review→fix→re-review cycles at T3, so the autonomous loop always terminates.
 const MAX_FIX_DEPTH: u8 = 2;
 
+/// Round-robin cursor per owner for rotating across its AI connections (process-local; rotation just
+/// spreads load, so it need not survive a restart).
+fn next_ai_index(owner: &str, n: usize) -> usize {
+    use std::sync::OnceLock;
+    static C: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    let m = C.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = m.lock().unwrap();
+    let e = g.entry(owner.to_string()).or_insert(0);
+    let i = *e % n.max(1);
+    *e = e.wrapping_add(1);
+    i
+}
+
+/// Resolve which AI backend to use for a request touching `repo`: the repo's owning org's connected
+/// credentials first, else the `fallback_actor`'s personal-account connections. With rotation on for
+/// the owner, cycle across its connections; else use the first. `None` → the process-configured default.
+fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&str>) -> Option<hull_plugin::AiCredential> {
+    let tenant = repo.split_once('/').map(|(t, _)| t).unwrap_or(repo);
+    let mut owner: Option<String> = None;
+    let mut conns: Vec<hull_core::AiConnection> = Vec::new();
+    if let Some(org) = app.store.accounts().into_iter().find(|a| a.handle == tenant) {
+        let c = app.store.ai_connections(&org.id);
+        if !c.is_empty() { owner = Some(org.id.clone()); conns = c; }
+    }
+    if conns.is_empty() {
+        if let Some(aid) = fallback_actor {
+            if let Some(pa) = app.store.accounts().into_iter().find(|a| a.kind == hull_core::AccountKind::Personal && a.members.iter().any(|m| m.actor == aid)) {
+                let c = app.store.ai_connections(&pa.id);
+                if !c.is_empty() { owner = Some(pa.id.clone()); conns = c; }
+            }
+        }
+    }
+    let owner = owner?;
+    let idx = if app.store.ai_rotate(&owner) { next_ai_index(&owner, conns.len()) } else { 0 };
+    let c = &conns[idx % conns.len()];
+    Some(hull_plugin::AiCredential { provider: c.provider.clone(), base_url: c.base_url.clone(), token: c.auth.bearer().to_string() })
+}
+
 async fn perform_auto_review(
     app: &App,
     tenant: &str,
@@ -3489,6 +3606,7 @@ async fn perform_auto_review(
         author_model,
         source_url,
         facts,
+        ai_credential: resolve_ai_credential(&app, &key, Some(&pr.author)),
     };
     // D9 — incremental re-review: reuse the cached verdict when nothing that feeds it changed. The
     // key is tree **+ verification** (a review's inputs are the diff AND the green/red signal), so a
@@ -3696,6 +3814,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
         path: path.to_string(),
         note: note.to_string(),
         severity: severity.to_string(),
+        ai_credential: resolve_ai_credential(&app, &key, Some(&pr.author)),
     };
     let change = req.change.clone();
     let registry = app.registry.clone();

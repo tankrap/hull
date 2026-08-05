@@ -2,7 +2,7 @@
 //! (accounts/issues/projects as relational rows) that references keel objects by content address.
 //! Keeping this a trait means the server, tests, and the eventual SQL store all share one shape.
 
-use crate::{Account, Actor, Comment, Issue, OwnerRule, Project, PullRequest, Repo, Review, SessionRecord, Team, User};
+use crate::{Account, Actor, AiConnection, Comment, Issue, OwnerRule, Project, PullRequest, Repo, Review, SessionRecord, Team, User};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,6 +37,12 @@ pub trait Store: Send + Sync {
     fn session_record(&self, repo: &str, change: &str) -> Option<SessionRecord>;
     fn put_project(&self, project: Project);
     fn projects(&self, owner: &str) -> Vec<Project>;
+    // ── AI connections (per account/org: multiple backends, optional rotation) ──
+    fn put_ai_connection(&self, conn: AiConnection);
+    fn ai_connections(&self, owner: &str) -> Vec<AiConnection>;
+    fn remove_ai_connection(&self, owner: &str, id: &str) -> bool;
+    fn set_ai_rotate(&self, owner: &str, on: bool);
+    fn ai_rotate(&self, owner: &str) -> bool;
     /// Set a repo's code-owner rules (replaces the existing set).
     fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>);
     fn owners(&self, repo: &str) -> Vec<OwnerRule>;
@@ -80,6 +86,8 @@ pub struct InMemory {
     projects: RwLock<Vec<Project>>,
     users: RwLock<HashMap<String, User>>,
     teams: RwLock<HashMap<String, Team>>,
+    ai_conns: RwLock<Vec<AiConnection>>,
+    ai_rotate: RwLock<HashMap<String, bool>>,
 }
 
 impl InMemory {
@@ -174,6 +182,24 @@ impl Store for InMemory {
     fn projects(&self, owner: &str) -> Vec<Project> {
         self.projects.read().unwrap().iter().filter(|p| p.owner == owner).cloned().collect()
     }
+    fn put_ai_connection(&self, conn: AiConnection) {
+        self.ai_conns.write().unwrap().push(conn);
+    }
+    fn ai_connections(&self, owner: &str) -> Vec<AiConnection> {
+        self.ai_conns.read().unwrap().iter().filter(|c| c.owner == owner).cloned().collect()
+    }
+    fn remove_ai_connection(&self, owner: &str, id: &str) -> bool {
+        let mut g = self.ai_conns.write().unwrap();
+        let n = g.len();
+        g.retain(|c| !(c.owner == owner && c.id == id));
+        g.len() != n
+    }
+    fn set_ai_rotate(&self, owner: &str, on: bool) {
+        self.ai_rotate.write().unwrap().insert(owner.to_string(), on);
+    }
+    fn ai_rotate(&self, owner: &str) -> bool {
+        self.ai_rotate.read().unwrap().get(owner).copied().unwrap_or(false)
+    }
     fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>) {
         self.owners.write().unwrap().insert(repo.to_string(), rules);
     }
@@ -236,6 +262,10 @@ struct Snapshot {
     users: HashMap<String, User>,
     #[serde(default)]
     teams: HashMap<String, Team>,
+    #[serde(default)]
+    ai_conns: Vec<AiConnection>,
+    #[serde(default)]
+    ai_rotate: HashMap<String, bool>,
 }
 
 /// A durable [`Store`] backed by a JSON snapshot on disk, so issues/accounts survive restarts.
@@ -396,6 +426,23 @@ impl Store for FileStore {
     }
     fn projects(&self, owner: &str) -> Vec<Project> {
         self.inner.read().unwrap().projects.iter().filter(|p| p.owner == owner).cloned().collect()
+    }
+    fn put_ai_connection(&self, conn: AiConnection) {
+        self.mutate(|s| s.ai_conns.push(conn));
+    }
+    fn ai_connections(&self, owner: &str) -> Vec<AiConnection> {
+        self.inner.read().unwrap().ai_conns.iter().filter(|c| c.owner == owner).cloned().collect()
+    }
+    fn remove_ai_connection(&self, owner: &str, id: &str) -> bool {
+        let mut removed = false;
+        self.mutate(|s| { let n = s.ai_conns.len(); s.ai_conns.retain(|c| !(c.owner == owner && c.id == id)); removed = s.ai_conns.len() != n; });
+        removed
+    }
+    fn set_ai_rotate(&self, owner: &str, on: bool) {
+        self.mutate(|s| { s.ai_rotate.insert(owner.to_string(), on); });
+    }
+    fn ai_rotate(&self, owner: &str) -> bool {
+        self.inner.read().unwrap().ai_rotate.get(owner).copied().unwrap_or(false)
     }
     fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>) {
         self.mutate(|s| {

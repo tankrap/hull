@@ -338,6 +338,65 @@ function LabelEditor({ labels, onChange }: { labels: RepoLabel[]; onChange: (l: 
   );
 }
 
+// AI connections — lend an account/org's OpenAI, Claude, or OpenRouter access to Hull's AI functions.
+// Connect several and toggle rotation; a repo's reviews use its org's connections (else the caller's).
+function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: string; authHeaders: () => Record<string, string>; scopeLabel?: string }) {
+  type Conn = { id: string; provider: string; label: string; base_url: string; auth_kind: string; hint: string };
+  const enc = encodeURIComponent;
+  const [conns, setConns] = useState<Conn[]>([]);
+  const [rotate, setRotate] = useState(false);
+  const [provider, setProvider] = useState("anthropic");
+  const [label, setLabel] = useState("");
+  const [key, setKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = () => { fetch(`/api/accounts/${enc(accountId)}/ai`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) { setConns(d.connections || []); setRotate(!!d.rotate); } }).catch(() => {}); };
+  useEffect(load, [accountId]); // eslint-disable-line
+  const add = async () => {
+    if (!key.trim()) return;
+    setBusy(true);
+    const r = await fetch(`/api/accounts/${enc(accountId)}/ai`, { method: "POST", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify({ provider, label: label.trim(), api_key: key.trim() }) });
+    setBusy(false);
+    if (r.ok) { setKey(""); setLabel(""); load(); } else uiAlert(await r.text());
+  };
+  const remove = async (id: string) => {
+    if (!(await uiConfirm({ title: "Remove connection", body: "Disconnect this AI backend from the account?", danger: true, confirmLabel: "Remove" }))) return;
+    const r = await fetch(`/api/accounts/${enc(accountId)}/ai/${enc(id)}`, { method: "DELETE", headers: authHeaders() });
+    if (r.ok) load(); else uiAlert(await r.text());
+  };
+  const toggleRotate = async (on: boolean) => { setRotate(on); await fetch(`/api/accounts/${enc(accountId)}/ai/rotate`, { method: "PUT", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify({ rotate: on }) }).catch(() => setRotate(!on)); };
+  const PROVIDERS = [{ value: "anthropic", label: "Claude (Anthropic)" }, { value: "openai", label: "OpenAI" }, { value: "openrouter", label: "OpenRouter" }];
+  const dot = (p: string) => (p === "anthropic" ? "bg-brass" : p === "openai" ? "bg-clear" : "bg-steel");
+  return (
+    <div>
+      <Eyebrow label="AI connections" right={conns.length > 1 ? <span className="inline-flex items-center gap-2 text-[12px] text-muted">rotate across them <Switch on={rotate} onChange={toggleRotate} /></span> : undefined} />
+      <Card>
+        <div className="px-5 py-4 grid gap-3">
+          <p className="text-[12.5px] text-muted leading-[1.5]">Bring OpenAI, Claude, or OpenRouter to {scopeLabel ?? "this account"} — AI reviews, fixes, and “ask agent”. Connect several and turn on rotate to spread load across them; without any, Hull uses its built-in reconciliation reviewer.</p>
+          {conns.length > 0 && (
+            <div className="grid gap-1.5">
+              {conns.map((c) => (
+                <div key={c.id} className="flex items-center gap-2.5 px-3 py-2 rounded-ctl border border-rule2 bg-paper/40">
+                  <span className={`w-2 h-2 rounded-full flex-none ${dot(c.provider)}`} />
+                  <span className="text-[13.5px] font-medium truncate">{c.label}</span>
+                  <span className="text-[11.5px] text-faint tabular-nums">{c.provider} · {c.auth_kind === "oauth" ? "subscription" : "key"} {c.hint}</span>
+                  <button onClick={() => remove(c.id)} className="ml-auto text-[12px] text-muted hover:text-fault-text">Remove</button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="flex flex-wrap items-end gap-2 pt-1 border-t border-rule3">
+            <div className="w-[180px]"><Picker size="sm" block value={provider} onChange={setProvider} options={PROVIDERS} /></div>
+            <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="label (optional)" className="box-border h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[160px]" />
+            <input value={key} onChange={(e) => setKey(e.target.value)} type="password" placeholder="API key" className="box-border flex-1 min-w-[180px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" />
+            <Button size="sm" disabled={!key.trim() || busy} onClick={add}>{busy ? "Connecting…" : "Connect"}</Button>
+          </div>
+          <p className="text-[11.5px] text-faint leading-[1.5]">To use a Claude or ChatGPT <b>subscription</b> instead of an API key, run <code className="px-1 rounded bg-rule2 text-dim">keel ai login {provider}</code> — a browser sign-in that stores the token here <span className="italic">(rolling out next)</span>.</p>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 // ── small token-only layout atoms (not controls — controls come from ./ui) ──────────
 const Card = ({ children, className = "", id }: { children: React.ReactNode; className?: string; id?: string }) => (
   <div id={id} className={`bg-surface border border-rule rounded-card overflow-hidden ${className}`}>{children}</div>
@@ -1930,6 +1989,10 @@ export function App() {
                   <div><Button size="sm" onClick={() => saveAccount({ username: account.username, email: account.email })}>Save</Button></div>
                 </div>
               </Card>
+              {(() => {
+                const pa = accounts.find((a) => a.kind === "personal" && me && a.members.some((m) => m.actor === me.id));
+                return pa ? <AiConnections accountId={pa.id} authHeaders={authHeaders} scopeLabel="your own reviews" /> : null;
+              })()}
               <Card>
                 <SectionHeader label="Passkeys" right={<Button size="sm" variant="secondary" onClick={addPasskey}>Add a passkey</Button>} />
                 <div>
@@ -2498,6 +2561,7 @@ export function App() {
               {acct && orgTab === "people" && (
               <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-x-12 gap-y-9">
               <section className="min-w-0 grid gap-8">
+                {amAdmin && <AiConnections accountId={acct.id} authHeaders={authHeaders} scopeLabel={`${acct.handle}'s repos`} />}
                 {amAdmin && (
                   <div>
                     <Eyebrow label="Default repository settings" right="inherited by new repos" />
