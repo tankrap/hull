@@ -416,11 +416,33 @@ are string lists (globs, cache paths, secret names); `needs` is a list of handle
 is a bool. The emitted DAG is the same declarative shape a YAML file would have produced, so nothing
 downstream (§6 memoization, §8) changes — only the authoring surface does.
 
-**Evaluation bounds** (defence-in-depth, though the language terminates by design): a max **step
-budget** / emitted-node count and a max **DAG depth**, so a pathological-but-valid module can't wedge
-the planner; plus starlark-rust's own call-stack cap. No `load()`, no file/URL fetch, and no `open`/
-network/clock builtins exist in the dialect — the billion-laughs / remote-reference class the YAML
-parser had to fence out is simply *absent*, not filtered.
+**Evaluation bounds**: a max **step budget** / emitted-node count and a max **DAG depth**, so a
+pathological-but-valid module can't wedge the planner; plus starlark-rust's own call-stack cap. No
+`load()`, no file/URL fetch, and no `open`/network/clock builtins exist in the dialect — the
+billion-laughs / remote-reference class the YAML parser had to fence out is simply *absent*, not
+filtered. Assert that absence as an **inventory** (a golden assertion over the complete set of global
+names), not as a blocklist, so a future starlark release that adds a global fails a test instead of
+quietly widening the surface.
+
+> **Correction — the bounds above are not sufficient, and the reason generalizes.** Every one of them
+> bounds *evaluation*. Roughly **800 nested brackets — about 1.6 KB of source — overflows the stack
+> inside `AstModule::parse`, before any of them exists to be consulted.** A Rust stack overflow is not
+> an error you catch; it aborts the process. That is a **remote crash of the control plane from a file
+> in an untrusted tree**, which is the one thing D§4.4 exists to prevent. Raising the stack does not
+> fix it: measured, 20k brackets still aborts a dedicated 128 MiB stack with `SIGABRT`.
+>
+> Parsing therefore needs its own **pre-parse bound** — a byte scan, before the parser sees anything,
+> capping bracket nesting, tokens per statement, and indentation. Brackets alone are not enough:
+> `x = ---…-1` and `x = 1+1+1+…` reach a deep AST with no brackets at all, and a parenthesised
+> continuation defeats any per-*line* cap. Evaluation should also run on a **dedicated thread with a
+> measured stack**, which additionally contains starlark-rust's heap limit being only periodically
+> checked — a bomb that allocates inside one call sails past it and *panics* rather than erroring.
+>
+> **The lesson, stated generally, because it is not specific to Starlark:** "hermetic, deterministic,
+> and guaranteed to terminate" is a claim about *evaluating* a program. It says nothing whatever about
+> *parsing* one. Any design that accepts attacker-controlled config on a trusted host has to make its
+> safety argument about the parser as well as the interpreter — and the parser is the part that runs
+> first, on the rawest input, usually in someone else's code.
 
 > **Prototyped (measured — I ran it).** In a throwaway crate against `starlark` 0.14, a ~250-line
 > evaluator implementing exactly the four builtins above ran the example `.hull/ci.star` and emitted
