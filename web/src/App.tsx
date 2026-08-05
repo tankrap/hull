@@ -3507,6 +3507,9 @@ function ReviewPage({
   // the window on a line (set by a "What changed here" click); diffExpand[path] grows it on "show more".
   const [diffFocus, setDiffFocus] = useState<Record<string, number>>({});
   const [diffExpand, setDiffExpand] = useState<Record<string, number>>({});
+  // "What changed here" defaults to the handful of edits that carry the most signal; the long tail of
+  // trivial token tweaks stays folded until you ask for it (per file).
+  const [allEdits, setAllEdits] = useState<Set<string>>(() => new Set());
   // Open a file's diff and jump to a line — the line stays highlighted (diffFocus drives CodePanel's
   // persistent `highlightLine`) so you can see exactly which line the "What changed here" click meant.
   const revealDiff = (path: string, line?: number) => {
@@ -4106,6 +4109,23 @@ function ReviewPage({
             const uniq = transforms
               .filter((t) => !(noise(t.old) && noise(t.next)))
               .filter((t) => { const k = t.old + "→" + t.next; if (seen.has(k)) return false; seen.add(k); return true; });
+            // Rank each edit by how much it's likely to *matter*: declarations and control flow beat a
+            // renamed local, a whole added/removed line beats a one-token tweak, and longer edits beat
+            // trivial ones. We show the top slice by default (in file order) and fold the long tail.
+            const SIG_KW = /\b(fn|def|func|function|class|struct|enum|impl|trait|interface|type|const|let|var|return|if|else|elif|for|while|match|switch|case|await|async|throw|raise|yield|import|export|from|pub|public|private|protected|new|delete|=>|->)\b/;
+            const editScore = (t: { old: string; next: string }) => {
+              let s = Math.min(60, Math.max(t.old.length, t.next.length));
+              if (t.old === "" || t.next === "") s += 20;
+              if (SIG_KW.test(t.old) || SIG_KW.test(t.next)) s += 45;
+              if (/[A-Za-z_][A-Za-z0-9_]{2,}\s*\(/.test(t.next || t.old)) s += 15; // a call/definition
+              return s;
+            };
+            const EDIT_CAP = 8;
+            const showAll = allEdits.has(f.path);
+            // The CAP most-significant edits (as a set of indices), still rendered in file order.
+            const topIdx = new Set(uniq.map((t, i) => [i, editScore(t)] as [number, number]).sort((a, b) => b[1] - a[1]).slice(0, EDIT_CAP).map(([i]) => i));
+            const shownEdits = uniq.length > EDIT_CAP && !showAll ? uniq.filter((_, i) => topIdx.has(i)) : uniq;
+            const hiddenEdits = uniq.length - shownEdits.length;
             return (
               <>
                 {uniq.length > 0 && (() => {
@@ -4114,10 +4134,10 @@ function ReviewPage({
                     <div className="mb-3 rounded-ctl border border-rule2 overflow-hidden">
                       <div className="px-3.5 py-2 bg-paper border-b border-rule2 flex items-center justify-between">
                         <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">What changed here</span>
-                        <span className="text-[11px] text-faint tabular-nums">{uniq.length} edit{uniq.length > 1 ? "s" : ""} · click to jump</span>
+                        <span className="text-[11px] text-faint tabular-nums">{hiddenEdits > 0 ? `top ${shownEdits.length} of ${uniq.length} edits` : `${uniq.length} edit${uniq.length > 1 ? "s" : ""} · click to jump`}</span>
                       </div>
                       <div className="py-1 max-h-[300px] overflow-y-auto">
-                        {uniq.map((t, i) => (
+                        {shownEdits.map((t, i) => (
                           <button key={i} onClick={() => revealDiff(f.path, t.ln)} title={`Jump to line ${t.ln}`}
                             className="group w-full grid grid-cols-[auto_1fr] items-center gap-x-2.5 text-[13px] text-left px-3.5 py-1.5 hover:bg-steel-wash/60 transition-colors">
                             <span className="inline-flex items-center h-[19px] px-1.5 rounded-[3px] bg-rule2 text-dim text-[11px] font-semibold tabular-nums group-hover:bg-steel group-hover:text-white transition-colors flex-none">L{t.ln}</span>
@@ -4128,6 +4148,13 @@ function ReviewPage({
                             </span>
                           </button>
                         ))}
+                        {(hiddenEdits > 0 || showAll) && (
+                          <button onClick={() => setAllEdits((s) => { const n = new Set(s); if (showAll) n.delete(f.path); else n.add(f.path); return n; })}
+                            className="w-full text-[12px] font-medium text-steel-text hover:bg-steel-wash/50 px-3.5 py-1.5 flex items-center gap-1.5">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={showAll ? "rotate-180 transition-transform" : "transition-transform"}><polyline points="6 9 12 15 18 9" /></svg>
+                            {showAll ? "Show fewer" : `Show all ${uniq.length} edits`}
+                          </button>
+                        )}
                       </div>
                     </div>
                   );
