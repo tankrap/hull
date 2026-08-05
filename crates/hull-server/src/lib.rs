@@ -1214,7 +1214,7 @@ async fn ai_connection_delete(State(app): State<App>, Path((id, cid)): Path<(Str
 /// returns `{session, login_url}` — the browser opens `login_url`, the user approves and pastes the
 /// code back to `/complete`. Owner/admin only. Runs the PTY work off the async runtime.
 async fn ai_agent_login_start(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (_acct, _) = match require_account_admin_ref(&app, &headers, &id) {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1226,13 +1226,24 @@ async fn ai_agent_login_start(State(app): State<App>, Path(id): Path<String>, he
         Ok(x) => x,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("could not provision bundle: {e}")).into_response(),
     };
-    let acct_id = acct.id.clone();
-    let res = tokio::task::spawn_blocking(move || agentlogin::begin(&command, &session, &dir).map(|url| (session, url))).await;
+    let session_for_cleanup = session.clone();
+    let res = tokio::task::spawn_blocking(move || agentlogin::begin(&command, &session, &dir).map(|b| (session, b))).await;
     match res {
-        Ok(Ok((session, url))) => Json(json!({ "session": session, "login_url": url, "provider": provider })).into_response(),
-        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, e).into_response(),
+        Ok(Ok((session, b))) => Json(json!({
+            "session": session,
+            "login_url": b.url,
+            "user_code": b.user_code,
+            // PasteCode ⇒ the user pastes a code back here; DevicePoll ⇒ they enter user_code on the
+            // site and we poll for approval.
+            "needs_code": matches!(b.mode, agentlogin::Mode::PasteCode),
+            "provider": provider,
+        })).into_response(),
+        Ok(Err(e)) => {
+            agentsession::remove(&session_for_cleanup);
+            (StatusCode::BAD_GATEWAY, e).into_response()
+        }
         Err(_) => {
-            let _ = acct_id;
+            agentsession::remove(&session_for_cleanup);
             (StatusCode::INTERNAL_SERVER_ERROR, "login task panicked").into_response()
         }
     }
@@ -1252,30 +1263,40 @@ async fn ai_agent_login_complete(State(app): State<App>, Path(id): Path<String>,
     let Some(command) = agent_command(&provider).map(str::to_string) else {
         return (StatusCode::BAD_REQUEST, "provider must be claude-code or codex").into_response();
     };
-    if session.is_empty() || code.is_empty() {
-        return (StatusCode::BAD_REQUEST, "session and code are required").into_response();
+    if session.is_empty() {
+        return (StatusCode::BAD_REQUEST, "session is required").into_response();
     }
     let sess = session.clone();
     let cmd = command.clone();
     let out = tokio::task::spawn_blocking(move || {
-        // Feed the code; the CLI exchanges it and writes credentials. Then judge success by the
-        // *bundle's* auth state, not the CLI's exit — some CLIs hang on a success screen after writing
-        // creds, and killing that must not discard a login that actually completed.
-        let fin = agentlogin::finish(&sess, &code);
-        match agent_auth_identity(&cmd, &agentsession::dir_for(&sess)) {
-            // Login landed — seal the plaintext staging dir into the encrypted at-rest bundle.
-            Ok(idy) => agentsession::seal(&sess).map(|_| idy),
-            Err(e) => Err(fin.err().unwrap_or(e)),
+        // Advance the login. For paste-code this feeds the code and waits; for device-auth this checks
+        // whether the self-polling CLI has been approved yet (Pending ⇒ poll again).
+        match agentlogin::finish(&sess, &code) {
+            Ok(agentlogin::Finish::Pending) => Ok(None),
+            // Judge success by the *bundle's* auth state, not the CLI's exit — some CLIs hang on a
+            // success screen after writing creds; killing that must not discard a completed login.
+            Ok(agentlogin::Finish::Done) => match agent_auth_identity(&cmd, &agentsession::dir_for(&sess)) {
+                Ok(idy) => agentsession::seal(&sess).map(|_| Some(idy)),
+                Err(e) => Err(e),
+            },
+            Err(e) => match agent_auth_identity(&cmd, &agentsession::dir_for(&sess)) {
+                Ok(idy) => agentsession::seal(&sess).map(|_| Some(idy)),
+                Err(_) => Err(e),
+            },
         }
     })
     .await;
     let identity = match out {
-        Ok(Ok(idy)) => idy,
+        Ok(Ok(Some(idy))) => idy,
+        // Device flow not approved yet — tell the client to keep polling.
+        Ok(Ok(None)) => return (StatusCode::ACCEPTED, Json(json!({ "pending": true }))).into_response(),
         Ok(Err(e)) => {
+            agentlogin::abort(&session);
             agentsession::remove(&session);
             return (StatusCode::BAD_GATEWAY, e).into_response();
         }
         Err(_) => {
+            agentlogin::abort(&session);
             agentsession::remove(&session);
             return (StatusCode::INTERNAL_SERVER_ERROR, "login task panicked").into_response();
         }
@@ -1312,13 +1333,16 @@ async fn ai_agent_login_cancel(State(app): State<App>, Path(id): Path<String>, h
     Json(json!({ "cancelled": true })).into_response()
 }
 
-/// Run `<command> auth status --json` against a bundle dir → `{loggedIn, email, plan}`. Errors if the
-/// bundle isn't actually logged in (so a failed login never persists a dead connection).
+/// Verify a bundle is actually authenticated and pull a non-secret `{loggedIn, email, plan}` identity
+/// from it, so a failed login never persists a dead connection. Codex has no `auth status --json`, so
+/// its identity comes from the tokens it wrote (`auth.json`, email from the id_token claims).
 fn agent_auth_identity(command: &str, dir: &std::path::Path) -> Result<Value, String> {
-    let env = if command == "codex" { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
+    if command == "codex" {
+        return codex_identity(dir);
+    }
     let out = std::process::Command::new(command)
         .args(["auth", "status", "--json"])
-        .env(env, dir)
+        .env("CLAUDE_CONFIG_DIR", dir)
         .output()
         .map_err(|e| format!("{command} auth status: {e}"))?;
     let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| format!("{command} auth status returned no JSON"))?;
@@ -1330,6 +1354,34 @@ fn agent_auth_identity(command: &str, dir: &std::path::Path) -> Result<Value, St
         "email": v.get("email").and_then(Value::as_str).unwrap_or(""),
         "plan": v.get("subscriptionType").and_then(Value::as_str).unwrap_or(""),
     }))
+}
+
+/// Codex identity from the credentials it persisted: confirm `login status` reports logged-in, then
+/// read `auth.json` (email decoded from the id_token JWT's claims, plan from `auth_mode`).
+fn codex_identity(dir: &std::path::Path) -> Result<Value, String> {
+    let status = std::process::Command::new("codex")
+        .args(["login", "status"])
+        .env("CODEX_HOME", dir)
+        .output()
+        .map_err(|e| format!("codex login status: {e}"))?;
+    let text = String::from_utf8_lossy(&status.stdout);
+    if !text.to_lowercase().contains("logged in") {
+        return Err("login did not complete — codex is not authenticated".into());
+    }
+    let auth: Value = std::fs::read(dir.join("auth.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(json!({}));
+    let email = auth["tokens"]["id_token"].as_str().and_then(jwt_email).unwrap_or_default();
+    let plan = auth["auth_mode"].as_str().unwrap_or("chatgpt").to_string();
+    Ok(json!({ "loggedIn": true, "email": email, "plan": plan }))
+}
+
+/// Decode a JWT's payload (middle segment, base64url) and return its `email` claim, if any. The token
+/// is never verified or used for auth here — only read for a display string.
+fn jwt_email(jwt: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("email").and_then(Value::as_str).map(str::to_string)
 }
 
 /// `PUT /api/accounts/:id/ai/rotate` — `{rotate: bool}`: cycle across the account's connections per
@@ -3505,7 +3557,7 @@ async fn ai_answer_comment(app: &App, key: &str, pr_num: u64, path: &str, line: 
         }
     }
     if code.trim().is_empty() { return None; }
-    let (cred, _bundle) = resolve_ai_credential(app, key, None);
+    let (cred, _bundle) = resolve_ai_credential(app, key, None).await;
     let req = hull_plugin::AskRequest {
         repo: key.to_string(), path: path.to_string(), line, line_end: line_end.max(line), code, question: question.to_string(),
         ai_credential: cred,
@@ -3658,7 +3710,7 @@ fn next_ai_index(owner: &str, n: usize) -> usize {
 /// Resolve which AI backend to use for a request touching `repo`: the repo's owning org's connected
 /// credentials first, else the `fallback_actor`'s personal-account connections. With rotation on for
 /// the owner, cycle across its connections; else use the first. `None` → the process-configured default.
-fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&str>) -> (Option<hull_plugin::AiCredential>, Option<agentsession::BundleGuard>) {
+async fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&str>) -> (Option<hull_plugin::AiCredential>, Option<agentsession::BundleGuard>) {
     let tenant = repo.split_once('/').map(|(t, _)| t).unwrap_or(repo);
     let mut owner: Option<String> = None;
     let mut conns: Vec<hull_core::AiConnection> = Vec::new();
@@ -3682,7 +3734,7 @@ fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&str>) ->
             // Per-user session: decrypt this user's bundle into a throwaway dir the CLI runs against;
             // the guard wipes it after. If it won't open, run no agent (degrade to the default
             // reviewer) rather than silently using the wrong identity (the host login).
-            match agentsession::open(session) {
+            match agentsession::open(session).await {
                 Ok(g) => { let d = g.dir_string(); (Some(command.clone()), Some(d), Some(g)) }
                 Err(e) => {
                     eprintln!("hull: agent bundle for session {session} won't open ({e}); skipping agent backend");
@@ -3780,7 +3832,7 @@ async fn perform_auto_review(
         let n = semantic.moves.len();
         (Verdict::Approve, Vec::new(), Some(ledger), format!("pure move — {n} file{} relocated with byte-identical content (verified by content address); no behavioral review needed", if n == 1 { "" } else { "s" }), false)
     } else {
-    let (cred, _bundle) = resolve_ai_credential(&app, &key, Some(&pr.author));
+    let (cred, _bundle) = resolve_ai_credential(&app, &key, Some(&pr.author)).await;
     let review_req = hull_plugin::ReviewRequest {
         repo: key.clone(),
         change: change.clone(),
@@ -3991,7 +4043,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
     let change = pr.changes.first().cloned()?;
     let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
     let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
-    let (cred, _bundle) = resolve_ai_credential(&app, &key, Some(&pr.author));
+    let (cred, _bundle) = resolve_ai_credential(&app, &key, Some(&pr.author)).await;
     let req = hull_plugin::FixRequest {
         repo: key.clone(),
         change,

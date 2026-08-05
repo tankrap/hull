@@ -15,8 +15,9 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 /// Root holding every user's bundle: `HULL_AGENT_SESSIONS` or `<HULL_DATA_DIR|~/.hull>/agent-sessions`.
 pub fn sessions_root() -> PathBuf {
@@ -77,39 +78,59 @@ pub fn remove(session: &str) {
     let _ = std::fs::remove_dir_all(dir_for(session));
 }
 
-/// Seal the plaintext staging dir into the encrypted at-rest bundle, then wipe the plaintext. Called
-/// once a login has written credentials into `dir_for(session)`.
-pub fn seal(session: &str) -> Result<(), String> {
-    let dir = dir_for(session);
-    if !dir.is_dir() {
-        return Err("nothing to seal (no staging dir)".into());
-    }
-    let tar_gz = pack(&dir).map_err(|e| format!("pack bundle: {e}"))?;
+/// Seal an arbitrary plaintext dir into the encrypted at-rest bundle for `session` (atomic rename).
+fn seal_dir(session: &str, src: &Path) -> Result<(), String> {
+    let tar_gz = pack(src).map_err(|e| format!("pack bundle: {e}"))?;
     let sealed = encrypt(&tar_gz).map_err(|e| format!("encrypt bundle: {e}"))?;
     let path = enc_path(session);
     let tmp = path.with_extension("enc.tmp");
     std::fs::write(&tmp, &sealed).map_err(|e| format!("write bundle: {e}"))?;
     harden_file(&tmp);
     std::fs::rename(&tmp, &path).map_err(|e| format!("commit bundle: {e}"))?;
+    Ok(())
+}
+
+/// Seal the plaintext *staging* dir into the encrypted at-rest bundle, then wipe it. Called once a
+/// login has written credentials into `dir_for(session)`.
+pub fn seal(session: &str) -> Result<(), String> {
+    let dir = dir_for(session);
+    if !dir.is_dir() {
+        return Err("nothing to seal (no staging dir)".into());
+    }
+    seal_dir(session, &dir)?;
     let _ = std::fs::remove_dir_all(&dir); // drop the plaintext staging copy
     Ok(())
 }
 
-/// Decrypt a sealed bundle into a throwaway private directory for use as the CLI's config home. The
-/// returned guard wipes that directory when dropped, so plaintext credentials never outlive the run.
-pub fn open(session: &str) -> Result<BundleGuard, String> {
+/// Per-session lock: serialize runs against the same bundle so two never refresh from — and rotate —
+/// the same refresh token concurrently (a double-spend that would invalidate the credential).
+fn lock_for(session: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    map.lock().unwrap().entry(session.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+}
+
+/// Decrypt a sealed bundle into a throwaway private directory for use as the CLI's config home,
+/// holding the per-session lock for the duration. The returned guard, on drop, **re-seals** the dir
+/// (persisting any credential refresh the run wrote — access/refresh tokens rotate) and then wipes it,
+/// so plaintext credentials never outlive the run and a rotated refresh token is never lost.
+pub async fn open(session: &str) -> Result<BundleGuard, String> {
+    let lock = lock_for(session).lock_owned().await;
     let sealed = std::fs::read(enc_path(session)).map_err(|e| format!("read bundle: {e}"))?;
     let tar_gz = decrypt(&sealed).map_err(|e| format!("decrypt bundle: {e}"))?;
     let dir = sessions_root().join(".open").join(uuid::Uuid::new_v4().simple().to_string());
     std::fs::create_dir_all(&dir).map_err(|e| format!("open dir: {e}"))?;
     harden(&dir);
     unpack(&tar_gz, &dir).map_err(|e| format!("unpack bundle: {e}"))?;
-    Ok(BundleGuard { dir })
+    Ok(BundleGuard { session: session.to_string(), dir, _lock: lock })
 }
 
-/// A live, decrypted bundle directory; wiped from disk on drop.
+/// A live, decrypted bundle directory; re-sealed (to persist token refresh) then wiped on drop, with
+/// the per-session lock held throughout.
 pub struct BundleGuard {
+    session: String,
     dir: PathBuf,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl BundleGuard {
@@ -120,6 +141,14 @@ impl BundleGuard {
 
 impl Drop for BundleGuard {
     fn drop(&mut self) {
+        // Persist whatever the run left (refreshed access token / rotated refresh token) — unless the
+        // dir was somehow emptied, in which case keep the last good sealed bundle rather than clobber.
+        let populated = std::fs::read_dir(&self.dir).map(|mut it| it.next().is_some()).unwrap_or(false);
+        if populated {
+            if let Err(e) = seal_dir(&self.session, &self.dir) {
+                eprintln!("hull: could not re-seal agent bundle {}: {e}", self.session);
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -216,14 +245,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seal_open_roundtrip_wipes_plaintext() {
+    fn seal_open_roundtrip_wipes_plaintext_and_persists_refresh() {
         let root = std::env::temp_dir().join(format!("hull-agent-test-{}", uuid::Uuid::new_v4().simple()));
         std::env::set_var("HULL_AGENT_SESSIONS", &root);
         std::env::set_var("HULL_SESSION_KEY", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        let rt = tokio::runtime::Runtime::new().unwrap();
 
         // A login writes a credential file into the staging dir…
         let (session, dir) = provision().unwrap();
-        std::fs::write(dir.join(".credentials.json"), b"{\"token\":\"secret-xyz\"}").unwrap();
+        std::fs::write(dir.join("auth.json"), b"{\"refresh_token\":\"secret-xyz\"}").unwrap();
         std::fs::create_dir_all(dir.join("nested")).unwrap();
         std::fs::write(dir.join("nested/state"), b"deep").unwrap();
 
@@ -235,15 +265,22 @@ mod tests {
         let raw = std::fs::read(sessions_root().join(format!("{session}.enc"))).unwrap();
         assert!(!raw.windows(10).any(|w| w == b"secret-xyz"), "secret must not appear in the sealed bytes");
 
-        // Opening decrypts into a throwaway dir with identical contents; dropping the guard wipes it.
+        // A run opens the bundle, mutates a credential (a token refresh), then drops the guard.
         let open_dir;
         {
-            let g = open(&session).unwrap();
+            let g = rt.block_on(open(&session)).unwrap();
             open_dir = g.dir_string();
-            assert_eq!(std::fs::read(PathBuf::from(&open_dir).join(".credentials.json")).unwrap(), b"{\"token\":\"secret-xyz\"}");
+            assert_eq!(std::fs::read(PathBuf::from(&open_dir).join("auth.json")).unwrap(), b"{\"refresh_token\":\"secret-xyz\"}");
             assert_eq!(std::fs::read(PathBuf::from(&open_dir).join("nested/state")).unwrap(), b"deep");
+            std::fs::write(PathBuf::from(&open_dir).join("auth.json"), b"{\"refresh_token\":\"rotated-abc\"}").unwrap();
         }
         assert!(!PathBuf::from(&open_dir).exists(), "decrypted dir must be wiped when the guard drops");
+
+        // Re-opening sees the rotated token (drop re-sealed it), proving refresh persists.
+        {
+            let g = rt.block_on(open(&session)).unwrap();
+            assert_eq!(std::fs::read(PathBuf::from(&g.dir_string()).join("auth.json")).unwrap(), b"{\"refresh_token\":\"rotated-abc\"}");
+        }
 
         remove(&session);
         assert!(!exists(&session));

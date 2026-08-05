@@ -352,10 +352,12 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [agentBusy, setAgentBusy] = useState("");
-  // An in-flight per-user subscription login (setup-token relay): the browser opens `url`, then the
-  // user pastes the code back to complete it.
-  const [login, setLogin] = useState<{ provider: string; label: string; session: string; url: string } | null>(null);
+  // An in-flight per-user subscription login. Two shapes: paste-code (Claude — user copies a code off
+  // the approval page and pastes it back) or device (Codex — user enters `userCode` on the site and we
+  // poll for approval).
+  const [login, setLogin] = useState<{ provider: string; label: string; session: string; url: string; needsCode: boolean; userCode: string | null } | null>(null);
   const [code, setCode] = useState("");
+  const [waiting, setWaiting] = useState(false);
   const load = () => { fetch(`/api/accounts/${enc(accountId)}/ai`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) { setConns(d.connections || []); setRotate(!!d.rotate); } }).catch(() => {}); };
   useEffect(load, [accountId]); // eslint-disable-line
   useEffect(() => { fetch(`/api/ai/agents`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) setAgents(d.agents || []); }).catch(() => {}); }, [accountId]); // eslint-disable-line
@@ -377,18 +379,40 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
     if (!r.ok) { uiAlert(await r.text()); return; }
     const d = await r.json();
     setCode("");
-    setLogin({ provider: kind, label: agentLabel, session: d.session, url: d.login_url });
+    setLogin({ provider: kind, label: agentLabel, session: d.session, url: d.login_url, needsCode: !!d.needs_code, userCode: d.user_code ?? null });
+  };
+  // One completion attempt. Returns "done" | "pending" | "error" so both the paste button and the
+  // device-flow poller can share it.
+  const attemptComplete = async (): Promise<"done" | "pending" | "error"> => {
+    if (!login) return "error";
+    const r = await postPath("agent/complete", { provider: login.provider, session: login.session, code: code.trim() });
+    if (r.status === 202) return "pending";
+    if (r.ok) { setLogin(null); setCode(""); setWaiting(false); load(); return "done"; }
+    uiAlert(await r.text());
+    return "error";
   };
   const completeAgentLogin = async () => {
     if (!login || !code.trim()) return;
     setBusy(true);
-    const r = await postPath("agent/complete", { provider: login.provider, session: login.session, code: code.trim() });
+    await attemptComplete();
     setBusy(false);
-    if (r.ok) { setLogin(null); setCode(""); load(); } else uiAlert(await r.text());
   };
+  // Device flow (Codex): once the user has the code, poll for approval every few seconds.
+  useEffect(() => {
+    if (!login || login.needsCode || !waiting) return;
+    let live = true;
+    const tick = async () => {
+      const s = await attemptComplete();
+      if (!live) return;
+      if (s === "pending") timer = window.setTimeout(tick, 3000);
+      else setWaiting(false);
+    };
+    let timer = window.setTimeout(tick, 2000);
+    return () => { live = false; window.clearTimeout(timer); };
+  }, [login, waiting]); // eslint-disable-line
   const cancelAgentLogin = async () => {
     if (login) await postPath("agent/cancel", { session: login.session }).catch(() => {});
-    setLogin(null); setCode("");
+    setLogin(null); setCode(""); setWaiting(false);
   };
   const remove = async (id: string) => {
     if (!(await uiConfirm({ title: "Remove connection", body: "Disconnect this AI backend from the account?", danger: true, confirmLabel: "Remove" }))) return;
@@ -433,19 +457,40 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
           {login && (
             <div className="grid gap-3 pt-3 border-t border-rule3">
               <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">Sign in to {login.label}</span>
-              <ol className="grid gap-2.5 text-[13px] text-body">
-                <li className="flex items-center gap-2.5">
-                  <span className="w-5 h-5 flex-none grid place-items-center rounded-full bg-rule2 text-[11px] font-semibold text-muted tabular-nums">1</span>
-                  <a href={login.url} target="_blank" rel="noreferrer"><Button size="sm">Open sign-in page ↗</Button></a>
-                  <span className="text-[12px] text-muted">approve access, then copy the code shown</span>
-                </li>
-                <li className="flex items-center gap-2.5">
-                  <span className="w-5 h-5 flex-none grid place-items-center rounded-full bg-rule2 text-[11px] font-semibold text-muted tabular-nums">2</span>
-                  <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="paste code here" autoFocus className="box-border flex-1 min-w-[200px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" onKeyDown={(e) => { if (e.key === "Enter") completeAgentLogin(); }} />
-                  <Button size="sm" disabled={!code.trim() || busy} onClick={completeAgentLogin}>{busy ? "Verifying…" : "Finish"}</Button>
-                  <button onClick={cancelAgentLogin} className="text-[12px] text-muted hover:text-fault-text">Cancel</button>
-                </li>
-              </ol>
+              {login.needsCode ? (
+                // Paste-code flow (Claude): approve, copy the code, paste it back.
+                <ol className="grid gap-2.5 text-[13px] text-body">
+                  <li className="flex items-center gap-2.5">
+                    <span className="w-5 h-5 flex-none grid place-items-center rounded-full bg-rule2 text-[11px] font-semibold text-muted tabular-nums">1</span>
+                    <a href={login.url} target="_blank" rel="noreferrer"><Button size="sm">Open sign-in page ↗</Button></a>
+                    <span className="text-[12px] text-muted">approve access, then copy the code shown</span>
+                  </li>
+                  <li className="flex items-center gap-2.5">
+                    <span className="w-5 h-5 flex-none grid place-items-center rounded-full bg-rule2 text-[11px] font-semibold text-muted tabular-nums">2</span>
+                    <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="paste code here" autoFocus className="box-border flex-1 min-w-[200px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" onKeyDown={(e) => { if (e.key === "Enter") completeAgentLogin(); }} />
+                    <Button size="sm" disabled={!code.trim() || busy} onClick={completeAgentLogin}>{busy ? "Verifying…" : "Finish"}</Button>
+                    <button onClick={cancelAgentLogin} className="text-[12px] text-muted hover:text-fault-text">Cancel</button>
+                  </li>
+                </ol>
+              ) : (
+                // Device flow (Codex): enter the code on the site; we poll for approval.
+                <ol className="grid gap-2.5 text-[13px] text-body">
+                  <li className="flex items-center gap-2.5">
+                    <span className="w-5 h-5 flex-none grid place-items-center rounded-full bg-rule2 text-[11px] font-semibold text-muted tabular-nums">1</span>
+                    <a href={login.url} target="_blank" rel="noreferrer"><Button size="sm">Open sign-in page ↗</Button></a>
+                    {login.userCode && <span className="text-[12px] text-muted">and enter code <code className="px-1.5 py-0.5 rounded bg-rule2 text-ink font-semibold tracking-[0.06em] select-all">{login.userCode}</code></span>}
+                  </li>
+                  <li className="flex items-center gap-2.5">
+                    <span className="w-5 h-5 flex-none grid place-items-center rounded-full bg-rule2 text-[11px] font-semibold text-muted tabular-nums">2</span>
+                    {waiting ? (
+                      <span className="text-[12.5px] text-muted inline-flex items-center gap-2"><span className="w-3.5 h-3.5 rounded-full border-2 border-rule2 border-t-body animate-spin" /> Waiting for you to approve…</span>
+                    ) : (
+                      <Button size="sm" onClick={() => setWaiting(true)}>I’ve entered the code</Button>
+                    )}
+                    <button onClick={cancelAgentLogin} className="text-[12px] text-muted hover:text-fault-text ml-1">Cancel</button>
+                  </li>
+                </ol>
+              )}
             </div>
           )}
           <div className="grid gap-2 pt-1 border-t border-rule3">
