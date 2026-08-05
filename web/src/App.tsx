@@ -3167,13 +3167,15 @@ type PierreAnno = { side: "additions" | "deletions"; lineNumber: number; metadat
 // One file's diff, rendered by @pierre/diffs (Shiki, GitHub-style context collapse). Findings and
 // comments ride inline as line annotations; hovering a line reveals a gutter "+" that opens a comment
 // there. This is the whole diff surface — no bespoke hunk machinery on top of it.
-function PierreReviewDiff({ patch, theme, lineAnnotations, renderAnnotation, onComment, onSelectRange, selectedLines }: {
+function PierreReviewDiff({ patch, filePath, theme, lineAnnotations, renderAnnotation, onComment, onSelectRange, loadFile, selectedLines }: {
   patch: string;
+  filePath: string;
   theme: string;
   lineAnnotations: PierreAnno[];
   renderAnnotation: (a: PierreAnno) => React.ReactNode;
   onComment: (from: number, to?: number) => void;
   onSelectRange?: (from: number, to: number) => void;
+  loadFile?: () => Promise<{ old: string | null; new: string | null }>;
   selectedLines?: { start: number; end: number; side?: "additions" | "deletions" } | null;
 }) {
   return (
@@ -3201,6 +3203,12 @@ function PierreReviewDiff({ patch, theme, lineAnnotations, renderAnnotation, onC
               onLineNumberClick: (p: { lineNumber: number }) => onComment(p.lineNumber),
               enableLineSelection: true,
               onLineSelected: (r: { start: number; end: number } | null) => { if (r && onSelectRange) onSelectRange(Math.min(r.start, r.end), Math.max(r.start, r.end)); },
+              // Clicking a "N unmodified lines" band fetches the full file so pierre can reveal the
+              // hidden context (the patch only carries the hunks' few lines).
+              ...(loadFile ? { loadDiffFiles: async () => {
+                const { old, new: nw } = await loadFile();
+                return { oldFile: old != null ? { name: filePath, contents: old } : null, newFile: nw != null ? { name: filePath, contents: nw } : null };
+              } } : {}),
               unsafeCSS: "[data-gutter]{background:var(--paper);border-right:1px solid var(--rule2)}[data-line-number-content]{padding-right:14px;opacity:.85;cursor:pointer}[data-line-number-content]:hover{color:var(--steel);text-decoration:underline}",
             } as never} />
         </div>
@@ -4106,6 +4114,12 @@ function ReviewPage({
                   </div>
                 ) : openDiff.has(f.path) ? (
                   <div>
+                    {/* Always-reachable hide bar — sticks to the top of the diff so you can collapse it
+                        without scrolling to the bottom of a long file. */}
+                    <div className="sticky top-0 z-[2] flex items-center justify-between gap-2 mb-1.5 px-3 py-1.5 rounded-ctl bg-paper border border-rule2">
+                      <span className="text-[12px] text-muted tabular-nums">{f.hunks.reduce((a, h) => a + h.lines.length, 0)} lines · drag line numbers to select a chunk</span>
+                      <button onClick={() => setOpenDiff((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] font-medium text-muted hover:text-ink inline-flex items-center gap-1">Hide diff<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>
+                    </div>
                     {selRange?.path === f.path && selRange.to > selRange.from && !commenting && (
                       <div className="mb-1.5 flex items-center justify-between gap-2 px-3 py-1.5 rounded-ctl bg-steel-wash/60 border border-steel/20">
                         <span className="text-[12px] text-body">Selected lines <b className="tabular-nums">{selRange.from}–{selRange.to}</b></span>
@@ -4115,10 +4129,16 @@ function ReviewPage({
                         </div>
                       </div>
                     )}
-                    <PierreReviewDiff patch={toPatch(f)} theme={theme}
+                    <PierreReviewDiff patch={toPatch(f)} filePath={f.path} theme={theme}
                       lineAnnotations={annos} renderAnnotation={renderAnno}
                       onComment={(from, to) => openLineComment(f.path, from, to)}
                       onSelectRange={(from, to) => setSelRange({ path: f.path, from, to })}
+                      loadFile={changeId ? async () => {
+                        const r = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/file?path=${encodeURIComponent(f.path)}`, { headers: authHeaders() });
+                        if (!r.ok) throw new Error("could not load full file");
+                        const d = await r.json();
+                        return { old: d.old ?? null, new: d.new ?? null };
+                      } : undefined}
                       selectedLines={selLn != null ? { start: selLn, end: selLn, side: "additions" } : null} />
                     <div className="flex justify-end pt-1.5">
                       <button onClick={() => setOpenDiff((s) => { const n = new Set(s); n.delete(f.path); return n; })} className="text-[12px] text-muted hover:text-ink inline-flex items-center gap-1">Hide diff<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15" /></svg></button>

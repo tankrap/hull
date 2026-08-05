@@ -832,6 +832,34 @@ impl RepoHost {
     }
 
     /// The per-file diff of a change vs its first parent — line hunks + a semantic-ops summary.
+    /// The full old + new text of one file at a change — powers the diff viewer's "expand unmodified
+    /// lines" (pierre's `loadDiffFiles`), which needs the whole file, not just the patch context.
+    /// `None` text = the file is absent on that side (a pure add or delete). Returns `None` if the
+    /// change/file can't be resolved or the blob is over the diff cap.
+    pub fn file_pair(&self, tenant: &str, repo: &str, hex: &str, path: &str) -> Option<(Option<String>, Option<String>)> {
+        let store = self.store(tenant, repo, false).ok().flatten()?;
+        let cid = ObjectId::from_hex(hex)?;
+        let Some(Object::Change(change)) = store.get(&cid).ok().flatten() else { return None };
+        let mut head = HashMap::new();
+        flatten_tree(&store, change.tree, "", &mut head, 0);
+        let mut parent = HashMap::new();
+        if let Some(p) = change.parents.first() {
+            if let Some(Object::Change(pc)) = store.get(p).ok().flatten() {
+                flatten_tree(&store, pc.tree, "", &mut parent, 0);
+            }
+        }
+        let read = |id: &ObjectId| -> Option<String> {
+            match store.get(id).ok().flatten() {
+                Some(Object::Blob(b)) if b.len() <= MAX_BLOB_FOR_DIFF => Some(String::from_utf8_lossy(&b).into_owned()),
+                _ => None,
+            }
+        };
+        let old = parent.get(path).and_then(read);
+        let new = head.get(path).and_then(read);
+        if old.is_none() && new.is_none() { return None; }
+        Some((old, new))
+    }
+
     pub fn diff(&self, tenant: &str, repo: &str, hex: &str) -> Vec<FileDiff> {
         let Ok(Some(store)) = self.store(tenant, repo, false) else { return Vec::new() };
         let Some(cid) = ObjectId::from_hex(hex) else { return Vec::new() };

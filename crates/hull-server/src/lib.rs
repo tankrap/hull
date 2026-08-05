@@ -348,6 +348,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/comments", get(comments_list).post(create_comment))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
+        .route("/api/repos/:tenant/:repo/change/:id/file", get(change_file))
         .route("/api/repos/:tenant/:repo/change/:id/semantic", get(change_semantic))
         .route("/api/repos/:tenant/:repo/change/:id/ledger", get(change_ledger))
         .route("/api/repos/:tenant/:repo/change/:id/claims/:claim/resolve", post(resolve_claim))
@@ -2051,6 +2052,23 @@ async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(Strin
 /// semantic-operations summary — the review's diff viewer.
 async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
     Json(json!({ "files": app.repos.diff(&tenant, &repo, &id) }))
+}
+
+/// Full old + new text of one file at a change (`GET …/change/:id/file?path=…`). The diff viewer
+/// calls this to *expand unmodified lines* — the patch alone only carries the hunks' context, so
+/// pierre needs the whole file to reveal the rest. `null` on either side = a pure add or delete.
+async fn change_file(
+    State(app): State<App>,
+    Path((tenant, repo, id)): Path<(String, String, String)>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(path) = q.get("path").map(|s| s.as_str()).filter(|s| !s.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    };
+    match app.repos.file_pair(&tenant, &repo, &id, path) {
+        Some((old, new)) => Json(json!({ "path": path, "old": old, "new": new })).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such file in this change").into_response(),
+    }
 }
 
 /// The **content-addressed semantic summary** of a change (`GET …/change/:id/semantic`, B1): files
