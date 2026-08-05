@@ -247,20 +247,20 @@ const TokenKpis = ({ tokens, scope }: { tokens?: { in: number; out: number; seri
   if (!tokens || tokens.in + tokens.out === 0) return null;
   const series = tokens.series ?? [];
   const kpi = (label: string, value: number, pts: number[], color: string) => (
-    <div className="flex-1 min-w-[180px] rounded-ctl border border-rule2 bg-paper/30 px-4 py-3">
+    <div className="flex-1 min-w-[160px] rounded-ctl border border-rule2 bg-paper/30 px-3.5 py-2.5">
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-[11px] font-semibold uppercase tracking-[0.05em] text-muted">{label}</span>
-        <span className="text-[20px] font-semibold tabular-nums" style={{ color }} title={value.toLocaleString()}>{fmtNum(value)}</span>
+        <span className="text-[17px] font-semibold tabular-nums" style={{ color }} title={value.toLocaleString()}>{fmtNum(value)}</span>
       </div>
-      <div className="mt-2"><Sparkline points={pts} color={color} /></div>
+      <div className="mt-1.5"><Sparkline points={pts} color={color} h={24} /></div>
     </div>
   );
   return (
     <Card>
       <SectionHeader label="Token usage" right={<span className="text-[12px] text-muted">agent sessions behind {scope} · last year</span>} />
-      <div className="px-5 py-4 flex flex-wrap gap-3">
-        {kpi("Tokens in", tokens.in, series.map((s) => s.in), "var(--dim)")}
-        {kpi("Tokens out", tokens.out, series.map((s) => s.out), "var(--steel)")}
+      <div className="px-5 py-3.5 flex flex-wrap gap-3">
+        {kpi("in", tokens.in, series.map((s) => s.in), "var(--dim)")}
+        {kpi("out", tokens.out, series.map((s) => s.out), "var(--steel)")}
       </div>
     </Card>
   );
@@ -1790,6 +1790,7 @@ export function App() {
                   <div className="px-6 py-5"><Markdown text={profileReadme || "_This README is empty._"} linkBase={`/${encodeURIComponent(me?.handle ?? "")}/${encodeURIComponent(me?.handle ?? "")}`} className="text-[14px] text-body leading-[1.6]" /></div>
                 </Card>
               )}
+              <TokenKpis tokens={profileStats?.tokens} scope="your changes" />
               <Card>
                 <SectionHeader label={`${profileStats?.total ?? 0} contribution${(profileStats?.total ?? 0) === 1 ? "" : "s"} in the last year`} />
                 <div className="px-5 py-4">
@@ -1813,7 +1814,6 @@ export function App() {
                   </div>
                 </div>
               </Card>
-              <TokenKpis tokens={profileStats?.tokens} scope="your changes" />
             </div>
           )}
 
@@ -2412,6 +2412,7 @@ export function App() {
                       <div className="px-6 py-5"><Markdown text={orgReadme || "_This README is empty._"} linkBase={`/${encodeURIComponent(oHandle)}/${encodeURIComponent(oHandle)}`} className="text-[14px] text-body leading-[1.6]" /></div>
                     </Card>
                   )}
+                  <TokenKpis tokens={orgStats?.tokens} scope={`${oHandle}'s repos`} />
                   <Card>
                     <SectionHeader label={`${orgStats?.total ?? 0} contribution${(orgStats?.total ?? 0) === 1 ? "" : "s"} in the last year`} />
                     <div className="px-5 py-4">
@@ -2430,7 +2431,6 @@ export function App() {
                       )}
                     </div>
                   </Card>
-                  <TokenKpis tokens={orgStats?.tokens} scope={`${oHandle}'s repos`} />
                 </div>
               )}
 
