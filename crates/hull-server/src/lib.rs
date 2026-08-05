@@ -346,6 +346,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/artifacts/:id", get(get_artifact))
         .route("/api/repos/:tenant/:repo/comments", get(comments_list).post(create_comment))
+        .route("/api/repos/:tenant/:repo/comments/:id", axum::routing::delete(delete_comment))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
         .route("/api/repos/:tenant/:repo/change/:id/file", get(change_file))
@@ -3223,6 +3224,24 @@ async fn create_comment(
         }
     }
     (StatusCode::CREATED, Json(json!({ "comment": comment }))).into_response()
+}
+
+/// Delete a comment (`DELETE …/comments/:id`). Only the comment's **author** or a repo **owner/admin**
+/// may delete it — you can't erase someone else's words.
+async fn delete_comment(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let Some(comment) = app.store.comments(&key).into_iter().find(|c| c.id == id) else {
+        return (StatusCode::NOT_FOUND, "no such comment").into_response();
+    };
+    if comment.author != actor.id && !is_repo_admin(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only the comment's author or a repo owner/admin can delete it").into_response();
+    }
+    let removed = app.store.remove_comment(&key, &id);
+    Json(json!({ "deleted": removed, "id": id })).into_response()
 }
 
 /// Build the code context around a commented line, ask the AI reviewer, and return its reply as a

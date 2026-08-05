@@ -224,38 +224,80 @@ const IcoExpand = ({ size = 13 }: { size?: number }) => <Ico size={size} path={<
 
 // Compact large-number format for KPIs: 15021 → 15k, 9952890 → 9.95M.
 const fmtNum = (n: number) => (n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(Math.round(n)));
-// Tiny inline sparkline — a KPI trend line, no chart lib.
-const Sparkline = ({ points, color = "var(--steel)", w = 132, h = 34 }: { points: number[]; color?: string; w?: number; h?: number }) => {
-  if (points.length < 2) return <div style={{ width: w, height: h }} className="grid place-items-center text-[11px] text-faint border border-rule3 rounded-ctl-sm">not enough data yet</div>;
-  const max = Math.max(...points, 1);
-  const step = w / (points.length - 1);
-  const pts = points.map((v, i) => [i * step, h - (v / max) * (h - 4) - 2] as [number, number]);
-  const line = "M" + pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" L");
+// A day's (or bucket's) worth of tokens for the bar chart. `dayEnd` is set only for bucketed bars.
+type TokBar = { day: number; dayEnd?: number; value: number };
+// Mini per-day bar chart — no chart lib. Hovering a bar reveals that day's exact token count.
+const MiniBars = ({ bars, color }: { bars: TokBar[]; color: string }) => {
+  const [hover, setHover] = useState<{ x: number; y: number; label: string; value: number } | null>(null);
+  if (bars.every((b) => b.value === 0)) return <div className="h-[40px] grid place-items-center text-[11px] text-faint">no usage in this range</div>;
+  const max = Math.max(...bars.map((b) => b.value), 1);
+  const fmtDay = (d: number) => new Date(d * 86_400_000).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   return (
-    <svg width="100%" height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" className="block">
-      <path d={`${line} L${w},${h} L0,${h} Z`} fill={color} opacity={0.09} />
-      <path d={line} fill="none" stroke={color} strokeWidth={1.6} strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
-    </svg>
+    <div className="relative flex items-end gap-px h-[40px]">
+      {bars.map((b, i) => (
+        <div key={i} className="flex-1 min-w-px flex items-end h-full cursor-default"
+          onMouseMove={(e) => setHover({ x: e.clientX, y: e.clientY, label: b.dayEnd && b.dayEnd !== b.day ? `${fmtDay(b.day)}–${fmtDay(b.dayEnd)}` : fmtDay(b.day), value: b.value })}
+          onMouseLeave={() => setHover(null)}>
+          <div className="w-full rounded-t-[2px] hover:brightness-110 transition-[filter]" style={{ height: b.value > 0 ? `${Math.max(9, (b.value / max) * 100)}%` : 0, background: color, opacity: b.value > 0 ? 1 : 0 }} />
+        </div>
+      ))}
+      {hover && (
+        <div className="fixed z-[80] pointer-events-none -translate-x-1/2 -translate-y-full" style={{ left: hover.x, top: hover.y - 10 }}>
+          <div className="rounded-ctl-sm bg-surface border border-rule2 shadow-modal px-2.5 py-1.5 text-[11.5px] whitespace-nowrap">
+            <div className="font-semibold tabular-nums" style={{ color }}>{hover.value.toLocaleString()} tokens</div>
+            <div className="text-faint mt-0.5">{hover.label}</div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 };
-// Token-usage KPIs + sparklines — shared by the profile and org Overview. No outer box: the two
-// in/out tiles stand on their own.
+// Token-usage KPIs — shared by the profile and org Overview. Per-day bar charts with a time-range
+// dropdown (above the out box); hovering a box shows the exact total, hovering a bar shows that day.
+const TOK_RANGES: { value: string; label: string; days: number }[] = [
+  { value: "7", label: "Last 7 days", days: 7 },
+  { value: "30", label: "Last 30 days", days: 30 },
+  { value: "90", label: "Last 90 days", days: 90 },
+  { value: "365", label: "Last year", days: 365 },
+];
 const TokenKpis = ({ tokens }: { tokens?: { in: number; out: number; series: { day: number; in: number; out: number }[] } }) => {
+  const [range, setRange] = useState("30");
   if (!tokens || tokens.in + tokens.out === 0) return null;
-  const series = tokens.series ?? [];
-  const kpi = (label: string, value: number, pts: number[], color: string) => (
-    <div className="flex-1 min-w-[160px] rounded-card border border-rule bg-surface px-3.5 py-2.5">
+  const days = TOK_RANGES.find((r) => r.value === range)?.days ?? 30;
+  const today = Math.floor(Date.now() / 86_400_000);
+  const start = today - days + 1;
+  const byDay = new Map((tokens.series ?? []).map((s) => [s.day, s]));
+  // Fill every day in the range (0 where idle), then bucket down to ≤45 bars so long ranges stay legible.
+  const fill = (pick: (s: { in: number; out: number }) => number): TokBar[] => {
+    const raw: TokBar[] = [];
+    for (let d = start; d <= today; d++) { const s = byDay.get(d); raw.push({ day: d, value: s ? pick(s) : 0 }); }
+    const MAX = 45;
+    if (raw.length <= MAX) return raw;
+    const size = Math.ceil(raw.length / MAX);
+    const out: TokBar[] = [];
+    for (let i = 0; i < raw.length; i += size) { const c = raw.slice(i, i + size); out.push({ day: c[0].day, dayEnd: c[c.length - 1].day, value: c.reduce((a, x) => a + x.value, 0) }); }
+    return out;
+  };
+  const barsIn = fill((s) => s.in), barsOut = fill((s) => s.out);
+  const sum = (b: TokBar[]) => b.reduce((a, x) => a + x.value, 0);
+  const kpi = (label: string, total: number, bars: TokBar[], color: string) => (
+    <div className="flex-1 min-w-[180px] rounded-card border border-rule bg-surface px-3.5 py-2.5" title={`${total.toLocaleString()} tokens ${label} · ${TOK_RANGES.find((r) => r.value === range)?.label.toLowerCase()}`}>
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-[11px] font-semibold uppercase tracking-[0.05em] text-muted">{label}</span>
-        <span className="text-[17px] font-semibold tabular-nums" style={{ color }} title={value.toLocaleString()}>{fmtNum(value)}</span>
+        <span className="text-[17px] font-semibold tabular-nums" style={{ color }}>{fmtNum(total)}</span>
       </div>
-      <div className="mt-1.5"><Sparkline points={pts} color={color} h={24} /></div>
+      <div className="mt-1.5"><MiniBars bars={bars} color={color} /></div>
     </div>
   );
   return (
-    <div className="flex flex-wrap gap-4">
-      {kpi("in", tokens.in, series.map((s) => s.in), "var(--dim)")}
-      {kpi("out", tokens.out, series.map((s) => s.out), "var(--steel)")}
+    <div className="grid gap-2">
+      <div className="flex items-center justify-end">
+        <Picker size="sm" width={150} value={range} onChange={setRange} options={TOK_RANGES.map((r) => ({ value: r.value, label: r.label }))} />
+      </div>
+      <div className="flex flex-wrap gap-4">
+        {kpi("in", sum(barsIn), barsIn, "var(--dim)")}
+        {kpi("out", sum(barsOut), barsOut, "var(--steel)")}
+      </div>
     </div>
   );
 };
@@ -2901,7 +2943,7 @@ function ContributionHeatmap({ days }: { days: HeatDay[] }) {
         ))}
       </div>
       <div className="flex items-center gap-4 text-[11.5px] text-muted self-end">
-        <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />you</span>
+        <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />humans</span>
         <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_AGENT[3] }} />agents</span>
       </div>
       {hover && (
@@ -2910,7 +2952,7 @@ function ContributionHeatmap({ days }: { days: HeatDay[] }) {
             <div className="font-semibold text-body">{hover.h + hover.a === 0 ? "No contributions" : `${hover.h + hover.a} contribution${hover.h + hover.a === 1 ? "" : "s"}`}</div>
             {hover.h + hover.a > 0 && (
               <div className="mt-0.5 flex items-center gap-2 text-muted">
-                <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />{hover.h} you</span>
+                <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />{hover.h} human{hover.h === 1 ? "" : "s"}</span>
                 <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-[2px]" style={{ background: HEAT_AGENT[3] }} />{hover.a} agents</span>
               </div>
             )}
@@ -3600,6 +3642,11 @@ function ReviewPage({
     else uiAlert(await res.text());
   };
   const openLineComment = (path: string, from: number, to?: number) => { const t = to ?? from; setCommenting({ path, from, to: t }); setLineDraft(""); };
+  const deleteComment = async (id: string) => {
+    if (!(await uiConfirm({ title: "Delete comment", body: "Delete this comment? This can't be undone.", danger: true, confirmLabel: "Delete" }))) return;
+    const r = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/comments/${encodeURIComponent(id)}`, { method: "DELETE", headers: authHeaders() });
+    if (r.ok) loadThread(); else uiAlert(await r.text());
+  };
   // Press "c" to comment on the currently-selected line(s) — the pierre selection drives it.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -3947,13 +3994,14 @@ function ReviewPage({
           };
           // A line-level review comment, shown under the line it references.
           const lineCommentNote = (c: Cmt) => (
-            <div className="flex gap-2.5 px-4 py-3 bg-surface">
+            <div className="group/cmt flex gap-2.5 px-4 py-3 bg-surface">
               <Avatar id={c.author} handle={handleOf(c.author)} kind={kindOf(c.author)} size={22} />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 text-[12.5px]">
                   <b className={kindOf(c.author) === "agent" ? "text-steel-text" : ""}>{handleOf(c.author)}</b>
                   <span className="text-faint tabular-nums" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
                   <span className="text-[11px] text-faint">on line {c.line}</span>
+                  {me?.id === c.author && <button onClick={() => deleteComment(c.id)} title="Delete this comment" className="ml-auto opacity-0 group-hover/cmt:opacity-100 text-faint hover:text-fault-text transition-opacity"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg></button>}
                 </div>
                 <Markdown text={c.body} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} className="text-[13.5px] text-body mt-0.5" />
               </div>

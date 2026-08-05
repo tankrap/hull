@@ -30,6 +30,8 @@ pub trait Store: Send + Sync {
     fn reviews(&self, repo: &str) -> Vec<Review>;
     fn put_comment(&self, comment: Comment);
     fn comments(&self, repo: &str) -> Vec<Comment>;
+    /// Delete a comment by id. Returns true if one was removed.
+    fn remove_comment(&self, repo: &str, id: &str) -> bool;
     /// Associate an ingested keel session with a change (latest write wins per change).
     fn put_session_record(&self, record: SessionRecord);
     fn session_record(&self, repo: &str, change: &str) -> Option<SessionRecord>;
@@ -151,6 +153,12 @@ impl Store for InMemory {
     }
     fn comments(&self, repo: &str) -> Vec<Comment> {
         self.comments.read().unwrap().iter().filter(|c| c.repo == repo).cloned().collect()
+    }
+    fn remove_comment(&self, repo: &str, id: &str) -> bool {
+        let mut g = self.comments.write().unwrap();
+        let before = g.len();
+        g.retain(|c| !(c.repo == repo && c.id == id));
+        g.len() != before
     }
     fn put_session_record(&self, record: SessionRecord) {
         let mut g = self.sessions.write().unwrap();
@@ -368,6 +376,11 @@ impl Store for FileStore {
     }
     fn comments(&self, repo: &str) -> Vec<Comment> {
         self.inner.read().unwrap().comments.iter().filter(|c| c.repo == repo).cloned().collect()
+    }
+    fn remove_comment(&self, repo: &str, id: &str) -> bool {
+        let mut removed = false;
+        self.mutate(|s| { let before = s.comments.len(); s.comments.retain(|c| !(c.repo == repo && c.id == id)); removed = s.comments.len() != before; });
+        removed
     }
     fn put_session_record(&self, record: SessionRecord) {
         self.mutate(|s| {
