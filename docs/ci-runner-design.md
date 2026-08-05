@@ -185,13 +185,14 @@ than per-node clones (§4.2).
 tightens isolation into a set of MUSTs (§7, §9), and §9.1 roughly doubles dispatch volume for
 test-touching changes while playing directly to step-level memoization's strength (§8).
 
-### 2.1 Four gaps
+### 2.1 Five gaps
 
 | # | Gap | Workaround today | Proposal |
 |---|---|---|---|
 | G1 | **No delta fetch.** `source_url` is whole-tree-or-nothing, and §6 makes it "the *only* fetch path." A one-line change to a 500 MB tree costs a 500 MB transfer on any node that doesn't already hold it. git's incremental fetch — the thing we gave up — was good at exactly this. | Fetch once into an internal content-addressed store, then serve nodes over LAN and cache per node (§4.2, §6.2). Absorbs it inside our fleet; the Hull→Drydock hop still pays full size on every new tree. | Additive, still content-addressed: `GET source_url?since=<tree_id>` returning only differing blobs, or a `…/tree/<id>/manifest` + per-blob fetch so the client asks for what it lacks. Either is a pure addition (§13) and turns cold fetch from O(tree) into O(diff). **This is the highest-value spec change available.** |
 | G2 | **Private repos have no auth story.** §6 defers it; §14.2 already assumes the eventual shape ("single-use, source-scoped token"). Hosted needs it on day one. | Network identity between Drydock and Hull. Fine for one operator, wrong for hosted. | Ship the reserved token now: `fetch_token` + expiry in the dispatch, scoped to this `tree_id`. Consumed by the fetch broker only — §14.2 forbids it entering the sandbox, and our architecture never lets it. |
 | G3 | **No cancellation.** A superseded change, a closed PR, or a verdict reached elsewhere leaves us burning node-minutes on dead work. §9.1 makes this worse: independence-tree jobs are exactly the kind that get invalidated. | Internal supersede only — a newer dispatch for the same lineage cancels older in-flight jobs; jobs self-cancel at their own timeout. | `POST <ci endpoint>/cancel {change, tree_id, reason}`, called by Hull on invalidation. Additive on both sides. |
+| G5 | **Archive verification is a MAY (§6), but Hull caches the result forever.** A conforming runner that skips the re-hash can attach one tree's verdict to another tree's code, and the memo is keyed by `tree_id`. Demonstrated, not theorised: served a different tree's bytes under an advertised `tree_id` and `scripts/fake-ci.py` runs it and reports `green`. It also let Hull's own archiver ship unverifiable tars (followed symlinks) unnoticed until a verifying runner existed. | Drydock verifies unconditionally and treats a mismatch as `errored` — the D§4.2 broker makes it mandatory regardless of what the spec requires of others. | Promote to MUST, with `errored`-not-`red` on mismatch. Exact wording in §15/G5. **Cheap to comply with** — the ids are already content addresses. |
 | G4 | **One verdict, no link, and `errored` is overloaded.** `{status, summary}` gives one sentence and nowhere to click. Worse: §9.1 now assigns **divergent meaning** to `errored` — "no tests" means *self_attested*, but "our node died" means nothing of the sort, and Hull cannot tell them apart. | Encode the distinction in `summary` prose and accept that Hull reads both as escalate-to-human. That direction is fail-safe (escalation, never auto-approval), so it is survivable. | Two optional additive callback fields: `details_url` (log view) and `reason` (`no_tests` \| `timeout` \| `infra` \| `capacity`). Hull's `ci_result` currently reads only `status`/`summary` and drops the rest, so both need a small Hull-side change to persist and render. |
 
 ### 2.2 Two places the spec contradicts or under-specifies itself
@@ -1235,7 +1236,10 @@ Autoscaling is on owned/rented hardware. (The **box-as-node** elastic-capacity o
 pool provisioned by disk-level fork from a cache-pre-baked snapshot — is deferred with the rest of Box;
 if it's ever revisited it's gated on the nested-KVM timing test in §12.1.)
 
-**Spec changes in parallel** (exact proposed wording in the appendix, §15): G1 (delta fetch) is the
+**Spec changes in parallel** (exact proposed wording in the appendix, §15): **G5 (verification as a
+MUST) should land first** — it is a one-paragraph text change, it costs a conforming runner almost
+nothing because the ids are already content addresses, and it is the only one of these whose absence
+lets a *silent* correctness failure reach the memo. G1 (delta fetch) is the
 highest-value addition and should be scoped during M4, when we'll have the numbers to justify it. G2
 (fetch token) before any private repo runs. G4 (`details_url`, `reason`) before M2 ships user-visible
 logs — and `reason` matters more now that §9.1 overloads `errored`. G3 (cancel) whenever Hull-side
@@ -1329,6 +1333,31 @@ that Hull cannot distinguish from an infra flake today. Add to the §7 callback 
 
 Hull's `ci_result` handler must persist and read `reason` for the §9.1 disambiguation; `details_url`
 is pure display. Everything else Hull already ignores as forward-compatible.
+
+**G5 — archive verification becomes a MUST (§6). Correctness-critical; the implementation earned this
+one three separate times.** §6 currently says a runner **MAY** re-hash the extracted tree and confirm
+it reproduces `tree_id`. MAY is too weak given what Hull does with the answer: the memo is keyed by
+`tree_id`, so a conforming-but-unverifying runner can attach one tree's verdict to another tree's
+code, and Hull will cache that green **forever**. Three findings converged on it:
+
+1. Building the broker showed verification is *cheap* — the ids are already content addresses, so it
+   is one blake3 pass over an encoding keel already implements, not a second hashing scheme.
+2. The conformance suite demonstrated the attack concretely: serve the bytes of a *different* tree
+   under the advertised `tree_id` and the spec's own `scripts/fake-ci.py` runs it and reports
+   **`green`** — fully conforming, and precisely the failure content addressing exists to prevent.
+3. Hull's own archiver was silently producing unverifiable archives (symlinks followed, so the tar
+   could never re-hash to its `tree_id`). **A MUST would have caught that on day one**; a MAY meant
+   nothing noticed until a verifying runner existed. That is the strongest argument of the three: the
+   clause protects the *producer* as much as the consumer.
+
+> Replace §6's "a conforming runner **MAY** re-hash…" with: a conforming runner **MUST** verify that
+> the extracted tree re-hashes to `tree_id`, and **MUST** report `errored` (never `red`) on a
+> mismatch — it has not tested anything, so it has nothing to say about the code. Hull **MUST NOT**
+> memoize a verdict from a runner that reports a mismatch.
+
+The `errored`-not-`red` half matters as much as the verification: a mismatch is a statement about the
+transport, and only `green`/`red` are cached, so getting this wrong is how a bad fetch poisons a tree
+permanently.
 
 **G1 — delta fetch (§6). Additive, highest-value.** Add after the `curl … | tar` example:
 
