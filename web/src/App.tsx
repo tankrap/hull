@@ -136,6 +136,7 @@ type Issue = {
   labels: string[];
   resolved_by?: string;
   linked_prs?: string[];
+  edited_unix?: number;
 };
 
 // Deterministic GitHub-style identicon: a symmetric 5×5 pixel pattern (left half mirrored) in a hue
@@ -1669,6 +1670,25 @@ export function App() {
     if (res.ok) loadIssues();
     else uiAlert(await apiError(res));
   };
+  // Inline issue title/body editing (author-only, mirrors comment editing). `editingIssue` is the
+  // number of the issue whose words are being edited, plus the working title/body drafts.
+  const [editingIssue, setEditingIssue] = useState<number | null>(null);
+  const [issueTitleDraft, setIssueTitleDraft] = useState("");
+  const [issueBodyDraft, setIssueBodyDraft] = useState("");
+  const startEditIssue = (it: Issue) => { setEditingIssue(it.number); setIssueTitleDraft(it.title); setIssueBodyDraft(it.body); };
+  const cancelEditIssue = () => { setEditingIssue(null); setIssueTitleDraft(""); setIssueBodyDraft(""); };
+  const saveEditIssue = async (number: number) => {
+    if (!canAct) return uiAlert("Sign in to act.");
+    const title = issueTitleDraft.trim();
+    if (!title) return uiAlert("Title must not be empty.");
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues/${number}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ action: "edit", title, body: issueBodyDraft }),
+    });
+    if (res.ok) { cancelEditIssue(); loadIssues(); }
+    else uiAlert(await apiError(res));
+  };
   // Board column → the issue action that lands a card in it. Every column maps to a supported
   // transition (reopen, or close with a reason), so every column is a valid drop target.
   const boardColAction = (k: string): [string, Record<string, unknown>] | null =>
@@ -2632,16 +2652,32 @@ export function App() {
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
               {issueRepo} · issues
             </button>
-            <div className="flex items-center gap-3 flex-wrap mb-1.5">
+            <div className="group flex items-center gap-3 flex-wrap mb-1.5">
               <StatusBadge kind={it.status.state === "open" ? "running" : "queued"}>{it.status.state === "open" ? "open" : it.status.reason ?? "closed"}</StatusBadge>
-              <h1 className="text-[24px] font-semibold tracking-tight">{it.title}</h1>
+              {editingIssue === it.number
+                ? <input autoFocus value={issueTitleDraft} onChange={(e) => setIssueTitleDraft(e.target.value)} placeholder="Issue title" className={`${modalInput} flex-1 min-w-[240px] !text-[20px] !h-auto py-1.5 font-semibold tracking-tight`} />
+                : <h1 className="text-[24px] font-semibold tracking-tight">{it.title}</h1>}
+              {me?.id === it.author && editingIssue !== it.number && (
+                <button onClick={() => startEditIssue(it)} title="Edit title & description" className="ml-auto inline-flex items-center gap-1 text-[12.5px] text-faint hover:text-steel-text transition-opacity opacity-0 group-hover:opacity-100">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg>Edit
+                </button>
+              )}
             </div>
             <p className="text-[13px] text-muted mb-7">
               <span className="tabular-nums">#{it.number}</span> · opened by <b className={kindOf(it.author) === "agent" ? "text-steel-text" : "text-body"}>{handleOf(it.author)}</b>
+              {it.edited_unix ? <span className="text-faint" title={`edited ${new Date(it.edited_unix * 1000).toLocaleString()}`}> · edited</span> : null}
             </p>
             <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-x-12 gap-y-9">
               <section className="min-w-0 grid gap-6">
-                {it.body ? <Markdown text={it.body} linkBase={`/${encodeURIComponent(tenant)}/${issueRepo}`} className="text-[14px] text-body" /> : <p className="text-[13px] text-muted">no description</p>}
+                {editingIssue === it.number ? (
+                  <div className="grid gap-2">
+                    <RichText value={issueBodyDraft} onChange={setIssueBodyDraft} rows={6} mentions={actors.map((a) => ({ handle: a.handle, kind: a.kind, email: a.email, avatar: <Avatar id={a.id} handle={a.handle} kind={a.kind} size={22} /> }))} onSubmit={() => saveEditIssue(it.number)} linkBase={`/${encodeURIComponent(tenant)}/${issueRepo}`} placeholder="Describe the issue…  (⌘↵ to save)" />
+                    <div className="flex gap-2">
+                      <Button size="sm" disabled={!issueTitleDraft.trim()} onClick={() => saveEditIssue(it.number)}>Save</Button>
+                      <Button size="sm" variant="ghost" onClick={cancelEditIssue}>Cancel</Button>
+                    </div>
+                  </div>
+                ) : it.body ? <Markdown text={it.body} linkBase={`/${encodeURIComponent(tenant)}/${issueRepo}`} className="text-[14px] text-body" /> : <p className="text-[13px] text-muted">no description</p>}
                 {it.code_refs.length > 0 && (
                   <div className="grid gap-2">
                     <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">Code references</span>
