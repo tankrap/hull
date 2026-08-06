@@ -477,7 +477,10 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
         });
     }
     if let Some(addr) = ingress_addr() {
-        ingress::spawn(addr, hub.clone()); // daemons dial in via hull-agent
+        // `HULL_INGRESS_TOKEN`, when set, is required in each daemon's header frame; unset (default)
+        // leaves the ingress open exactly as before.
+        let ingress_token = std::env::var("HULL_INGRESS_TOKEN").ok().filter(|t| !t.is_empty());
+        ingress::spawn(addr, hub.clone(), ingress_token); // daemons dial in via hull-agent
     }
     let store: Arc<dyn Store> = Arc::new(FileStore::open(data_path()));
     eprintln!("hull-server: domain store at {}", data_path().display());

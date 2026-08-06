@@ -16,22 +16,26 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const MAX_FRAME: usize = 1 << 20; // 1 MiB — an event is small; reject anything larger
 
-/// Start the ingress server on `addr` in the background.
-pub fn spawn(addr: SocketAddr, hub: Arc<ActivityHub>) {
+/// Start the ingress server on `addr` in the background. `expected_token` is the shared daemon token
+/// required in each connection's header frame; `None` (the default, `HULL_INGRESS_TOKEN` unset) keeps
+/// the ingress fully open — exactly as before this change.
+pub fn spawn(addr: SocketAddr, hub: Arc<ActivityHub>, expected_token: Option<String>) {
     tokio::spawn(async move {
-        if let Err(e) = serve(addr, hub).await {
+        if let Err(e) = serve(addr, hub, expected_token).await {
             eprintln!("hull: ingress server error: {e}");
         }
     });
 }
 
-async fn serve(addr: SocketAddr, hub: Arc<ActivityHub>) -> Result<(), BoxError> {
+async fn serve(addr: SocketAddr, hub: Arc<ActivityHub>, expected_token: Option<String>) -> Result<(), BoxError> {
     let endpoint = quinn::Endpoint::server(crate::quic::server_config()?, addr)?;
     eprintln!("hull: coordination ingress (QUIC) on {}", endpoint.local_addr()?);
+    let expected_token = Arc::new(expected_token);
     while let Some(incoming) = endpoint.accept().await {
         let hub = hub.clone();
+        let expected_token = expected_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(incoming, hub).await {
+            if let Err(e) = handle_conn(incoming, hub, expected_token.as_deref()).await {
                 eprintln!("hull: ingress connection ended: {e}");
             }
         });
@@ -39,21 +43,14 @@ async fn serve(addr: SocketAddr, hub: Arc<ActivityHub>) -> Result<(), BoxError> 
     Ok(())
 }
 
-// ⚠️ AUTHORIZATION — DEFERRED (authz-hardening, area D). This QUIC ingress is UNAUTHENTICATED: the
-// TLS layer uses a self-signed server cert with `with_no_client_auth` (see `quic::server_config`),
-// and `handle_conn` trusts the `{tenant,repo}` header verbatim — any peer that can reach the socket
-// can publish coordination events into ANY tenant's situation room (spoofing ref moves / merge
-// verdicts). There is **no existing daemon-credential mechanism to require** here today (the
-// `hull-agent` uplink sends no token, and `handle_conn` is handed only the `ActivityHub`, not the
-// auth/token store), so it is documented rather than half-gated.
-//
-// What a correct fix needs: (a) a daemon credential — either QUIC **mTLS** with a per-tenant client
-// cert pinned to a real CA (the `quic.rs` module header already notes a hosted deploy should do this,
-// tying into the NEW-1166 auth work), or (b) an auth token carried in the first `{tenant,repo,token}`
-// header frame, verified against a shared daemon-token store threaded into `serve`/`handle_conn`
-// (which today only receives the hub). Then reject the connection when the credential is
-// missing/invalid or doesn't authorize the claimed `tenant`, before publishing any event.
-async fn handle_conn(incoming: quinn::Incoming, hub: Arc<ActivityHub>) -> Result<(), BoxError> {
+// AUTHORIZATION (authz-hardening, area D). This QUIC ingress supports an optional shared daemon token
+// (`HULL_INGRESS_TOKEN`), threaded from config through `spawn`/`serve` into `handle_conn`. When SET,
+// the first `{tenant,repo,token}` header frame must carry a matching `token` or the connection is
+// rejected before any event is published. When UNSET (the default), the check is a no-op — the header
+// `token` field is ignored and the current tokenless `hull-agent` uplink keeps working, so the wire
+// stays backward-compatible. (A stronger per-tenant QUIC mTLS binding — see `quic.rs` — remains the
+// roadmapped hardening for a multi-tenant hosted deploy; this token is the minimal shared-secret gate.)
+async fn handle_conn(incoming: quinn::Incoming, hub: Arc<ActivityHub>, expected_token: Option<&str>) -> Result<(), BoxError> {
     let conn = incoming.await?;
     let peer = conn.remote_address();
     let mut recv = conn.accept_uni().await?;
@@ -62,6 +59,14 @@ async fn handle_conn(incoming: quinn::Incoming, hub: Arc<ActivityHub>) -> Result
     let hdr: serde_json::Value = serde_json::from_slice(&header)?;
     let tenant = hdr.get("tenant").and_then(serde_json::Value::as_str).unwrap_or("local").to_string();
     let repo = hdr.get("repo").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+
+    // When a daemon token is configured, the header frame must carry a matching `token` before any
+    // event is published. Unset (the default) is a no-op — the header's `token` field is ignored and
+    // the current tokenless daemon keeps working, so this stays backward-compatible with the wire.
+    let presented = hdr.get("token").and_then(serde_json::Value::as_str);
+    if !token_ok(expected_token, presented) {
+        return Err(format!("ingress: rejected uplink for {tenant}/{repo} from {peer}: missing/invalid token").into());
+    }
     eprintln!("hull: ingress uplink for {tenant}/{repo} from {peer}");
 
     while let Some(frame) = read_frame(&mut recv).await? {
@@ -70,6 +75,16 @@ async fn handle_conn(incoming: quinn::Incoming, hub: Arc<ActivityHub>) -> Result
         }
     }
     Ok(())
+}
+
+/// Whether an ingress connection's presented token satisfies the configured expectation. `None`
+/// expected = ingress open to all (the default, `HULL_INGRESS_TOKEN` unset) — always OK. When a token
+/// is expected, the header must carry exactly that value.
+fn token_ok(expected: Option<&str>, presented: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(exp) => presented == Some(exp),
+    }
 }
 
 /// Read one length-prefixed frame (`u32` LE length + payload). `Ok(None)` when the stream ends.
@@ -92,4 +107,21 @@ pub async fn write_frame(send: &mut quinn::SendStream, payload: &[u8]) -> Result
     send.write_all(&(payload.len() as u32).to_le_bytes()).await?;
     send.write_all(payload).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token_ok;
+
+    #[test]
+    fn ingress_token_gate() {
+        // Unset expectation (default): every connection is accepted, with or without a token — the
+        // backward-compatible no-op that keeps the current tokenless daemon working.
+        assert!(token_ok(None, None), "no token configured → open (tokenless daemon)");
+        assert!(token_ok(None, Some("anything")), "no token configured → a stray token is ignored");
+        // Configured: only the exact token is accepted; missing or wrong is rejected.
+        assert!(token_ok(Some("s3cret"), Some("s3cret")), "matching token accepted");
+        assert!(!token_ok(Some("s3cret"), None), "missing token rejected when one is required");
+        assert!(!token_ok(Some("s3cret"), Some("wrong")), "wrong token rejected");
+    }
 }
