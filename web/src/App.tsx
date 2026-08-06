@@ -36,6 +36,22 @@ const uiConfirm = (o: Omit<Extract<ModalReq, { kind: "confirm" }>, "kind">) =>
   new Promise<boolean>((res) => (_pushModal ? _pushModal({ kind: "confirm", ...o }, (v) => res(!!v)) : res(false)));
 const uiAlert = (title: string, body?: string) =>
   new Promise<void>((res) => (_pushModal ? _pushModal({ kind: "alert", title, body }, () => res()) : res()));
+
+// Turn a failed Response into human copy: map the common status codes to a friendly line, and fall
+// back to the server's own message for anything else (validation errors etc. read better raw).
+const FRIENDLY_STATUS: Record<number, string> = {
+  401: "Please sign in again.",
+  403: "You don't have permission to do that.",
+  404: "Not found.",
+  500: "Something went wrong on the server.",
+  502: "Something went wrong on the server.",
+  503: "Something went wrong on the server.",
+};
+async function apiError(res: Response): Promise<string> {
+  if (FRIENDLY_STATUS[res.status]) return FRIENDLY_STATUS[res.status];
+  const text = await res.text().catch(() => "");
+  return text.trim() || "Something went wrong.";
+}
 const sanitizeHandle = (s: string) => s.replace(/\s+/g, "_");
 
 // Compact relative time ("3h ago") from a unix seconds timestamp.
@@ -1111,7 +1127,7 @@ export function App() {
       body: JSON.stringify({ handle: handle.trim(), kind: "human" }),
     });
     if (!res.ok) {
-      uiAlert(await res.text());
+      uiAlert(await apiError(res));
       return;
     }
     const { secret_key } = await res.json();
@@ -1132,7 +1148,7 @@ export function App() {
         body: JSON.stringify({ actor, nonce, signature: bytesToHex(sig) }),
       });
       if (!res.ok) {
-        uiAlert(await res.text());
+        uiAlert(await apiError(res));
         return;
       }
       const { token: t } = await res.json();
@@ -1173,7 +1189,7 @@ export function App() {
         headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
         body: JSON.stringify({ handle: handle.trim(), kind: "agent", child_pub: childPub, scope, delegation_sig: sig }),
       });
-      if (!res.ok) return uiAlert(await res.text());
+      if (!res.ok) return uiAlert(await apiError(res));
       refresh();
       uiAlert(`Agent created, cryptographically delegated by you (Hull never saw this key).\n\nIts secret key — save it, the agent signs in with this:\n\n${bytesToHex(childSk)}`);
     } else {
@@ -1183,7 +1199,7 @@ export function App() {
         headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
         body: JSON.stringify({ handle: handle.trim(), kind: "agent", scope }),
       });
-      if (!res.ok) return uiAlert(await res.text());
+      if (!res.ok) return uiAlert(await apiError(res));
       const d = await res.json();
       refresh();
       uiAlert(`Agent created — Hull signed the delegation on your behalf.\n\nIts secret key — save it, the agent signs in with this:\n\n${d.secret_key ?? "(stored)"}`);
@@ -1294,7 +1310,7 @@ export function App() {
   };
   const saveAccount = async (patch: { username?: string; email?: string }) => {
     const res = await fetch("/api/account", { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
-    if (!res.ok) return uiAlert(await res.text());
+    if (!res.ok) return uiAlert(await apiError(res));
     loadAccount();
     fetch("/api/auth/me", { headers: { authorization: `Bearer ${token}` } }).then((r) => (r.ok ? r.json() : null)).then((m) => setMe(m)).catch(() => {});
   };
@@ -1315,7 +1331,7 @@ export function App() {
   const removePasskey = async (id: string) => {
     if (!(await uiConfirm({ title: "Remove passkey", body: "Remove this passkey?", danger: true, confirmLabel: "Remove" }))) return;
     const res = await fetch(`/api/account/passkeys/${encodeURIComponent(id)}`, { method: "DELETE", headers: { authorization: `Bearer ${token}` } });
-    if (!res.ok) return uiAlert(await res.text());
+    if (!res.ok) return uiAlert(await apiError(res));
     loadAccount();
   };
 
@@ -1339,7 +1355,7 @@ export function App() {
   const reloadAccounts = () => fetch("/api/accounts", { headers: authHeaders() }).then((r) => (r.ok ? r.json() : { accounts: [] })).then((d) => setAccounts(d.accounts ?? [])).catch(() => {});
   const orgApi = async (path: string, method: string, body?: unknown) => {
     const res = await fetch(`/api/accounts/${path}`, { method, headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: body ? JSON.stringify(body) : undefined });
-    if (!res.ok) { uiAlert(await res.text()); return false; }
+    if (!res.ok) { uiAlert(await apiError(res)); return false; }
     return true;
   };
   const addOrgMember = async (accountId: string, ref: { actor?: string; username?: string }, role: string) => {
@@ -1366,7 +1382,7 @@ export function App() {
     const handle = (await uiPrompt({ title: "New organization", label: "handle", placeholder: "e.g. acme", sanitize: sanitizeHandle, check: "account", confirmLabel: "Create" })) ?? "";
     if (!handle.trim()) return;
     const res = await fetch("/api/accounts", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ handle: handle.trim(), kind: "organization" }) });
-    if (!res.ok) return uiAlert(await res.text());
+    if (!res.ok) return uiAlert(await apiError(res));
     await reloadAccounts();
     navigate(`/orgs/${encodeURIComponent(handle.trim())}`);
   };
@@ -1378,7 +1394,7 @@ export function App() {
   const doCreateRepo = async (p: { account: string; name: string; visibility: "public" | "private" | "unlisted"; branch: string }): Promise<boolean> => {
     if (!canAct) { uiAlert("Sign in to act."); return false; }
     const res = await fetch("/api/repos", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ account: p.account, name: sanitizeHandle(p.name), default_branch: p.branch }) });
-    if (!res.ok) { uiAlert(await res.text()); return false; }
+    if (!res.ok) { uiAlert(await apiError(res)); return false; }
     const d = await res.json();
     if (p.visibility !== "public") await fetch(`/api/repos/${encodeURIComponent(d.tenant)}/${encodeURIComponent(d.name)}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ visibility: p.visibility }) });
     navigate(`/${encodeURIComponent(d.tenant)}/${encodeURIComponent(d.name)}`);
@@ -1389,7 +1405,7 @@ export function App() {
     const slash = p.repo.indexOf("/");
     const t = p.repo.slice(0, slash), r = p.repo.slice(slash + 1);
     const res = await fetch(`/api/repos/${encodeURIComponent(t)}/${encodeURIComponent(r)}/issues`, { method: "POST", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify({ title: p.title, author: actingAs, body: p.body, labels: p.labels, assignees: p.assignees }) });
-    if (!res.ok) { uiAlert(await res.text()); return false; }
+    if (!res.ok) { uiAlert(await apiError(res)); return false; }
     navigate(`/${encodeURIComponent(t)}/${encodeURIComponent(r)}`);
     return true;
   };
@@ -1408,7 +1424,7 @@ export function App() {
   // grant. We never list the App's installations, so you can't see or connect an org you don't admin.
   const connectGh = async (acctId: string) => {
     const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/github/connect-url`, { method: "POST", headers: authHeaders() });
-    if (!res.ok) return uiAlert(await res.text());
+    if (!res.ok) return uiAlert(await apiError(res));
     const { url } = await res.json();
     window.location.href = url; // GitHub → /api/github/setup → back here, connected
   };
@@ -1429,7 +1445,7 @@ export function App() {
     setImportBusy(source);
     try {
       const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/repos/import`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify({ source, name: name.trim() }) });
-      if (!res.ok) { uiAlert(await res.text()); return; }
+      if (!res.ok) { uiAlert(await apiError(res)); return; }
       const d = await res.json();
       setImportList(null);
       navigate(`/${encodeURIComponent(d.tenant)}/${encodeURIComponent(d.name)}`);
@@ -1452,7 +1468,7 @@ export function App() {
   const orgAccountFor = (handle: string) => accounts.find((a) => a.handle === handle);
   const saveRepoSettings = async (patch: Partial<{ private: boolean; visibility: "public" | "private" | "unlisted"; require_review_to_land: boolean; author_independence: boolean; default_reviewers: string[]; team_access: { team: string; role: string }[]; labels: RepoLabel[] }>) => {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
-    if (!res.ok) return uiAlert(await res.text());
+    if (!res.ok) return uiAlert(await apiError(res));
     setRepoSettings(await res.json());
   };
 
@@ -1536,7 +1552,7 @@ export function App() {
       body: JSON.stringify({ action, ...(action === "close" ? { reason: "completed" } : {}), ...extra }),
     });
     if (res.ok) loadIssues();
-    else uiAlert(await res.text());
+    else uiAlert(await apiError(res));
   };
   // Issue comment composer mode per target (Comment / Close with comment / Close as not planned / Reopen).
   const [issueMode, setIssueMode] = useState<Record<string, string>>({});
@@ -1558,7 +1574,7 @@ export function App() {
   const loadOrgDefaults = (acctId: string) => fetch(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setOrgDefaults(d)).catch(() => {});
   const saveOrgDefaults = async (acctId: string, patch: Partial<{ visibility: string; require_review_to_land: boolean; labels: RepoLabel[] }>) => {
     const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
-    if (res.ok) setOrgDefaults(await res.json()); else uiAlert(await res.text());
+    if (res.ok) setOrgDefaults(await res.json()); else uiAlert(await apiError(res));
   };
   useEffect(() => { if (orgAccount) { loadTeams(orgAccount.id); loadGh(orgAccount.id); loadOrgDefaults(orgAccount.id); setImportList(null); } }, [orgAccount?.id]);
   useEffect(() => {
@@ -1616,7 +1632,7 @@ export function App() {
       body: JSON.stringify({ tier }),
     });
     if (res.ok) loadAutonomy();
-    else uiAlert(await res.text());
+    else uiAlert(await apiError(res));
   };
   const TIERS: Record<string, string> = {
     t0: "Observe — no autonomous action",
@@ -1691,7 +1707,7 @@ export function App() {
       body: JSON.stringify({ target, body }),
     });
     if (res.ok) { setCommentDraft((d) => ({ ...d, [target]: "" })); loadComments(); }
-    else uiAlert(await res.text());
+    else uiAlert(await apiError(res));
   };
   // The issue discussion thread is a stable top-level component (IssueThread) so typing in its
   // composer doesn't remount and steal focus. This closure just binds the current App state to it.
@@ -1706,7 +1722,7 @@ export function App() {
       body: JSON.stringify({ reviewer }),
     });
     if (res.ok) loadPrs();
-    else uiAlert(await res.text());
+    else uiAlert(await apiError(res));
   };
   const autoReview = async (prNumber: number) => {
     if (!canAct) return uiAlert("Sign in to act.");
@@ -1722,7 +1738,7 @@ export function App() {
         loadReviews();
         loadPrs();
       } else {
-        uiAlert(await res.text());
+        uiAlert(await apiError(res));
       }
     } finally {
       setAutoReviewing(null);
@@ -1737,7 +1753,7 @@ export function App() {
       body: JSON.stringify({ reopen }),
     });
     if (res.ok) loadPrs();
-    else uiAlert(await res.text());
+    else uiAlert(await apiError(res));
   };
   const mergePr = async (number: number, force = false) => {
     if (!canAct) return uiAlert("Sign in to act.");
@@ -1748,7 +1764,7 @@ export function App() {
       body: JSON.stringify({ actor: actingAs, force }),
     });
     if (res.ok) loadPrs();
-    else uiAlert(await res.text());
+    else uiAlert(await apiError(res));
   };
   // What AI capabilities this instance can fulfill — hide AI actions it can't run.
   const [caps, setCaps] = useState<{ ai_fix: boolean; ai_review: boolean }>({ ai_fix: true, ai_review: true });
@@ -1816,7 +1832,7 @@ export function App() {
       <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[440px] max-w-[92vw] bg-surface rounded-[13px] shadow-modal border border-rule animate-ov-in overflow-hidden">
         <div className="px-5 py-3.5 border-b border-rule2 flex items-center justify-between">
           <span className="text-[14.5px] font-semibold">Keyboard shortcuts</span>
-          <span onClick={() => setShowShortcuts(false)} className="text-muted cursor-pointer hover:text-ink">×</span>
+          <button type="button" aria-label="Close" onClick={() => setShowShortcuts(false)} className="text-muted hover:text-ink"><IcoX size={16} /></button>
         </div>
         <div className="px-5 py-4 grid gap-2.5 text-[13px]">
           {([["⌘K  /  /", "Open the command palette"], ["g h", "Go home"], ["g i", "Go to issues"], ["g p", "Go to pull requests"], ["g s", "Go to repo settings"], ["c", "Focus the comment box"], ["?", "Toggle this help"]] as [string, string][]).map(([k, d]) => (
@@ -2048,7 +2064,11 @@ export function App() {
             return (
               <div className="grid gap-4">
                 <div className="flex justify-end"><div className="w-[260px]"><SearchInput placeholder="Find a repository" shortcut="" value={profileRepoQ} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setProfileRepoQ(e.target.value)} /></div></div>
-                {repos.length === 0 && <div className="py-8 text-[13px] text-muted">No repositories yet.</div>}
+                {repos.length === 0 && (
+                  <div className="py-8 text-[13px] text-muted">
+                    No repositories yet.{me && <> <button className="text-steel-text hover:underline" onClick={() => setNewRepoOpen(true)}>Create a repository →</button></>}
+                  </div>
+                )}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   {grid.map((r) => (
                     <button key={`${r.tenant}/${r.repo}`} onClick={() => navigate(`/${encodeURIComponent(r.tenant)}/${encodeURIComponent(r.repo)}`)} className="group text-left bg-surface border border-rule rounded-card p-4 hover:border-ctl hover:shadow-[0_2px_10px_-4px_rgba(15,23,42,0.12)] transition-all">
@@ -2272,11 +2292,23 @@ export function App() {
     </header>
   );
 
+  // A notification's PR/issue lives only in its summary text ("… PR !12", "… issue #7") — the payload
+  // carries no tenant/repo, so we can resolve a target only while a repo is open. Issue-kinds prefer
+  // the issue number (their summary can name both an issue and the PR that closed it).
+  const openNotif = (n: { kind: string; summary: string }) => {
+    setShowNotifs(false);
+    if (view !== "repo") return;
+    const issue = n.summary.match(/#(\d+)/)?.[1];
+    const voyage = n.summary.match(/!(\d+)/)?.[1];
+    if (n.kind.startsWith("issue") && issue) navigate(`${repoBase()}/issues/${issue}`);
+    else if (voyage) navigate(`${repoBase()}/voyages/${voyage}`);
+    else if (issue) navigate(`${repoBase()}/issues/${issue}`);
+  };
   const notifDrawer = (
     <Drawer open={showNotifs} onClose={() => setShowNotifs(false)} title={`inbox · ${handleOf(actingAs)}`}>
       {notifs.length === 0 && <div className="text-[13px] text-muted">nothing yet</div>}
       {notifs.slice(0, 20).map((n, i) => (
-        <div key={`${n.ts}-${n.kind}-${i}`} className="flex items-start gap-2 py-2 border-b border-rule3 last:border-0">
+        <button key={`${n.ts}-${n.kind}-${i}`} onClick={() => openNotif(n)} className="w-full text-left flex items-start gap-2 py-2 border-b border-rule3 last:border-0 -mx-1 px-1 rounded-ctl hover:bg-paper/60 transition-colors">
           <span className={`w-1.5 h-1.5 rounded-full mt-1.5 flex-none ${n.ts > seenTs ? "bg-steel" : "bg-rule"}`} />
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
@@ -2285,9 +2317,8 @@ export function App() {
             </div>
             <div className="text-[12.5px] text-muted mt-0.5">{n.summary}</div>
           </div>
-        </div>
+        </button>
       ))}
-      <div className="text-[11px] text-faint pt-1">via Notifier plugin</div>
     </Drawer>
   );
 
@@ -2463,10 +2494,10 @@ export function App() {
                 {it.code_refs.length > 0 && (
                   <div className="grid gap-2">
                     <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">Code references</span>
-                    {it.code_refs.map((c, i) => {
+                    {it.code_refs.map((c) => {
                       const key = `${it.number}:${c.path}`;
                       return (
-                        <div key={i} className="border border-rule2 rounded-ctl overflow-hidden">
+                        <div key={key} className="border border-rule2 rounded-ctl overflow-hidden">
                           <button className="w-full flex items-center gap-2 px-3 py-2.5 bg-paper hover:bg-surface transition-colors text-left" onClick={() => showWhy(key, c.path)}>
                             <code className="text-[12.5px] text-body flex-1">{c.path}:{c.line_start}{c.line_end ? `-${c.line_end}` : ""}</code>
                             <span className="text-[11.5px] text-steel-text" title={`content-addressed → keel blob ${c.blob}`}><IcoGit size={12} /> {c.blob.slice(0, 10)}</span>
@@ -2475,8 +2506,8 @@ export function App() {
                           {prov[key] && (
                             <div className="border-t border-rule3">
                               {prov[key].length === 0 && <div className="px-3 py-2 text-[12px] text-muted">no recorded history</div>}
-                              {prov[key].map((p, j) => (
-                                <div key={j} className="px-3 py-2 border-b border-rule3 last:border-0 flex gap-3 text-[12.5px]">
+                              {prov[key].map((p) => (
+                                <div key={p.change} className="px-3 py-2 border-b border-rule3 last:border-0 flex gap-3 text-[12.5px]">
                                   <code className="text-steel-text tabular-nums">{p.change.slice(0, 8)}</code>
                                   <span className="text-body flex-1">{p.intent}</span>
                                   <span className="text-muted">{p.author}</span>
@@ -2671,7 +2702,11 @@ export function App() {
                 return (
                   <div className="grid gap-4">
                     <div className="flex justify-end"><div className="w-[260px]"><SearchInput placeholder="Find a repository" shortcut="" value={orgRepoQ} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setOrgRepoQ(e.target.value)} /></div></div>
-                    {oRepos.length === 0 && <div className="py-8 text-[13px] text-muted">No repositories yet.</div>}
+                    {oRepos.length === 0 && (
+                      <div className="py-8 text-[13px] text-muted">
+                        No repositories yet.{amAdmin && <> <button className="text-steel-text hover:underline" onClick={() => setNewRepoOpen(true)}>Create a repository →</button></>}
+                      </div>
+                    )}
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                       {list.map((rp: string) => (
                         <button key={rp} onClick={() => navigate(`/${encodeURIComponent(oHandle)}/${encodeURIComponent(rp)}`)} className="group text-left bg-surface border border-rule rounded-card p-4 hover:border-ctl hover:shadow-[0_2px_10px_-4px_rgba(15,23,42,0.12)] transition-all">
@@ -2956,7 +2991,7 @@ export function App() {
           )}
 
           {tab === "graph" && (
-            <RepoGraph tenant={tenant} repo={issueRepo} authHeaders={authHeaders} />
+            <RepoGraph tenant={tenant} repo={issueRepo} authHeaders={authHeaders} onOpenFile={(p) => navigate(`${repoBase()}/files?path=${encodeURIComponent(p)}`)} />
           )}
 
           {tab === "settings" && !isTenantOwner && (
@@ -3027,7 +3062,7 @@ export function App() {
                   {(s?.team_access ?? []).map((ta, i) => {
                     const tm = teams.find((t) => t.id === ta.team);
                     return (
-                      <div key={i} className="flex items-center gap-3">
+                      <div key={ta.team} className="flex items-center gap-3">
                         <span className="flex-1 text-[13.5px]">{tm?.name ?? ta.team}</span>
                         <span className="text-[11px] font-bold uppercase tracking-[0.03em] px-1.5 py-[3px] rounded-badge bg-rule2 text-dim">{ta.role}</span>
                         {isTenantOwner && <button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => saveRepoSettings({ team_access: (s!.team_access.filter((_, j) => j !== i)) })}>×</button>}
@@ -3078,8 +3113,8 @@ export function App() {
                 <SectionHeader label="Code owners" right={<span className="text-[12.5px] text-muted">path → owners · also .hull/CODEOWNERS</span>} />
                 <div className="px-5 py-4 grid gap-2">
                   {ownerRules.length === 0 && <span className="text-[12.5px] text-muted">no code-owner rules</span>}
-                  {ownerRules.map((r, i) => (
-                    <div key={i} className="flex items-center gap-3 text-[13px]">
+                  {ownerRules.map((r) => (
+                    <div key={r.glob} className="flex items-center gap-3 text-[13px]">
                       <code className="text-body">{r.glob}</code>
                       <span className="text-muted flex-1">{r.owners.map((o) => handleOf(o)).join(", ")}</span>
                     </div>
@@ -3163,7 +3198,7 @@ function ContributionHeatmap({ days }: { days: HeatDay[] }) {
 type GNode = { path: string; dir: string; lang: string; size: number; deg: number };
 type GEdge = { from: string; to: string };
 const LANG_COLOR: Record<string, string> = { rust: "#dea584", ts: "#3178c6", js: "#f1e05a", python: "#3572A5", go: "#00ADD8" };
-function RepoGraph({ tenant, repo, authHeaders }: { tenant: string; repo: string; authHeaders: () => Record<string, string> }) {
+function RepoGraph({ tenant, repo, authHeaders, onOpenFile }: { tenant: string; repo: string; authHeaders: () => Record<string, string>; onOpenFile: (path: string) => void }) {
   const base = `/api/repos/${encodeURIComponent(tenant)}/${repo}`;
   const [branch, setBranch] = useState("main");
   const [branches, setBranches] = useState<string[]>([]);
@@ -3224,7 +3259,7 @@ function RepoGraph({ tenant, repo, authHeaders }: { tenant: string; repo: string
                 const on = !anyMatch || match(n.path);
                 const showLabel = hover === n.path || n.deg >= 4 || match(n.path);
                 return (
-                  <g key={n.path} transform={`translate(${p.x} ${p.y})`} onMouseEnter={() => setHover(n.path)} onMouseLeave={() => setHover(null)} style={{ cursor: "pointer" }} opacity={on ? 1 : 0.25}>
+                  <g key={n.path} transform={`translate(${p.x} ${p.y})`} onMouseEnter={() => setHover(n.path)} onMouseLeave={() => setHover(null)} onClick={() => onOpenFile(n.path)} style={{ cursor: "pointer" }} opacity={on ? 1 : 0.25}>
                     <circle r={r} fill={LANG_COLOR[n.lang] || "#8b949e"} stroke={match(n.path) ? "#111827" : "#ffffff"} strokeWidth={match(n.path) ? 2 : 1} />
                     {showLabel && <text x={r + 3} y={4} className="fill-body" style={{ fontSize: 11, paintOrder: "stroke", stroke: "var(--surface)", strokeWidth: 3 }}>{base2(n.path)}</text>}
                     <title>{n.path} · {n.deg} imports</title>
@@ -3276,6 +3311,12 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
   };
   // Clear any open file / search when the branch changes (the tree reloads via the paths effect).
   useEffect(() => { setResults(null); setQuery(""); setFile(null); /* eslint-disable-next-line */ }, [branch]);
+  // Deep-link: /…/files?path=<p> (e.g. from a dependency-graph node) opens that file once branches settle.
+  const [pendingPath, setPendingPath] = useState<string | null>(() => new URLSearchParams(location.search).get("path"));
+  useEffect(() => {
+    if (pendingPath && branches.length) { openFile(pendingPath); setPendingPath(null); }
+    /* eslint-disable-next-line */
+  }, [pendingPath, branches]);
   // Debounced fuzzy/full-text search.
   useEffect(() => {
     if (!query.trim()) { setResults(null); return; }
@@ -3579,7 +3620,7 @@ function ReviewPage({
       body: JSON.stringify({ judgment, note }),
     });
     if (res.ok) loadResolutions();
-    else uiAlert(await res.text());
+    else uiAlert(await apiError(res));
   };
   // Bulk-verify the intent claims at once — the common case is "I read the diff, these all hold",
   // which shouldn't be 20 separate clicks (and prompts).
@@ -3611,7 +3652,7 @@ function ReviewPage({
         body: JSON.stringify({ path: f.path, note: f.note, severity: f.severity }),
       });
       if (res.ok) { const d = await res.json(); uiAlert("AI fix applied as a new change (re-verified):\n\n" + (d.fix?.explanation ?? "")); loadThread(); loadChange(); }
-      else uiAlert(await res.text());
+      else uiAlert(await apiError(res));
     } finally {
       setFixing(null);
     }
@@ -3628,7 +3669,7 @@ function ReviewPage({
         body: JSON.stringify({ path: change?.files[0]?.path ?? "", note: `Reconcile claim: ${c.text}`, severity: c.status === "contradicted" ? "blocker" : "warn" }),
       });
       if (res.ok) { const d = await res.json(); uiAlert("AI fix applied as a new change (re-verified):\n\n" + (d.fix?.explanation ?? "")); loadThread(); loadChange(); }
-      else uiAlert(await res.text());
+      else uiAlert(await apiError(res));
     } finally { setFixingClaim(null); }
   };
 
@@ -3744,7 +3785,7 @@ function ReviewPage({
       body: JSON.stringify({ target: `pr:${pr.number}`, body: draft.trim() }),
     });
     if (res.ok) { setDraft(""); loadThread(); }
-    else uiAlert(await res.text());
+    else uiAlert(await apiError(res));
   };
   // The composer's split button posts a verdict-carrying review (approve / request changes / reject),
   // with the draft as its summary. "Comment" alone routes to postThreadComment instead.
@@ -3759,7 +3800,7 @@ function ReviewPage({
         body: JSON.stringify({ target: `pr:${pr.number}`, reviewer: me?.id ?? "", verdict, summary: draft.trim(), findings: [] }),
       });
       if (res.ok) { setDraft(""); onReviewsChanged?.(); loadThread(); }
-      else uiAlert(await res.text());
+      else uiAlert(await apiError(res));
     } finally { setComposerBusy(false); }
   };
   const closeOrReopenPr = async (reopen: boolean) => {
@@ -3768,7 +3809,7 @@ function ReviewPage({
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/prs/${pr.number}/close`, {
       method: "POST", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify({ reopen }),
     });
-    if (res.ok) { onReviewsChanged?.(); if (!reopen) onBack(); } else uiAlert(await res.text());
+    if (res.ok) { onReviewsChanged?.(); if (!reopen) onBack(); } else uiAlert(await apiError(res));
   };
   type ComposerMode = "comment" | "approve" | "request_changes" | "reject";
   const [composerMode, setComposerMode] = useState<ComposerMode>("comment");
@@ -3855,7 +3896,7 @@ function ReviewPage({
     });
     setAskingAI(false);
     if (res.ok) { setLineDraft(""); setCommenting(null); setSelRange(null); loadThread(); }
-    else uiAlert(await res.text());
+    else uiAlert(await apiError(res));
   };
   const openLineComment = (path: string, from: number, to?: number) => { const t = to ?? from; setCommenting({ path, from, to: t }); setLineDraft(""); };
   const deleteComment = async (id: string) => {
@@ -4491,8 +4532,8 @@ function ReviewPage({
                 </div>
                 {c.evidence.length > 0 && (
                   <div className="grid gap-1 mt-2">
-                    {c.evidence.map((e, i) => (
-                      <div key={i} className={`text-[12.5px] flex gap-2 items-baseline ${e.supports ? "text-dim" : "text-fault-text"}`}>
+                    {c.evidence.map((e) => (
+                      <div key={`${e.kind}:${e.detail}`} className={`text-[12.5px] flex gap-2 items-baseline ${e.supports ? "text-dim" : "text-fault-text"}`}>
                         <span className={`text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded flex-none ${e.supports ? "bg-paper text-muted" : "bg-fault-wash text-fault-text"}`}>{e.kind}</span>
                         <span className="leading-snug">{e.detail}</span>
                       </div>
@@ -4534,7 +4575,7 @@ function ReviewPage({
                   </summary>
                   <div className="px-5 pb-3.5 pl-[52px]">
                     <SearchableList items={ledger.unclaimed!} searchOf={(op) => op} placeholder="Search unclaimed changes…"
-                      renderItem={(op, i) => <div key={i} className="text-[12.5px] text-fault-text flex gap-2 items-baseline"><span className="text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded bg-fault-wash flex-none">phantom</span><span className="leading-snug break-all">{op}</span></div>} />
+                      renderItem={(op) => <div key={op} className="text-[12.5px] text-fault-text flex gap-2 items-baseline"><span className="text-[10px] font-semibold uppercase tracking-[0.05em] px-1.5 py-[1px] rounded bg-fault-wash flex-none">phantom</span><span className="leading-snug break-all">{op}</span></div>} />
                   </div>
                 </details>
               )}
