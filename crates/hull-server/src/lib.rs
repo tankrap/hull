@@ -341,6 +341,7 @@ fn make_router(app: App) -> Router {
         .route("/api/me", get(me_profile))
         .route("/api/notifications", get(notifications_list))
         .route("/api/repos", get(repos_list).post(create_repo_handler))
+        .route("/api/repos/:tenant/:repo", axum::routing::patch(rename_repo_handler).delete(delete_repo_handler))
         .route("/api/accounts/:id/repo-defaults", get(repo_defaults_get).put(repo_defaults_set))
         .route("/api/accounts/:id/ai", get(ai_connections_get).post(ai_connection_add))
         .route("/api/accounts/:id/ai/rotate", axum::routing::put(ai_rotate_set))
@@ -1111,6 +1112,89 @@ async fn create_repo_handler(State(app): State<App>, headers: axum::http::Header
     let defaults = app.repo_settings.get(&repo_defaults_key(&acct.id));
     app.repo_settings.set(&format!("{tenant}/{name}"), defaults);
     (StatusCode::CREATED, Json(json!({ "repo": repo, "tenant": tenant, "name": name }))).into_response()
+}
+
+/// `PATCH /api/repos/:tenant/:repo` `{name}` — rename a repo. Owner/admin only. Sanitizes the new
+/// name, rejects a collision under the same owner, then re-keys the repo record and its domain state
+/// (issues, PRs, reviews, comments, sessions, code-owners) plus the per-repo side stores (settings,
+/// autonomy, CI) and the on-disk keel repo. Content-addressed / cache-only state that is NOT re-keyed:
+/// the mirror ledger, review cache, artifact store, and claim resolutions (all recomputed or
+/// mirror-scoped, not user-visible history).
+async fn rename_repo_handler(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let acting = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_repo_admin(&app, &tenant, &repo, &acting.id) {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin can rename this repo").into_response();
+    }
+    let Some(existing) = find_repo(&app, &tenant, &repo) else {
+        return (StatusCode::NOT_FOUND, "no such repo").into_response();
+    };
+    let new_name = sanitize_handle(body.get("name").and_then(Value::as_str).unwrap_or(""));
+    if new_name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name is required").into_response();
+    }
+    if new_name == existing.name {
+        // No-op rename — nothing to move.
+        return Json(json!({ "repo": existing, "tenant": tenant, "name": new_name })).into_response();
+    }
+    if app.store.repos().iter().any(|r| r.owner == existing.owner && r.name.eq_ignore_ascii_case(&new_name)) {
+        return (StatusCode::CONFLICT, "a repo with that name already exists").into_response();
+    }
+    // Move the on-disk keel repo first — if that fails, leave all domain state untouched.
+    if let Err(e) = app.repos.rename_repo(&tenant, &repo, &new_name) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, format!("could not rename repo on disk: {e}")).into_response();
+    }
+    let old_key = format!("{tenant}/{repo}");
+    let new_key = format!("{tenant}/{new_name}");
+    // Re-key the repo record (its id embeds the name) and all domain state.
+    let renamed = Repo { id: format!("repo_{tenant}_{new_name}"), name: new_name.clone(), ..existing.clone() };
+    app.store.remove_repo(&existing.id);
+    app.store.put_repo(renamed.clone());
+    app.store.rekey_repo_data(&old_key, &new_key);
+    app.repo_settings.rename(&old_key, &new_key);
+    app.autonomy.rename_repo(&tenant, &repo, &new_name);
+    app.ci_config.rename(&old_key, &new_key);
+    Json(json!({ "repo": renamed, "tenant": tenant, "name": new_name })).into_response()
+}
+
+/// `DELETE /api/repos/:tenant/:repo` — delete a repo. Owner/admin only. Removes the repo record, its
+/// domain state (issues, PRs, reviews, comments, sessions, code-owners), the per-repo side stores
+/// (settings, autonomy, CI endpoint), and the on-disk keel repo. Cache/mirror-scoped state (review
+/// cache, artifacts, claim resolutions, mirror ledger) is left to age out — none of it is reachable
+/// once the repo record is gone.
+async fn delete_repo_handler(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let acting = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_repo_admin(&app, &tenant, &repo, &acting.id) {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin can delete this repo").into_response();
+    }
+    let Some(existing) = find_repo(&app, &tenant, &repo) else {
+        return (StatusCode::NOT_FOUND, "no such repo").into_response();
+    };
+    let key = format!("{tenant}/{repo}");
+    app.store.remove_repo(&existing.id);
+    app.store.purge_repo_data(&key);
+    app.repo_settings.delete(&key);
+    app.autonomy.delete_repo(&tenant, &repo);
+    app.ci_config.delete(&key);
+    if let Err(e) = app.repos.delete_repo(&tenant, &repo) {
+        // Domain state is already gone; report the on-disk failure so an operator can clean up.
+        return (StatusCode::UNPROCESSABLE_ENTITY, format!("repo record removed but on-disk delete failed: {e}")).into_response();
+    }
+    (StatusCode::OK, Json(json!({ "deleted": true, "tenant": tenant, "name": repo }))).into_response()
 }
 
 /// The RepoSettingsStore key holding an account's default repo settings (inherited by new repos).
@@ -5181,6 +5265,85 @@ mod tests {
         let c = app.store.comments("acme/web").into_iter().find(|c| c.id == "cm_1").unwrap();
         assert_eq!(c.body, "revised");
         assert!(c.edited_unix.is_some(), "an accepted edit stamps edited_unix");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── repo danger zone (rename / delete) is owner/admin only ────────────────────────────────────
+
+    /// Seed a tenant account (`handle`, id `acct_<handle>`) with `boss` as Owner, and a repo record
+    /// `<handle>/<name>`. `boss` and `rando` are accountable humans with session tokens minted.
+    fn seed_repo_admin_fixture(app: &App, handle: &str, name: &str) {
+        app.store.put_actor(actor("boss", ActorKind::Human));
+        app.store.put_actor(actor("rando", ActorKind::Human));
+        mint_token(app, "tok-boss", "boss");
+        mint_token(app, "tok-rando", "rando");
+        app.store.put_account(Account {
+            id: format!("acct_{handle}"),
+            kind: AccountKind::Organization,
+            handle: handle.into(),
+            members: vec![Membership { actor: "boss".into(), role: Role::Owner }],
+        });
+        app.store.put_repo(Repo {
+            id: format!("repo_{handle}_{name}"),
+            owner: format!("acct_{handle}"),
+            name: name.into(),
+            default_branch: "main".into(),
+        });
+    }
+
+    #[tokio::test]
+    async fn repo_delete_is_admin_only() {
+        let (app, tmp) = build_test_app("repo-delete");
+        seed_repo_admin_fixture(&app, "acme", "web");
+        let key = "acme/web";
+        put_pr(&app, key, 1, "boss", "deadbeef");
+
+        // A non-admin actor is rejected server-side — and nothing is removed.
+        let resp = delete_repo_handler(State(app.clone()), Path(("acme".into(), "web".into())), bearer("tok-rando")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a non-admin must not delete a repo");
+        assert!(find_repo(&app, "acme", "web").is_some(), "a rejected delete leaves the repo intact");
+        assert_eq!(app.store.prs(key).len(), 1, "a rejected delete leaves PRs intact");
+
+        // The owner may delete: the repo record and its domain state are gone.
+        let resp = delete_repo_handler(State(app.clone()), Path(("acme".into(), "web".into())), bearer("tok-boss")).await;
+        assert_eq!(resp.status(), StatusCode::OK, "an owner may delete the repo");
+        assert!(find_repo(&app, "acme", "web").is_none(), "the repo record is removed");
+        assert!(app.store.prs(key).is_empty(), "the repo's PRs are purged");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn repo_rename_is_admin_only_and_rekeys_state() {
+        let (app, tmp) = build_test_app("repo-rename");
+        seed_repo_admin_fixture(&app, "acme", "web");
+        put_pr(&app, "acme/web", 1, "boss", "deadbeef");
+
+        // A non-admin actor is rejected server-side — the name is unchanged.
+        let resp = rename_repo_handler(
+            State(app.clone()),
+            Path(("acme".into(), "web".into())),
+            bearer("tok-rando"),
+            Json(json!({ "name": "site" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a non-admin must not rename a repo");
+        assert!(find_repo(&app, "acme", "web").is_some(), "a rejected rename leaves the old name");
+
+        // The owner may rename: the repo record and its PRs re-key to the new name.
+        let resp = rename_repo_handler(
+            State(app.clone()),
+            Path(("acme".into(), "web".into())),
+            bearer("tok-boss"),
+            Json(json!({ "name": "site" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "an owner may rename the repo");
+        assert!(find_repo(&app, "acme", "web").is_none(), "the old name no longer resolves");
+        assert!(find_repo(&app, "acme", "site").is_some(), "the new name resolves");
+        assert!(app.store.prs("acme/web").is_empty(), "PRs no longer sit under the old key");
+        assert_eq!(app.store.prs("acme/site").len(), 1, "PRs re-key to the new name");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
