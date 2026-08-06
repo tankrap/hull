@@ -7,7 +7,7 @@ const RepoTree = lazy(() => import("./RepoTree"));
 import * as ed from "@noble/ed25519";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
-import { SearchInput, Switch, Select, TextField } from "./ui/Field";
+import { SearchInput, Switch, TextField } from "./ui/Field";
 import { StatusBadge, Tag } from "./ui/Badge";
 import { Drawer, Dialog, PromptModal, ConfirmModal } from "./ui/Overlay";
 import { SemanticDiff, OldTok, NewTok } from "./ui/SemanticDiff";
@@ -3265,7 +3265,7 @@ export function App() {
                         <StatusBadge kind={autonomy.tier === "t0" ? "queued" : "agent"}>{autonomy.tier.toUpperCase()}</StatusBadge>
                         <span className="text-[12.5px] text-muted">{TIERS[autonomy.tier]}</span>
                       </div>
-                      {isTenantOwner && <div className="max-w-[160px]"><Select options={["t0", "t1", "t2", "t3"].map((t) => t.toUpperCase())} value={autonomy.tier.toUpperCase()} onChange={(v: string) => setTier(v.toLowerCase())} /></div>}
+                      {isTenantOwner && <div className="max-w-[160px]"><Picker block options={["t0", "t1", "t2", "t3"].map((t) => ({ value: t.toUpperCase(), label: t.toUpperCase() }))} value={autonomy.tier.toUpperCase()} onChange={(v: string) => setTier(v.toLowerCase())} /></div>}
                     </>
                   )}
                 </div>
