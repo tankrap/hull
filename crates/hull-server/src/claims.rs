@@ -60,4 +60,37 @@ impl ClaimResolutions {
             .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|claim| (claim.to_string(), v.clone())))
             .collect()
     }
+
+    /// Re-key every resolution belonging to `old_repo` under `new_repo` (on repo rename). Keys are
+    /// `"{repo}|{change}|{claim}"`, so we move each entry whose key starts with `"{old_repo}|"` to the
+    /// same key with the prefix swapped — preserving the durable human verified/concern judgments
+    /// across the rename.
+    pub fn rekey(&self, old_repo: &str, new_repo: &str) {
+        let old_prefix = format!("{old_repo}|");
+        let mut m = self.map.lock().unwrap();
+        let moved: Vec<(String, ClaimResolution)> = m
+            .iter()
+            .filter_map(|(k, v)| k.strip_prefix(&old_prefix).map(|rest| (format!("{new_repo}|{rest}"), v.clone())))
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        m.retain(|k, _| !k.starts_with(&old_prefix));
+        for (k, v) in moved {
+            m.insert(k, v);
+        }
+        crate::jsonstore::persist_json_atomic(&self.path, &*m);
+    }
+
+    /// Drop every resolution for a repo (on repo delete), so stale judgments can't resurface if the
+    /// name is later recreated. Keys are `"{repo}|{change}|{claim}"` — remove those with the prefix.
+    pub fn remove_repo(&self, repo: &str) {
+        let prefix = format!("{repo}|");
+        let mut m = self.map.lock().unwrap();
+        let before = m.len();
+        m.retain(|k, _| !k.starts_with(&prefix));
+        if m.len() != before {
+            crate::jsonstore::persist_json_atomic(&self.path, &*m);
+        }
+    }
 }
