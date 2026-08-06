@@ -71,6 +71,15 @@ struct Notification {
     #[serde(skip_serializing_if = "Option::is_none")]
     change: Option<String>,
     ts: u64,
+    /// The `"tenant/repo"` key this notification is about, so the inbox can link to the right repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    /// Structured link target within the repo (`"pr"` / `"issue"`), paired with `target_number`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_kind: Option<String>,
+    /// The PR / issue number this notification links to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_number: Option<u64>,
 }
 
 /// A core [`Notifier`] capability that records recent notifications in memory so the UI can show
@@ -85,6 +94,9 @@ impl Notifier for RecordingNotifier {
             summary: e.summary.clone(),
             change: e.change.clone(),
             ts: now(),
+            repo: e.repo.clone(),
+            target_kind: e.target_kind.clone(),
+            target_number: e.target_number,
         });
         let n = buf.len();
         if n > 100 {
@@ -364,7 +376,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/artifacts/:id", get(get_artifact))
         .route("/api/repos/:tenant/:repo/comments", get(comments_list).post(create_comment))
-        .route("/api/repos/:tenant/:repo/comments/:id", axum::routing::delete(delete_comment))
+        .route("/api/repos/:tenant/:repo/comments/:id", axum::routing::patch(edit_comment).delete(delete_comment))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
         .route("/api/repos/:tenant/:repo/change/:id/file", get(change_file))
@@ -694,7 +706,7 @@ async fn notifications_list(
         .iter()
         .map(|x| {
             let to_handles: Vec<String> = x.to.iter().map(|id| app.store.actor(id).map(|a| a.handle).unwrap_or_else(|| id.chars().take(8).collect())).collect();
-            json!({ "kind": x.kind, "summary": x.summary, "change": x.change, "ts": x.ts, "to": to_handles, "broadcast": x.to.is_empty() })
+            json!({ "kind": x.kind, "summary": x.summary, "change": x.change, "ts": x.ts, "to": to_handles, "broadcast": x.to.is_empty(), "repo": x.repo, "target_kind": x.target_kind, "target_number": x.target_number })
         })
         .collect();
     Json(json!({ "notifications": items }))
@@ -2806,6 +2818,9 @@ fn notify_ci(app: &App, tenant: &str, repo: &str, change: &str, status: &str, su
         to: vec![],
         summary: format!("checks {status} for {tenant}/{repo}@{}: {}", &change[..change.len().min(12)], summary),
         change: Some(change.to_string()),
+        repo: Some(format!("{tenant}/{repo}")),
+        target_kind: None,
+        target_number: None,
     });
 }
 
@@ -3102,6 +3117,9 @@ async fn request_reviewer(
         to: vec![reviewer.clone()],
         summary: format!("{} requested your review on PR !{number}", requester.handle),
         change: pr.changes.first().cloned(),
+        repo: Some(key.clone()),
+        target_kind: Some("pr".into()),
+        target_number: Some(number),
     });
     Json(json!({ "pr": pr })).into_response()
 }
@@ -3260,6 +3278,9 @@ async fn perform_merge(
                     to,
                     summary: format!("issue #{num} closed by merging PR !{number}"),
                     change: resolving.clone(),
+                    repo: Some(key.clone()),
+                    target_kind: Some("issue".into()),
+                    target_number: Some(num),
                 });
             }
         }
@@ -3444,6 +3465,9 @@ fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
             to: vec![],
             summary: format!("mirrored {}/{} @ {} → {target}", tenant, repo, &change[..change.len().min(12)]),
             change: Some(change.to_string()),
+            repo: Some(format!("{tenant}/{repo}")),
+            target_kind: None,
+            target_number: None,
         });
     }
     result.ok
@@ -3588,6 +3612,7 @@ async fn create_comment(
         created_unix: now(),
         path,
         line,
+        edited_unix: None,
     };
     app.store.put_comment(comment.clone());
     // Notify the people watching the target (not the commenter): a PR's author + reviewers, or an
@@ -3618,7 +3643,8 @@ async fn create_comment(
     to.sort();
     to.dedup();
     if !to.is_empty() {
-        app.registry.notify(&NotifyEvent { kind: "comment_posted".into(), to, summary, change });
+        let (target_kind, target_number) = notify_target(&target);
+        app.registry.notify(&NotifyEvent { kind: "comment_posted".into(), to, summary, change, repo: Some(key.clone()), target_kind, target_number });
     }
     // @mentions in a comment add the mentioned actor as a reviewer (on a PR) or assignee (on an issue).
     let mentioned = parse_mentions(&comment.body);
@@ -3636,7 +3662,7 @@ async fn create_comment(
                 }
                 if !added.is_empty() {
                     app.store.replace_pr(pr.clone());
-                    app.registry.notify(&NotifyEvent { kind: "review_requested".into(), to: added, summary: format!("{} mentioned you as a reviewer on PR !{num}", author.handle), change: pr.changes.first().cloned() });
+                    app.registry.notify(&NotifyEvent { kind: "review_requested".into(), to: added, summary: format!("{} mentioned you as a reviewer on PR !{num}", author.handle), change: pr.changes.first().cloned(), repo: Some(key.clone()), target_kind: Some("pr".into()), target_number: Some(num) });
                 }
             }
         } else if let Some(num) = target.strip_prefix("issue:").and_then(|s| s.parse::<u64>().ok()) {
@@ -3650,7 +3676,7 @@ async fn create_comment(
                 }
                 if !added.is_empty() {
                     app.store.replace_issue(issue.clone());
-                    app.registry.notify(&NotifyEvent { kind: "issue_assigned".into(), to: added, summary: format!("{} mentioned you on issue #{num}", author.handle), change: None });
+                    app.registry.notify(&NotifyEvent { kind: "issue_assigned".into(), to: added, summary: format!("{} mentioned you on issue #{num}", author.handle), change: None, repo: Some(key.clone()), target_kind: Some("issue".into()), target_number: Some(num) });
                 }
             }
         }
@@ -3669,6 +3695,18 @@ async fn create_comment(
     (StatusCode::CREATED, Json(json!({ "comment": comment }))).into_response()
 }
 
+/// Parse a comment/notification `target` string (`"pr:1"` / `"issue:2"`) into the structured
+/// `(target_kind, target_number)` pair carried on a [`NotifyEvent`] so the inbox can link to it.
+fn notify_target(target: &str) -> (Option<String>, Option<u64>) {
+    if let Some(n) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
+        (Some("pr".into()), Some(n))
+    } else if let Some(n) = target.strip_prefix("issue:").and_then(|s| s.parse::<u64>().ok()) {
+        (Some("issue".into()), Some(n))
+    } else {
+        (None, None)
+    }
+}
+
 /// Delete a comment (`DELETE …/comments/:id`). Only the comment's **author** or a repo **owner/admin**
 /// may delete it — you can't erase someone else's words.
 async fn delete_comment(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
@@ -3685,6 +3723,30 @@ async fn delete_comment(State(app): State<App>, Path((tenant, repo, id)): Path<(
     }
     let removed = app.store.remove_comment(&key, &id);
     Json(json!({ "deleted": removed, "id": id })).into_response()
+}
+
+/// Edit a comment (`PATCH …/comments/:id` with `{body}`). Only the comment's **author** may edit it —
+/// unlike delete, a repo admin can't rewrite someone else's words, only remove them. Updates the body
+/// and stamps `edited_unix`.
+async fn edit_comment(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let new_body = body.get("body").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if new_body.is_empty() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "comment body must not be empty").into_response();
+    }
+    let Some(comment) = app.store.comments(&key).into_iter().find(|c| c.id == id) else {
+        return (StatusCode::NOT_FOUND, "no such comment").into_response();
+    };
+    if comment.author != actor.id {
+        return (StatusCode::FORBIDDEN, "only the comment's author can edit it").into_response();
+    }
+    app.store.update_comment_body(&key, &id, &new_body, now());
+    let updated = app.store.comments(&key).into_iter().find(|c| c.id == id);
+    Json(json!({ "comment": updated })).into_response()
 }
 
 /// Build the code context around a commented line, ask the AI reviewer, and return its reply as a
@@ -3733,6 +3795,7 @@ async fn ai_answer_comment(app: &App, key: &str, pr_num: u64, path: &str, line: 
         created_unix: now(),
         path: Some(path.to_string()),
         line: Some(line),
+        edited_unix: None,
     })
 }
 
@@ -3810,6 +3873,9 @@ async fn create_review(
                 to: vec![pr.author.clone()],
                 summary: format!("{} posted a {:?} review on PR !{num}", reviewer.handle, review.verdict),
                 change: pr.changes.first().cloned(),
+                repo: Some(review.repo.clone()),
+                target_kind: Some("pr".into()),
+                target_number: Some(num),
             });
         }
     }
@@ -4115,6 +4181,9 @@ async fn perform_auto_review(
         to: vec![pr.author.clone()],
         summary: format!("{} auto-reviewed PR !{number}: {:?}", reviewer.handle, review.verdict),
         change: Some(change.clone()),
+        repo: Some(key.clone()),
+        target_kind: Some("pr".into()),
+        target_number: Some(number),
     });
 
     // Auto-triage (T2+): a review that requests changes turns its blocker findings into a triaged
@@ -4156,6 +4225,9 @@ async fn perform_auto_review(
                     to: vec![pr.author.clone()],
                     summary: format!("auto-triaged issue #{inum} from the review of PR !{number}"),
                     change: Some(change.clone()),
+                    repo: Some(key.clone()),
+                    target_kind: Some("issue".into()),
+                    target_number: Some(inum),
                 });
                 app.hub.publish(
                     tenant,
@@ -4196,6 +4268,9 @@ async fn perform_auto_review(
                     to: vec![pr.author.clone()],
                     summary: format!("{} auto-merged PR !{number} (autonomy T3){}", reviewer.handle, if closed.is_empty() { String::new() } else { format!(", closed #{:?}", closed) }),
                     change: Some(change.clone()),
+                    repo: Some(key.clone()),
+                    target_kind: Some("pr".into()),
+                    target_number: Some(number),
                 });
             }
             Err((_, why)) => eprintln!("hull: T3 auto-merge of PR !{number} declined: {why}"),
@@ -4255,12 +4330,16 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
                     created_unix: now(),
                     path: None,
                     line: None,
+                    edited_unix: None,
                 });
                 app.registry.notify(&NotifyEvent {
                     kind: "fix_applied".into(),
                     to: vec![pr.author.clone()],
                     summary: format!("{} applied a fix to PR !{number} (new change {})", agent.handle, &fix_change[..12]),
                     change: Some(fix_change),
+                    repo: Some(key.clone()),
+                    target_kind: Some("pr".into()),
+                    target_number: Some(number),
                 });
             }
             None => {
@@ -4275,6 +4354,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
                     created_unix: now(),
                     path: None,
                     line: None,
+                    edited_unix: None,
                 });
             }
         }
@@ -4410,7 +4490,7 @@ async fn create_pr(
     }
     let pr = PullRequest {
         id: format!("pr_{}_{number}", key.replace('/', "_")),
-        repo: key,
+        repo: key.clone(),
         number,
         title,
         author: actor.id,
@@ -4427,6 +4507,9 @@ async fn create_pr(
             to: owners,
             summary: format!("your code is in PR !{number}: {}", pr.title),
             change: pr.changes.first().cloned(),
+            repo: Some(key.clone()),
+            target_kind: Some("pr".into()),
+            target_number: Some(number),
         });
     }
     app.store.put_pr(pr.clone());
@@ -4532,7 +4615,7 @@ async fn create_issue(
     let author = actor.id.clone();
     let issue = Issue {
         id: format!("iss_{}_{number}", key.replace('/', "_")),
-        repo: key,
+        repo: key.clone(),
         number,
         title,
         body: body.get("body").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -4554,6 +4637,9 @@ async fn create_issue(
             to: issue.assignees.clone(),
             summary: format!("{} assigned issue #{number}: {}", actor.handle, issue.title),
             change: None,
+            repo: Some(key.clone()),
+            target_kind: Some("issue".into()),
+            target_number: Some(number),
         });
     }
     app.hub.publish(
@@ -5037,6 +5123,65 @@ mod tests {
         let boss = actor("boss", ActorKind::Human);
         perform_merge(&app, "t", "r", 1, &boss, true).await.expect("admin force override merges despite the gate");
         assert!(is_merged(&app, "t/r", 1).await);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── edit-comment authorization (`edit_comment`) ───────────────────────────────────────────────
+
+    /// Mint a valid session token for `actor_id` so a handler's `require_actor` accepts it.
+    fn mint_token(app: &App, token: &str, actor_id: &str) {
+        app.auth.lock().unwrap().tokens.insert(token.into(), (actor_id.into(), now()));
+    }
+
+    fn bearer(token: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn edit_comment_is_author_only() {
+        let (app, tmp) = build_test_app("edit-comment");
+        app.store.put_actor(actor("author", ActorKind::Human));
+        app.store.put_actor(actor("intruder", ActorKind::Human));
+        mint_token(&app, "tok-author", "author");
+        mint_token(&app, "tok-intruder", "intruder");
+        app.store.put_comment(Comment {
+            id: "cm_1".into(),
+            repo: "acme/web".into(),
+            target: "pr:1".into(),
+            author: "author".into(),
+            body: "original".into(),
+            created_unix: 0,
+            path: None,
+            line: None,
+            edited_unix: None,
+        });
+
+        // A non-author is rejected server-side (not just hidden in the UI) and the body is untouched.
+        let resp = edit_comment(
+            State(app.clone()),
+            Path(("acme".into(), "web".into(), "cm_1".into())),
+            bearer("tok-intruder"),
+            Json(json!({ "body": "hijacked" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a non-author must not be allowed to edit");
+        assert_eq!(app.store.comments("acme/web")[0].body, "original", "a rejected edit leaves the body unchanged");
+
+        // The author can edit: the body updates and `edited_unix` is stamped.
+        let resp = edit_comment(
+            State(app.clone()),
+            Path(("acme".into(), "web".into(), "cm_1".into())),
+            bearer("tok-author"),
+            Json(json!({ "body": "revised" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "the author may edit their own comment");
+        let c = app.store.comments("acme/web").into_iter().find(|c| c.id == "cm_1").unwrap();
+        assert_eq!(c.body, "revised");
+        assert!(c.edited_unix.is_some(), "an accepted edit stamps edited_unix");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

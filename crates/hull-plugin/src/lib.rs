@@ -511,6 +511,13 @@ pub struct NotifyEvent {
     pub summary: String,
     /// Optional keel change id this is about (so an agent recipient can act).
     pub change: Option<String>,
+    /// The `"tenant/repo"` key this notification is about, so a recipient UI can link back to it.
+    pub repo: Option<String>,
+    /// Structured link target within the repo when the notification is about a PR or issue
+    /// (`"pr"` / `"issue"`), paired with [`Self::target_number`].
+    pub target_kind: Option<String>,
+    /// The PR / issue number this notification links to (see [`Self::target_kind`]).
+    pub target_number: Option<u64>,
 }
 
 // ── registry ───────────────────────────────────────────────────────────────────────────────────
