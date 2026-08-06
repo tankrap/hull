@@ -3149,10 +3149,25 @@ fn is_repo_member(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
 // Git presents credentials natively via HTTP Basic on an HTTP remote; we treat the Basic **password**
 // as a hull session token (username ignored). A `Bearer` header is accepted as a fallback.
 
-/// Whether git smart-HTTP auth is enforced (`HULL_GIT_AUTH=enforce`). Anything else (incl. unset,
-/// the default) means `off` — fully anonymous git, exactly as before this change.
+/// Whether git smart-HTTP auth is enforced. Enabled by any common truthy value
+/// (`enforce`/`on`/`true`/`1`/`yes`); unset or a falsey value means `off` — fully anonymous git,
+/// exactly as before this change. An UNRECOGNIZED non-empty value logs a warning and defaults to off
+/// rather than silently failing open on a typo (a security control must not quietly stay disabled).
 fn git_auth_enforced() -> bool {
-    std::env::var("HULL_GIT_AUTH").map(|v| v.eq_ignore_ascii_case("enforce")).unwrap_or(false)
+    match std::env::var("HULL_GIT_AUTH") {
+        Ok(v) => {
+            let v = v.trim();
+            if ["enforce", "on", "true", "1", "yes"].iter().any(|t| v.eq_ignore_ascii_case(t)) {
+                true
+            } else if v.is_empty() || ["off", "false", "0", "no"].iter().any(|t| v.eq_ignore_ascii_case(t)) {
+                false
+            } else {
+                eprintln!("hull: HULL_GIT_AUTH=\"{v}\" not recognized — git auth stays OFF (use `enforce` to enable)");
+                false
+            }
+        }
+        Err(_) => false,
+    }
 }
 
 /// Extract a hull session token from a git request's `Authorization` header. Accepts HTTP Basic
