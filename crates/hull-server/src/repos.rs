@@ -1415,6 +1415,39 @@ fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>) -> Vec<u8> {
 }
 
 #[cfg(test)]
+impl RepoHost {
+    /// Test-only: ensure `tenant/repo` exists and commit `files` as a new keel change (parented on
+    /// `parent`, or a root change if `None`) carrying `intent`; points `main` at it. Returns the new
+    /// change id (hex). Shared by the cross-module CI / merge-gate tests that need real changes.
+    pub(crate) fn test_commit(&self, tenant: &str, repo: &str, intent: &str, parent: Option<&str>, files: &[(&str, &str)]) -> String {
+        let store = self.store(tenant, repo, true).unwrap().unwrap();
+        let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("hull-testcommit-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (p, c) in files {
+            let fp = dir.join(p);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, c).unwrap();
+        }
+        let tree = keel_store::snapshot::snapshot_uncached(&store, &dir).unwrap();
+        let parents: Vec<ObjectId> = parent.and_then(ObjectId::from_hex).into_iter().collect();
+        let change = keel_store::Change {
+            parents,
+            tree,
+            session: None,
+            intent: intent.to_string(),
+            author: "tester".into(),
+            timestamp: 0,
+            verification: keel_store::Verification::Unverified,
+        };
+        let id = store.put(&Object::Change(change)).unwrap();
+        let _ = store.set_ref("main", &id);
+        let _ = std::fs::remove_dir_all(&dir);
+        id.to_hex()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1525,6 +1558,110 @@ mod tests {
         assert!(b.whitespace_only.is_empty());
         assert!(!b.mechanical, "a real content edit is behavioral");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Build a single hunk from `(tag, text)` lines for driving `semantic_ops` directly.
+    fn hunk(lines: &[(Tag, &str)]) -> keel_store::Hunk {
+        keel_store::Hunk {
+            old_start: 0,
+            old_len: 0,
+            new_start: 0,
+            new_len: 0,
+            lines: lines.iter().map(|(t, s)| keel_store::DiffLine { tag: *t, text: (*s).to_string() }).collect(),
+        }
+    }
+
+    #[test]
+    fn semantic_ops_detects_rust_definitions() {
+        let h = hunk(&[
+            (Tag::Add, "pub fn verify(x: u32) -> bool {"),
+            (Tag::Add, "async fn spawn() {"),
+            (Tag::Add, "pub struct Config {"),
+            (Tag::Add, "enum State {"),
+            (Tag::Add, "trait Runner {"),
+            (Tag::Add, "type Id = u64;"),
+            (Tag::Add, "use std::io::Read;"),
+            (Tag::Del, "fn old_impl() {"),
+        ]);
+        let ops = semantic_ops(&[h]);
+        assert!(ops.contains(&"added fn `verify`".to_string()));
+        assert!(ops.contains(&"added fn `spawn`".to_string()), "async prefix is stripped");
+        assert!(ops.contains(&"added struct `Config`".to_string()));
+        assert!(ops.contains(&"added enum `State`".to_string()));
+        assert!(ops.contains(&"added trait `Runner`".to_string()));
+        assert!(ops.contains(&"added type `Id`".to_string()));
+        assert!(ops.contains(&"added import".to_string()));
+        assert!(ops.contains(&"removed fn `old_impl`".to_string()), "a deleted def is a removed op");
+    }
+
+    #[test]
+    fn semantic_ops_detects_ts_js_forms_including_arrow_fns() {
+        let h = hunk(&[
+            (Tag::Add, "export function handleClick() {"),
+            (Tag::Add, "const Widget = (props) => {"),       // uppercase ⇒ component
+            (Tag::Add, "const add = (a, b) => a + b"),        // lowercase ⇒ fn
+            (Tag::Add, "let load = async () => {}"),          // `= async` ⇒ fn
+            (Tag::Add, "const [count, setCount] = useState(0)"), // destructured hook ⇒ state
+            (Tag::Add, "interface Opts {"),
+            (Tag::Add, "import { x } from 'y'"),
+        ]);
+        let ops = semantic_ops(&[h]);
+        assert!(ops.contains(&"added fn `handleClick`".to_string()));
+        assert!(ops.contains(&"added component `Widget`".to_string()), "Uppercase arrow-fn ⇒ component");
+        assert!(ops.contains(&"added fn `add`".to_string()), "lowercase arrow-fn ⇒ fn");
+        assert!(ops.contains(&"added fn `load`".to_string()));
+        assert!(ops.contains(&"added state `count`".to_string()));
+        assert!(ops.contains(&"added interface `Opts`".to_string()));
+        assert!(ops.contains(&"added import".to_string()));
+    }
+
+    #[test]
+    fn semantic_ops_detects_python_and_css() {
+        let py = hunk(&[
+            (Tag::Add, "def compute(n):"),
+            (Tag::Add, "class Model:"),
+            (Tag::Add, "from os import path"),
+            (Tag::Add, "import sys"),
+        ]);
+        let ops = semantic_ops(&[py]);
+        assert!(ops.contains(&"added fn `compute`".to_string()), "python def ⇒ fn");
+        assert!(ops.contains(&"added class `Model`".to_string()));
+        // both `from …` and `import …` are imports (deduped to one entry).
+        assert_eq!(ops.iter().filter(|o| *o == "added import").count(), 1);
+
+        let css = hunk(&[
+            (Tag::Add, ".btn {"),
+            (Tag::Add, "#header {"),
+            (Tag::Add, ".card { color: red; }"), // single-line rule
+        ]);
+        let cops = semantic_ops(&[css]);
+        assert!(cops.contains(&"added style `.btn`".to_string()));
+        assert!(cops.contains(&"added style `#header`".to_string()));
+        assert!(cops.contains(&"added style `.card`".to_string()));
+    }
+
+    #[test]
+    fn semantic_ops_does_not_hallucinate_on_non_definition_lines() {
+        let h = hunk(&[
+            (Tag::Add, "let x = 5;"),          // plain binding, not an arrow-fn
+            (Tag::Add, "return compute(y);"),
+            (Tag::Add, "// a comment"),
+            (Tag::Add, "    total += 1"),
+            (Tag::Context, "fn should_be_ignored() {"), // context lines never count
+            (Tag::Del, "x += 1;"),
+        ]);
+        assert!(semantic_ops(&[h]).is_empty(), "no ops from ordinary statements or context lines");
+    }
+
+    #[test]
+    fn semantic_ops_sorts_and_dedups() {
+        let h = hunk(&[
+            (Tag::Add, "fn dup() {"),
+            (Tag::Add, "fn dup() {"), // identical ⇒ one op
+            (Tag::Add, "fn apex() {"),
+        ]);
+        let ops = semantic_ops(&[h]);
+        assert_eq!(ops, vec!["added fn `apex`".to_string(), "added fn `dup`".to_string()], "sorted + deduped");
     }
 
     #[test]
