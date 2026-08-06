@@ -1,18 +1,30 @@
 // keel/hull overlays — Tailwind. Modal (blocking, destructive confirm only),
 // Dialog (one decision, two buttons, light scrim), Drawer (right edge only).
 // All dismiss on backdrop click. Entrances: bd-in / ov-in / dw-in (tailwind.config).
-import React, { useState, useEffect } from 'react';
-import { Button } from './Button.jsx';
-import { TextField } from './Field.jsx';
+import { useState, useEffect } from 'react';
+import { Button } from './Button';
+import { TextField } from './Field';
 
-const cx = (...a) => a.filter(Boolean).join(' ');
+const cx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(' ');
 
-function Backdrop({ onClose, strength = 'bg-ink/40', z = 'z-40' }) {
+function Backdrop({ onClose, strength = 'bg-ink/40', z = 'z-40' }: {
+  onClose?: () => void;
+  strength?: string;
+  z?: string;
+}) {
   return <div onClick={onClose} className={cx('fixed inset-0 animate-bd-in', z, strength)} />;
 }
 
 // Destructive confirm: action disabled until typed id matches confirmId.
-export function ConfirmModal({ open, onClose, title, body, confirmId, actionLabel, onConfirm }) {
+export function ConfirmModal({ open, onClose, title, body, confirmId, actionLabel, onConfirm }: {
+  open?: boolean;
+  onClose?: () => void;
+  title?: React.ReactNode;
+  body?: React.ReactNode;
+  confirmId?: string;
+  actionLabel?: React.ReactNode;
+  onConfirm: () => void;
+}) {
   const [typed, setTyped] = useState('');
   if (!open) return null;
   const ok = typed.trim() === confirmId;
@@ -37,7 +49,16 @@ export function ConfirmModal({ open, onClose, title, body, confirmId, actionLabe
 }
 
 // One decision, two buttons. Never a form inside.
-export function Dialog({ open, onClose, icon, title, body, cancelLabel = 'Cancel', actionLabel, onAction }) {
+export function Dialog({ open, onClose, icon, title, body, cancelLabel = 'Cancel', actionLabel, onAction }: {
+  open?: boolean;
+  onClose?: () => void;
+  icon?: React.ReactNode;
+  title?: React.ReactNode;
+  body?: React.ReactNode;
+  cancelLabel?: React.ReactNode;
+  actionLabel?: React.ReactNode;
+  onAction?: () => void;
+}) {
   if (!open) return null;
   return (
     <>
@@ -60,11 +81,25 @@ export function Dialog({ open, onClose, icon, title, body, cancelLabel = 'Cancel
   );
 }
 
+type ValidateResult = { available?: boolean; hint?: string };
+
 // A single text input in a modal (replaces window.prompt). Sanitizes on type and, if `validate` is
 // given, shows live availability. `validate(value) -> { available, hint }` (async).
-export function PromptModal({ open, title, label, placeholder, initial = '', sanitize, validate, optional = false, confirmLabel = 'Confirm', onCancel, onConfirm }) {
+export function PromptModal({ open, title, label, placeholder, initial = '', sanitize, validate, optional = false, confirmLabel = 'Confirm', onCancel, onConfirm }: {
+  open?: boolean;
+  title?: React.ReactNode;
+  label?: React.ReactNode;
+  placeholder?: string;
+  initial?: string;
+  sanitize?: (s: string) => string;
+  validate?: (v: string) => Promise<ValidateResult>;
+  optional?: boolean;
+  confirmLabel?: React.ReactNode;
+  onCancel: () => void;
+  onConfirm: (value: string) => void;
+}) {
   const [val, setVal] = useState(initial);
-  const [status, setStatus] = useState(null);
+  const [status, setStatus] = useState<ValidateResult | null>(null);
   const [checking, setChecking] = useState(false);
   useEffect(() => { if (open) { setVal(initial); setStatus(null); setChecking(false); } }, [open]);
   useEffect(() => {
@@ -112,7 +147,13 @@ export function PromptModal({ open, title, label, placeholder, initial = '', san
 }
 
 // Inspect without losing the list. Right edge, never bottom.
-export function Drawer({ open, onClose, title, children, footer }) {
+export function Drawer({ open, onClose, title, children, footer }: {
+  open?: boolean;
+  onClose?: () => void;
+  title?: React.ReactNode;
+  children?: React.ReactNode;
+  footer?: React.ReactNode;
+}) {
   if (!open) return null;
   return (
     <>
@@ -131,7 +172,7 @@ export function Drawer({ open, onClose, title, children, footer }) {
 }
 
 // Key-value row for drawer bodies
-export function DrawerRow({ k, v, accent }) {
+export function DrawerRow({ k, v, accent }: { k: React.ReactNode; v: React.ReactNode; accent?: string }) {
   return (
     <div className="flex justify-between">
       <span className="text-muted">{k}</span>

@@ -1,9 +1,21 @@
 // keel/hull HistoryRow — Tailwind. Flat list row (no card). Hover swaps trailing
 // +/- metadata for an animated open-link icon. Clickable only because it opens a detail.
-import React from 'react';
-import { StatusBadge, DiffStat, Tag } from './Badge.jsx';
+import { StatusBadge, DiffStat, Tag } from './Badge';
 
-export function HistoryRow({ voyage, onOpen }) {
+type Voyage = {
+  title: React.ReactNode;
+  tag?: React.ReactNode;
+  status?: string;
+  id: React.ReactNode;
+  crates: React.ReactNode;
+  files: React.ReactNode;
+  author: React.ReactNode;
+  when: React.ReactNode;
+  add: React.ReactNode;
+  del: React.ReactNode;
+};
+
+export function HistoryRow({ voyage, onOpen }: { voyage: Voyage; onOpen?: () => void }) {
   return (
     <div onClick={onOpen}
       className="group px-3.5 py-3 border-b border-rule2 flex gap-2.5 items-start cursor-pointer transition-colors duration-150 hover:bg-paper">

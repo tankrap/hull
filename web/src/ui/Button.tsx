@@ -1,7 +1,6 @@
 // keel/hull buttons — Tailwind. Every clickable presses: active:translate-y-px active:scale-[0.99].
-import React from 'react';
 
-const cx = (...a) => a.filter(Boolean).join(' ');
+const cx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(' ');
 
 // Every button: centered content, consistent icon spacing, a soft press, and a smooth hover.
 const BASE = 'inline-flex items-center justify-center gap-1.5 font-medium cursor-pointer select-none whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-steel focus-visible:ring-offset-2 focus-visible:ring-offset-surface';
@@ -22,7 +21,12 @@ const SIZE = {
   lg: 'h-ctl-lg px-[18px] text-[15px] rounded-[9px]',
 };
 
-export function Button({ variant = 'primary', size = 'md', className, disabled, children, ...rest }) {
+type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: keyof typeof VARIANT;
+  size?: keyof typeof SIZE;
+};
+
+export function Button({ variant = 'primary', size = 'md', className, disabled, children, ...rest }: ButtonProps) {
   if (disabled) {
     return (
       <button disabled className={cx(BASE, 'bg-ink/[0.05] text-faint border border-ink/[0.05] cursor-not-allowed shadow-none', SIZE[size], className)} {...rest}>
@@ -37,7 +41,7 @@ export function Button({ variant = 'primary', size = 'md', className, disabled, 
   );
 }
 
-export function LinkButton({ className, children, ...rest }) {
+export function LinkButton({ className, children, ...rest }: React.ButtonHTMLAttributes<HTMLButtonElement>) {
   return (
     <button className={cx('bg-transparent border-none p-0 text-[13.5px] font-medium text-steel-text cursor-pointer hover:underline hover:text-[oklch(0.42_0.12_248)] active:text-[oklch(0.35_0.12_248)]', className)} {...rest}>
       {children}

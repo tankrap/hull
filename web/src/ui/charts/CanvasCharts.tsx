@@ -3,18 +3,20 @@
 // Each is a React component owning one <canvas> + a rAF loop. Tailwind handles the
 // frame (use ChartCard/ChartFrame); this file is the drawing logic, ported 1:1 from
 // the reference in "Keel Brand Guidelines.dc.html" section 10.
-import React, { useEffect, useRef } from 'react';
-import { RAMP } from './ChartCard.jsx';
+import { useEffect, useRef } from 'react';
+import { RAMP } from './ChartCard';
 
 // ---- shared helpers --------------------------------------------------------
-const hash = (x, y) => { const v = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return v - Math.floor(v); };
-const ss = (a, b, x) => { x = Math.min(1, Math.max(0, (x - a) / (b - a))); return x * x * (3 - 2 * x); };
+const hash = (x: number, y: number) => { const v = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return v - Math.floor(v); };
+const ss = (a: number, b: number, x: number) => { x = Math.min(1, Math.max(0, (x - a) / (b - a))); return x * x * (3 - 2 * x); };
 const reduced = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-function useCanvasLoop(draw) {
-  const ref = useRef(null);
+type DrawFn = (ctx: CanvasRenderingContext2D, w: number, h: number, t: number) => void;
+
+function useCanvasLoop(draw: DrawFn) {
+  const ref = useRef<HTMLCanvasElement | null>(null);
   useEffect(() => {
-    let raf, t = 0;
+    let raf = 0, t = 0;
     const loop = () => {
       raf = requestAnimationFrame(loop);
       if (!reduced()) t += 0.02;
@@ -22,7 +24,7 @@ function useCanvasLoop(draw) {
       const w = cv.clientWidth, h = cv.clientHeight; if (!w) return;
       const dpr = Math.min(2, devicePixelRatio || 1);
       if (cv.width !== Math.ceil(w * dpr)) { cv.width = Math.ceil(w * dpr); cv.height = Math.ceil(h * dpr); }
-      const ctx = cv.getContext('2d');
+      const ctx = cv.getContext('2d')!;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
       draw(ctx, w, h, t);
@@ -37,8 +39,8 @@ function useCanvasLoop(draw) {
 // shares: number[] summing to 1 · hover: index|null
 // Tile-field ring: inner r 52, outer 89 of a 200 unit box. Hovered segment lifts
 // 6px along its mid-angle over a 12% wash; others dim to 0.216 (0.72 * 0.3).
-export function Donut({ shares, hover = null }) {
-  const draw = (ctx, w, h, t) => {
+export function Donut({ shares, hover = null }: { shares: number[]; hover?: number | null }) {
+  const draw: DrawFn = (ctx, w, h, t) => {
     const s = Math.min(w, h) / 200;
     ctx.setTransform(ctx.getTransform().a * s, 0, 0, ctx.getTransform().d * s, 0, 0);
     const cell = 4.6, any = hover != null;
@@ -74,8 +76,8 @@ export function Donut({ shares, hover = null }) {
 // cols: number[branches][bands] as 0-1 heights · hover: {c, b}|null
 // Tile-filled stacks, 4px band gap, rounded outer corners (top band 8/8/5/5,
 // bottom 5/5/7/7). Hovered band: full ramp-1, stroked outline + 10px glow.
-export function StackedBars({ cols, hover = null }) {
-  const draw = (ctx, w, h, t) => {
+export function StackedBars({ cols, hover = null }: { cols: number[][]; hover?: { c: number; b: number } | null }) {
+  const draw: DrawFn = (ctx, w, h, t) => {
     const tile = Math.max(3, Math.round(w / 200));
     cols.forEach((bands, r) => {
       const colW = w / cols.length, cx0 = r * colW + colW / 2, bw = Math.min(colW * 0.62, 54);
@@ -110,8 +112,8 @@ export function StackedBars({ cols, hover = null }) {
 // series: number[] · max: number. Full tile grid: lit under the curve (soft ramp-4
 // below p=0.55, ramp-1 above), rest tiles oklch(0.9 0.02 264) at 26%. Curve top at
 // 84% of value/max. Add pointer wash + scrub crosshair per the reference.
-export function AreaField({ series, max }) {
-  const draw = (ctx, w, h, t) => {
+export function AreaField({ series, max }: { series: number[]; max: number }) {
+  const draw: DrawFn = (ctx, w, h, t) => {
     ctx.imageSmoothingEnabled = false;
     const cell = Math.max(3, Math.round(w / 180)), cols = Math.ceil(w / cell), rows = Math.ceil(h / cell);
     const rest = new Path2D(), rs = cell * 0.26;
@@ -140,13 +142,13 @@ export function AreaField({ series, max }) {
 // ---- LineChart (latency) ------------------------------------------------------
 // series: number[] · domain [min,max]. 2px ramp-1 line, gradient wash to 0,
 // 700ms ease-out draw-in, endpoint dot. Scrub readout per the reference.
-export function LineChart({ series, domain }) {
+export function LineChart({ series, domain }: { series: number[]; domain: [number, number] }) {
   const start = useRef(performance.now());
-  const draw = (ctx, w, h) => {
+  const draw: DrawFn = (ctx, w, h) => {
     const [lo, hi] = domain, n = series.length;
     const prog = reduced() ? 1 : Math.min(1, (performance.now() - start.current) / 700);
     const e = 1 - Math.pow(1 - prog, 3);
-    const X = (i) => (i / (n - 1)) * w, Y = (v) => (1 - (v - lo) / (hi - lo)) * h;
+    const X = (i: number) => (i / (n - 1)) * w, Y = (v: number) => (1 - (v - lo) / (hi - lo)) * h;
     const last = Math.max(1, e * (n - 1)), li = Math.floor(last), lf = last - li;
     const path = new Path2D(); path.moveTo(X(0), Y(series[0]));
     for (let i = 1; i <= li; i++) path.lineTo(X(i), Y(series[i]));

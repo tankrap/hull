@@ -1,11 +1,16 @@
 // keel/hull form controls — Tailwind. Focus = border darkens to ink. NO focus rings.
-import React from 'react';
 
-const cx = (...a) => a.filter(Boolean).join(' ');
+const cx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(' ');
 const FIELD = 'w-full box-border h-ctl px-2.5 rounded-ctl border bg-surface font-sans text-[13.5px] text-ink outline-none transition-colors duration-150';
-const Label = ({ children }) => <div className="text-[12.5px] font-semibold text-body mb-1.5">{children}</div>;
+const Label = ({ children }: { children?: React.ReactNode }) => <div className="text-[12.5px] font-semibold text-body mb-1.5">{children}</div>;
 
-export function TextField({ label, help, error, className, ...rest }) {
+type TextFieldProps = React.InputHTMLAttributes<HTMLInputElement> & {
+  label?: React.ReactNode;
+  help?: React.ReactNode;
+  error?: React.ReactNode;
+};
+
+export function TextField({ label, help, error, className, ...rest }: TextFieldProps) {
   return (
     <div>
       {label && <Label>{label}</Label>}
@@ -16,7 +21,7 @@ export function TextField({ label, help, error, className, ...rest }) {
 }
 
 // Search input with leading icon and trailing shortcut chip.
-export function SearchInput({ shortcut = '⌘K', ...rest }) {
+export function SearchInput({ shortcut = '⌘K', ...rest }: React.InputHTMLAttributes<HTMLInputElement> & { shortcut?: React.ReactNode }) {
   return (
     <div className="flex items-center gap-2 h-ctl px-2.5 rounded-ctl border border-ctl bg-surface transition-colors duration-150 focus-within:border-body">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none">
@@ -28,7 +33,7 @@ export function SearchInput({ shortcut = '⌘K', ...rest }) {
   );
 }
 
-export function Switch({ on, onChange }) {
+export function Switch({ on, onChange }: { on?: boolean; onChange: (v: boolean) => void }) {
   return (
     <div onClick={() => onChange(!on)}
       className={cx('w-9 h-5 rounded-full p-0.5 box-border cursor-pointer flex-none transition-colors duration-150', on ? 'bg-steel' : 'bg-[oklch(0.85_0.008_250)]')}>
