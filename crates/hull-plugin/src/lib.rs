@@ -312,6 +312,17 @@ pub struct AiCredential {
     /// For a per-user agent session, the credential-bundle directory to point the CLI at (its
     /// `CLAUDE_CONFIG_DIR` / `CODEX_HOME`). `None` ⇒ the agent uses the Hull host's own login.
     pub agent_config_dir: Option<String>,
+    /// The owning [`AiConnection`] id, so Hull can meter this run's token usage against it.
+    pub connection_id: Option<String>,
+}
+
+/// Token usage reported by an agent run (parsed from the CLI's own accounting), for per-connection
+/// metering. `cost_micros` is USD × 1e6 when the agent reports a cost.
+#[derive(Debug, Clone, Default)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micros: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +355,9 @@ pub struct FixResult {
     pub explanation: String,
     /// The edits to apply (empty if `ok` is false).
     pub edits: Vec<FixEdit>,
+    /// Token usage for this fix, when the backend reported it (agent-CLI path). Internal metering.
+    #[serde(skip)]
+    pub usage: Option<Usage>,
 }
 
 // ── Reviewer (Epic D / D1) ──────────────────────────────────────────────────────────────────────
@@ -439,6 +453,9 @@ pub struct ReviewPackage {
     /// The reconciliation ledger evidence, when the reviewer produced one (the OSS default does; a
     /// model-backed reviewer may attach its own or leave this `None`).
     pub ledger: Option<hull_core::reconcile::ClaimLedger>,
+    /// Token usage for this review, when the backend reported it (agent-CLI path). Internal metering.
+    #[serde(skip)]
+    pub usage: Option<Usage>,
 }
 
 /// The OSS default reviewer (Epic C): reconcile the change's narrative against its facts and
@@ -480,7 +497,7 @@ pub fn default_review(req: &ReviewRequest) -> ReviewPackage {
             ReviewVerdict::Comment => "Not green, or nothing corroborates the intent — a human should look.",
         }
     );
-    ReviewPackage { verdict, summary, findings, ledger: Some(ledger) }
+    ReviewPackage { verdict, summary, findings, ledger: Some(ledger), usage: None }
 }
 
 /// A notification payload (kept generic so plugins map it to their channel).

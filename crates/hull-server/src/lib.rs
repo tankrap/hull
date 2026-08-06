@@ -1141,7 +1141,12 @@ async fn ai_connections_get(State(app): State<App>, Path(id): Path<String>, head
     };
     let conns: Vec<Value> = app.store.ai_connections(&acct.id).into_iter().map(|c| {
         let kind = match &c.auth { hull_core::AiAuth::Key { .. } => "key", hull_core::AiAuth::AgentCli { .. } => "agent" };
-        json!({ "id": c.id, "provider": c.provider, "label": c.label, "base_url": c.base_url, "auth_kind": kind, "hint": c.auth.hint(), "created_unix": c.created_unix })
+        let u = app.store.ai_usage(&c.id);
+        json!({
+            "id": c.id, "provider": c.provider, "label": c.label, "base_url": c.base_url, "auth_kind": kind,
+            "hint": c.auth.hint(), "created_unix": c.created_unix, "token_expires_unix": c.token_expires_unix,
+            "usage": { "input_tokens": u.input_tokens, "output_tokens": u.output_tokens, "cost_micros": u.cost_micros, "runs": u.runs, "updated_unix": u.updated_unix },
+        })
     }).collect();
     Json(json!({ "connections": conns, "rotate": app.store.ai_rotate(&acct.id) })).into_response()
 }
@@ -1175,7 +1180,7 @@ async fn ai_connection_add(State(app): State<App>, Path(id): Path<String>, heade
         return (StatusCode::BAD_REQUEST, "provider must be openai|anthropic|openrouter (key) or claude-code|codex (agent)").into_response();
     };
     let label = body.get("label").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(def_label);
-    let conn = hull_core::AiConnection { id: format!("ai_{}_{}", acct.id, n + 1), owner: acct.id.clone(), provider, label, base_url, auth, created_unix: now() };
+    let conn = hull_core::AiConnection { id: format!("ai_{}_{}", acct.id, n + 1), owner: acct.id.clone(), provider, label, base_url, auth, created_unix: now(), token_expires_unix: None };
     app.store.put_ai_connection(conn.clone());
     (StatusCode::CREATED, Json(json!({ "id": conn.id }))).into_response()
 }
@@ -1269,23 +1274,37 @@ async fn ai_agent_login_complete(State(app): State<App>, Path(id): Path<String>,
     let sess = session.clone();
     let cmd = command.clone();
     let out = tokio::task::spawn_blocking(move || {
-        // Advance the login. For paste-code this feeds the code and waits; for device-auth this checks
-        // whether the self-polling CLI has been approved yet (Pending ⇒ poll again).
+        let dir = agentsession::dir_for(&sess);
         match agentlogin::finish(&sess, &code) {
+            // Device flow not approved yet — the client polls again.
             Ok(agentlogin::Finish::Pending) => Ok(None),
-            // Judge success by the *bundle's* auth state, not the CLI's exit — some CLIs hang on a
-            // success screen after writing creds; killing that must not discard a completed login.
-            Ok(agentlogin::Finish::Done) => match agent_auth_identity(&cmd, &agentsession::dir_for(&sess)) {
+            // Claude paste-code: the CLI printed a long-lived token. Verify it works, write it into the
+            // bundle, seal. The token is scoped to inference only (can't read the profile — 403), so the
+            // account/plan is whatever the CLI's success screen printed, else just "subscription".
+            Ok(agentlogin::Finish::Done { token: Some(tok), email, plan, ttl_days }) => {
+                verify_claude_token(&tok)?;
+                std::fs::write(dir.join(agentsession::OAUTH_TOKEN_FILE), tok.as_bytes()).map_err(|e| format!("store token: {e}"))?;
+                let expires = ttl_days.map(|d| now() + d * 86_400);
+                agentsession::seal(&sess).map(|_| Some(json!({
+                    "email": email.unwrap_or_default(),
+                    "plan": plan.unwrap_or_else(|| "subscription".into()),
+                    "expires_unix": expires,
+                })))
+            }
+            // Codex device flow: the CLI wrote its own bundle; verify + read identity, then seal.
+            Ok(agentlogin::Finish::Done { token: None, .. }) => match agent_auth_identity(&cmd, &dir) {
                 Ok(idy) => agentsession::seal(&sess).map(|_| Some(idy)),
                 Err(e) => Err(e),
             },
-            Err(e) => match agent_auth_identity(&cmd, &agentsession::dir_for(&sess)) {
-                Ok(idy) => agentsession::seal(&sess).map(|_| Some(idy)),
-                Err(_) => Err(e),
-            },
+            Err(e) => Err(e),
         }
     })
     .await;
+    if let Ok(Ok(Some(_))) = &out {
+        eprintln!("hull agentlogin: connected {provider} for account {}", acct.id);
+    } else if let Ok(Err(e)) = &out {
+        eprintln!("hull agentlogin: complete failed for {provider}: {e}");
+    }
     let identity = match out {
         Ok(Ok(Some(idy))) => idy,
         // Device flow not approved yet — tell the client to keep polling.
@@ -1315,6 +1334,7 @@ async fn ai_agent_login_complete(State(app): State<App>, Path(id): Path<String>,
         base_url: String::new(),
         auth: hull_core::AiAuth::AgentCli { command, session: session.clone(), account_email: email, plan },
         created_unix: now(),
+        token_expires_unix: identity.get("expires_unix").and_then(Value::as_u64),
     };
     app.store.put_ai_connection(conn.clone());
     (StatusCode::CREATED, Json(json!({ "id": conn.id, "identity": identity }))).into_response()
@@ -1354,6 +1374,31 @@ fn agent_auth_identity(command: &str, dir: &std::path::Path) -> Result<Value, St
         "email": v.get("email").and_then(Value::as_str).unwrap_or(""),
         "plan": v.get("subscriptionType").and_then(Value::as_str).unwrap_or(""),
     }))
+}
+
+/// Confirm a captured Claude long-lived token actually authenticates, by running a tiny `claude -p`
+/// with it in a throwaway config dir. Cheap, and it means a bad capture never persists a dead
+/// connection. A 401/invalid-token error fails; a working token (any normal reply) passes.
+fn verify_claude_token(token: &str) -> Result<(), String> {
+    if !token.starts_with("sk-ant-") {
+        return Err("captured value is not a Claude token".into());
+    }
+    let scratch = agentsession::sessions_root().join(".verify").join(uuid::Uuid::new_v4().simple().to_string());
+    let _ = std::fs::create_dir_all(&scratch);
+    let out = std::process::Command::new("claude")
+        .args(["-p", "Reply with the single word: ok"])
+        .env("CLAUDE_CODE_OAUTH_TOKEN", token)
+        .env("CLAUDE_CONFIG_DIR", &scratch)
+        .stdin(std::process::Stdio::null())
+        .output();
+    let _ = std::fs::remove_dir_all(&scratch);
+    let out = out.map_err(|e| format!("verify token: {e}"))?;
+    let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if out.status.success() && !combined.to_lowercase().contains("invalid") && !combined.contains("401") {
+        Ok(())
+    } else {
+        Err(format!("token did not authenticate: {}", combined.trim().chars().take(160).collect::<String>()))
+    }
 }
 
 /// Codex identity from the credentials it persisted: confirm `login status` reports logged-in, then
@@ -3729,24 +3774,33 @@ async fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&st
     let Some(owner) = owner else { return (None, None) };
     let idx = if app.store.ai_rotate(&owner) { next_ai_index(&owner, conns.len()) } else { 0 };
     let c = &conns[idx % conns.len()];
-    let (agent_cli, agent_config_dir, guard) = match &c.auth {
+    let (agent_cli, agent_config_dir, agent_token, guard) = match &c.auth {
         hull_core::AiAuth::AgentCli { command, session, .. } if !session.is_empty() => {
             // Per-user session: decrypt this user's bundle into a throwaway dir the CLI runs against;
             // the guard wipes it after. If it won't open, run no agent (degrade to the default
             // reviewer) rather than silently using the wrong identity (the host login).
             match agentsession::open(session).await {
-                Ok(g) => { let d = g.dir_string(); (Some(command.clone()), Some(d), Some(g)) }
+                Ok(g) => {
+                    let d = g.dir_string();
+                    // A Claude bundle holds a captured OAuth token → run via CLAUDE_CODE_OAUTH_TOKEN, no
+                    // config dir. A Codex bundle IS the config dir (CODEX_HOME).
+                    match agentsession::read_oauth_token(std::path::Path::new(&d)) {
+                        Some(tok) => (Some(command.clone()), None, tok, Some(g)),
+                        None => (Some(command.clone()), Some(d), String::new(), Some(g)),
+                    }
+                }
                 Err(e) => {
                     eprintln!("hull: agent bundle for session {session} won't open ({e}); skipping agent backend");
                     return (None, None);
                 }
             }
         }
-        // Host-login agent (empty session): no CLAUDE_CONFIG_DIR override.
-        hull_core::AiAuth::AgentCli { command, .. } => (Some(command.clone()), None, None),
-        _ => (None, None, None),
+        // Host-login agent (empty session): no override — the CLI uses the Hull host's own login.
+        hull_core::AiAuth::AgentCli { command, .. } => (Some(command.clone()), None, String::new(), None),
+        _ => (None, None, c.auth.bearer().to_string(), None),
     };
-    (Some(hull_plugin::AiCredential { provider: c.provider.clone(), base_url: c.base_url.clone(), token: c.auth.bearer().to_string(), agent_cli, agent_config_dir }), guard)
+    let token = if agent_cli.is_some() { agent_token } else { c.auth.bearer().to_string() };
+    (Some(hull_plugin::AiCredential { provider: c.provider.clone(), base_url: c.base_url.clone(), token, agent_cli, agent_config_dir, connection_id: Some(c.id.clone()) }), guard)
 }
 
 /// Default command for an agent kind.
@@ -3833,6 +3887,7 @@ async fn perform_auto_review(
         (Verdict::Approve, Vec::new(), Some(ledger), format!("pure move — {n} file{} relocated with byte-identical content (verified by content address); no behavioral review needed", if n == 1 { "" } else { "s" }), false)
     } else {
     let (cred, _bundle) = resolve_ai_credential(&app, &key, Some(&pr.author)).await;
+    let usage_conn = cred.as_ref().and_then(|c| c.connection_id.clone());
     let review_req = hull_plugin::ReviewRequest {
         repo: key.clone(),
         change: change.clone(),
@@ -3866,6 +3921,10 @@ async fn perform_auto_review(
             let pkg = tokio::task::spawn_blocking(move || registry.review(&review_req))
                 .await
                 .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "reviewer panicked".to_string()))?;
+            // Meter this run's token usage against the connection that served it.
+            if let (Some(cid), Some(u)) = (&usage_conn, &pkg.usage) {
+                app.store.add_ai_usage(cid, u.input_tokens, u.output_tokens, u.cost_micros, now());
+            }
             let v = match pkg.verdict {
                 hull_plugin::ReviewVerdict::Approve => Verdict::Approve,
                 hull_plugin::ReviewVerdict::RequestChanges => Verdict::RequestChanges,
@@ -4044,6 +4103,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
     let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
     let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
     let (cred, _bundle) = resolve_ai_credential(&app, &key, Some(&pr.author)).await;
+    let usage_conn = cred.as_ref().and_then(|c| c.connection_id.clone());
     let req = hull_plugin::FixRequest {
         repo: key.clone(),
         change,
@@ -4057,6 +4117,9 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
     let registry = app.registry.clone();
     // `_bundle` (decrypted per-user bundle, if any) stays alive across the fixer call, then wipes.
     let res = tokio::task::spawn_blocking(move || registry.fix(&req)).await.ok()??;
+    if let (Some(cid), Some(u)) = (&usage_conn, &res.usage) {
+        app.store.add_ai_usage(cid, u.input_tokens, u.output_tokens, u.cost_micros, now());
+    }
     if res.ok && !res.edits.is_empty() {
         let intent = format!("fix: {}", res.explanation);
         let edits: Vec<(String, String, String)> = res.edits.iter().map(|e| (e.path.clone(), e.search.clone(), e.replace.clone())).collect();

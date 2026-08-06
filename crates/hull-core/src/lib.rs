@@ -161,6 +161,24 @@ pub struct AiConnection {
     pub base_url: String,
     pub auth: AiAuth,
     pub created_unix: u64,
+    /// When a captured agent token expires (e.g. Claude `setup-token` is valid ~1 year). `None` for
+    /// key connections / device sessions that self-refresh. Used to warn before reviews start failing.
+    #[serde(default)]
+    pub token_expires_unix: Option<u64>,
+}
+
+/// Rolling token-usage tally for one [`AiConnection`] — what the account's subscription has spent on
+/// Hull's AI work (reviews/fixes/answers). `cost_micros` is USD × 1e6 (agents that report a cost).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cost_micros: u64,
+    #[serde(default)]
+    pub runs: u64,
+    #[serde(default)]
+    pub updated_unix: u64,
 }
 
 /// How an [`AiConnection`] authenticates. `Key` = a static API key. `AgentCli` = a locally-installed

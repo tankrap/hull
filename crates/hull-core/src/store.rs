@@ -43,6 +43,10 @@ pub trait Store: Send + Sync {
     fn remove_ai_connection(&self, owner: &str, id: &str) -> bool;
     fn set_ai_rotate(&self, owner: &str, on: bool);
     fn ai_rotate(&self, owner: &str) -> bool;
+    /// Add one agent run's token usage to a connection's rolling tally.
+    fn add_ai_usage(&self, conn_id: &str, input: u64, output: u64, cost_micros: u64, at_unix: u64);
+    /// A connection's accumulated usage (default zeros if none).
+    fn ai_usage(&self, conn_id: &str) -> crate::AiUsage;
     /// Set a repo's code-owner rules (replaces the existing set).
     fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>);
     fn owners(&self, repo: &str) -> Vec<OwnerRule>;
@@ -88,6 +92,7 @@ pub struct InMemory {
     teams: RwLock<HashMap<String, Team>>,
     ai_conns: RwLock<Vec<AiConnection>>,
     ai_rotate: RwLock<HashMap<String, bool>>,
+    ai_usage: RwLock<HashMap<String, crate::AiUsage>>,
 }
 
 impl InMemory {
@@ -200,6 +205,18 @@ impl Store for InMemory {
     fn ai_rotate(&self, owner: &str) -> bool {
         self.ai_rotate.read().unwrap().get(owner).copied().unwrap_or(false)
     }
+    fn add_ai_usage(&self, conn_id: &str, input: u64, output: u64, cost_micros: u64, at_unix: u64) {
+        let mut g = self.ai_usage.write().unwrap();
+        let u = g.entry(conn_id.to_string()).or_default();
+        u.input_tokens += input;
+        u.output_tokens += output;
+        u.cost_micros += cost_micros;
+        u.runs += 1;
+        u.updated_unix = at_unix;
+    }
+    fn ai_usage(&self, conn_id: &str) -> crate::AiUsage {
+        self.ai_usage.read().unwrap().get(conn_id).cloned().unwrap_or_default()
+    }
     fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>) {
         self.owners.write().unwrap().insert(repo.to_string(), rules);
     }
@@ -266,6 +283,8 @@ struct Snapshot {
     ai_conns: Vec<AiConnection>,
     #[serde(default)]
     ai_rotate: HashMap<String, bool>,
+    #[serde(default)]
+    ai_usage: HashMap<String, crate::AiUsage>,
 }
 
 /// A durable [`Store`] backed by a JSON snapshot on disk, so issues/accounts survive restarts.
@@ -443,6 +462,19 @@ impl Store for FileStore {
     }
     fn ai_rotate(&self, owner: &str) -> bool {
         self.inner.read().unwrap().ai_rotate.get(owner).copied().unwrap_or(false)
+    }
+    fn add_ai_usage(&self, conn_id: &str, input: u64, output: u64, cost_micros: u64, at_unix: u64) {
+        self.mutate(|s| {
+            let u = s.ai_usage.entry(conn_id.to_string()).or_default();
+            u.input_tokens += input;
+            u.output_tokens += output;
+            u.cost_micros += cost_micros;
+            u.runs += 1;
+            u.updated_unix = at_unix;
+        });
+    }
+    fn ai_usage(&self, conn_id: &str) -> crate::AiUsage {
+        self.inner.read().unwrap().ai_usage.get(conn_id).cloned().unwrap_or_default()
     }
     fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>) {
         self.mutate(|s| {

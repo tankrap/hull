@@ -341,8 +341,11 @@ function LabelEditor({ labels, onChange }: { labels: RepoLabel[]; onChange: (l: 
 // AI connections — lend an account/org's OpenAI, Claude, or OpenRouter access to Hull's AI functions.
 // Connect several and toggle rotation; a repo's reviews use its org's connections (else the caller's).
 function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: string; authHeaders: () => Record<string, string>; scopeLabel?: string }) {
-  type Conn = { id: string; provider: string; label: string; base_url: string; auth_kind: string; hint: string };
+  type Usage = { input_tokens: number; output_tokens: number; cost_micros: number; runs: number; updated_unix: number };
+  type Conn = { id: string; provider: string; label: string; base_url: string; auth_kind: string; hint: string; token_expires_unix?: number | null; usage?: Usage };
   type AgentInfo = { kind: string; command: string; label: string; installed: boolean };
+  const fmtTok = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
+  const fmtExpiry = (unix: number) => new Date(unix * 1000).toLocaleDateString(undefined, { month: "short", year: "numeric" });
   const enc = encodeURIComponent;
   const [conns, setConns] = useState<Conn[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
@@ -431,14 +434,31 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
           <p className="text-[12.5px] text-muted leading-[1.5]">Power AI reviews, fixes, triage, and “ask agent” for {scopeLabel ?? "this account"}. Connect a coding agent to run on <b>your own Claude / ChatGPT subscription</b>, or add an API key. Connect several and turn on rotate to spread load; without any, Hull uses its built-in reconciliation reviewer.</p>
           {conns.length > 0 && (
             <div className="grid gap-1.5">
-              {conns.map((c) => (
-                <div key={c.id} className="flex items-center gap-2.5 px-3 py-2 rounded-ctl border border-rule2 bg-paper/40">
-                  <span className={`w-2 h-2 rounded-full flex-none ${dot(c)}`} />
-                  <span className="text-[13.5px] font-medium truncate">{c.label}</span>
-                  <span className="text-[11.5px] text-faint">{c.auth_kind === "agent" ? <>{c.provider} · {c.hint}</> : <>{c.provider} · key {c.hint}</>}</span>
-                  <button onClick={() => remove(c.id)} className="ml-auto text-[12px] text-muted hover:text-fault-text">Remove</button>
+              {conns.map((c) => {
+                const u = c.usage;
+                const exp = c.token_expires_unix;
+                const soon = exp ? exp * 1000 - Date.now() < 30 * 86400 * 1000 : false;
+                return (
+                <div key={c.id} className="px-3 py-2 rounded-ctl border border-rule2 bg-paper/40">
+                  <div className="flex items-center gap-2.5">
+                    <span className={`w-2 h-2 rounded-full flex-none ${dot(c)}`} />
+                    <span className="text-[13.5px] font-medium truncate">{c.label}</span>
+                    <span className="text-[11.5px] text-faint">{c.auth_kind === "agent" ? <>{c.provider} · {c.hint}</> : <>{c.provider} · key {c.hint}</>}</span>
+                    <button onClick={() => remove(c.id)} className="ml-auto text-[12px] text-muted hover:text-fault-text">Remove</button>
+                  </div>
+                  {(!!(u && u.runs > 0) || !!exp) && (
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 mt-1 pl-[18px] text-[11px] text-faint tabular-nums">
+                      {u && u.runs > 0 && (
+                        <span title={`${u.input_tokens.toLocaleString()} in · ${u.output_tokens.toLocaleString()} out over ${u.runs} run(s)`}>
+                          ↑ {fmtTok(u.input_tokens)} in · ↓ {fmtTok(u.output_tokens)} out · {u.runs} run{u.runs === 1 ? "" : "s"}{u.cost_micros > 0 ? ` · $${(u.cost_micros / 1e6).toFixed(2)}` : ""}
+                        </span>
+                      )}
+                      {exp && <span className={soon ? "text-fault-text" : ""}>token expires {fmtExpiry(exp)}{soon ? " — reconnect soon" : ""}</span>}
+                    </div>
+                  )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
           {installed.length > 0 && !login && (
