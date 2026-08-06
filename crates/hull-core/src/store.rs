@@ -18,6 +18,14 @@ pub trait Store: Send + Sync {
     fn accounts(&self) -> Vec<Account>;
     fn put_repo(&self, repo: Repo);
     fn repos(&self) -> Vec<Repo>;
+    /// Remove a repo record by id. Returns true if one was removed.
+    fn remove_repo(&self, id: &str) -> bool;
+    /// Remove every domain record (issues, PRs, reviews, comments, sessions, code-owner rules)
+    /// whose repo key is `repo_key` (`<tenant>/<repo>`). Used when a repo is deleted.
+    fn purge_repo_data(&self, repo_key: &str);
+    /// Re-key every domain record (issues, PRs, reviews, comments, sessions, code-owner rules)
+    /// from `old_key` to `new_key`. Used when a repo is renamed.
+    fn rekey_repo_data(&self, old_key: &str, new_key: &str);
     fn put_issue(&self, issue: Issue);
     fn issues(&self, repo: &str) -> Vec<Issue>;
     /// Replace an existing issue, matched by `repo` + `number`. Returns true if one was replaced.
@@ -149,6 +157,38 @@ impl Store for InMemory {
     }
     fn repos(&self) -> Vec<Repo> {
         self.repos.read().unwrap().values().cloned().collect()
+    }
+    fn remove_repo(&self, id: &str) -> bool {
+        self.repos.write().unwrap().remove(id).is_some()
+    }
+    fn purge_repo_data(&self, repo_key: &str) {
+        self.issues.write().unwrap().retain(|i| i.repo != repo_key);
+        self.prs.write().unwrap().retain(|p| p.repo != repo_key);
+        self.reviews.write().unwrap().retain(|r| r.repo != repo_key);
+        self.comments.write().unwrap().retain(|c| c.repo != repo_key);
+        self.sessions.write().unwrap().retain(|s| s.repo != repo_key);
+        self.owners.write().unwrap().remove(repo_key);
+    }
+    fn rekey_repo_data(&self, old_key: &str, new_key: &str) {
+        for i in self.issues.write().unwrap().iter_mut().filter(|i| i.repo == old_key) {
+            i.repo = new_key.to_string();
+        }
+        for p in self.prs.write().unwrap().iter_mut().filter(|p| p.repo == old_key) {
+            p.repo = new_key.to_string();
+        }
+        for r in self.reviews.write().unwrap().iter_mut().filter(|r| r.repo == old_key) {
+            r.repo = new_key.to_string();
+        }
+        for c in self.comments.write().unwrap().iter_mut().filter(|c| c.repo == old_key) {
+            c.repo = new_key.to_string();
+        }
+        for s in self.sessions.write().unwrap().iter_mut().filter(|s| s.repo == old_key) {
+            s.repo = new_key.to_string();
+        }
+        let mut owners = self.owners.write().unwrap();
+        if let Some(rules) = owners.remove(old_key) {
+            owners.insert(new_key.to_string(), rules);
+        }
     }
     fn put_issue(&self, issue: Issue) {
         self.issues.write().unwrap().push(issue);
@@ -410,6 +450,43 @@ impl Store for FileStore {
     }
     fn repos(&self) -> Vec<Repo> {
         self.inner.read().unwrap().repos.values().cloned().collect()
+    }
+    fn remove_repo(&self, id: &str) -> bool {
+        let mut removed = false;
+        self.mutate(|s| removed = s.repos.remove(id).is_some());
+        removed
+    }
+    fn purge_repo_data(&self, repo_key: &str) {
+        self.mutate(|s| {
+            s.issues.retain(|i| i.repo != repo_key);
+            s.prs.retain(|p| p.repo != repo_key);
+            s.reviews.retain(|r| r.repo != repo_key);
+            s.comments.retain(|c| c.repo != repo_key);
+            s.sessions.retain(|x| x.repo != repo_key);
+            s.owners.remove(repo_key);
+        });
+    }
+    fn rekey_repo_data(&self, old_key: &str, new_key: &str) {
+        self.mutate(|s| {
+            for i in s.issues.iter_mut().filter(|i| i.repo == old_key) {
+                i.repo = new_key.to_string();
+            }
+            for p in s.prs.iter_mut().filter(|p| p.repo == old_key) {
+                p.repo = new_key.to_string();
+            }
+            for r in s.reviews.iter_mut().filter(|r| r.repo == old_key) {
+                r.repo = new_key.to_string();
+            }
+            for c in s.comments.iter_mut().filter(|c| c.repo == old_key) {
+                c.repo = new_key.to_string();
+            }
+            for x in s.sessions.iter_mut().filter(|x| x.repo == old_key) {
+                x.repo = new_key.to_string();
+            }
+            if let Some(rules) = s.owners.remove(old_key) {
+                s.owners.insert(new_key.to_string(), rules);
+            }
+        });
     }
     fn put_issue(&self, issue: Issue) {
         self.mutate(|s| s.issues.push(issue));

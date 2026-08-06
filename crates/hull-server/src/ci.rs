@@ -211,6 +211,23 @@ impl CiConfig {
         crate::jsonstore::persist_json_atomic(&self.path, &*m);
     }
 
+    /// Drop a repo's CI endpoint config (on repo delete).
+    pub fn delete(&self, repo: &str) {
+        let mut m = self.map.lock().unwrap();
+        if m.remove(repo).is_some() {
+            crate::jsonstore::persist_json_atomic(&self.path, &*m);
+        }
+    }
+
+    /// Move a repo's CI endpoint config to a new name (on repo rename).
+    pub fn rename(&self, old: &str, new: &str) {
+        let mut m = self.map.lock().unwrap();
+        if let Some(c) = m.remove(old) {
+            m.insert(new.to_string(), c);
+            crate::jsonstore::persist_json_atomic(&self.path, &*m);
+        }
+    }
+
     /// The effective endpoint for a repo: its own config, else the hull-instance default
     /// (`HULL_CI_URL` / `HULL_CI_SECRET`), else none (fall back to the built-in local runner).
     pub fn resolve(&self, repo: &str) -> (Option<RepoCi>, CiSource) {

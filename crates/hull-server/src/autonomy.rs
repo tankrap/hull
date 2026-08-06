@@ -65,6 +65,21 @@ impl AutonomyStore {
         m.insert(account_scope(account), p);
         self.persist(&m);
     }
+    /// Drop a repo's autonomy override (on repo delete).
+    pub fn delete_repo(&self, tenant: &str, repo: &str) {
+        let mut m = self.map.lock().unwrap();
+        if m.remove(&repo_scope(tenant, repo)).is_some() {
+            self.persist(&m);
+        }
+    }
+    /// Move a repo's autonomy override to a new name (on repo rename).
+    pub fn rename_repo(&self, tenant: &str, old: &str, new: &str) {
+        let mut m = self.map.lock().unwrap();
+        if let Some(p) = m.remove(&repo_scope(tenant, old)) {
+            m.insert(repo_scope(tenant, new), p);
+            self.persist(&m);
+        }
+    }
 
     /// The instance-default tier from `HULL_DEFAULT_AUTONOMY` (t0..t3), default T1.
     fn instance_tier() -> AutonomyTier {
