@@ -39,7 +39,7 @@ impl CiMemo {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(format!("{home}/.hull/ci-memo.json"))
         });
-        let map = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let map = crate::jsonstore::load_json(&path);
         CiMemo { path, map: Mutex::new(map) }
     }
 
@@ -50,11 +50,7 @@ impl CiMemo {
     /// The memoized verdict for a tree, as a [`CiOutcome`] (with `memoized: true`), if any.
     pub fn get_memoized(&self, tree: &str) -> Option<CiOutcome> {
         self.get(tree).map(|hit| {
-            let status = match hit.status.as_str() {
-                "green" => CiStatus::Green,
-                "red" => CiStatus::Red,
-                _ => CiStatus::Errored,
-            };
+            let status = status_from_str(&hit.status);
             CiOutcome { status, summary: hit.summary, memoized: true }
         })
     }
@@ -62,12 +58,7 @@ impl CiMemo {
     fn put(&self, tree: &str, entry: MemoEntry) {
         let mut m = self.map.lock().unwrap();
         m.insert(tree.to_string(), entry);
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&*m) {
-            let _ = std::fs::write(&self.path, json);
-        }
+        crate::jsonstore::persist_json_atomic(&self.path, &*m);
     }
 }
 
@@ -80,6 +71,17 @@ fn status_str(s: CiStatus) -> &'static str {
         CiStatus::Green => "green",
         CiStatus::Red => "red",
         CiStatus::Errored => "errored",
+    }
+}
+
+/// Parse a persisted/callback status string back into a [`CiStatus`]. Anything that isn't the exact
+/// `"green"`/`"red"` verdict is treated as errored — the inverse of [`status_str`]. Centralizes the
+/// `"green" | "red" | _` match that the memo lookups and the callback finalizer all need.
+fn status_from_str(s: &str) -> CiStatus {
+    match s {
+        "green" => CiStatus::Green,
+        "red" => CiStatus::Red,
+        _ => CiStatus::Errored,
     }
 }
 
@@ -101,11 +103,7 @@ pub fn run_check(
     // Content-addressed memo hit: an identical tree has already been judged.
     if !force {
         if let Some(hit) = memo.get(&tree) {
-            let status = match hit.status.as_str() {
-                "green" => CiStatus::Green,
-                "red" => CiStatus::Red,
-                _ => CiStatus::Errored,
-            };
+            let status = status_from_str(&hit.status);
             apply_verification(repos, tenant, repo, change, status);
             return CiOutcome { status, summary: hit.summary, memoized: true };
         }
@@ -138,11 +136,7 @@ pub fn run_check(
 /// Memoized by tree id like any other run, so an identical composed tree is judged once.
 pub fn run_check_tree(repos: &RepoHost, registry: &Registry, memo: &CiMemo, tenant: &str, repo: &str, tree: &str) -> CiOutcome {
     if let Some(hit) = memo.get(tree) {
-        let status = match hit.status.as_str() {
-            "green" => CiStatus::Green,
-            "red" => CiStatus::Red,
-            _ => CiStatus::Errored,
-        };
+        let status = status_from_str(&hit.status);
         return CiOutcome { status, summary: hit.summary, memoized: true };
     }
     let seq = CI_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -197,7 +191,7 @@ impl CiConfig {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(format!("{home}/.hull/ci-config.json"))
         });
-        let map = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let map = crate::jsonstore::load_json(&path);
         CiConfig { path, map: Mutex::new(map), inflight: Mutex::new(HashSet::new()) }
     }
 
@@ -214,12 +208,7 @@ impl CiConfig {
         } else {
             m.insert(repo.to_string(), cfg);
         }
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(j) = serde_json::to_string_pretty(&*m) {
-            let _ = std::fs::write(&self.path, j);
-        }
+        crate::jsonstore::persist_json_atomic(&self.path, &*m);
     }
 
     /// The effective endpoint for a repo: its own config, else the hull-instance default
@@ -274,11 +263,7 @@ pub fn dispatch_body(tenant: &str, repo: &str, change: &str, tree: &str, intent:
 /// keel verification, and release the in-flight guard. Returns the parsed status.
 #[allow(clippy::too_many_arguments)]
 pub fn finalize(repos: &RepoHost, memo: &CiMemo, config: &CiConfig, tenant: &str, repo: &str, change: &str, status: &str, summary: &str) -> CiStatus {
-    let st = match status {
-        "green" => CiStatus::Green,
-        "red" => CiStatus::Red,
-        _ => CiStatus::Errored,
-    };
+    let st = status_from_str(status);
     if let Some(tree) = repos.change_tree(tenant, repo, change) {
         if matches!(st, CiStatus::Green | CiStatus::Red) {
             memo.put(&tree, MemoEntry { status: status_str(st).into(), summary: summary.to_string() });
