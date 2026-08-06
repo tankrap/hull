@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 // Code-split the heavy Shiki-powered @pierre viewers into their own chunk (kept out of the initial bundle).
 const PierreFile = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.File })));
@@ -16,6 +16,9 @@ import { hlToHtml, wordDiff, type Seg } from "./highlight";
 import { Markdown } from "./markdown";
 import { RichText } from "./ui/RichText";
 import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from "./api";
+import { Popover, Picker, SplitButton } from "./components/menus";
+import { CommandPalette, type CmdItem } from "./components/CommandPalette";
+import { ContributionHeatmap, type HeatDay } from "./components/ContributionHeatmap";
 
 // Syntax-highlighted code fragment (hljs HTML). Used across the diff viewer.
 const Hl = ({ text, path }: { text: string; path: string }) => <span dangerouslySetInnerHTML={{ __html: hlToHtml(text, path) }} />;
@@ -671,121 +674,6 @@ const Stat = ({ k, v }: { k: React.ReactNode; v: React.ReactNode }) => (
   </div>
 );
 
-// A click-to-open popover anchored under its trigger. Closes on outside-click or Escape. Used for the
-// header "checks" summary, so the landing gate is reachable from the top of the page.
-function Popover({ trigger, children, align = "left", width = 300, direction = "down", block = false, onToggle }: { trigger: (open: boolean) => React.ReactNode; children: React.ReactNode; align?: "left" | "right"; width?: number; direction?: "down" | "up"; block?: boolean; onToggle?: (open: boolean) => void }) {
-  const [open, setOpen] = useState(false);
-  const [rect, setRect] = useState<DOMRect | null>(null);
-  const wrapRef = useRef<HTMLSpanElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const set = (v: boolean) => { setOpen(v); onToggle?.(v); };
-  const measure = () => { if (wrapRef.current) setRect(wrapRef.current.getBoundingClientRect()); };
-  useLayoutEffect(() => { if (open) measure(); /* eslint-disable-next-line */ }, [open]);
-  useEffect(() => {
-    if (!open) return;
-    // Close on an outside click — but NOT when the click lands inside ANY popover panel (panels are
-    // portaled to <body>, so a nested menu's panel is a DOM sibling that would otherwise read as
-    // "outside" and wrongly close its parent). Menu items still close via the panel's own onClick.
-    const onDoc = (e: MouseEvent) => {
-      const t = e.target as HTMLElement;
-      if (wrapRef.current?.contains(t)) return;
-      if (t.closest?.("[data-popover-panel]")) return;
-      set(false);
-    };
-    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") set(false); };
-    const reflow = () => measure();
-    document.addEventListener("mousedown", onDoc);
-    document.addEventListener("keydown", onEsc);
-    window.addEventListener("scroll", reflow, true);
-    window.addEventListener("resize", reflow);
-    return () => { document.removeEventListener("mousedown", onDoc); document.removeEventListener("keydown", onEsc); window.removeEventListener("scroll", reflow, true); window.removeEventListener("resize", reflow); };
-  }, [open]);
-  // The panel renders in a body portal with FIXED positioning, so it escapes every ancestor's
-  // overflow-hidden / stacking context and always paints on top — no clipping, no z-index fights.
-  const style: React.CSSProperties = { position: "fixed", zIndex: 60, width: block ? (rect?.width ?? width) : width };
-  if (rect) {
-    if (direction === "up") { style.bottom = window.innerHeight - rect.top + 6; style.maxHeight = rect.top - 16; }
-    else { style.top = rect.bottom + 6; style.maxHeight = window.innerHeight - rect.bottom - 16; }
-    if (align === "right") style.right = window.innerWidth - rect.right; else style.left = rect.left;
-  }
-  return (
-    <span ref={wrapRef} className={`relative inline-flex ${block ? "w-full" : ""}`}>
-      {/* stopPropagation so a Popover nested inside another Popover's panel doesn't bubble its trigger
-          click up to the outer panel's close-on-click handler (which would shut everything). */}
-      <button type="button" onClick={(e) => { e.stopPropagation(); set(!open); }} className={`inline-flex ${block ? "w-full" : ""}`}>{trigger(open)}</button>
-      {open && rect && createPortal(
-        <div ref={panelRef} style={style} data-popover-panel onClick={() => set(false)}
-          className="bg-surface border border-rule rounded-card shadow-menu overflow-y-auto overflow-x-hidden animate-[bd-in_120ms_ease-out]">
-          {children}
-        </div>,
-        document.body,
-      )}
-    </span>
-  );
-}
-
-// Styled select (replaces native <select>). options: {value,label}[]. When value is "" it shows the
-// placeholder — used both for bound selects and "pick to act" menus.
-type PickerOption = { value: string; label: string; sub?: string; avatar?: React.ReactNode };
-function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", block = false, direction = "down", className = "", searchable: searchableProp }: { value: string; onChange: (v: string) => void; options: PickerOption[]; placeholder?: string; width?: number; size?: "sm" | "md"; block?: boolean; direction?: "down" | "up"; className?: string; searchable?: boolean }) {
-  const cur = options.find((o) => o.value === value);
-  const h = size === "sm" ? "h-ctl-sm text-xs" : "h-ctl text-[13px]";
-  const [q, setQ] = useState("");
-  const searchable = searchableProp ?? options.length >= 8;
-  const ql = q.trim().toLowerCase();
-  const filtered = ql ? options.filter((o) => o.label.toLowerCase().includes(ql) || (o.sub ?? "").toLowerCase().includes(ql)) : options;
-  const rich = options.some((o) => o.avatar || o.sub);
-  return (
-    <Popover align="left" width={width} block={block} direction={direction} onToggle={(o) => { if (!o) setQ(""); }} trigger={(open) => (
-      <span className={`inline-flex items-center justify-between gap-2 ${h} px-2.5 rounded-ctl border bg-surface transition-colors ${block ? "w-full" : ""} ${open ? "border-body" : "border-ctl hover:border-dim"} ${className}`}>
-        <span className={`truncate ${cur ? "text-ink" : "text-faint"}`}>{cur?.label ?? placeholder}</span>
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`text-muted flex-none transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
-      </span>
-    )}>
-      {searchable && (
-        <div className="p-1.5 border-b border-rule2 sticky top-0 bg-surface" onClick={(e) => e.stopPropagation()}>
-          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…" className="w-full box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" />
-        </div>
-      )}
-      <div className="py-1 max-h-[280px] overflow-y-auto overflow-x-hidden">
-        {filtered.length === 0 && <div className="px-3 py-1.5 text-[12.5px] text-muted">{ql ? "no matches" : "none available"}</div>}
-        {filtered.map((o) => (rich ? (
-          <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:bg-paper ${o.value === value ? "bg-paper" : ""}`}>
-            {o.avatar ? <span className="flex-none">{o.avatar}</span> : null}
-            <span className="min-w-0 flex-1">
-              <span className={`block text-[13px] truncate ${o.value === value ? "font-medium text-ink" : "text-body"}`}>{o.label}</span>
-              {o.sub && <span className="block text-[11.5px] text-muted truncate">{o.sub}</span>}
-            </span>
-            {o.value === value && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
-          </button>
-        ) : (
-          <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-3 py-1.5 text-[13px] truncate hover:bg-paper ${o.value === value ? "bg-paper font-medium text-ink" : "text-body"}`}>{o.label}</button>
-        )))}
-      </div>
-    </Popover>
-  );
-}
-
-// A cohesive split button: a primary action + a dropdown, sharing ONE dark/muted skin so a disabled
-// submit never leaves a stray bright chevron. The chevron stays clickable while the submit is disabled
-// (to pick a verdict / mode / secondary action). Shared by every composer — issues AND pull requests.
-function SplitButton({ label, icon, disabled, onSubmit, menu, menuWidth = 252 }: { label: React.ReactNode; icon?: React.ReactNode; disabled?: boolean; onSubmit: () => void; menu: React.ReactNode; menuWidth?: number }) {
-  return (
-    <div className={`flex-none inline-flex h-ctl rounded-ctl overflow-hidden border ${disabled ? "border-ctl" : "border-ink"}`}>
-      <button type="button" disabled={disabled} onClick={onSubmit}
-        className={`inline-flex items-center gap-1.5 px-3.5 text-[13px] font-semibold whitespace-nowrap transition-colors ${disabled ? "bg-paper text-faint cursor-not-allowed" : "bg-ink text-surface hover:brightness-110"}`}>
-        {icon}{label}
-      </button>
-      <Popover align="right" width={menuWidth} direction="up" trigger={(open) => (
-        <span className={`inline-flex items-center h-full px-1.5 border-l cursor-pointer transition-[filter,background-color] ${disabled ? "bg-paper text-muted border-ctl hover:text-ink" : "bg-ink text-surface border-l-white/25 hover:brightness-110"} ${open ? "brightness-110" : ""}`}>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
-        </span>
-      )}>
-        {menu}
-      </Popover>
-    </div>
-  );
-}
 
 // Centered modal shell (backdrop + card + header). Closes on backdrop click / ✕ / Escape.
 function ModalShell({ title, onClose, children, width = 480 }: { title: string; onClose: () => void; children: React.ReactNode; width?: number }) {
@@ -1040,62 +928,6 @@ function IssueThread({ target, comments, issues, commentDraft, setCommentDraft, 
 }
 
 // ── ⌘K command palette: search or jump to repos / issues / voyages / actions ──────
-type CmdItem = { id: string; group: string; label: string; sublabel?: string; icon?: React.ReactNode; run: () => void };
-function CommandPalette({ open, items, onClose }: { open: boolean; items: CmdItem[]; onClose: () => void }) {
-  const [q, setQ] = useState("");
-  const [sel, setSel] = useState(0);
-  useEffect(() => { if (open) { setQ(""); setSel(0); } }, [open]);
-  const ql = q.trim().toLowerCase();
-  const matches = ql ? items.filter((it) => `${it.label} ${it.sublabel ?? ""} ${it.group}`.toLowerCase().includes(ql)) : items;
-  useEffect(() => { setSel(0); }, [ql]);
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "ArrowDown") { e.preventDefault(); setSel((s) => Math.min(matches.length - 1, s + 1)); }
-      else if (e.key === "ArrowUp") { e.preventDefault(); setSel((s) => Math.max(0, s - 1)); }
-      else if (e.key === "Enter") { e.preventDefault(); const m = matches[sel]; if (m) { m.run(); onClose(); } }
-      else if (e.key === "Escape") { e.preventDefault(); onClose(); }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, matches, sel, onClose]);
-  if (!open) return null;
-  const groups: string[] = [];
-  matches.forEach((m) => { if (!groups.includes(m.group)) groups.push(m.group); });
-  let idx = -1;
-  return (
-    <>
-      <div onClick={onClose} className="fixed inset-0 z-40 bg-ink/30 animate-bd-in" />
-      <div className="fixed left-1/2 top-[11vh] -translate-x-1/2 z-50 w-[580px] max-w-[92vw] bg-surface rounded-[13px] shadow-modal overflow-hidden animate-ov-in border border-rule">
-        <div className="flex items-center gap-2.5 px-4 h-[50px] border-b border-rule2">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
-          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search or jump to a repo, issue, pull request, or action…" className="flex-1 bg-transparent outline-none font-sans text-[14px] text-ink placeholder:text-faint" />
-          <span className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-1.5 py-0.5 bg-paper">esc</span>
-        </div>
-        <div className="max-h-[54vh] overflow-y-auto py-1.5">
-          {matches.length === 0 && <div className="px-4 py-8 text-[13px] text-muted text-center">no matches</div>}
-          {groups.map((g) => (
-            <div key={g}>
-              <div className="px-4 pt-2.5 pb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">{g}</div>
-              {matches.filter((m) => m.group === g).map((m) => {
-                idx++;
-                const i = idx;
-                return (
-                  <button key={m.id} onMouseEnter={() => setSel(i)} onClick={() => { m.run(); onClose(); }}
-                    className={`w-full text-left flex items-center gap-2.5 px-4 py-2 cursor-pointer ${sel === i ? "bg-steel-wash" : "hover:bg-paper"}`}>
-                    <span className="flex-none w-4 grid place-items-center text-muted">{m.icon ?? <span className="text-faint">›</span>}</span>
-                    <span className={`text-[13.5px] flex-1 truncate ${sel === i ? "text-steel-text font-medium" : "text-ink"}`}>{m.label}</span>
-                    {m.sublabel && <span className="text-[12px] text-faint truncate flex-none max-w-[40%]">{m.sublabel}</span>}
-                  </button>
-                );
-              })}
-            </div>
-          ))}
-        </div>
-      </div>
-    </>
-  );
-}
 // verification/state → StatusBadge kind
 /**
  * The home page IS a live projection of the fleet's coordination stream: repos rank by activity
@@ -3338,67 +3170,6 @@ export function App() {
 // A GitHub-style contribution heatmap: ~53 weeks × 7 days. Each cell is split into TWO triangles —
 // top-left = your own contributions, bottom-right = your agents' — each shaded by its own intensity.
 // Columns flex to fill the width, so there's never a scrollbar.
-type HeatDay = { day: number; human: number; agent: number };
-const HEAT_EMPTY = "var(--rule2)"; // theme-aware neutral for days with no contributions
-const HEAT_YOU = [HEAT_EMPTY, "#9be9a8", "#40c463", "#30a14e", "#216e39"]; // green
-const HEAT_AGENT = [HEAT_EMPTY, "#a9c9f5", "#5a9bd4", "#2f6fb0", "#1b4d80"]; // blue
-function ContributionHeatmap({ days }: { days: HeatDay[] }) {
-  const byDay = new Map(days.map((d) => [d.day, d]));
-  const today = Math.floor(Date.now() / 86_400_000);
-  const start = today - 371;
-  const dow = (e: number) => ((e % 7) + 4) % 7; // epoch day 0 = Thursday; 0=Sun … 6=Sat
-  const gridStart = start - dow(start);
-  const maxH = Math.max(1, ...days.map((d) => d.human));
-  const maxA = Math.max(1, ...days.map((d) => d.agent));
-  const lvl = (c: number, m: number) => (c <= 0 ? 0 : c <= m * 0.25 ? 1 : c <= m * 0.5 ? 2 : c <= m * 0.75 ? 3 : 4);
-  const weeks: number[][] = [];
-  for (let w = 0; gridStart + w * 7 <= today; w++) {
-    const col: number[] = [];
-    for (let d = 0; d < 7; d++) { const e = gridStart + w * 7 + d; col.push(e >= start && e <= today ? e : -1); }
-    weeks.push(col);
-  }
-  const fmtFull = (e: number) => new Date(e * 86_400_000).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
-  // Hover reveals that day's specifics in a small cursor-anchored tooltip.
-  const [hover, setHover] = useState<{ x: number; y: number; e: number; h: number; a: number } | null>(null);
-  return (
-    <div className="grid gap-2">
-      <div className="flex gap-[2px] w-full">
-        {weeks.map((col, i) => (
-          <div key={i} className="grid gap-[2px] flex-1 min-w-0 content-start">
-            {col.map((e, j) => {
-              if (e < 0) return <span key={j} className="aspect-square" />;
-              const d = byDay.get(e); const h = d?.human ?? 0; const a = d?.agent ?? 0;
-              const bg = h === 0 && a === 0 ? HEAT_EMPTY : `linear-gradient(to bottom right, ${HEAT_YOU[lvl(h, maxH)]} 0 50%, ${HEAT_AGENT[lvl(a, maxA)]} 50% 100%)`;
-              return <span key={j}
-                onMouseEnter={(ev) => setHover({ x: ev.clientX, y: ev.clientY, e, h, a })}
-                onMouseMove={(ev) => setHover((prev) => (prev && prev.e === e ? { ...prev, x: ev.clientX, y: ev.clientY } : { x: ev.clientX, y: ev.clientY, e, h, a }))}
-                onMouseLeave={() => setHover((prev) => (prev && prev.e === e ? null : prev))}
-                className="aspect-square rounded-[2px] hover:ring-2 hover:ring-ink/25 transition-shadow" style={{ background: bg }} />;
-            })}
-          </div>
-        ))}
-      </div>
-      <div className="flex items-center gap-4 text-[11.5px] text-muted self-end">
-        <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />humans</span>
-        <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_AGENT[3] }} />agents</span>
-      </div>
-      {hover && (
-        <div className="fixed z-[80] pointer-events-none -translate-x-1/2 -translate-y-full" style={{ left: hover.x, top: hover.y - 10 }}>
-          <div className="rounded-ctl-sm bg-surface border border-rule2 shadow-modal px-2.5 py-1.5 text-[11.5px] whitespace-nowrap">
-            <div className="font-semibold text-body">{hover.h + hover.a === 0 ? "No contributions" : `${hover.h + hover.a} contribution${hover.h + hover.a === 1 ? "" : "s"}`}</div>
-            {hover.h + hover.a > 0 && (
-              <div className="mt-0.5 flex items-center gap-2 text-muted">
-                <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />{hover.h} human{hover.h === 1 ? "" : "s"}</span>
-                <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-[2px]" style={{ background: HEAT_AGENT[3] }} />{hover.a} agents</span>
-              </div>
-            )}
-            <div className={`text-faint ${hover.h + hover.a > 0 ? "mt-0.5" : "mt-0.5"}`}>{fmtFull(hover.e)}</div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ── Graph tab: the codebase as a force-directed import graph, searchable ─────────────────────────
 type GNode = { path: string; dir: string; lang: string; size: number; deg: number };
