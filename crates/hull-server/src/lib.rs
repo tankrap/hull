@@ -3032,6 +3032,30 @@ fn is_repo_admin(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The account that owns `tenant/repo`: the repo record's owner, or (no repo record yet) the org whose
+/// handle == `tenant`. Same resolution as `repo_account_id`, returning the full [`Account`].
+fn repo_owner_account(app: &App, tenant: &str, repo: &str) -> Option<Account> {
+    let owner = repo_account_id(app, tenant, repo)?;
+    app.store.accounts().into_iter().find(|a| a.id == owner)
+}
+
+/// The write-side membership gate: does `actor` belong to the account that owns `tenant/repo` — in ANY
+/// role (Owner/Admin/Write/Read) — or to a team that account has granted access to this repo? Unlike
+/// `can_read_repo`, this never short-circuits on visibility: a *public* repo is still only mutated by
+/// its members. `is_repo_admin` (Owner/Admin only) is the stricter peer used for repo-config changes.
+fn is_repo_member(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
+    let Some(acct) = repo_owner_account(app, tenant, repo) else { return false };
+    if acct.members.iter().any(|m| m.actor == actor) {
+        return true;
+    }
+    // A member of a team the repo grants access to counts as a member (teams carry a repo role).
+    let settings = app.repo_settings.get(&format!("{tenant}/{repo}"));
+    app.store
+        .teams(&acct.id)
+        .into_iter()
+        .any(|t| settings.team_access.iter().any(|ta| ta.team == t.id) && t.members.iter().any(|m| m.actor == actor))
+}
+
 /// Git push endpoint, wrapped so that **every successful push runs CI** on the new HEAD change —
 /// independent of autonomy tier (CI is a mechanical check, not an autonomous action). Fire-and-forget
 /// (memoized by tree, so an unchanged tree is a no-op); dispatched to the configured CI or the local
@@ -5498,6 +5522,65 @@ mod tests {
         let resolved = app.claims.for_change("acme/site", "chg1");
         assert_eq!(resolved.get("claimA").map(|r| r.judgment.as_str()), Some("verified"), "the claim resolution re-keys to the new name");
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── authz-hardening: membership helpers + read/mutation gates ──────────────────────────────────
+    //
+    // Truth tables for the shared helpers (area A), the private-repo read gate (area B) driven through
+    // a real handler, and the mutation gates (area C) on `verify_change` / `set_owners` / a member-only
+    // endpoint plus the same-org scoping of `independent_agent_reviewer`.
+
+    /// Seed an org whose handle == `tenant`, owning `repo`, with the given members and visibility — the
+    /// exact shape `find_repo` / `repo_account_id` / `can_read_repo` read.
+    fn setup_org_repo(app: &App, tenant: &str, repo: &str, private: bool, members: &[(&str, Role)]) {
+        let acct_id = format!("acct-{tenant}");
+        app.store.put_account(Account {
+            id: acct_id.clone(),
+            kind: AccountKind::Organization,
+            handle: tenant.into(),
+            members: members.iter().map(|(a, r)| Membership { actor: (*a).into(), role: *r }).collect(),
+        });
+        app.store.put_repo(Repo { id: format!("repo-{tenant}-{repo}"), owner: acct_id, name: repo.into(), default_branch: "main".into() });
+        app.repo_settings.set(&format!("{tenant}/{repo}"), crate::reposettings::RepoSettings { private, ..Default::default() });
+    }
+
+    fn set_private(app: &App, key: &str, private: bool) {
+        app.repo_settings.set(key, crate::reposettings::RepoSettings { private, ..Default::default() });
+    }
+
+    #[test]
+    fn can_read_repo_truth_table() {
+        let (app, tmp) = build_test_app("can-read");
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
+        // PRIVATE: only members read; anonymous and outsiders are refused.
+        assert!(!can_read_repo(&app, None, "acme", "web"), "anonymous cannot read a private repo");
+        assert!(!can_read_repo(&app, Some("outsider"), "acme", "web"), "a non-member cannot read a private repo");
+        assert!(can_read_repo(&app, Some("member"), "acme", "web"), "a member can read a private repo");
+        // PUBLIC (and unlisted, which is `!private`): readable by anyone, including anonymous.
+        set_private(&app, "acme/web", false);
+        assert!(can_read_repo(&app, None, "acme", "web"), "anonymous CAN read a public repo");
+        assert!(can_read_repo(&app, Some("outsider"), "acme", "web"), "a non-member can read a public repo");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_repo_member_and_admin_truth_table() {
+        let (app, tmp) = build_test_app("is-member");
+        setup_org_repo(&app, "acme", "web", true, &[("owner", Role::Owner), ("dev", Role::Write), ("reader", Role::Read)]);
+        // is_repo_member: ANY role of the owning account.
+        assert!(is_repo_member(&app, "acme", "web", "owner"));
+        assert!(is_repo_member(&app, "acme", "web", "dev"));
+        assert!(is_repo_member(&app, "acme", "web", "reader"), "even a Read role is a member");
+        assert!(!is_repo_member(&app, "acme", "web", "outsider"));
+        // Visibility is irrelevant to membership: a public repo is still only *mutated* by members.
+        set_private(&app, "acme/web", false);
+        assert!(!is_repo_member(&app, "acme", "web", "outsider"), "a public repo does not make an outsider a member");
+        // is_repo_admin: Owner/Admin only, a strict subset of members.
+        assert!(is_repo_admin(&app, "acme", "web", "owner"));
+        assert!(!is_repo_admin(&app, "acme", "web", "dev"), "Write is a member but not an admin");
+        assert!(!is_repo_admin(&app, "acme", "web", "reader"), "Read is a member but not an admin");
+        assert!(!is_repo_admin(&app, "acme", "web", "outsider"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
