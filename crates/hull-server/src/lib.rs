@@ -4824,4 +4824,218 @@ mod tests {
         assert!(!tokens.contains_key("ancient"), "a long-expired token must be dropped");
         assert_eq!(tokens.len(), 2, "only unexpired tokens remain — the map cannot grow unbounded");
     }
+
+    // ── merge gate (`perform_merge`) ──────────────────────────────────────────────────────────────
+    //
+    // Drives the real gate end-to-end against an isolated in-memory `App`: a temp-dir RepoHost with a
+    // real keel change, a domain store with the PR/reviews/actors, and a per-repo autonomy tier.
+
+    // Serialize the env-var writes that isolate each `App`'s file-backed side stores under a fresh HOME.
+    static MERGE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn build_test_app(tag: &str) -> (App, std::path::PathBuf) {
+        let g = MERGE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("hull-merge-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Point every `from_env` side store (and the repo host) at the throwaway dir so nothing touches
+        // the real ~/.hull, then build the app while still holding the lock (env is captured at build).
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("HULL_REPOS_ROOT", tmp.join("repos"));
+        std::env::remove_var("HULL_DEFAULT_AUTONOMY");
+        let app = build_app(Registry::new(), Arc::new(ActivityHub::new()), Arc::new(InMemory::new()));
+        drop(g);
+        (app, tmp)
+    }
+
+    fn actor(id: &str, kind: ActorKind) -> Actor {
+        Actor { id: id.into(), kind, lifetime: Lifetime::Static, handle: id.into(), delegation: None, nostr_pubkey: None, revoked: false }
+    }
+
+    fn put_pr(app: &App, key: &str, number: u64, author: &str, change: &str) {
+        app.store.put_pr(PullRequest {
+            id: format!("pr-{number}"),
+            repo: key.into(),
+            number,
+            title: "a change".into(),
+            author: author.into(),
+            changes: vec![change.into()],
+            verification: Verification::Unverified,
+            reviewers: vec![],
+            state: PrState::Open,
+            merged_by: None,
+            created_unix: 0,
+        });
+    }
+
+    fn put_approval(app: &App, key: &str, number: u64, reviewer: &str) {
+        app.store.put_review(Review {
+            id: format!("rev-{reviewer}-{number}"),
+            repo: key.into(),
+            target: format!("pr:{number}"),
+            reviewer: reviewer.into(),
+            verdict: Verdict::Approve,
+            summary: "lgtm".into(),
+            findings: vec![],
+            ledger: None,
+            artifact_id: None,
+            created_unix: 0,
+        });
+    }
+
+    async fn is_merged(app: &App, key: &str, number: u64) -> bool {
+        app.store.prs(key).into_iter().find(|p| p.number == number).map(|p| p.state == PrState::Merged).unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn merge_blocked_when_change_not_green() {
+        let (app, tmp) = build_test_app("notgreen");
+        let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
+        // verification left unset (unverified). A human reviewer approves — but green is required.
+        app.store.put_actor(actor("human", ActorKind::Human));
+        put_pr(&app, "t/r", 1, "author", &change);
+        put_approval(&app, "t/r", 1, "human");
+        let acting = actor("author", ActorKind::Human);
+        let res = perform_merge(&app, "t", "r", 1, &acting, false).await;
+        let (code, msg) = res.expect_err("un-green change must be blocked");
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(msg.contains("not keel-verify green"), "msg: {msg}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_self_approval_unless_repo_allows_it() {
+        let (app, tmp) = build_test_app("selfapprove");
+        let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
+        app.repos.set_verification("t", "r", &change, true);
+        app.store.put_actor(actor("author", ActorKind::Human));
+        put_pr(&app, "t/r", 1, "author", &change);
+        put_approval(&app, "t/r", 1, "author"); // the author approves their OWN pr
+        let acting = actor("author", ActorKind::Human);
+
+        // Default: self-approval doesn't count ⇒ no independent approval ⇒ blocked.
+        let (code, msg) = perform_merge(&app, "t", "r", 1, &acting, false).await.expect_err("self-approval blocked by default");
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(msg.contains("someone other than the author"), "msg: {msg}");
+
+        // Opt in to self-approval ⇒ the author's own approve now satisfies the gate.
+        app.repo_settings.set("t/r", crate::reposettings::RepoSettings { allow_self_approve: true, ..Default::default() });
+        perform_merge(&app, "t", "r", 1, &acting, false).await.expect("self-approval allowed once opted in");
+        assert!(is_merged(&app, "t/r", 1).await);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn merge_allows_independent_human_approval() {
+        let (app, tmp) = build_test_app("humanok");
+        let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
+        app.repos.set_verification("t", "r", &change, true);
+        app.store.put_actor(actor("author", ActorKind::Human));
+        app.store.put_actor(actor("reviewer", ActorKind::Human));
+        put_pr(&app, "t/r", 1, "author", &change);
+        put_approval(&app, "t/r", 1, "reviewer");
+        let acting = actor("author", ActorKind::Human);
+        perform_merge(&app, "t", "r", 1, &acting, false).await.expect("green + independent human approval merges");
+        assert!(is_merged(&app, "t/r", 1).await);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn merge_agent_approval_blocked_at_t1_but_merges_at_t3() {
+        let (app, tmp) = build_test_app("agenttier");
+        // A clean, non-protected change with a claimed narrative (no phantom ops from notes.txt).
+        let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
+        app.repos.set_verification("t", "r", &change, true);
+        app.store.put_actor(actor("author", ActorKind::Human));
+        app.store.put_actor(actor("agent", ActorKind::Agent));
+        put_pr(&app, "t/r", 1, "author", &change);
+        put_approval(&app, "t/r", 1, "agent");
+        let acting = actor("author", ActorKind::Human);
+
+        // T1: an agent's approve is advisory ⇒ still needs a human.
+        app.autonomy.set_repo("t", "r", AutonomyPolicy { tier: AutonomyTier::T1, protected_paths: vec![] });
+        let (code, msg) = perform_merge(&app, "t", "r", 1, &acting, false).await.expect_err("agent approve doesn't count at T1");
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(msg.contains("autonomy tier doesn't let an agent approve"), "msg: {msg}");
+
+        // T3: an agent's approve counts for a non-protected change.
+        app.autonomy.set_repo("t", "r", AutonomyPolicy { tier: AutonomyTier::T3, protected_paths: vec![] });
+        perform_merge(&app, "t", "r", 1, &acting, false).await.expect("agent approve counts at T3 for a non-protected change");
+        assert!(is_merged(&app, "t/r", 1).await);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn merge_agent_approval_blocked_on_protected_path_even_at_t3() {
+        let (app, tmp) = build_test_app("protected");
+        // Touches a protected path (auth/…) → D11: always needs a human, even at the top tier.
+        let change = app.repos.test_commit("t", "r", "", None, &[("auth/token.rs", "x\n")]);
+        app.repos.set_verification("t", "r", &change, true);
+        app.store.put_actor(actor("author", ActorKind::Human));
+        app.store.put_actor(actor("agent", ActorKind::Agent));
+        put_pr(&app, "t/r", 1, "author", &change);
+        put_approval(&app, "t/r", 1, "agent");
+        app.autonomy.set_repo("t", "r", AutonomyPolicy { tier: AutonomyTier::T3, protected_paths: vec![] });
+        let acting = actor("author", ActorKind::Human);
+        let (code, msg) = perform_merge(&app, "t", "r", 1, &acting, false).await.expect_err("protected path blocks agent auto-merge at T3");
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(msg.contains("protected path"), "msg: {msg}");
+        assert!(!is_merged(&app, "t/r", 1).await);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn merge_agent_approval_at_t2_requires_low_risk() {
+        // T2 auto-approves only LOW-RISK changes (green, uncontradicted, no phantom, no protected path).
+        // A change whose narrative (empty intent) doesn't account for the `fn` it added is phantom work
+        // ⇒ not low-risk ⇒ an agent's approve must not auto-merge it.
+        let (app, tmp) = build_test_app("t2phantom");
+        let phantom = app.repos.test_commit("t", "r", "", None, &[("helper.rs", "fn secret_backdoor() {}\n")]);
+        app.repos.set_verification("t", "r", &phantom, true);
+        app.store.put_actor(actor("author", ActorKind::Human));
+        app.store.put_actor(actor("agent", ActorKind::Agent));
+        put_pr(&app, "t/r", 1, "author", &phantom);
+        put_approval(&app, "t/r", 1, "agent");
+        app.autonomy.set_repo("t", "r", AutonomyPolicy { tier: AutonomyTier::T2, protected_paths: vec![] });
+        let acting = actor("author", ActorKind::Human);
+        let (code, _msg) = perform_merge(&app, "t", "r", 1, &acting, false).await.expect_err("phantom work is not low-risk ⇒ blocked at T2");
+        assert_eq!(code, StatusCode::CONFLICT);
+
+        // A clean low-risk change (no phantom ops) DOES auto-merge at T2.
+        let clean = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "just prose\n")]);
+        app.repos.set_verification("t", "r", &clean, true);
+        put_pr(&app, "t/r", 2, "author", &clean);
+        put_approval(&app, "t/r", 2, "agent");
+        perform_merge(&app, "t", "r", 2, &acting, false).await.expect("clean low-risk change auto-merges at T2");
+        assert!(is_merged(&app, "t/r", 2).await);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn merge_force_overrides_gate_only_for_a_repo_admin() {
+        let (app, tmp) = build_test_app("force");
+        // An org account whose handle == tenant, with `boss` as Owner (⇒ repo admin via the fallback).
+        app.store.put_account(Account {
+            id: "acct-t".into(),
+            kind: AccountKind::Organization,
+            handle: "t".into(),
+            members: vec![Membership { actor: "boss".into(), role: Role::Owner }],
+        });
+        app.store.put_actor(actor("boss", ActorKind::Human));
+        app.store.put_actor(actor("rando", ActorKind::Human));
+        // Un-green, no approvals — the gate would normally block.
+        let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
+        put_pr(&app, "t/r", 1, "author", &change);
+
+        // A non-admin can't override even with force.
+        let rando = actor("rando", ActorKind::Human);
+        assert!(perform_merge(&app, "t", "r", 1, &rando, true).await.is_err(), "force by a non-admin does not override the gate");
+        assert!(!is_merged(&app, "t/r", 1).await);
+
+        // An owner/admin CAN force-merge past red/unrun checks and missing approval.
+        let boss = actor("boss", ActorKind::Human);
+        perform_merge(&app, "t", "r", 1, &boss, true).await.expect("admin force override merges despite the gate");
+        assert!(is_merged(&app, "t/r", 1).await);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
