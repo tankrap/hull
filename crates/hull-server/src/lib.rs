@@ -40,7 +40,7 @@ use hull_plugin::{NotifyEvent, Notifier};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use futures::stream::Stream;
-use hull_core::store::{FileStore, InMemory, Store};
+use hull_core::store::{FileStore, InMemory, PostgresStore, Store};
 use hull_core::*;
 use hull_plugin::Registry;
 use serde_json::{json, Value};
@@ -233,6 +233,22 @@ fn data_path() -> std::path::PathBuf {
         format!("{home}/.hull/data")
     });
     std::path::PathBuf::from(dir).join("store.json")
+}
+
+/// One-shot migration entrypoint: import the on-disk `store.json` snapshot into Postgres, then exit.
+/// Reads `HULL_DATABASE_URL` (required) and the same `store.json` path `run` would use. Idempotent —
+/// the domain tables are replaced with the snapshot. Invoked by the `import-postgres` subcommand.
+/// Returns `Err` (never panics on the operator's behalf) so the binary can print + exit non-zero.
+pub fn import_postgres() -> Result<(), String> {
+    let url = std::env::var("HULL_DATABASE_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .ok_or("hull: set HULL_DATABASE_URL to the target Postgres before importing")?;
+    let path = data_path();
+    let pg = PostgresStore::connect(&url)?;
+    let stats = hull_core::store::import_store_json(&pg, &path)?;
+    eprintln!("hull: imported {stats} from {} into Postgres", path.display());
+    Ok(())
 }
 
 fn seed_if_empty(store: &dyn Store) {
@@ -482,8 +498,19 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
         let ingress_token = std::env::var("HULL_INGRESS_TOKEN").ok().filter(|t| !t.is_empty());
         ingress::spawn(addr, hub.clone(), ingress_token); // daemons dial in via hull-agent
     }
-    let store: Arc<dyn Store> = Arc::new(FileStore::open(data_path()));
-    eprintln!("hull-server: domain store at {}", data_path().display());
+    // Backend selection. `HULL_DATABASE_URL` set → Postgres (build the pool, run migrations); UNSET
+    // (the default) → the durable FileStore exactly as before, so the current dogfood is unchanged.
+    let store: Arc<dyn Store> = match std::env::var("HULL_DATABASE_URL") {
+        Ok(url) if !url.is_empty() => {
+            eprintln!("hull-server: domain store = Postgres");
+            Arc::new(PostgresStore::connect(&url).expect("hull-server: Postgres store"))
+        }
+        _ => {
+            let store = Arc::new(FileStore::open(data_path()));
+            eprintln!("hull-server: domain store at {}", data_path().display());
+            store
+        }
+    };
     seed_if_empty(&*store);
     let router = make_router(build_app(registry, hub, store));
     let listener = tokio::net::TcpListener::bind(&opts.addr).await.expect("bind");
