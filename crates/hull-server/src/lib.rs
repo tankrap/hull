@@ -2901,9 +2901,9 @@ async fn resolve_check(app: &App, tenant: &str, repo: &str, change: &str, force:
     let Some(tree) = app.repos.change_tree(tenant, repo, change) else {
         return CiResolution::Failed("unknown change".into());
     };
-    // Memo hit: an identical tree already has a verdict — no dispatch, no run.
+    // Memo hit: an identical tree THIS tenant already judged — no dispatch, no run.
     if !force {
-        if let Some(o) = app.ci.get_memoized(&tree) {
+        if let Some(o) = app.ci.get_memoized(tenant, &tree) {
             app.repos.set_verification(tenant, repo, change, o.status == hull_plugin::CiStatus::Green);
             return CiResolution::Done(o);
         }
