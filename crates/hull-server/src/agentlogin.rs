@@ -379,6 +379,96 @@ fn scrape_device_code(buf: &[u8]) -> Option<String> {
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrape_url_finds_claude_authorize_url() {
+        // Emitted as an OSC-8 hyperlink target (BEL-terminated) — scrape_url reads the raw stream and
+        // takes the https run up to the next control byte.
+        let buf = b"\x1b]8;;https://claude.ai/oauth/authorize?code=abc&code_challenge=xyz\x07click here\x1b]8;;\x07";
+        assert_eq!(
+            scrape_url(buf).as_deref(),
+            Some("https://claude.ai/oauth/authorize?code=abc&code_challenge=xyz")
+        );
+    }
+
+    #[test]
+    fn scrape_url_finds_codex_device_url() {
+        // A scraped URL runs until the next control byte/quote (a wide-terminal OSC target has no
+        // embedded spaces), so terminate with a newline like the real stream.
+        let buf = b"Open https://auth.openai.com/oauth/device?user_code=WDJB-MJHT\nin your browser\n";
+        assert_eq!(scrape_url(buf).as_deref(), Some("https://auth.openai.com/oauth/device?user_code=WDJB-MJHT"));
+        // A bare `/device` path (no openai host) also qualifies.
+        let buf2 = b"visit https://example.test/device/activate\n";
+        assert_eq!(scrape_url(buf2).as_deref(), Some("https://example.test/device/activate"));
+    }
+
+    #[test]
+    fn scrape_url_rejects_non_auth_urls_and_skips_junk_to_the_real_one() {
+        // A plain link with none of the auth markers is not returned.
+        assert_eq!(scrape_url(b"see https://example.com/docs\n"), None);
+        assert_eq!(scrape_url(b"no url here at all"), None);
+        // The first https is junk (no marker); the scraper keeps scanning and returns the real one.
+        let buf = b"https://example.com\nhttps://claude.ai/oauth/authorize?code_challenge=z\n";
+        assert_eq!(scrape_url(buf).as_deref(), Some("https://claude.ai/oauth/authorize?code_challenge=z"));
+    }
+
+    #[test]
+    fn scrape_device_code_extracts_grouped_code() {
+        assert_eq!(scrape_device_code(b"Enter code WDJB-MJHT to continue").as_deref(), Some("WDJB-MJHT"));
+        // Digits are allowed in a group.
+        assert_eq!(scrape_device_code(b"code: A1B2-9Z0Q done").as_deref(), Some("A1B2-9Z0Q"));
+    }
+
+    #[test]
+    fn scrape_device_code_ignores_lowercase_words_and_bare_prose() {
+        // A lowercase hyphenated word ("sign-in") is not an uppercase/digit device code.
+        assert_eq!(scrape_device_code(b"please sign-in on the web page"), None);
+        assert_eq!(scrape_device_code(b"nothing code-like present"), None);
+    }
+
+    #[test]
+    fn scrape_token_captures_wide_unwrapped_oauth_token() {
+        // A real `sk-ant-oat…` token: long, contains the `oat` OAuth marker, printed unwrapped on a
+        // wide terminal. It's captured whole and stops at the trailing whitespace.
+        let tok = "sk-ant-oat01-AbCdEf0123456789_AbCdEf0123456789-AbCdEf0123456789";
+        let buf = format!("Your token:\n{tok}\nKeep it safe");
+        assert_eq!(scrape_token(buf.as_bytes()).as_deref(), Some(tok));
+    }
+
+    #[test]
+    fn scrape_token_rejects_short_or_non_oat_shaped_hits() {
+        // Right prefix but no `oat` marker and too short → not a token.
+        assert_eq!(scrape_token(b"sk-ant-api03-short"), None);
+        // Contains `oat` but is far too short to be a real token.
+        assert_eq!(scrape_token(b"sk-ant-oat01-x"), None);
+        assert_eq!(scrape_token(b"no token here"), None);
+    }
+
+    #[test]
+    fn scrape_validity_days_converts_units() {
+        assert_eq!(scrape_validity_days(b"This token is valid for 1 year."), Some(365));
+        assert_eq!(scrape_validity_days(b"valid for 6 months"), Some(180));
+        assert_eq!(scrape_validity_days(b"valid for 2 weeks or so"), Some(14));
+        assert_eq!(scrape_validity_days(b"valid for 30 days"), Some(30));
+        // No validity phrase, or an unrecognized unit → None.
+        assert_eq!(scrape_validity_days(b"token issued successfully"), None);
+        assert_eq!(scrape_validity_days(b"valid for 5 fortnights"), None);
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_and_osc_sequences() {
+        // CSI color codes are removed, plain text kept.
+        assert_eq!(strip_ansi("\x1b[1;32mHELLO\x1b[0m world"), "HELLO world");
+        // OSC-8 hyperlink wrappers (BEL-terminated) are removed, the visible label kept.
+        assert_eq!(strip_ansi("a\x1b]8;;http://x\x07shown\x1b]8;;\x07b"), "ashownb");
+        // No escapes → identity.
+        assert_eq!(strip_ansi("plain text"), "plain text");
+    }
+}
+
 /// Remove ANSI/OSC escape sequences so scraping sees plain text.
 fn strip_ansi(s: &str) -> String {
     let b = s.as_bytes();
