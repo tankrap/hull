@@ -1115,6 +1115,24 @@ The one externally visible output, so it gets its own durable state and worker:
 - Exhausted retries → job parks in `report_failed` and **alerts**. §10 of the spec says an undelivered
   verdict just leaves the tree unverified, so no heroics are required — but silent non-delivery looks
   exactly like "CI is broken" to a user, so the alert is not optional.
+- **Release every resource at the verdict, never at delivery.** The quota a job holds, its workspace,
+  its place in the scheduler's accounting: all of it comes back the moment the verdict exists, while
+  delivery is still retrying. This is what `reported` being a *separate state* from the verdict is
+  for, and it is easy to write code that has the states and still gets the ordering wrong — the
+  implementation did exactly that, awaiting delivery before retiring the job, so a single unreachable
+  Hull held a tenant's whole concurrency allocation for the length of the retry budget (about an
+  hour). The fleet idles, the next steps sit `ready`, and nothing in the logs explains it.
+
+  Stated as a rule, because it is not specific to callbacks: **never hold a local resource across an
+  operation whose duration is bounded by a remote party's availability.** Delivery is bookkeeping
+  about telling someone the work is done; the work being done is what releases the resources.
+
+  It is worth noticing *how* this was found. It was invisible while the default per-tenant quota (16)
+  exceeded what the fleet could run (1), because sixteen simultaneously-undeliverable jobs are needed
+  to wedge a tenant that way. Clamping the quota to real capacity — a tidiness fix, made for
+  legibility — turned "needs sixteen coincidences" into "needs one", and the next conformance run
+  deadlocked. **Making a system's numbers honest is a way of finding its bugs**, because a limit that
+  cannot be reached also cannot be tested.
 
 ### 10.2 Timeouts
 
