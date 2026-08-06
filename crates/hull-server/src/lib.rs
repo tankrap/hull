@@ -2377,31 +2377,42 @@ fn accountable(app: &App, a: &Actor) -> Result<(), String> {
 async fn why(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let path = q.get("path").map(String::as_str).unwrap_or("");
     let prov = app.repos.why(&tenant, &repo, path, 10);
-    Json(json!({ "path": path, "provenance": prov }))
+    Json(json!({ "path": path, "provenance": prov })).into_response()
 }
 
 /// Branch names for a repo (`GET /api/repos/:tenant/:repo/branches`).
-async fn repo_branches(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "branches": app.repos.branches(&tenant, &repo) }))
+async fn repo_branches(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "branches": app.repos.branches(&tenant, &repo) })).into_response()
 }
 
 /// A directory listing at a branch (`GET /api/repos/:tenant/:repo/tree?ref=<branch>&path=<dir>`).
 async fn repo_tree(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
     // `?flat=1` → every file path in the branch (for the full file-tree view).
     if q.get("flat").is_some_and(|v| v == "1" || v == "true") {
-        return Json(json!({ "ref": ref_name, "paths": app.repos.all_paths(&tenant, &repo, ref_name) }));
+        return Json(json!({ "ref": ref_name, "paths": app.repos.all_paths(&tenant, &repo, ref_name) })).into_response();
     }
     let path = q.get("path").map(String::as_str).unwrap_or("");
-    Json(json!({ "ref": ref_name, "path": path, "entries": app.repos.list_tree(&tenant, &repo, ref_name, path) }))
+    Json(json!({ "ref": ref_name, "path": path, "entries": app.repos.list_tree(&tenant, &repo, ref_name, path) })).into_response()
 }
 
 /// A file's contents at a branch (`GET /api/repos/:tenant/:repo/blob?ref=<branch>&path=<file>`).
@@ -2409,8 +2420,12 @@ async fn repo_tree(
 async fn repo_blob(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
     let path = q.get("path").map(String::as_str).unwrap_or("");
     match app.repos.read_file_at(&tenant, &repo, ref_name, path) {
@@ -2418,9 +2433,9 @@ async fn repo_blob(
             let binary = bytes.iter().take(8000).any(|&b| b == 0);
             let size = bytes.len();
             let text = if binary { String::new() } else { String::from_utf8_lossy(&bytes).into_owned() };
-            Json(json!({ "path": path, "ref": ref_name, "size": size, "binary": binary, "text": text }))
+            Json(json!({ "path": path, "ref": ref_name, "size": size, "binary": binary, "text": text })).into_response()
         }
-        None => Json(json!({ "path": path, "ref": ref_name, "missing": true })),
+        None => Json(json!({ "path": path, "ref": ref_name, "missing": true })).into_response(),
     }
 }
 
@@ -2444,16 +2459,23 @@ async fn repo_graph(
 async fn repo_search(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
     let query = q.get("q").map(String::as_str).unwrap_or("");
-    Json(json!({ "q": query, "ref": ref_name, "hits": app.repos.search(&tenant, &repo, ref_name, query) }))
+    Json(json!({ "q": query, "ref": ref_name, "hits": app.repos.search(&tenant, &repo, ref_name, query) })).into_response()
 }
 
 /// A repo's code-owner rules (`GET /api/repos/:tenant/:repo/owners`).
-async fn owners_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "owners": app.store.owners(&format!("{tenant}/{repo}")) }))
+async fn owners_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "owners": app.store.owners(&format!("{tenant}/{repo}")) })).into_response()
 }
 
 /// Set a repo's code-owner rules (`POST …/owners` with `{rules: [{glob, owners:[actorId]}]}`),
@@ -2545,14 +2567,20 @@ fn owners_for(app: &App, repo_key: &str, files: &[String]) -> Vec<String> {
 }
 
 /// Secret findings from the server-side push scan (`GET /api/repos/:tenant/:repo/security`).
-async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "secrets": app.repos.secrets(&format!("{tenant}/{repo}")) }))
+async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "secrets": app.repos.secrets(&format!("{tenant}/{repo}")) })).into_response()
 }
 
 /// The diff of a change (`GET /api/repos/:tenant/:repo/change/:id/diff`): per-file line hunks plus a
 /// semantic-operations summary — the review's diff viewer.
-async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
-    Json(json!({ "files": app.repos.diff(&tenant, &repo, &id) }))
+async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "files": app.repos.diff(&tenant, &repo, &id) })).into_response()
 }
 
 /// Full old + new text of one file at a change (`GET …/change/:id/file?path=…`). The diff viewer
@@ -2561,8 +2589,12 @@ async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(Str
 async fn change_file(
     State(app): State<App>,
     Path((tenant, repo, id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let Some(path) = q.get("path").map(|s| s.as_str()).filter(|s| !s.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "path is required").into_response();
     };
@@ -2575,8 +2607,11 @@ async fn change_file(
 /// The **content-addressed semantic summary** of a change (`GET …/change/:id/semantic`, B1): files
 /// purely moved (proven by an unchanged blob id, not guessed by similarity) vs really added/deleted/
 /// modified, and whether the whole change is a behavior-preserving `pure_move`.
-async fn change_semantic(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
-    Json(json!({ "semantic": app.repos.semantic_summary(&tenant, &repo, &id) }))
+async fn change_semantic(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "semantic": app.repos.semantic_summary(&tenant, &repo, &id) })).into_response()
 }
 
 /// **keel-native content-addressed source fetch** (`GET …/tree/:tree/tar`): the change's keel tree,
@@ -2584,7 +2619,10 @@ async fn change_semantic(State(app): State<App>, Path((tenant, repo, id)): Path<
 /// reviewer runner obtains source — by content address, over keel, **not** `git clone`. (Hull's git
 /// smart-HTTP endpoints exist only for interop/mirroring, never as the runner fetch path.) The
 /// archive is verifiable: re-hashing the tree reproduces `tree`.
-async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(String, String, String)>) -> Response {
+async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     // The scratch path must be unique **per request**, not per (tree, pid): two concurrent fetches of
     // the same tree — an ordinary occurrence once a CI shards a job or a re-check races a first
     // dispatch — would otherwise share a directory and `remove_dir_all` each other's checkout out
@@ -2639,9 +2677,12 @@ async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(
 /// unsupported** against the real facts of the change (touched files, semantic ops, keel
 /// verification, secret scan). This is the substance of a Hull review — does the code do what its
 /// author said it does — computed the same way every time (pure, content-addressable).
-async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
+async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let Some(info) = app.repos.change_info(&tenant, &repo, &id) else {
-        return Json(json!({ "ledger": null }));
+        return Json(json!({ "ledger": null })).into_response();
     };
     // Narrative: the change intent, plus the lesson from a native or ingested session.
     let lesson = info
@@ -2684,7 +2725,7 @@ async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(S
             }
         }
     }
-    Json(json!({ "ledger": val }))
+    Json(json!({ "ledger": val })).into_response()
 }
 
 /// Record a human judgment on a reconciliation claim (`POST …/change/:id/claims/:claim/resolve`) —
@@ -2717,7 +2758,10 @@ async fn resolve_claim(
 
 /// Expand a keel change (`GET /api/repos/:tenant/:repo/change/:id`): intent, author, and the files
 /// it changed vs its parent — the keel-native "what does this touch" that anchors a review.
-async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
+async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     match app.repos.change_info(&tenant, &repo, &id) {
         Some(mut info) => {
             // If the change carries no NATIVE keel session (e.g. it arrived over git), fall back to
@@ -2735,9 +2779,9 @@ async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(Str
                     });
                 }
             }
-            Json(json!({ "change": info }))
+            Json(json!({ "change": info })).into_response()
         }
-        None => Json(json!({ "change": null })),
+        None => Json(json!({ "change": null })).into_response(),
     }
 }
 
@@ -2974,7 +3018,10 @@ async fn ci_result(
 /// A repo's CI endpoint config (`GET/PUT …/ci-config`). GET reports the effective endpoint and where
 /// it comes from (repo / instance default / none), never leaking the secret. PUT (owner-gated) sets
 /// or clears the repo's own endpoint.
-async fn get_ci_config(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+async fn get_ci_config(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let key = format!("{tenant}/{repo}");
     let (cfg, src) = app.ci_config.resolve(&key);
     let source = match src {
@@ -2986,7 +3033,7 @@ async fn get_ci_config(State(app): State<App>, Path((tenant, repo)): Path<(Strin
         "url": cfg.as_ref().map(|c| c.url.clone()),
         "has_secret": cfg.as_ref().map(|c| !c.secret.is_empty()).unwrap_or(false),
         "source": source,
-    }))
+    })).into_response()
 }
 
 async fn set_ci_config(
@@ -3714,8 +3761,11 @@ async fn get_artifact(State(app): State<App>, Path((tenant, repo, id)): Path<(St
 
 /// Discussion comments for a repo (`GET /api/repos/:tenant/:repo/comments`); the client filters by
 /// `target` (e.g. `pr:1`). The conversation layer over the structured review.
-async fn comments_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "comments": app.store.comments(&format!("{tenant}/{repo}")) }))
+async fn comments_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "comments": app.store.comments(&format!("{tenant}/{repo}")) })).into_response()
 }
 
 /// Post a comment (`POST /api/repos/:tenant/:repo/comments`) — `{target, body}`. Authored by the
@@ -5581,6 +5631,31 @@ mod tests {
         assert!(!is_repo_admin(&app, "acme", "web", "dev"), "Write is a member but not an admin");
         assert!(!is_repo_admin(&app, "acme", "web", "reader"), "Read is a member but not an admin");
         assert!(!is_repo_admin(&app, "acme", "web", "outsider"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn private_repo_read_is_gated_but_public_stays_open() {
+        // Area B: drive a real gated handler (`change_diff`) — a private repo is hidden (404) from
+        // anonymous and non-members, visible to a member, and flips fully open once public.
+        let (app, tmp) = build_test_app("read-gate");
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
+        app.store.put_actor(actor("member", ActorKind::Human));
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        mint_token(&app, "tok-member", "member");
+        mint_token(&app, "tok-outsider", "outsider");
+        let t = ("acme".to_string(), "web".to_string(), "deadbeef".to_string());
+
+        let r = change_diff(State(app.clone()), Path(t.clone()), axum::http::HeaderMap::new()).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "anonymous read of a private repo is 404");
+        let r = change_diff(State(app.clone()), Path(t.clone()), bearer("tok-outsider")).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "a non-member (valid token) still gets 404 on a private repo");
+        let r = change_diff(State(app.clone()), Path(t.clone()), bearer("tok-member")).await;
+        assert_eq!(r.status(), StatusCode::OK, "a member reads a private repo");
+
+        set_private(&app, "acme/web", false);
+        let r = change_diff(State(app.clone()), Path(t.clone()), axum::http::HeaderMap::new()).await;
+        assert_eq!(r.status(), StatusCode::OK, "a public repo is readable by anyone, incl. anonymous");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
