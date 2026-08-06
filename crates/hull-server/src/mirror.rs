@@ -81,17 +81,12 @@ impl MirrorLedger {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(format!("{home}/.hull/mirror.json"))
         });
-        let inner = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let inner = crate::jsonstore::load_json(&path);
         MirrorLedger { path, inner: Mutex::new(inner) }
     }
 
     fn persist(&self, l: &Ledger) {
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(l) {
-            let _ = std::fs::write(&self.path, json);
-        }
+        crate::jsonstore::persist_json_atomic(&self.path, l);
     }
 
     /// Where a change first entered, if known.

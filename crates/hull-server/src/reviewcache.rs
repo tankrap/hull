@@ -43,7 +43,7 @@ impl ReviewCache {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(format!("{home}/.hull/review-cache.json"))
         });
-        let map = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let map = crate::jsonstore::load_json(&path);
         ReviewCache { path, map: Mutex::new(map) }
     }
 
@@ -54,11 +54,6 @@ impl ReviewCache {
     pub fn put(&self, tree: &str, r: CachedReview) {
         let mut m = self.map.lock().unwrap();
         m.insert(tree.to_string(), r);
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(j) = serde_json::to_string_pretty(&*m) {
-            let _ = std::fs::write(&self.path, j);
-        }
+        crate::jsonstore::persist_json_atomic(&self.path, &*m);
     }
 }

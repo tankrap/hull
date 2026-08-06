@@ -40,19 +40,14 @@ impl ClaimResolutions {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(format!("{home}/.hull/claim-resolutions.json"))
         });
-        let map = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let map = crate::jsonstore::load_json(&path);
         ClaimResolutions { path, map: Mutex::new(map) }
     }
 
     pub fn set(&self, repo: &str, change: &str, claim: &str, r: ClaimResolution) {
         let mut m = self.map.lock().unwrap();
         m.insert(key(repo, change, claim), r);
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(j) = serde_json::to_string_pretty(&*m) {
-            let _ = std::fs::write(&self.path, j);
-        }
+        crate::jsonstore::persist_json_atomic(&self.path, &*m);
     }
 
     /// All resolutions for a change, keyed by claim id — for overlaying onto the ledger.
