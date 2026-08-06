@@ -2106,17 +2106,19 @@ export function App() {
             </div>
             <Button disabled={authBusy} onClick={() => loginPasskey(authForm.username)}>{authBusy ? "waiting for passkey…" : "Continue with a passkey"}</Button>
             <div className="text-[13px] text-muted pt-1 border-t border-rule2">New here? <LinkButton onClick={() => { setAuthError(""); navigate("/signup"); }}>Create an account</LinkButton></div>
-            <details className="text-[12.5px]">
-              <summary className="text-muted cursor-pointer">Advanced: key login</summary>
-              <div className="grid gap-2 mt-2.5">
-                <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="ed25519 secret key (hex)" value={secretInput} onChange={(e) => setSecretInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signIn()} />
-                <div className="flex gap-2 items-center">
-                  <Button size="sm" variant="secondary" onClick={signIn}>Sign in with key</Button>
-                  <LinkButton onClick={registerAndSignIn}>new raw identity</LinkButton>
-                  <LinkButton onClick={() => signInWith(DEMO_OWNER_SECRET)}>demo</LinkButton>
+            {import.meta.env.DEV && (
+              <details className="text-[12.5px]">
+                <summary className="text-muted cursor-pointer">Advanced: key login</summary>
+                <div className="grid gap-2 mt-2.5">
+                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="ed25519 secret key (hex)" value={secretInput} onChange={(e) => setSecretInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signIn()} />
+                  <div className="flex gap-2 items-center">
+                    <Button size="sm" variant="secondary" onClick={signIn}>Sign in with key</Button>
+                    <LinkButton onClick={registerAndSignIn}>new raw identity</LinkButton>
+                    <LinkButton onClick={() => signInWith(DEMO_OWNER_SECRET)}>demo</LinkButton>
+                  </div>
                 </div>
-              </div>
-            </details>
+              </details>
+            )}
           </div>
         </Card>
       ));
