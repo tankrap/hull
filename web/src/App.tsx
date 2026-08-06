@@ -1624,6 +1624,11 @@ export function App() {
   const [tab, setTab] = useState<RepoTab>(() => parseRoute(location.pathname).tab);
   useEffect(() => { if (tab === "settings") loadRepoSettings(); }, [tab, tenant, issueRepo]);
   const [issueView, setIssueView] = useState<"list" | "board">("list");
+  // Mobile-only: reveal the (desktop-always-visible) filter input via a small toggle.
+  const [filterOpen, setFilterOpen] = useState(false);
+  // Kanban drag-to-restatus: which issue is being dragged and which column it's hovering.
+  const [dragIssue, setDragIssue] = useState<number | null>(null);
+  const [dragOverCol, setDragOverCol] = useState<string | null>(null);
   type StateFilter = "open" | "closed" | "all";
   const [issueFilter, setIssueFilter] = useState<StateFilter>("open");
   const [prFilter, setPrFilter] = useState<StateFilter>("open");
@@ -1663,6 +1668,27 @@ export function App() {
     });
     if (res.ok) loadIssues();
     else uiAlert(await apiError(res));
+  };
+  // Board column → the issue action that lands a card in it. Every column maps to a supported
+  // transition (reopen, or close with a reason), so every column is a valid drop target.
+  const boardColAction = (k: string): [string, Record<string, unknown>] | null =>
+    k === "open" ? ["reopen", {}]
+      : k === "completed" ? ["close", { reason: "completed" }]
+      : k === "not_planned" ? ["close", { reason: "not_planned" }]
+      : k === "cancelled" ? ["close", { reason: "cancelled" }]
+      : k === "duplicate" ? ["close", { reason: "duplicate" }]
+      : null;
+  const dropIssueOnCol = (colKey: string) => {
+    const num = dragIssue;
+    setDragOverCol(null);
+    setDragIssue(null);
+    if (num == null) return;
+    const it = issues.find((i) => i.number === num);
+    if (!it) return;
+    const cur = it.status.state === "open" ? "open" : it.status.reason;
+    if (cur === colKey) return; // same column — no-op
+    const m = boardColAction(colKey);
+    if (m) issueAction(num, m[0], m[1]);
   };
   // Issue comment composer mode per target (Comment / Close with comment / Close as not planned / Reopen).
   const [issueMode, setIssueMode] = useState<Record<string, string>>({});
@@ -2971,12 +2997,14 @@ export function App() {
                         ))}
                       </div>
                       <div className="w-[240px] hidden sm:block"><SearchInput placeholder="Filter issues" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>
+                      <button className={`sm:hidden inline-flex items-center gap-1.5 px-2.5 py-1 rounded-ctl-sm border border-rule text-[13px] transition-colors ${filterOpen || q ? "text-ink border-ctl" : "text-muted hover:text-ink"}`} aria-expanded={filterOpen} onClick={() => setFilterOpen((v) => !v)}><IcoSearch size={13} />Filter</button>
                     </div>
                     <div className="flex items-center gap-2.5">
                       <Segmented items={["List", "Board"]} value={issueView === "list" ? 0 : 1} onChange={(i: number) => setIssueView(i === 0 ? "list" : "board")} />
                       {canAct && <Button size="sm" variant="ghost" className="inline-flex items-center gap-1.5" onClick={() => setNewIssueOpen(true)}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>New issue</Button>}
                     </div>
                   </div>
+                  {filterOpen && <div className="sm:hidden -mt-3 mb-5"><SearchInput placeholder="Filter issues" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>}
                   {issueView === "list" ? (
                     <div>
                       {issues.length === 0 && <div className="py-8 text-[13px] text-muted">no issues yet — open one with the New issue button</div>}
@@ -3025,11 +3053,21 @@ export function App() {
                       ].map((col) => {
                         const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k && matchQ(`${i.title} ${i.body} #${i.number} ${i.labels.join(" ")}`));
                         if (col.k !== "open" && inCol.length === 0) return null;
+                        // A card can be dropped here only when the viewer can change status and the
+                        // column maps to a real transition (all current columns do).
+                        const droppable = canAct && !!boardColAction(col.k);
                         return (
-                          <div key={col.k} className="grid gap-2 content-start">
+                          <div key={col.k} className={`grid gap-2 content-start rounded-ctl transition-colors ${dragOverCol === col.k && droppable ? "bg-steel-wash ring-1 ring-steel-text/40" : ""}`}
+                            onDragOver={droppable ? (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; } : undefined}
+                            onDragEnter={droppable ? () => setDragOverCol(col.k) : undefined}
+                            onDragLeave={droppable ? (e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOverCol(null); } : undefined}
+                            onDrop={droppable ? (e) => { e.preventDefault(); dropIssueOnCol(col.k); } : undefined}>
                             <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted flex gap-1.5 mb-1">{col.label} <span className="text-faint">{inCol.length}</span></div>
                             {inCol.map((it) => (
-                              <button key={it.number} className="text-left bg-surface border border-rule rounded-ctl p-3 cursor-pointer hover:border-ctl transition-colors" onClick={() => navigate(`${repoBase()}/issues/${it.number}`)}>
+                              <button key={it.number} draggable={canAct}
+                                onDragStart={canAct ? (e) => { e.dataTransfer.effectAllowed = "move"; setDragIssue(it.number); } : undefined}
+                                onDragEnd={canAct ? () => { setDragIssue(null); setDragOverCol(null); } : undefined}
+                                className={`text-left bg-surface border border-rule rounded-ctl p-3 cursor-pointer hover:border-ctl transition-colors ${canAct ? "active:cursor-grabbing" : ""} ${dragIssue === it.number ? "opacity-50" : ""}`} onClick={() => navigate(`${repoBase()}/issues/${it.number}`)}>
                                 <div className="text-xs text-faint tabular-nums">#{it.number}</div>
                                 <div className="text-[13.5px] font-medium mt-0.5 leading-snug">{it.title}</div>
                                 {it.assignees.length > 0 && <div className="text-[11.5px] text-muted mt-1.5 inline-flex items-center gap-1.5"><Ico size={11} path={<><circle cx="12" cy="8" r="3.5" /><path d="M5 21a7 7 0 0 1 14 0" /></>} />{it.assignees.map((id) => handleOf(id)).join(", ")}</div>}
@@ -3053,7 +3091,9 @@ export function App() {
                       })}
                     </div>
                     <div className="w-[240px] hidden sm:block"><SearchInput placeholder="Filter pull requests" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>
+                    <button className={`sm:hidden inline-flex items-center gap-1.5 px-2.5 py-1 rounded-ctl-sm border border-rule text-[13px] transition-colors ${filterOpen || q ? "text-ink border-ctl" : "text-muted hover:text-ink"}`} aria-expanded={filterOpen} onClick={() => setFilterOpen((v) => !v)}><IcoSearch size={13} />Filter</button>
                   </div>
+                  {filterOpen && <div className="sm:hidden -mt-3 mb-5"><SearchInput placeholder="Filter pull requests" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>}
                   <div>
                     {prs.length === 0 && <div className="py-8 text-[13px] text-muted">no pull requests yet — agents open these when they push a change for review</div>}
                     {[...prs].filter((p) => prFilter === "all" || (prFilter === "open" ? p.state === "open" : p.state !== "open")).filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
