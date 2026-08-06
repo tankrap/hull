@@ -3052,7 +3052,10 @@ export function App() {
                         { k: "duplicate", label: "Duplicate" },
                       ].map((col) => {
                         const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k && matchQ(`${i.title} ${i.body} #${i.number} ${i.labels.join(" ")}`));
-                        if (col.k !== "open" && inCol.length === 0) return null;
+                        // Empty non-open columns are hidden to avoid clutter, but stay
+                        // rendered while a drag is in progress so they remain valid drop
+                        // targets (e.g. dragging an open card onto Completed to close it).
+                        if (col.k !== "open" && inCol.length === 0 && !dragIssue) return null;
                         // A card can be dropped here only when the viewer can change status and the
                         // column maps to a real transition (all current columns do).
                         const droppable = canAct && !!boardColAction(col.k);
@@ -3073,6 +3076,9 @@ export function App() {
                                 {it.assignees.length > 0 && <div className="text-[11.5px] text-muted mt-1.5 inline-flex items-center gap-1.5"><Ico size={11} path={<><circle cx="12" cy="8" r="3.5" /><path d="M5 21a7 7 0 0 1 14 0" /></>} />{it.assignees.map((id) => handleOf(id)).join(", ")}</div>}
                               </button>
                             ))}
+                            {inCol.length === 0 && dragIssue && droppable && (
+                              <div className="text-[12px] text-muted border border-dashed border-rule rounded-ctl p-3 text-center pointer-events-none">Drop to mark {col.label}</div>
+                            )}
                           </div>
                         );
                       })}
