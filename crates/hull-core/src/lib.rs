@@ -144,6 +144,94 @@ pub struct Account {
     pub members: Vec<Membership>,
 }
 
+/// A configured AI backend an account (personal or org) can lend to Hull's AI functions — reviews,
+/// fixes, "ask agent". Several can be connected and rotated across; a repo's reviews use its owning
+/// org's connections, falling back to the triggering user's own. The credential is an API key OR an
+/// OAuth token from a `keel ai login` (a subscription sign-in).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConnection {
+    pub id: String,
+    /// Owning account id (a personal account or an org).
+    pub owner: String,
+    /// `openai` | `anthropic` | `openrouter`.
+    pub provider: String,
+    /// Human label shown in settings (e.g. "Claude Pro (justin)").
+    pub label: String,
+    /// API root, e.g. `https://api.anthropic.com/v1`.
+    pub base_url: String,
+    pub auth: AiAuth,
+    pub created_unix: u64,
+    /// When a captured agent token expires (e.g. Claude `setup-token` is valid ~1 year). `None` for
+    /// key connections / device sessions that self-refresh. Used to warn before reviews start failing.
+    #[serde(default)]
+    pub token_expires_unix: Option<u64>,
+}
+
+/// Rolling token-usage tally for one [`AiConnection`] — what the account's subscription has spent on
+/// Hull's AI work (reviews/fixes/answers). `cost_micros` is USD × 1e6 (agents that report a cost).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cost_micros: u64,
+    #[serde(default)]
+    pub runs: u64,
+    #[serde(default)]
+    pub updated_unix: u64,
+}
+
+/// How an [`AiConnection`] authenticates. `Key` = a static API key. `AgentCli` = a locally-installed
+/// agent (Claude Code / Codex) that Hull runs with the user's OWN subscription login — no token is
+/// stored or reused; the CLI authenticates itself. (This is the ToS-compliant way to use a Pro/Max or
+/// ChatGPT subscription: the actual agent uses it, not a third-party app reusing an OAuth token.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AiAuth {
+    Key { api_key: String },
+    AgentCli {
+        command: String,
+        /// Storage key for this user's own credential bundle (the CLI's `CLAUDE_CONFIG_DIR` /
+        /// `CODEX_HOME` contents, populated by a web-relayed subscription login). Empty ⇒ fall back to
+        /// the Hull host's own agent login (single-tenant / self-hosted).
+        #[serde(default)]
+        session: String,
+        /// Introspected identity for the settings UI (from `<cli> auth status`). Non-secret.
+        #[serde(default)]
+        account_email: String,
+        /// e.g. `max`, `pro`, `plus`. Non-secret.
+        #[serde(default)]
+        plan: String,
+    },
+}
+
+impl AiAuth {
+    /// The bearer token to send now (an API key), or empty for an agent CLI (which self-authenticates).
+    pub fn bearer(&self) -> &str {
+        match self {
+            AiAuth::Key { api_key } => api_key,
+            AiAuth::AgentCli { .. } => "",
+        }
+    }
+    /// A short, non-secret hint for the settings UI: the connected account/plan for a per-user
+    /// session, else the bare command (host login), else the key's last chars.
+    pub fn hint(&self) -> String {
+        match self {
+            AiAuth::AgentCli { command, account_email, plan, .. } => {
+                if !account_email.is_empty() {
+                    if plan.is_empty() { account_email.clone() } else { format!("{account_email} · {plan}") }
+                } else {
+                    command.clone()
+                }
+            }
+            AiAuth::Key { api_key } => {
+                let tail: String = api_key.chars().rev().take(3).collect::<String>().chars().rev().collect();
+                format!("…{tail}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountKind {
@@ -164,6 +252,57 @@ pub enum Role {
     Admin,
     Write,
     Read,
+}
+
+/// A login identity (a hosted account). Distinct from [`Actor`]: a `User` authenticates with
+/// **passkeys** (WebAuthn) + email/username — no passwords — and *owns* a human [`Actor`] whose
+/// Ed25519 signing key Hull holds server-side, so Hull can sign agent delegations on the user's
+/// behalf. Passkeys can only sign server challenges (not arbitrary delegation messages), so login
+/// and signing are deliberately separated here. Legacy key-import login (proving possession of an
+/// actor keypair) still works and needs no `User`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    /// Stable id = the WebAuthn user handle (a uuid), independent of `username` (which may change).
+    pub id: String,
+    pub username: String,
+    pub email: String,
+    /// The human actor this user drives (its id is that actor's public key).
+    pub actor: ActorId,
+    /// Hex Ed25519 secret Hull holds to sign delegations for this user. Plaintext in the dev store;
+    /// a real deployment encrypts this at rest (KMS/enclave). This is the tradeoff the hosted-account
+    /// model accepts in exchange for passkey login.
+    pub secret_key: String,
+    #[serde(default)]
+    pub passkeys: Vec<PasskeyCred>,
+    #[serde(default)]
+    pub created_unix: u64,
+    /// A short self-description shown on the profile page. Free text, user-editable.
+    #[serde(default)]
+    pub bio: String,
+}
+
+/// A registered WebAuthn passkey. `data` is the opaque `webauthn_rs::prelude::Passkey`, kept as JSON
+/// so hull-core never has to depend on the WebAuthn crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasskeyCred {
+    /// Base64url credential id — the stable handle for display / removal.
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub created_unix: u64,
+    pub data: serde_json::Value,
+}
+
+/// A team within an organization account: a named group of members, used to grant repo access
+/// collectively (see repo settings). Personal accounts have no teams.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Team {
+    pub id: String,
+    /// Owning account id.
+    pub account: String,
+    pub name: String,
+    #[serde(default)]
+    pub members: Vec<Membership>,
 }
 
 /// A hosted keel repository.
@@ -344,6 +483,11 @@ pub struct Comment {
     pub author: ActorId,
     pub body: String,
     pub created_unix: u64,
+    /// Optional file + line this comment is anchored to (a line-level review comment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
 }
 
 /// A specific issue a review raises, anchored to a file (and optionally a line). What turns a

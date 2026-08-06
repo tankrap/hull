@@ -190,11 +190,36 @@ pub fn reconcile(change: &str, intent: &str, lesson: &str, facts: &ChangeFacts) 
     ClaimLedger { change: change.to_string(), claims, unclaimed }
 }
 
+/// Reflow hard-wrapped prose into logical lines: a commit body wrapped at ~72 columns arrives as many
+/// physical lines mid-sentence. Join a line onto the previous one unless it starts a new thought — a
+/// blank line, a bullet/number marker, a trailer, or a previous line that already ended a statement
+/// (`.`/`;`/`:`). Without this, a wrap boundary shears "…the issues/PRs" off "list now spans…".
+fn reflow_lines(prose: &str) -> Vec<String> {
+    let mut logical: Vec<String> = Vec::new();
+    for raw in prose.lines() {
+        let t = raw.trim();
+        let bullet = t.starts_with("- ") || t.starts_with("* ") || t.chars().next().is_some_and(|c| c.is_ascii_digit());
+        let starts_new = t.is_empty()
+            || bullet
+            || is_trailer(raw)
+            || logical.last().is_none_or(|p| { let e = p.trim_end(); e.ends_with('.') || e.ends_with(';') || e.ends_with(':') });
+        if starts_new {
+            logical.push(raw.to_string());
+        } else {
+            let last = logical.last_mut().unwrap();
+            last.push(' ');
+            last.push_str(t);
+        }
+    }
+    logical
+}
+
 /// Break a narrative into clause-level assertions. Splits on sentence and clause boundaries, drops
 /// a leading conventional-commit prefix (`feat(x): ...`), and keeps only substantive clauses.
 fn split_claims(prose: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for raw_line in prose.lines() {
+    for raw_line in reflow_lines(prose) {
+        let raw_line = raw_line.as_str();
         if is_trailer(raw_line) {
             continue;
         }
@@ -203,7 +228,10 @@ fn split_claims(prose: &str) -> Vec<String> {
             Some((head, rest)) if head.len() <= 24 && !head.contains(' ') => rest,
             _ => raw_line,
         };
-        for clause in line.split(['.', ';', '\n', ',']) {
+        // Split on sentence/statement boundaries only — NOT commas. A comma usually joins parts of a
+        // single assertion ("move X, directly above Y"); splitting on it shatters coherent prose into
+        // fragments ("and enable", "directly above the list") that judge as noise.
+        for clause in line.split(['.', ';', '\n']) {
             let c = clause.trim().trim_start_matches("- ").trim();
             // Keep clauses that read as an assertion. A real claim carries substance: either two
             // content words, or one long one (≥5 chars). This drops bare fragments like "the page"
@@ -534,6 +562,17 @@ mod tests {
         // "the page" is a sentence shard, not an assertion — it should not appear at all.
         let l = reconcile("c1", "reworked navigation. the page. added fn foo", "", &facts());
         assert!(!l.claims.iter().any(|c| c.text.eq_ignore_ascii_case("the page")));
+    }
+
+    #[test]
+    fn hard_wrapped_prose_reflows_instead_of_shearing() {
+        // A commit body wrapped mid-sentence must not shear "add the add_member" off "handler
+        // and more" — the two physical lines are one assertion.
+        let intent = "add the add_member\nhandler to the accounts module";
+        let l = reconcile("c1", intent, "", &facts());
+        assert!(l.claims.iter().any(|c| c.text == "add the add_member handler to the accounts module"), "wrapped lines should join: {:?}", l.claims.iter().map(|c| &c.text).collect::<Vec<_>>());
+        // The shorn fragment "add the add_member" must NOT stand alone as its own claim.
+        assert!(!l.claims.iter().any(|c| c.text == "add the add_member"));
     }
 
     #[test]

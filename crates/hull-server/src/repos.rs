@@ -158,6 +158,17 @@ impl RepoHost {
         self.open.lock().unwrap().insert(key, store.clone());
         Ok(Some(store))
     }
+
+    /// Provision an empty repo (dir + keel store) so it can be cloned and pushed to. Returns `true`
+    /// if newly created, `false` if it already existed. Errors on an invalid name.
+    pub fn create_repo(&self, tenant: &str, repo: &str) -> io::Result<bool> {
+        if !safe_segment(tenant) || !safe_segment(repo) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid repo name"));
+        }
+        let existed = self.root.join(tenant).join(repo).join(".keel/store").exists();
+        self.store(tenant, repo, true)?;
+        Ok(!existed)
+    }
 }
 
 /// A resolved content-addressed anchor: the keel blob id a path currently maps to at HEAD, plus the
@@ -176,6 +187,21 @@ impl RepoHost {
         store.get_ref("main").ok()?.map(|id| id.to_hex())
     }
 
+    /// Resolve a pushed git commit (full 40-hex SHA-1) to the keel change it was bridged into — the
+    /// glue that lets a voyage be opened from a pushed branch's HEAD, not just `main`.
+    /// The `gchange` aux namespace (git-commit-oid(20) → keel change id(32)) is written by the bridge
+    /// for every pushed commit, so a branch's changes are resolvable even before it's merged.
+    pub fn change_for_commit(&self, tenant: &str, repo: &str, sha_hex: &str) -> Option<String> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let s = sha_hex.trim();
+        if s.len() != 40 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let oid: Vec<u8> = (0..40).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect();
+        let cid = store.aux_get("gchange", &oid).ok()??;
+        Some(cid.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
     /// Resolve `path` in a hosted repo to the keel blob it points at in HEAD's tree. This is what
     /// makes a Hull code-ref content-addressed rather than a fragile `file#L42`. `None` if the repo
     /// or path doesn't exist. Reuses the cached store (no second LMDB open).
@@ -188,6 +214,356 @@ impl RepoHost {
         };
         let blob = resolve_path_in_tree(&store, tree, path)?;
         Some(BlobAnchor { blob: blob.to_hex(), change: head.to_hex() })
+    }
+
+    /// Read a file's bytes from the repo's HEAD tree by path (content-addressed). Used to read the
+    /// in-repo `.hull/CODEOWNERS`. `None` if the repo or path doesn't exist.
+    pub fn read_file(&self, tenant: &str, repo: &str, path: &str) -> Option<Vec<u8>> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let head = store.get_ref("main").ok()??;
+        let tree = match store.get(&head).ok()?? {
+            Object::Change(c) => c.tree,
+            _ => return None,
+        };
+        let blob = resolve_path_in_tree(&store, tree, path)?;
+        match store.get(&blob).ok()?? {
+            Object::Blob(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
+impl RepoHost {
+    /// `(author, unix)` for every change reachable from ANY ref (all branches) newer than `since` —
+    /// the raw material for a contribution heatmap. Each change is counted once. Stops descending a
+    /// branch once it predates `since` (parents are older still) and caps total work.
+    pub fn history(&self, tenant: &str, repo: &str, extra_roots: &[String], since: u64) -> Vec<(String, u64, String)> {
+        let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return vec![] };
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<keel_store::ObjectId> = store.list_refs().unwrap_or_default().into_iter().map(|(_, id)| id).collect();
+        // Feature branches aren't keel refs, but every PR/voyage points at its change — seed those too
+        // so work on unmerged branches still counts.
+        for hex in extra_roots {
+            if let Some(oid) = keel_store::ObjectId::from_hex(hex) {
+                stack.push(oid);
+            }
+        }
+        while let Some(id) = stack.pop() {
+            if out.len() > 50_000 {
+                break;
+            }
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.insert(id);
+            let Ok(Some(Object::Change(c))) = store.get(&id) else { continue };
+            if c.timestamp >= since {
+                out.push((c.author.clone(), c.timestamp, id.to_hex()));
+                for p in c.parents {
+                    stack.push(p);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A node (file) + edges (imports) for the codebase graph.
+#[derive(serde::Serialize)]
+pub struct GraphNode {
+    pub path: String,
+    pub dir: String,
+    pub lang: String,
+    pub size: u64,
+    pub deg: usize,
+}
+#[derive(serde::Serialize)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+}
+
+impl RepoHost {
+    /// Build a codebase import graph at a branch: nodes are source files, edges are resolved in-repo
+    /// imports (TS/JS relative `import`/`require`, Rust `mod`). Self-contained (no resolver sidecars).
+    pub fn code_graph(&self, tenant: &str, repo: &str, ref_name: &str) -> (Vec<GraphNode>, Vec<GraphEdge>) {
+        let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return (vec![], vec![]) };
+        let Some(root) = self.root_tree(&store, ref_name) else { return (vec![], vec![]) };
+        // Collect all source files (path -> text).
+        let mut files: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut stack = vec![(String::new(), root)];
+        let lang_of = |p: &str| -> Option<&'static str> {
+            if p.ends_with(".tsx") || p.ends_with(".ts") { Some("ts") }
+            else if p.ends_with(".jsx") || p.ends_with(".js") || p.ends_with(".mjs") { Some("js") }
+            else if p.ends_with(".rs") { Some("rust") }
+            else if p.ends_with(".py") { Some("python") }
+            else if p.ends_with(".go") { Some("go") }
+            else { None }
+        };
+        while let Some((prefix, tid)) = stack.pop() {
+            if files.len() > 6000 { break; }
+            let entries = match store.get(&tid) { Ok(Some(Object::Tree(t))) => t.entries, _ => continue };
+            for e in entries {
+                let full = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+                match store.get(&e.id) {
+                    Ok(Some(Object::Tree(_))) => stack.push((full, e.id)),
+                    Ok(Some(Object::Blob(b))) if lang_of(&full).is_some() && b.len() < 400_000 => {
+                        files.insert(full, String::from_utf8_lossy(&b).into_owned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let paths: std::collections::HashSet<String> = files.keys().cloned().collect();
+        // Resolve a relative TS/JS import spec from `dir` to an existing repo file.
+        let resolve_rel = |dir: &str, spec: &str| -> Option<String> {
+            let mut parts: Vec<String> = if dir.is_empty() { vec![] } else { dir.split('/').map(str::to_string).collect() };
+            for seg in spec.split('/') {
+                match seg {
+                    "." | "" => {}
+                    ".." => { parts.pop(); }
+                    s => parts.push(s.to_string()),
+                }
+            }
+            let base = parts.join("/");
+            for ext in ["", ".ts", ".tsx", ".js", ".jsx", ".mjs"] {
+                let cand = format!("{base}{ext}");
+                if paths.contains(&cand) { return Some(cand); }
+            }
+            for idx in ["/index.ts", "/index.tsx", "/index.js", "/index.jsx"] {
+                let cand = format!("{base}{idx}");
+                if paths.contains(&cand) { return Some(cand); }
+            }
+            None
+        };
+        let mut edges: Vec<GraphEdge> = Vec::new();
+        let mut deg: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut seen_edge: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for (path, text) in &files {
+            let dir = path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+            let lang = lang_of(path).unwrap_or("");
+            for line in text.lines() {
+                let t = line.trim();
+                let mut targets: Vec<String> = Vec::new();
+                if lang == "ts" || lang == "js" {
+                    // from "X" / require("X") / import "X"
+                    for marker in ["from \"", "from '", "require(\"", "require('", "import \"", "import '"] {
+                        if let Some(i) = t.find(marker) {
+                            let rest = &t[i + marker.len()..];
+                            let end = rest.find(['"', '\'']).unwrap_or(rest.len());
+                            let spec = &rest[..end];
+                            if spec.starts_with('.') { if let Some(r) = resolve_rel(&dir, spec) { targets.push(r); } }
+                        }
+                    }
+                } else if lang == "rust" {
+                    // mod x;  → sibling x.rs or x/mod.rs
+                    if let Some(rest) = t.strip_prefix("mod ").or_else(|| t.strip_prefix("pub mod ")) {
+                        if let Some(name) = rest.split(&[';', ' '][..]).next().filter(|s| !s.is_empty()) {
+                            for cand in [format!("{dir}/{name}.rs"), format!("{dir}/{name}/mod.rs")] {
+                                let c = cand.trim_start_matches('/').to_string();
+                                if paths.contains(&c) { targets.push(c); }
+                            }
+                        }
+                    }
+                }
+                for to in targets {
+                    if &to != path && seen_edge.insert((path.clone(), to.clone())) {
+                        *deg.entry(path.clone()).or_default() += 1;
+                        *deg.entry(to.clone()).or_default() += 1;
+                        edges.push(GraphEdge { from: path.clone(), to });
+                    }
+                }
+            }
+        }
+        let mut nodes: Vec<GraphNode> = files
+            .iter()
+            .map(|(p, txt)| GraphNode {
+                path: p.clone(),
+                dir: p.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default(),
+                lang: lang_of(p).unwrap_or("").to_string(),
+                size: txt.len() as u64,
+                deg: deg.get(p).copied().unwrap_or(0),
+            })
+            .collect();
+        nodes.sort_by(|a, b| a.path.cmp(&b.path));
+        (nodes, edges)
+    }
+}
+
+/// One entry in a directory listing for the file browser.
+#[derive(serde::Serialize)]
+pub struct TreeItem {
+    pub name: String,
+    pub path: String,
+    pub dir: bool,
+    pub size: u64,
+}
+
+/// A search hit: a filename match (`kind:"path"`, line 0) or a content-line match (`kind:"content"`).
+#[derive(serde::Serialize)]
+pub struct SearchHit {
+    pub path: String,
+    pub line: u32,
+    pub text: String,
+    pub kind: &'static str,
+}
+
+impl RepoHost {
+    /// Branch names that resolve to a keel change, `main` first then alphabetical. The keel store
+    /// keys refs by bare branch name (`main`, `feat/x`), so this is just the ref table filtered.
+    pub fn branches(&self, tenant: &str, repo: &str) -> Vec<String> {
+        let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return vec![] };
+        let mut names: Vec<String> = store
+            .list_refs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, id)| matches!(store.get(id), Ok(Some(Object::Change(_)))))
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        names.dedup();
+        if let Some(pos) = names.iter().position(|n| n == "main") {
+            let m = names.remove(pos);
+            names.insert(0, m);
+        }
+        names
+    }
+
+    /// The root tree of a branch head (`None` if the repo/ref is missing or not a change).
+    fn root_tree(&self, store: &Store, ref_name: &str) -> Option<ObjectId> {
+        let head = store.get_ref(ref_name).ok()??;
+        match store.get(&head).ok()?? {
+            Object::Change(c) => Some(c.tree),
+            _ => None,
+        }
+    }
+
+    /// List a directory (`path`, "" = root) at a branch. Directories first, then files, both by name.
+    /// `None` if the repo/ref/path is missing or the path isn't a directory.
+    pub fn list_tree(&self, tenant: &str, repo: &str, ref_name: &str, path: &str) -> Option<Vec<TreeItem>> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let root = self.root_tree(&store, ref_name)?;
+        let base = path.trim_matches('/');
+        let tree_id = if base.is_empty() { root } else { resolve_path_in_tree(&store, root, base)? };
+        let entries = match store.get(&tree_id).ok()?? {
+            Object::Tree(t) => t.entries,
+            _ => return None,
+        };
+        let mut out: Vec<TreeItem> = entries
+            .into_iter()
+            .map(|e| {
+                let (dir, size) = match store.get(&e.id) {
+                    Ok(Some(Object::Tree(_))) => (true, 0),
+                    Ok(Some(Object::Blob(b))) => (false, b.len() as u64),
+                    _ => (e.mode == 0o040000, 0),
+                };
+                let full = if base.is_empty() { e.name.clone() } else { format!("{base}/{}", e.name) };
+                TreeItem { name: e.name, path: full, dir, size }
+            })
+            .collect();
+        out.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
+        Some(out)
+    }
+
+    /// Every file path in a branch's tree (recursive), for a full file-tree view. Capped.
+    pub fn all_paths(&self, tenant: &str, repo: &str, ref_name: &str) -> Vec<String> {
+        let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return vec![] };
+        let Some(root) = self.root_tree(&store, ref_name) else { return vec![] };
+        let mut out = Vec::new();
+        let mut stack = vec![(String::new(), root)];
+        while let Some((prefix, tid)) = stack.pop() {
+            if out.len() > 50_000 {
+                break;
+            }
+            let entries = match store.get(&tid) { Ok(Some(Object::Tree(t))) => t.entries, _ => continue };
+            for e in entries {
+                let full = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+                match store.get(&e.id) {
+                    Ok(Some(Object::Tree(_))) => stack.push((full, e.id)),
+                    Ok(Some(Object::Blob(_))) => out.push(full),
+                    _ => {}
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Read a file's bytes at a specific branch (`None` if repo/ref/path missing or not a blob).
+    pub fn read_file_at(&self, tenant: &str, repo: &str, ref_name: &str, path: &str) -> Option<Vec<u8>> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let root = self.root_tree(&store, ref_name)?;
+        let blob = resolve_path_in_tree(&store, root, path)?;
+        match store.get(&blob).ok()?? {
+            Object::Blob(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Fuzzy filename + full-text content search across a branch's tree. Filename hits first, then
+    /// content-line hits; capped so a huge repo can't run away. (Semantic/vector search is a
+    /// follow-up — this is the fuzzy/full-text tier.)
+    pub fn search(&self, tenant: &str, repo: &str, ref_name: &str, query: &str) -> Vec<SearchHit> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return vec![];
+        }
+        let Some(store) = self.store(tenant, repo, false).ok().flatten() else { return vec![] };
+        let Some(root) = self.root_tree(&store, ref_name) else { return vec![] };
+        // Walk the whole tree, collecting (path, blob id).
+        let mut files: Vec<(String, ObjectId)> = Vec::new();
+        let mut stack = vec![(String::new(), root)];
+        while let Some((prefix, tid)) = stack.pop() {
+            if files.len() > 50_000 {
+                break;
+            }
+            let entries = match store.get(&tid) {
+                Ok(Some(Object::Tree(t))) => t.entries,
+                _ => continue,
+            };
+            for e in entries {
+                let full = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+                match store.get(&e.id) {
+                    Ok(Some(Object::Tree(_))) => stack.push((full, e.id)),
+                    Ok(Some(Object::Blob(_))) => files.push((full, e.id)),
+                    _ => {}
+                }
+            }
+        }
+        let mut hits: Vec<SearchHit> = Vec::new();
+        for (path, _) in &files {
+            if path.to_lowercase().contains(&q) {
+                hits.push(SearchHit { path: path.clone(), line: 0, text: String::new(), kind: "path" });
+            }
+        }
+        for (path, id) in &files {
+            if hits.len() > 300 {
+                break;
+            }
+            let bytes = match store.get(id) {
+                Ok(Some(Object::Blob(b))) => b,
+                _ => continue,
+            };
+            if bytes.len() > 512 * 1024 || bytes.iter().take(8000).any(|&b| b == 0) {
+                continue; // skip huge or binary files
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            for (i, line) in text.lines().enumerate() {
+                if line.to_lowercase().contains(&q) {
+                    hits.push(SearchHit {
+                        path: path.clone(),
+                        line: (i + 1) as u32,
+                        text: line.trim().chars().take(200).collect(),
+                        kind: "content",
+                    });
+                    if hits.len() > 300 {
+                        break;
+                    }
+                }
+            }
+        }
+        hits
     }
 }
 
@@ -265,10 +641,14 @@ pub struct FileDiff {
     pub status: String,
     pub ops: Vec<String>,
     pub hunks: Vec<HunkOut>,
+    /// The file changed but is past [`MAX_BLOB_FOR_DIFF`], so no line hunks were computed. Lets the
+    /// UI say "too large to diff" instead of silently rendering an empty ("0 lines") diff.
+    #[serde(default)]
+    pub too_large: bool,
 }
 
 const MAX_DIFF_FILES: usize = 40;
-const MAX_BLOB_FOR_DIFF: usize = 256 * 1024; // skip huge/binary blobs
+const MAX_BLOB_FOR_DIFF: usize = 1024 * 1024; // skip only genuinely huge/binary blobs (line-diffing 1MB of text is cheap)
 
 /// A file relocated with byte-identical content — a **pure move**, detected exactly by content
 /// address (the blob id is unchanged), not guessed by similarity like git.
@@ -452,6 +832,34 @@ impl RepoHost {
     }
 
     /// The per-file diff of a change vs its first parent — line hunks + a semantic-ops summary.
+    /// The full old + new text of one file at a change — powers the diff viewer's "expand unmodified
+    /// lines" (pierre's `loadDiffFiles`), which needs the whole file, not just the patch context.
+    /// `None` text = the file is absent on that side (a pure add or delete). Returns `None` if the
+    /// change/file can't be resolved or the blob is over the diff cap.
+    pub fn file_pair(&self, tenant: &str, repo: &str, hex: &str, path: &str) -> Option<(Option<String>, Option<String>)> {
+        let store = self.store(tenant, repo, false).ok().flatten()?;
+        let cid = ObjectId::from_hex(hex)?;
+        let Some(Object::Change(change)) = store.get(&cid).ok().flatten() else { return None };
+        let mut head = HashMap::new();
+        flatten_tree(&store, change.tree, "", &mut head, 0);
+        let mut parent = HashMap::new();
+        if let Some(p) = change.parents.first() {
+            if let Some(Object::Change(pc)) = store.get(p).ok().flatten() {
+                flatten_tree(&store, pc.tree, "", &mut parent, 0);
+            }
+        }
+        let read = |id: &ObjectId| -> Option<String> {
+            match store.get(id).ok().flatten() {
+                Some(Object::Blob(b)) if b.len() <= MAX_BLOB_FOR_DIFF => Some(String::from_utf8_lossy(&b).into_owned()),
+                _ => None,
+            }
+        };
+        let old = parent.get(path).and_then(read);
+        let new = head.get(path).and_then(read);
+        if old.is_none() && new.is_none() { return None; }
+        Some((old, new))
+    }
+
     pub fn diff(&self, tenant: &str, repo: &str, hex: &str) -> Vec<FileDiff> {
         let Ok(Some(store)) = self.store(tenant, repo, false) else { return Vec::new() };
         let Some(cid) = ObjectId::from_hex(hex) else { return Vec::new() };
@@ -467,10 +875,12 @@ impl RepoHost {
                 flatten_tree(&store, pc.tree, "", &mut parent, 0);
             }
         }
-        let read = |id: &ObjectId| -> Option<String> {
+        // Read a blob as text; `too_large` distinguishes "over the diff cap" from "missing/non-blob".
+        let read = |id: &ObjectId| -> (Option<String>, bool) {
             match store.get(id).ok().flatten() {
-                Some(Object::Blob(b)) if b.len() <= MAX_BLOB_FOR_DIFF => Some(String::from_utf8_lossy(&b).into_owned()),
-                _ => None,
+                Some(Object::Blob(b)) if b.len() <= MAX_BLOB_FOR_DIFF => (Some(String::from_utf8_lossy(&b).into_owned()), false),
+                Some(Object::Blob(_)) => (None, true),
+                _ => (None, false),
             }
         };
         // union of paths, changed only
@@ -486,8 +896,17 @@ impl RepoHost {
                 (Some(a), Some(b)) if a != b => "modified",
                 _ => continue,
             };
-            let old = p.and_then(read).unwrap_or_default();
-            let new = h.and_then(read).unwrap_or_default();
+            let (old_txt, old_big) = p.map(&read).unwrap_or((None, false));
+            let (new_txt, new_big) = h.map(&read).unwrap_or((None, false));
+            // A changed file past the cap: report it as changed, but flag it instead of diffing.
+            if old_big || new_big {
+                out.push(FileDiff { path: path.clone(), status: status.to_string(), ops: Vec::new(), hunks: Vec::new(), too_large: true });
+                if out.len() >= MAX_DIFF_FILES {
+                    break;
+                }
+                continue;
+            }
+            let (old, new) = (old_txt.unwrap_or_default(), new_txt.unwrap_or_default());
             let hunks = diff_lines(&old, &new);
             let ops = semantic_ops(&hunks);
             let hunks_out = hunks
@@ -510,7 +929,7 @@ impl RepoHost {
                         .collect(),
                 })
                 .collect();
-            out.push(FileDiff { path: path.clone(), status: status.to_string(), ops, hunks: hunks_out });
+            out.push(FileDiff { path: path.clone(), status: status.to_string(), ops, hunks: hunks_out, too_large: false });
             if out.len() >= MAX_DIFF_FILES {
                 break;
             }

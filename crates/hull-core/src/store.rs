@@ -2,7 +2,7 @@
 //! (accounts/issues/projects as relational rows) that references keel objects by content address.
 //! Keeping this a trait means the server, tests, and the eventual SQL store all share one shape.
 
-use crate::{Account, Actor, Comment, Issue, OwnerRule, Project, PullRequest, Repo, Review, SessionRecord};
+use crate::{Account, Actor, AiConnection, Comment, Issue, OwnerRule, Project, PullRequest, Repo, Review, SessionRecord, Team, User};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,14 +30,37 @@ pub trait Store: Send + Sync {
     fn reviews(&self, repo: &str) -> Vec<Review>;
     fn put_comment(&self, comment: Comment);
     fn comments(&self, repo: &str) -> Vec<Comment>;
+    /// Delete a comment by id. Returns true if one was removed.
+    fn remove_comment(&self, repo: &str, id: &str) -> bool;
     /// Associate an ingested keel session with a change (latest write wins per change).
     fn put_session_record(&self, record: SessionRecord);
     fn session_record(&self, repo: &str, change: &str) -> Option<SessionRecord>;
     fn put_project(&self, project: Project);
     fn projects(&self, owner: &str) -> Vec<Project>;
+    // ── AI connections (per account/org: multiple backends, optional rotation) ──
+    fn put_ai_connection(&self, conn: AiConnection);
+    fn ai_connections(&self, owner: &str) -> Vec<AiConnection>;
+    fn remove_ai_connection(&self, owner: &str, id: &str) -> bool;
+    fn set_ai_rotate(&self, owner: &str, on: bool);
+    fn ai_rotate(&self, owner: &str) -> bool;
+    /// Add one agent run's token usage to a connection's rolling tally.
+    fn add_ai_usage(&self, conn_id: &str, input: u64, output: u64, cost_micros: u64, at_unix: u64);
+    /// A connection's accumulated usage (default zeros if none).
+    fn ai_usage(&self, conn_id: &str) -> crate::AiUsage;
     /// Set a repo's code-owner rules (replaces the existing set).
     fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>);
     fn owners(&self, repo: &str) -> Vec<OwnerRule>;
+    // ── hosted-account identities (passkey login) ──
+    fn put_user(&self, user: User);
+    fn user(&self, id: &str) -> Option<User>;
+    fn user_by_username(&self, username: &str) -> Option<User>;
+    fn user_by_actor(&self, actor: &str) -> Option<User>;
+    fn users(&self) -> Vec<User>;
+    // ── org teams ──
+    fn put_team(&self, team: Team);
+    fn team(&self, id: &str) -> Option<Team>;
+    fn teams(&self, account: &str) -> Vec<Team>;
+    fn delete_team(&self, id: &str);
 }
 
 /// Match a code-owner glob against a repo-relative path. Supports `dir/**` (prefix), `*.ext`
@@ -65,6 +88,11 @@ pub struct InMemory {
     sessions: RwLock<Vec<SessionRecord>>,
     owners: RwLock<HashMap<String, Vec<OwnerRule>>>,
     projects: RwLock<Vec<Project>>,
+    users: RwLock<HashMap<String, User>>,
+    teams: RwLock<HashMap<String, Team>>,
+    ai_conns: RwLock<Vec<AiConnection>>,
+    ai_rotate: RwLock<HashMap<String, bool>>,
+    ai_usage: RwLock<HashMap<String, crate::AiUsage>>,
 }
 
 impl InMemory {
@@ -139,6 +167,12 @@ impl Store for InMemory {
     fn comments(&self, repo: &str) -> Vec<Comment> {
         self.comments.read().unwrap().iter().filter(|c| c.repo == repo).cloned().collect()
     }
+    fn remove_comment(&self, repo: &str, id: &str) -> bool {
+        let mut g = self.comments.write().unwrap();
+        let before = g.len();
+        g.retain(|c| !(c.repo == repo && c.id == id));
+        g.len() != before
+    }
     fn put_session_record(&self, record: SessionRecord) {
         let mut g = self.sessions.write().unwrap();
         g.retain(|s| !(s.repo == record.repo && s.change == record.change));
@@ -153,11 +187,68 @@ impl Store for InMemory {
     fn projects(&self, owner: &str) -> Vec<Project> {
         self.projects.read().unwrap().iter().filter(|p| p.owner == owner).cloned().collect()
     }
+    fn put_ai_connection(&self, conn: AiConnection) {
+        self.ai_conns.write().unwrap().push(conn);
+    }
+    fn ai_connections(&self, owner: &str) -> Vec<AiConnection> {
+        self.ai_conns.read().unwrap().iter().filter(|c| c.owner == owner).cloned().collect()
+    }
+    fn remove_ai_connection(&self, owner: &str, id: &str) -> bool {
+        let mut g = self.ai_conns.write().unwrap();
+        let n = g.len();
+        g.retain(|c| !(c.owner == owner && c.id == id));
+        g.len() != n
+    }
+    fn set_ai_rotate(&self, owner: &str, on: bool) {
+        self.ai_rotate.write().unwrap().insert(owner.to_string(), on);
+    }
+    fn ai_rotate(&self, owner: &str) -> bool {
+        self.ai_rotate.read().unwrap().get(owner).copied().unwrap_or(false)
+    }
+    fn add_ai_usage(&self, conn_id: &str, input: u64, output: u64, cost_micros: u64, at_unix: u64) {
+        let mut g = self.ai_usage.write().unwrap();
+        let u = g.entry(conn_id.to_string()).or_default();
+        u.input_tokens += input;
+        u.output_tokens += output;
+        u.cost_micros += cost_micros;
+        u.runs += 1;
+        u.updated_unix = at_unix;
+    }
+    fn ai_usage(&self, conn_id: &str) -> crate::AiUsage {
+        self.ai_usage.read().unwrap().get(conn_id).cloned().unwrap_or_default()
+    }
     fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>) {
         self.owners.write().unwrap().insert(repo.to_string(), rules);
     }
     fn owners(&self, repo: &str) -> Vec<OwnerRule> {
         self.owners.read().unwrap().get(repo).cloned().unwrap_or_default()
+    }
+    fn put_user(&self, user: User) {
+        self.users.write().unwrap().insert(user.id.clone(), user);
+    }
+    fn user(&self, id: &str) -> Option<User> {
+        self.users.read().unwrap().get(id).cloned()
+    }
+    fn user_by_username(&self, username: &str) -> Option<User> {
+        self.users.read().unwrap().values().find(|u| u.username.eq_ignore_ascii_case(username)).cloned()
+    }
+    fn user_by_actor(&self, actor: &str) -> Option<User> {
+        self.users.read().unwrap().values().find(|u| u.actor == actor).cloned()
+    }
+    fn users(&self) -> Vec<User> {
+        self.users.read().unwrap().values().cloned().collect()
+    }
+    fn put_team(&self, team: Team) {
+        self.teams.write().unwrap().insert(team.id.clone(), team);
+    }
+    fn team(&self, id: &str) -> Option<Team> {
+        self.teams.read().unwrap().get(id).cloned()
+    }
+    fn teams(&self, account: &str) -> Vec<Team> {
+        self.teams.read().unwrap().values().filter(|t| t.account == account).cloned().collect()
+    }
+    fn delete_team(&self, id: &str) {
+        self.teams.write().unwrap().remove(id);
     }
 }
 
@@ -184,6 +275,16 @@ struct Snapshot {
     owners: HashMap<String, Vec<OwnerRule>>,
     #[serde(default)]
     projects: Vec<Project>,
+    #[serde(default)]
+    users: HashMap<String, User>,
+    #[serde(default)]
+    teams: HashMap<String, Team>,
+    #[serde(default)]
+    ai_conns: Vec<AiConnection>,
+    #[serde(default)]
+    ai_rotate: HashMap<String, bool>,
+    #[serde(default)]
+    ai_usage: HashMap<String, crate::AiUsage>,
 }
 
 /// A durable [`Store`] backed by a JSON snapshot on disk, so issues/accounts survive restarts.
@@ -325,6 +426,11 @@ impl Store for FileStore {
     fn comments(&self, repo: &str) -> Vec<Comment> {
         self.inner.read().unwrap().comments.iter().filter(|c| c.repo == repo).cloned().collect()
     }
+    fn remove_comment(&self, repo: &str, id: &str) -> bool {
+        let mut removed = false;
+        self.mutate(|s| { let before = s.comments.len(); s.comments.retain(|c| !(c.repo == repo && c.id == id)); removed = s.comments.len() != before; });
+        removed
+    }
     fn put_session_record(&self, record: SessionRecord) {
         self.mutate(|s| {
             s.sessions.retain(|x| !(x.repo == record.repo && x.change == record.change));
@@ -340,6 +446,36 @@ impl Store for FileStore {
     fn projects(&self, owner: &str) -> Vec<Project> {
         self.inner.read().unwrap().projects.iter().filter(|p| p.owner == owner).cloned().collect()
     }
+    fn put_ai_connection(&self, conn: AiConnection) {
+        self.mutate(|s| s.ai_conns.push(conn));
+    }
+    fn ai_connections(&self, owner: &str) -> Vec<AiConnection> {
+        self.inner.read().unwrap().ai_conns.iter().filter(|c| c.owner == owner).cloned().collect()
+    }
+    fn remove_ai_connection(&self, owner: &str, id: &str) -> bool {
+        let mut removed = false;
+        self.mutate(|s| { let n = s.ai_conns.len(); s.ai_conns.retain(|c| !(c.owner == owner && c.id == id)); removed = s.ai_conns.len() != n; });
+        removed
+    }
+    fn set_ai_rotate(&self, owner: &str, on: bool) {
+        self.mutate(|s| { s.ai_rotate.insert(owner.to_string(), on); });
+    }
+    fn ai_rotate(&self, owner: &str) -> bool {
+        self.inner.read().unwrap().ai_rotate.get(owner).copied().unwrap_or(false)
+    }
+    fn add_ai_usage(&self, conn_id: &str, input: u64, output: u64, cost_micros: u64, at_unix: u64) {
+        self.mutate(|s| {
+            let u = s.ai_usage.entry(conn_id.to_string()).or_default();
+            u.input_tokens += input;
+            u.output_tokens += output;
+            u.cost_micros += cost_micros;
+            u.runs += 1;
+            u.updated_unix = at_unix;
+        });
+    }
+    fn ai_usage(&self, conn_id: &str) -> crate::AiUsage {
+        self.inner.read().unwrap().ai_usage.get(conn_id).cloned().unwrap_or_default()
+    }
     fn set_owners(&self, repo: &str, rules: Vec<OwnerRule>) {
         self.mutate(|s| {
             s.owners.insert(repo.to_string(), rules);
@@ -347,6 +483,39 @@ impl Store for FileStore {
     }
     fn owners(&self, repo: &str) -> Vec<OwnerRule> {
         self.inner.read().unwrap().owners.get(repo).cloned().unwrap_or_default()
+    }
+    fn put_user(&self, user: User) {
+        self.mutate(|s| {
+            s.users.insert(user.id.clone(), user);
+        });
+    }
+    fn user(&self, id: &str) -> Option<User> {
+        self.inner.read().unwrap().users.get(id).cloned()
+    }
+    fn user_by_username(&self, username: &str) -> Option<User> {
+        self.inner.read().unwrap().users.values().find(|u| u.username.eq_ignore_ascii_case(username)).cloned()
+    }
+    fn user_by_actor(&self, actor: &str) -> Option<User> {
+        self.inner.read().unwrap().users.values().find(|u| u.actor == actor).cloned()
+    }
+    fn users(&self) -> Vec<User> {
+        self.inner.read().unwrap().users.values().cloned().collect()
+    }
+    fn put_team(&self, team: Team) {
+        self.mutate(|s| {
+            s.teams.insert(team.id.clone(), team);
+        });
+    }
+    fn team(&self, id: &str) -> Option<Team> {
+        self.inner.read().unwrap().teams.get(id).cloned()
+    }
+    fn teams(&self, account: &str) -> Vec<Team> {
+        self.inner.read().unwrap().teams.values().filter(|t| t.account == account).cloned().collect()
+    }
+    fn delete_team(&self, id: &str) {
+        self.mutate(|s| {
+            s.teams.remove(id);
+        });
     }
 }
 

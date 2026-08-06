@@ -136,6 +136,28 @@ pub trait Mirror: Send + Sync {
     fn pull_in(&self, _repo: &str) -> MirrorResult {
         MirrorResult { ok: false, external_ref: None, detail: "inbound pull not supported by this mirror".into() }
     }
+    /// Verify a forge **connection** (e.g. a GitHub App installation id) and return the external
+    /// account login it grants access to, or `None` if it's invalid / unsupported. Used to let an org
+    /// admin explicitly connect their account to a forge before any import — so nothing is ever
+    /// importable without a deliberate, verified connection.
+    fn verify_connection(&self, _connection: &str) -> Option<String> {
+        None
+    }
+    /// External repos importable through `connection` (forge full-names). Default: none.
+    fn list_importable(&self, _connection: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// Every connection this forge already grants (e.g. GitHub App installations) as
+    /// `(connection_id, external_login)` — so an admin can PICK their org instead of pasting an id.
+    /// Default: none (a mirror with no discoverable connections).
+    fn list_installations(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Import `source` (a forge full-name) through `connection` INTO hull's `dest` (`tenant/repo`).
+    /// Default: unsupported.
+    fn import_repo(&self, _connection: &str, _source: &str, _dest: &str) -> MirrorResult {
+        MirrorResult { ok: false, external_ref: None, detail: "import not supported by this mirror".into() }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -161,8 +183,12 @@ pub struct MirrorResult {
 pub struct LogMirror;
 
 impl Mirror for LogMirror {
-    fn target(&self, _repo: &str) -> Option<String> {
-        std::env::var("HULL_MIRROR_TARGET").ok().filter(|s| !s.is_empty())
+    fn target(&self, repo: &str) -> Option<String> {
+        // `HULL_MIRROR_TARGET` (e.g. "github:tenant/repo") configures ONE repo's mirror — only that
+        // repo reports a target, not every repo in the instance.
+        let t = std::env::var("HULL_MIRROR_TARGET").ok().filter(|s| !s.is_empty())?;
+        let repo_part = t.split_once(':').map(|(_, r)| r).unwrap_or(&t);
+        (repo_part == repo).then_some(t)
     }
     fn push(&self, req: &MirrorPush) -> MirrorResult {
         let target = std::env::var("HULL_MIRROR_TARGET").unwrap_or_default();
@@ -270,6 +296,35 @@ pub trait Fixer: Send + Sync {
     fn fix(&self, req: &FixRequest) -> FixResult;
 }
 
+/// An AI backend resolved for one request — the provider + base URL + bearer token the hosted reviewer
+/// should call, chosen (and rotated) by the core from the owning account/org's connected credentials.
+/// `None` on a request means "use the process-configured provider" (the `.env` default).
+#[derive(Debug, Clone)]
+pub struct AiCredential {
+    /// API provider (`openai`/`anthropic`/`openrouter`) OR an agent kind (`claude-code`/`codex`).
+    pub provider: String,
+    pub base_url: String,
+    /// The bearer token (an API key). Empty when this is an agent CLI.
+    pub token: String,
+    /// When set, this backend is a locally-installed **agent CLI** (the string is the command, e.g.
+    /// `claude`), run with the user's own subscription login — not an API call.
+    pub agent_cli: Option<String>,
+    /// For a per-user agent session, the credential-bundle directory to point the CLI at (its
+    /// `CLAUDE_CONFIG_DIR` / `CODEX_HOME`). `None` ⇒ the agent uses the Hull host's own login.
+    pub agent_config_dir: Option<String>,
+    /// The owning [`AiConnection`] id, so Hull can meter this run's token usage against it.
+    pub connection_id: Option<String>,
+}
+
+/// Token usage reported by an agent run (parsed from the CLI's own accounting), for per-connection
+/// metering. `cost_micros` is USD × 1e6 when the agent reports a cost.
+#[derive(Debug, Clone, Default)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micros: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct FixRequest {
     pub repo: String,
@@ -279,6 +334,8 @@ pub struct FixRequest {
     pub path: String,
     pub note: String,
     pub severity: String,
+    /// Resolved AI backend for this request (from the owner's connections), or None for the default.
+    pub ai_credential: Option<AiCredential>,
 }
 
 /// One edit as a **search/replace** on a file — `search` is the exact existing code, `replace` is
@@ -298,6 +355,9 @@ pub struct FixResult {
     pub explanation: String,
     /// The edits to apply (empty if `ok` is false).
     pub edits: Vec<FixEdit>,
+    /// Token usage for this fix, when the backend reported it (agent-CLI path). Internal metering.
+    #[serde(skip)]
+    pub usage: Option<Usage>,
 }
 
 // ── Reviewer (Epic D / D1) ──────────────────────────────────────────────────────────────────────
@@ -311,6 +371,25 @@ pub struct FixResult {
 /// green + an independent human/agent approval).
 pub trait Reviewer: Send + Sync {
     fn review(&self, req: &ReviewRequest) -> ReviewPackage;
+    /// Answer a reviewer's free-form question about a specific span of code (a line or range). Used by
+    /// the "comment & ask agent" action. Default: unsupported (the OSS reconciliation reviewer has no
+    /// model to answer with); the hosted AI reviewer overrides it.
+    fn answer(&self, _req: &AskRequest) -> Option<String> {
+        None
+    }
+}
+
+/// A reviewer's question about a code span: the human's `question`, the `path`, the `code` around the
+/// referenced lines, and the anchor `line`. The reviewer reads the code and replies in prose.
+#[derive(Debug, Clone)]
+pub struct AskRequest {
+    pub repo: String,
+    pub path: String,
+    pub line: u32,
+    pub line_end: u32,
+    pub code: String,
+    pub question: String,
+    pub ai_credential: Option<AiCredential>,
 }
 
 /// What a reviewer judges: the change's narrative (intent + session lesson), its author, the
@@ -329,6 +408,8 @@ pub struct ReviewRequest {
     /// keel-native content-addressed source (a `…/tree/:tree_id/tar` URL). NOT git.
     pub source_url: String,
     pub facts: hull_core::reconcile::ChangeFacts,
+    /// Resolved AI backend for this request (from the owner's connections), or None for the default.
+    pub ai_credential: Option<AiCredential>,
 }
 
 /// The "family" of a model id for independence checks — vendor + line, with the trailing version and
@@ -372,6 +453,9 @@ pub struct ReviewPackage {
     /// The reconciliation ledger evidence, when the reviewer produced one (the OSS default does; a
     /// model-backed reviewer may attach its own or leave this `None`).
     pub ledger: Option<hull_core::reconcile::ClaimLedger>,
+    /// Token usage for this review, when the backend reported it (agent-CLI path). Internal metering.
+    #[serde(skip)]
+    pub usage: Option<Usage>,
 }
 
 /// The OSS default reviewer (Epic C): reconcile the change's narrative against its facts and
@@ -413,7 +497,7 @@ pub fn default_review(req: &ReviewRequest) -> ReviewPackage {
             ReviewVerdict::Comment => "Not green, or nothing corroborates the intent — a human should look.",
         }
     );
-    ReviewPackage { verdict, summary, findings, ledger: Some(ledger) }
+    ReviewPackage { verdict, summary, findings, ledger: Some(ledger), usage: None }
 }
 
 /// A notification payload (kept generic so plugins map it to their channel).
@@ -490,6 +574,13 @@ impl Registry {
     pub fn set_fixer(&mut self, f: Arc<dyn Fixer>) {
         self.fixer = Some(f);
     }
+    /// Whether an AI fixer / reviewer is installed — so the UI can hide AI actions it can't fulfill.
+    pub fn has_fixer(&self) -> bool {
+        self.fixer.is_some()
+    }
+    pub fn has_reviewer(&self) -> bool {
+        self.reviewer.is_some()
+    }
     /// Add a config/secret provider. Tried in registration order; a hosted plugin adds Infisical/Vault.
     pub fn add_config_provider(&mut self, c: Arc<dyn ConfigProvider>) {
         self.config_providers.push(c);
@@ -550,6 +641,12 @@ impl Registry {
         }
     }
 
+    /// Ask the installed reviewer a question about a code span. `None` when no reviewer is installed
+    /// or it declines to answer.
+    pub fn answer(&self, req: &AskRequest) -> Option<String> {
+        self.reviewer.as_ref().and_then(|r| r.answer(req))
+    }
+
     /// The external target this repo mirrors to, if any (installed mirror, else the dry-run default).
     pub fn mirror_target(&self, repo: &str) -> Option<String> {
         match &self.mirror {
@@ -565,6 +662,26 @@ impl Registry {
             Some(m) => m.push(req),
             None => LogMirror.push(req),
         }
+    }
+    /// Verify a forge connection through the installed mirror; returns the external account login.
+    pub fn mirror_verify_connection(&self, connection: &str) -> Option<String> {
+        self.mirror.as_ref().and_then(|m| m.verify_connection(connection))
+    }
+    /// Import an external repo into hull through the installed mirror + a verified connection.
+    pub fn mirror_import(&self, connection: &str, source: &str, dest: &str) -> MirrorResult {
+        match &self.mirror {
+            Some(m) => m.import_repo(connection, source, dest),
+            None => MirrorResult { ok: false, external_ref: None, detail: "no mirror configured".into() },
+        }
+    }
+    /// External repos available to import through the installed mirror + a verified connection.
+    pub fn mirror_importable(&self, connection: &str) -> Vec<String> {
+        self.mirror.as_ref().map(|m| m.list_importable(connection)).unwrap_or_default()
+    }
+    /// Discoverable forge connections (e.g. GitHub App installations) as `(id, login)` — for the
+    /// "pick your org" connect flow that replaces pasting an installation id.
+    pub fn mirror_installations(&self) -> Vec<(String, String)> {
+        self.mirror.as_ref().map(|m| m.list_installations()).unwrap_or_default()
     }
     pub fn mirror_pull_in(&self, repo: &str) -> MirrorResult {
         match &self.mirror {

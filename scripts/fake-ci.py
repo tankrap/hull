@@ -37,8 +37,15 @@ def fetch_source(job):
 
 def run_checks(job):
     """Where a real CI extracts the source into a sandbox and runs tests. Returns (status, summary).
-    This stand-in fetches the tree (proving the keel-native fetch works) and reports a fixed verdict."""
-    fetch_source(job)
+    This stand-in fetches the tree (proving the keel-native fetch works) and reports a fixed verdict.
+
+    §7: anything that stops us producing a verdict about the *code* is `errored`, never `red`. That
+    covers the fetch failing, the body not being a tar, and any other infrastructure problem — they
+    are statements about this runner, not about the change, and only green/red are memoized."""
+    try:
+        fetch_source(job)
+    except Exception as e:  # noqa: BLE001 — any fetch/extract failure is infrastructure, not a verdict
+        return "errored", f"fake-ci could not obtain the source: {type(e).__name__}: {e}"
     return VERDICT, f"fake-ci reporting {VERDICT} for {job['change'][:12]}"
 
 
@@ -64,7 +71,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b'{"accepted":true}')
 
         # ...run the job (your concern)...
-        status, summary = run_checks(job)
+        #
+        # §7/§10: a verdict MUST eventually arrive. If this raised, the handler thread would die and
+        # Hull would receive *nothing* — and silence is not a verdict: the tree stays unverified with
+        # nothing to explain why, which looks identical to "the CI is down" from the outside. So every
+        # escape route out of the job ends in a callback, and an unexpected failure is `errored`.
+        try:
+            status, summary = run_checks(job)
+        except Exception as e:  # noqa: BLE001 — never let a job failure become silence
+            status, summary = "errored", f"fake-ci failed to run the job: {type(e).__name__}: {e}"
 
         # §7 — post the verdict to the exact callback_url, echoing the secret.
         headers = {"Content-Type": "application/json"}
