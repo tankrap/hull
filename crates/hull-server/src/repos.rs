@@ -1340,42 +1340,15 @@ fn safe_segment(s: &str) -> bool {
 
 // ── axum handlers (wired by `router` in lib.rs) ─────────────────────────────────────────────────
 //
-// ⚠️ AUTHORIZATION — DEFERRED (authz-hardening, area D). The three git smart-HTTP endpoints below
-// (`info_refs` / `upload_pack` / `receive_pack`) currently perform **NO authentication**: anyone can
-// clone or push ANY repo — including private ones — and a `git push` to an unknown name even
-// auto-creates the repo (`store(.., create=true)` for `git-receive-pack`). This is the single biggest
-// hole the audit found. It is deliberately left for a focused follow-up rather than half-closed here,
-// because there is currently **no client-side credential path to preserve**, and gating naively would
-// break the only known-legitimate clients:
-//
-//   • The dogfood flow is a plain `git push hull <branch>` / `git clone` against these endpoints with
-//     the `hull` remote configured with NO credential helper and NO token — it sends zero auth
-//     headers. Enforcing auth on push would break it outright (even for a public repo).
-//   • Hull has no server-side HTTP Basic / git-credential parsing today; `authed_actor` only reads an
-//     `Authorization: Bearer <session-token>` (minted by passkey login), which `git` never sends.
-//   • Public-repo anonymous clone is a REQUIRED capability and must keep working.
-//
-// What a correct fix needs (all three pieces, together, so legitimate clients keep working):
-//   1. Server: parse credentials from the git request. The git-standard path is HTTP Basic — accept
-//      `Authorization: Basic base64("<anything>:<session-token>")` (password = a hull session token)
-//      and/or `Authorization: Bearer <session-token>`, resolving to an `Actor` via the same token map
-//      `authed_actor` uses. On a private/push request with no/!valid credential, reply `401` with
-//      `WWW-Authenticate: Basic realm="hull"` so `git` invokes its credential helper (the standard
-//      handshake GitHub/GitLab use).
-//   2. Gate, mirroring the JSON endpoints' policy (these handlers are generic over `S: HasRepoHost`,
-//      so either move the auth into per-repo wrappers in lib.rs — which hold the full `App` and can
-//      call `can_read_repo` / `is_repo_member` — or widen the trait to expose the auth/token store):
-//        · FETCH  (info/refs?service=git-upload-pack  + git-upload-pack)  → require `can_read_repo`
-//          (public/unlisted stays anonymous; private requires a member/team-grant token).
-//        · PUSH   (info/refs?service=git-receive-pack + git-receive-pack) → require `is_repo_member`,
-//          AND gate the auto-create-on-first-push so only an authorized actor can bring a repo into
-//          existence by pushing (today `create=true` provisions for anyone).
-//   3. Client: teach `keel push`/the dogfood remote to present the token (a git credential helper that
-//      emits the hull session token, or a token-in-URL remote) so authenticated clone/push keeps
-//      working. Until this ships, the fetch/push gates cannot be enabled without breaking the flow.
-//
-// See the shared helpers `can_read_repo` / `is_repo_member` / `is_repo_admin` in lib.rs — the gate is
-// ready; only the credential-extraction seam (1) and the client (3) are missing.
+// AUTHORIZATION (authz-hardening, area D — closed). These three git smart-HTTP handlers are the
+// success-path wire protocol ONLY; the auth pre-check lives in front of them in lib.rs (where the full
+// `App` — and thus `can_read_repo` / `is_repo_member` — is available): `info_refs_handler`,
+// `upload_pack_handler` and `receive_pack_handler` run `git_gate` before delegating here. Enforcement
+// is config-gated by `HULL_GIT_AUTH` (default `off` = fully anonymous, a byte-for-byte no-op; set
+// `enforce` to require credentials). Credentials arrive as HTTP Basic (the password is a hull session
+// token) or a `Bearer` fallback; see `git_auth_decision` in lib.rs for the fetch/push/create matrix.
+// These handlers therefore assume authorization already happened — do not call them on a path that
+// bypasses the lib.rs wrappers.
 
 /// The `RepoHost` is pulled from the app state via this trait so the handlers stay decoupled from
 /// the concrete `App` struct.

@@ -29,8 +29,8 @@ pub mod repos;
 
 use activity::{ActivityEvent, ActivityHub};
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, Query, RawQuery, State},
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -419,8 +419,8 @@ fn make_router(app: App) -> Router {
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
         // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
-        .route("/:tenant/:repo/info/refs", get(repos::info_refs::<App>))
-        .route("/:tenant/:repo/git-upload-pack", post(repos::upload_pack::<App>))
+        .route("/:tenant/:repo/info/refs", get(info_refs_handler))
+        .route("/:tenant/:repo/git-upload-pack", post(upload_pack_handler))
         .route("/:tenant/:repo/git-receive-pack", post(receive_pack_handler))
         .with_state(app)
 }
@@ -2326,6 +2326,13 @@ fn authed_actor(app: &App, headers: &axum::http::HeaderMap) -> Option<Actor> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))?;
+    actor_for_token(app, token)
+}
+
+/// Resolve a **raw** session token (no scheme prefix) to its actor, applying the same expiry prune
+/// as [`authed_actor`]. Factored out so non-`Bearer` credential paths (git HTTP Basic, where the
+/// token arrives as the Basic password) resolve identity through the exact same token map.
+fn actor_for_token(app: &App, token: &str) -> Option<Actor> {
     let now = now();
     let actor_id = {
         let mut a = app.auth.lock().unwrap();
@@ -3125,16 +3132,150 @@ fn is_repo_member(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
         .any(|t| settings.team_access.iter().any(|ta| ta.team == t.id) && t.members.iter().any(|m| m.actor == actor))
 }
 
+// ── git smart-HTTP authorization (closes authz-hardening area D) ────────────────────────────────
+//
+// Enforcement is CONFIG-GATED by `HULL_GIT_AUTH` so the credential-free dogfood keeps working: the
+// DEFAULT (`off`, or unset) is a byte-for-byte no-op — every request is `Allow` and the handlers run
+// exactly as before. Set `HULL_GIT_AUTH=enforce` to require credentials:
+//   · FETCH (upload-pack): anonymous OK for public/unlisted repos (`can_read_repo(None)`), a private
+//     repo needs a token whose actor can read it — else 401 (so git prompts / a credential helper runs).
+//   · PUSH  (receive-pack): always needs a token whose actor is a repo member; non-member → 403,
+//     missing/invalid creds → 401. This also gates auto-create-on-push, because `is_repo_member`
+//     resolves the owning account from the tenant handle, so only a member of that account can
+//     provision a new repo by pushing.
+// Git presents credentials natively via HTTP Basic on an HTTP remote; we treat the Basic **password**
+// as a hull session token (username ignored). A `Bearer` header is accepted as a fallback.
+
+/// Whether git smart-HTTP auth is enforced (`HULL_GIT_AUTH=enforce`). Anything else (incl. unset,
+/// the default) means `off` — fully anonymous git, exactly as before this change.
+fn git_auth_enforced() -> bool {
+    std::env::var("HULL_GIT_AUTH").map(|v| v.eq_ignore_ascii_case("enforce")).unwrap_or(false)
+}
+
+/// Extract a hull session token from a git request's `Authorization` header. Accepts HTTP Basic
+/// (git's native scheme for HTTP remotes — the **password** field is the token, username ignored) and
+/// a `Bearer` fallback. `None` if there is no usable credential.
+fn git_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let auth = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok())?;
+    if let Some(b64) = auth.strip_prefix("Basic ") {
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?;
+        let text = String::from_utf8(decoded).ok()?;
+        // `user:password` — the password (everything after the first colon) is the token.
+        let (_user, pass) = text.split_once(':')?;
+        let pass = pass.trim();
+        return (!pass.is_empty()).then(|| pass.to_string());
+    }
+    if let Some(bearer) = auth.strip_prefix("Bearer ") {
+        let bearer = bearer.trim();
+        return (!bearer.is_empty()).then(|| bearer.to_string());
+    }
+    None
+}
+
+/// The authorization verdict for one git smart-HTTP request.
+#[derive(Debug, PartialEq, Eq)]
+enum GitAuthDecision {
+    /// Proceed to the handler.
+    Allow,
+    /// 401 + `WWW-Authenticate: Basic` — missing/insufficient creds on a gated request.
+    Unauthorized,
+    /// 403 — a valid actor that isn't a member (push).
+    Forbidden,
+}
+
+/// Decide whether a git request may proceed. Pure over (`enforce`, repo visibility/membership,
+/// service, token) so it can be unit-tested exhaustively. When `enforce` is false this is ALWAYS
+/// `Allow` — the config-off no-op. `service` is `git-upload-pack` (fetch) or `git-receive-pack`
+/// (push); `token` is the raw session token extracted from the request, if any.
+fn git_auth_decision(app: &App, enforce: bool, tenant: &str, repo: &str, service: &str, token: Option<&str>) -> GitAuthDecision {
+    if !enforce {
+        return GitAuthDecision::Allow;
+    }
+    let actor = token.and_then(|t| actor_for_token(app, t)).map(|a| a.id);
+    if service == "git-receive-pack" {
+        // Push: always require a member. This also gates auto-create-on-push (an anonymous or
+        // non-member actor can neither push to nor provision a repo).
+        match actor {
+            None => GitAuthDecision::Unauthorized,
+            Some(aid) if is_repo_member(app, tenant, repo, &aid) => GitAuthDecision::Allow,
+            Some(_) => GitAuthDecision::Forbidden,
+        }
+    } else {
+        // Fetch: public/unlisted stays anonymous; a private repo needs a read-authorized actor.
+        // Any shortfall is 401 (not 403) so git re-tries with a credential helper.
+        if can_read_repo(app, actor.as_deref(), tenant, repo) {
+            GitAuthDecision::Allow
+        } else {
+            GitAuthDecision::Unauthorized
+        }
+    }
+}
+
+/// Run the git-auth gate for a request. `Some(resp)` = reject with that response; `None` = proceed.
+fn git_gate(app: &App, tenant: &str, repo: &str, service: &str, headers: &HeaderMap) -> Option<Response> {
+    let token = git_token_from_headers(headers);
+    match git_auth_decision(app, git_auth_enforced(), tenant, repo, service, token.as_deref()) {
+        GitAuthDecision::Allow => None,
+        GitAuthDecision::Unauthorized => Some(
+            (StatusCode::UNAUTHORIZED, [(axum::http::header::WWW_AUTHENTICATE, "Basic realm=\"hull\"")], "authentication required").into_response(),
+        ),
+        GitAuthDecision::Forbidden => Some((StatusCode::FORBIDDEN, "not a repo member").into_response()),
+    }
+}
+
+/// The git service named by an `info/refs?service=…` query, or `""` if absent/unrecognized.
+fn info_refs_service(query: Option<&str>) -> String {
+    query
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("service=")))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// `GET /{tenant}/{repo}/info/refs` — auth pre-check in front of [`repos::info_refs`]. The gate only
+/// fires for the two real services; an unrecognized service falls through to the handler's own 403.
+async fn info_refs_handler(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let service = info_refs_service(query.as_deref());
+    if service == "git-upload-pack" || service == "git-receive-pack" {
+        if let Some(resp) = git_gate(&app, &tenant, &repo, &service, &headers) {
+            return resp;
+        }
+    }
+    repos::info_refs(State(app), Path((tenant, repo)), RawQuery(query)).await
+}
+
+/// `POST /{tenant}/{repo}/git-upload-pack` — auth pre-check in front of [`repos::upload_pack`].
+async fn upload_pack_handler(
+    State(app): State<App>,
+    Path((tenant, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(resp) = git_gate(&app, &tenant, &repo, "git-upload-pack", &headers) {
+        return resp;
+    }
+    repos::upload_pack(State(app), Path((tenant, repo)), headers, body).await
+}
+
 /// Git push endpoint, wrapped so that **every successful push runs CI** on the new HEAD change —
 /// independent of autonomy tier (CI is a mechanical check, not an autonomous action). Fire-and-forget
 /// (memoized by tree, so an unchanged tree is a no-op); dispatched to the configured CI or the local
-/// runner.
+/// runner. Also carries the push auth gate (receive-pack), enforced BEFORE the handler provisions or
+/// mutates the repo.
 async fn receive_pack_handler(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    if let Some(resp) = git_gate(&app, &tenant, &repo, "git-receive-pack", &headers) {
+        return resp;
+    }
     let resp = repos::receive_pack(State(app.clone()), Path((tenant.clone(), repo.clone())), headers, body).await;
     if resp.status().is_success() {
         if let Some(change) = app.repos.head_change(&tenant, &repo) {
@@ -5734,6 +5875,91 @@ mod tests {
         assert!(!is_repo_admin(&app, "acme", "web", "dev"), "Write is a member but not an admin");
         assert!(!is_repo_admin(&app, "acme", "web", "reader"), "Read is a member but not an admin");
         assert!(!is_repo_admin(&app, "acme", "web", "outsider"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn git_basic_and_bearer_token_extraction() {
+        use base64::Engine;
+        // HTTP Basic: git sends base64("user:password"); the PASSWORD is the token, username ignored.
+        let creds = base64::engine::general_purpose::STANDARD.encode("x-access-token:tok-123");
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::AUTHORIZATION, format!("Basic {creds}").parse().unwrap());
+        assert_eq!(git_token_from_headers(&h).as_deref(), Some("tok-123"), "Basic password is the token");
+        // A token with no username still resolves (git-credential emits ":<token>" shapes too).
+        let creds = base64::engine::general_purpose::STANDARD.encode(":only-pass");
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::AUTHORIZATION, format!("Basic {creds}").parse().unwrap());
+        assert_eq!(git_token_from_headers(&h).as_deref(), Some("only-pass"));
+        // Bearer fallback.
+        assert_eq!(git_token_from_headers(&bearer("tok-b")).as_deref(), Some("tok-b"));
+        // No/empty credential → None.
+        assert_eq!(git_token_from_headers(&axum::http::HeaderMap::new()), None);
+        let empty = base64::engine::general_purpose::STANDARD.encode("user:");
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::AUTHORIZATION, format!("Basic {empty}").parse().unwrap());
+        assert_eq!(git_token_from_headers(&h), None, "empty password is not a token");
+    }
+
+    #[test]
+    fn git_auth_decision_matrix() {
+        // Area D: the pure decision over public/private × fetch/push × member/non-member/anon, with the
+        // config-off case proven a total no-op (always Allow) regardless of visibility/creds.
+        let (app, tmp) = build_test_app("git-auth");
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
+        app.store.put_actor(actor("member", ActorKind::Human));
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        mint_token(&app, "tok-member", "member");
+        mint_token(&app, "tok-outsider", "outsider");
+        let fetch = "git-upload-pack";
+        let push = "git-receive-pack";
+        let d = |enforce, service, token| git_auth_decision(&app, enforce, "acme", "web", service, token);
+
+        // ── enforce OFF: ALWAYS Allow, whatever the repo/service/creds. The no-op guarantee. ──
+        for service in [fetch, push] {
+            for token in [None, Some("tok-member"), Some("tok-outsider"), Some("bad")] {
+                assert_eq!(d(false, service, token), GitAuthDecision::Allow, "config off is always Allow ({service}, {token:?})");
+            }
+        }
+
+        // ── enforce ON, PRIVATE repo ──
+        // Fetch: anon/non-member/invalid → 401 (so git prompts); a read-authorized member → Allow.
+        assert_eq!(d(true, fetch, None), GitAuthDecision::Unauthorized, "anon fetch of a private repo → 401");
+        assert_eq!(d(true, fetch, Some("bad")), GitAuthDecision::Unauthorized, "invalid token fetch of private → 401");
+        assert_eq!(d(true, fetch, Some("tok-outsider")), GitAuthDecision::Unauthorized, "non-member fetch of private → 401");
+        assert_eq!(d(true, fetch, Some("tok-member")), GitAuthDecision::Allow, "member fetch of a private repo → Allow");
+        // Push: anon/invalid → 401; a valid non-member → 403; a member → Allow.
+        assert_eq!(d(true, push, None), GitAuthDecision::Unauthorized, "anon push → 401");
+        assert_eq!(d(true, push, Some("bad")), GitAuthDecision::Unauthorized, "invalid token push → 401");
+        assert_eq!(d(true, push, Some("tok-outsider")), GitAuthDecision::Forbidden, "non-member push → 403");
+        assert_eq!(d(true, push, Some("tok-member")), GitAuthDecision::Allow, "member push → Allow");
+
+        // ── enforce ON, PUBLIC repo ── anonymous clone MUST still work; push still needs a member.
+        set_private(&app, "acme/web", false);
+        assert_eq!(d(true, fetch, None), GitAuthDecision::Allow, "anon fetch of a PUBLIC repo → Allow even when enforcing");
+        assert_eq!(d(true, fetch, Some("tok-outsider")), GitAuthDecision::Allow, "non-member fetch of a public repo → Allow");
+        assert_eq!(d(true, push, None), GitAuthDecision::Unauthorized, "anon push to a public repo still → 401");
+        assert_eq!(d(true, push, Some("tok-outsider")), GitAuthDecision::Forbidden, "non-member push to a public repo → 403");
+        assert_eq!(d(true, push, Some("tok-member")), GitAuthDecision::Allow, "member push to a public repo → Allow");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn git_auth_create_on_push_requires_account_member() {
+        // Area D: auto-create-on-push must not let an anon/outsider provision a repo. For a not-yet-
+        // existent repo under account handle `acme`, the push decision is Allow only for an `acme`
+        // member (via `is_repo_member`'s tenant→account resolution), else 401 (anon) / 403 (outsider).
+        let (app, tmp) = build_test_app("git-create");
+        // Account exists (handle == tenant) but the repo record/dir does not yet.
+        setup_org_repo(&app, "acme", "placeholder", false, &[("member", Role::Write)]);
+        app.store.put_actor(actor("member", ActorKind::Human));
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        mint_token(&app, "tok-member", "member");
+        mint_token(&app, "tok-outsider", "outsider");
+        let push = "git-receive-pack";
+        assert_eq!(git_auth_decision(&app, true, "acme", "brand-new", push, None), GitAuthDecision::Unauthorized, "anon cannot provision a new repo by push");
+        assert_eq!(git_auth_decision(&app, true, "acme", "brand-new", push, Some("tok-outsider")), GitAuthDecision::Forbidden, "an outsider cannot provision a new repo under acme");
+        assert_eq!(git_auth_decision(&app, true, "acme", "brand-new", push, Some("tok-member")), GitAuthDecision::Allow, "an acme member may provision a new repo by push");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
