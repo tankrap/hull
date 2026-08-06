@@ -676,7 +676,9 @@ fn can_read_repo(app: &App, actor_id: Option<&str>, tenant: &str, repo: &str) ->
         return true;
     }
     let Some(aid) = actor_id else { return false };
-    let Some(acct) = app.store.accounts().into_iter().find(|a| a.handle == tenant) else { return false };
+    // Resolve the owning account the same way the write-side gate does (repo record's owner, falling
+    // back to handle==tenant), so read-side and write-side membership evaluate the same account.
+    let Some(acct) = repo_owner_account(app, tenant, repo) else { return false };
     if acct.members.iter().any(|m| m.actor == aid) {
         return true;
     }
@@ -2829,6 +2831,11 @@ async fn run_check_handler(
                     if let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author) {
                         let (app2, t2, r2, n2) = (app.clone(), tenant.clone(), repo.clone(), pr.number);
                         tokio::spawn(async move { let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent, 0).await; });
+                    } else {
+                        eprintln!(
+                            "CI-red auto-review skipped for {tenant}/{repo} PR !{}: no org-member agent reviewer is registered",
+                            pr.number
+                        );
                     }
                 }
             }
@@ -3159,14 +3166,17 @@ fn tier_from_str(s: &str) -> Option<hull_core::AutonomyTier> {
 
 /// The effective autonomy policy for a repo (`GET …/autonomy`) — the resolved tier, where it comes
 /// from, and the protected paths that always require a human.
-async fn get_repo_autonomy(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+async fn get_repo_autonomy(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let acct = repo_account_id(&app, &tenant, &repo);
     let e = app.autonomy.effective(&tenant, &repo, acct.as_deref());
     Json(json!({
         "tier": e.tier, "source": e.source, "protected_paths": e.protected_paths,
         "repo_override": app.autonomy.get_repo(&tenant, &repo).map(|p| p.tier),
         "account_tier": acct.as_deref().and_then(|a| app.autonomy.get_account(a)).map(|p| p.tier),
-    }))
+    })).into_response()
 }
 
 /// Set the repo's autonomy tier (`PUT …/autonomy` `{tier, protected_paths?}`) — owner/admin only.
@@ -3307,6 +3317,10 @@ async fn request_reviewer(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Repo-op gate: requesting a reviewer is a repo operation, not public participation — members only.
+    if !is_repo_member(&app, &tenant, &repo, &requester.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member can request a reviewer").into_response();
+    }
     let reviewer = body.get("reviewer").and_then(Value::as_str).unwrap_or("").to_string();
     if app.store.actor(&reviewer).is_none() {
         return (StatusCode::UNPROCESSABLE_ENTITY, "reviewer must be a registered actor").into_response();
@@ -3341,6 +3355,11 @@ async fn merge_pr(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Repo-op gate: merging is a repo operation — members only. The independent-approval / green-verify
+    // gate inside `perform_merge` is preserved and still enforced on top of this.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member can merge").into_response();
+    }
     let force = _body.get("force").and_then(Value::as_bool).unwrap_or(false);
     match perform_merge(&app, &tenant, &repo, number, &actor, force).await {
         Ok((pr, closed)) => Json(json!({ "pr": pr, "closed_issues": closed })).into_response(),
@@ -3608,8 +3627,13 @@ async fn mirror_github_webhook(
 /// per-change idempotency guard so a re-sync always runs; loop-origin is still recorded.
 async fn mirror_push_now(State(app): State<App>, headers: axum::http::HeaderMap, Path((tenant, repo)): Path<(String, String)>) -> Response {
     let key = format!("{tenant}/{repo}");
-    if let Err(resp) = require_actor(&app, &headers, "") {
-        return resp;
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Repo-op gate: pushing to the mirror is a repo operation — members only.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member can push to the mirror").into_response();
     }
     let Some(target) = app.registry.mirror_target(&key) else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "no mirror target configured for this repo").into_response();
@@ -3681,7 +3705,10 @@ fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
 
 /// The repo's mirror status (`GET /api/repos/:tenant/:repo/mirror`): the external target it's linked
 /// to (if any) and the outbound pushes recorded, for the UI's mirror panel.
-async fn mirror_status(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+async fn mirror_status(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let key = format!("{tenant}/{repo}");
     let inbound = app.mirror.inbound_for(&key);
     Json(json!({
@@ -3692,7 +3719,7 @@ async fn mirror_status(State(app): State<App>, Path((tenant, repo)): Path<(Strin
             "change": i.change, "git_author": i.git_author, "github_login": i.github_login,
             "attributed_actor": i.attributed_actor, "accountable": i.accountable(), "ts": i.ts,
         })).collect::<Vec<_>>(),
-    }))
+    })).into_response()
 }
 
 /// Inbound mirror (`POST /api/repos/:tenant/:repo/mirror/inbound`) — a forge → Hull delivery
@@ -3802,6 +3829,11 @@ async fn create_comment(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
+    // lets people who can read it (its members) comment.
+    if !can_read_repo(&app, Some(&author.id), &tenant, &repo) {
+        return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
+    }
     let target = body.get("target").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let text = body.get("body").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if target.is_empty() || text.is_empty() {
@@ -3965,9 +3997,11 @@ async fn ai_answer_comment(app: &App, key: &str, pr_num: u64, path: &str, line: 
     let (tenant, repo) = key.split_once('/')?;
     let pr = app.store.prs(key).into_iter().find(|p| p.number == pr_num)?;
     let change = pr.changes.first().cloned()?;
-    // An accountable agent to author the reply — the org's reviewer, never the PR author.
-    let reviewer = app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.handle == "agent:reviewer" && a.id != pr.author)
-        .or_else(|| app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.id != pr.author && accountable(app, a).is_ok()))?;
+    // An accountable agent to author the reply — the org's reviewer, never the PR author. Same-org
+    // only: the selected agent must be a member of this repo (matching `independent_agent_reviewer`),
+    // so an agent from another tenant can't be picked to answer on a repo it isn't a member of.
+    let reviewer = app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.handle == "agent:reviewer" && a.id != pr.author && is_repo_member(app, tenant, repo, &a.id))
+        .or_else(|| app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.id != pr.author && accountable(app, a).is_ok() && is_repo_member(app, tenant, repo, &a.id)))?;
     // Code context from the change's diff hunks (the change is content-addressed, not a git ref):
     // walk the file's hunks tracking the NEW line number and keep the referenced span plus ~13 lines
     // of surrounding context, marking added lines with '+'.
@@ -4109,8 +4143,13 @@ async fn auto_review(
 ) -> Response {
     // Any signed-in accountable actor may *ask* for an agent review; the reviewer is never supplied
     // by the client (no impersonation) — the server picks an agent independent of the PR author.
-    if let Err(resp) = require_actor(&app, &headers, "") {
-        return resp;
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Repo-op gate: auto-review spawns agent compute — members only, not open participation.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member can request an auto-review").into_response();
     }
     let key = format!("{tenant}/{repo}");
     let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
@@ -4585,8 +4624,13 @@ async fn fix_finding(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(resp) = require_actor(&app, &headers, "") {
-        return resp;
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Repo-op gate: requesting an AI fix spawns agent compute — members only, not open participation.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member can request an AI fix").into_response();
     }
     let key = format!("{tenant}/{repo}");
     let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
@@ -4686,6 +4730,11 @@ async fn create_pr(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
+    // lets people who can read it (its members) open a PR.
+    if !can_read_repo(&app, Some(&actor.id), &tenant, &repo) {
+        return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
+    }
     let title = body.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title is required").into_response();
@@ -4768,6 +4817,10 @@ async fn create_pr(
             tokio::spawn(async move {
                 let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent, 0).await;
             });
+        } else {
+            eprintln!(
+                "auto-review skipped for {tenant}/{repo} PR !{number}: no org-member agent reviewer is registered"
+            );
         }
     }
     (StatusCode::CREATED, Json(json!({ "pr": pr }))).into_response()
@@ -4798,6 +4851,11 @@ async fn create_issue(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
+    // lets people who can read it (its members) open an issue.
+    if !can_read_repo(&app, Some(&actor.id), &tenant, &repo) {
+        return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
+    }
     let title = body.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title is required").into_response();
@@ -4896,6 +4954,12 @@ async fn update_issue(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
+    // lets people who can read it (its members) transition an issue. The per-action author/admin
+    // checks below (edit = author-only, etc.) are still enforced ON TOP of this.
+    if !can_read_repo(&app, Some(&acting.id), &tenant, &repo) {
+        return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
+    }
     let Some(mut issue) = app.store.issues(&key).into_iter().find(|i| i.number == number) else {
         return (StatusCode::NOT_FOUND, "no such issue").into_response();
     };
@@ -5793,6 +5857,104 @@ mod tests {
             members: vec![Membership { actor: human.actor.id.clone(), role: Role::Owner }],
         });
         assert!(independent_agent_reviewer(&app, "acme", "web", &human.actor.id).is_none(), "an out-of-org agent is never selected as reviewer");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn participation_is_gated_on_read_not_membership() {
+        // Area C (participation): comment/issue open uses `can_read_repo`, NOT `is_repo_member`. On a
+        // PRIVATE repo a non-reader (valid, accountable, but not a member) is refused; the SAME actor is
+        // ALLOWED once the repo is public — a public repo stays open to any authed actor (no regression).
+        let (app, tmp) = build_test_app("participation-gate");
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        mint_token(&app, "tok-outsider", "outsider");
+        let t = ("acme".to_string(), "web".to_string());
+        let comment = json!({ "target": "pr:1", "body": "hello" });
+        let issue = json!({ "title": "a bug" });
+
+        // PRIVATE: the non-reader is denied both.
+        let r = create_comment(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(comment.clone())).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-reader cannot comment on a PRIVATE repo");
+        assert!(app.store.comments("acme/web").is_empty(), "no comment persisted for a refused call");
+        let r = create_issue(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(issue.clone())).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-reader cannot open an issue on a PRIVATE repo");
+        assert!(app.store.issues("acme/web").is_empty(), "no issue persisted for a refused call");
+
+        // PUBLIC: the very same non-member actor may now participate freely.
+        set_private(&app, "acme/web", false);
+        let r = create_comment(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(comment)).await;
+        assert_eq!(r.status(), StatusCode::CREATED, "any authed actor may comment on a PUBLIC repo");
+        assert_eq!(app.store.comments("acme/web").len(), 1, "the public comment persisted");
+        let r = create_issue(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(issue)).await;
+        assert_eq!(r.status(), StatusCode::CREATED, "any authed actor may open an issue on a PUBLIC repo");
+        assert_eq!(app.store.issues("acme/web").len(), 1, "the public issue persisted");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn repo_ops_require_membership_even_on_public() {
+        // Area C (repo-ops): auto-review + request-reviewer are repo operations gated on `is_repo_member`
+        // — a non-member is refused even on a PUBLIC repo (unlike participation). A member is allowed
+        // past the gate (request_reviewer succeeds; auto_review reaches the "no agent" stage, i.e. it is
+        // NOT refused for membership).
+        let (app, tmp) = build_test_app("repo-op-gate");
+        setup_org_repo(&app, "acme", "web", false, &[("member", Role::Write)]);
+        app.store.put_actor(actor("member", ActorKind::Human));
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        app.store.put_actor(actor("rev", ActorKind::Human));
+        mint_token(&app, "tok-member", "member");
+        mint_token(&app, "tok-outsider", "outsider");
+        put_pr(&app, "acme/web", 1, "author", "chg");
+        let t = ("acme".to_string(), "web".to_string(), 1u64);
+
+        // request_reviewer: non-member refused, member allowed.
+        let rr = json!({ "reviewer": "rev" });
+        let r = request_reviewer(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(rr.clone())).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-member cannot request a reviewer, even on a public repo");
+        let r = request_reviewer(State(app.clone()), Path(t.clone()), bearer("tok-member"), Json(rr)).await;
+        assert_eq!(r.status(), StatusCode::OK, "a repo member may request a reviewer");
+
+        // auto_review: non-member refused with FORBIDDEN (membership), member passes the membership gate
+        // (then stops at UNPROCESSABLE_ENTITY because no independent agent is registered — not a 403).
+        let r = auto_review(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(json!({}))).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-member cannot request an auto-review");
+        let r = auto_review(State(app.clone()), Path(t.clone()), bearer("tok-member"), Json(json!({}))).await;
+        assert_ne!(r.status(), StatusCode::FORBIDDEN, "a member passes the auto-review membership gate");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn missed_reads_are_gated_on_private_but_open_on_public() {
+        // Area B (missed reads): `mirror_status` + `get_repo_autonomy` join the read sweep — a private
+        // repo is hidden (404) from anonymous/non-members and visible to a member; a public repo is open.
+        let (app, tmp) = build_test_app("missed-reads");
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
+        app.store.put_actor(actor("member", ActorKind::Human));
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        mint_token(&app, "tok-member", "member");
+        mint_token(&app, "tok-outsider", "outsider");
+        let t = ("acme".to_string(), "web".to_string());
+
+        for (label, run) in [
+            ("mirror_status", 0u8),
+            ("get_repo_autonomy", 1u8),
+        ] {
+            let call = |h: axum::http::HeaderMap| {
+                let (app, t) = (app.clone(), t.clone());
+                async move {
+                    if run == 0 { mirror_status(State(app), Path(t), h).await }
+                    else { get_repo_autonomy(State(app), Path(t), h).await }
+                }
+            };
+            assert_eq!(call(axum::http::HeaderMap::new()).await.status(), StatusCode::NOT_FOUND, "{label}: anonymous read of a private repo is 404");
+            assert_eq!(call(bearer("tok-outsider")).await.status(), StatusCode::NOT_FOUND, "{label}: a non-member still gets 404 on a private repo");
+            assert_eq!(call(bearer("tok-member")).await.status(), StatusCode::OK, "{label}: a member reads a private repo");
+        }
+
+        set_private(&app, "acme/web", false);
+        assert_eq!(mirror_status(State(app.clone()), Path(t.clone()), axum::http::HeaderMap::new()).await.status(), StatusCode::OK, "mirror_status: public repo is open to anonymous");
+        assert_eq!(get_repo_autonomy(State(app.clone()), Path(t.clone()), axum::http::HeaderMap::new()).await.status(), StatusCode::OK, "get_repo_autonomy: public repo is open to anonymous");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
