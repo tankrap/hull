@@ -1386,7 +1386,13 @@ that must fail the `tree_id` re-hash rather than run.
 
 **Security, as tests not assertions** (each maps to a §14 clause, and each must *fail closed*):
 
-- A job that reads `169.254.169.254` gets nothing (§14.2).
+- A job that reads `169.254.169.254` gets nothing (§14.2). **This one cannot be tested the obvious
+  way, and the obvious way is exactly what an earlier draft of this list asked for.** On a host with
+  no metadata service, nothing listens on that address, so the connection fails identically whether it
+  is blackholed or wide open — the probe passes on a completely unprotected network. It was caught by
+  running it against a deliberately open bridge as a control, where it passed and should not have.
+  Assert the **routing fact** instead (no route exists, and `CAP_NET_ADMIN` is dropped so the job
+  cannot add one): observable, and not satisfiable by mere absence.
 - A job that tries arbitrary egress gets nothing; only the proxy answers (§14.3).
 - A job that greps its own environment finds no secret, no token, no cloud key (§14.2).
 - A job that plants a binary in `/usr/local/bin` — the next job on that node does not see it (§14.1).
@@ -1397,6 +1403,18 @@ that must fail the `tree_id` re-hash rather than run.
 - A job printing 10 GB of ANSI and control characters is truncated, and the resulting `summary`
   contains no control characters and no forged fields (§14.4, §14.5).
 - A job that forks a process left running is gone with the sandbox (§14.1).
+
+> **The rule every one of these belongs to: a negative test needs a positive control.** "The job could
+> not reach X" is evidence only if the same probe is also shown to reach X once the control is
+> removed. Otherwise you have tested whether X happens to exist. Pair each probe above with a run
+> against a deliberately unprotected configuration and watch it fail there.
+>
+> This is not hypothetical bookkeeping. Three probes written for this design passed for the wrong
+> reason until it was applied: the metadata one above; an egress probe that would have passed had
+> `wget` simply been absent from the image; and a symlink test whose comment claimed it would notice
+> when Hull was fixed, while it built its own archive and could never observe Hull at all. **A
+> security test that cannot fail is worse than no test, because it manufactures confidence** — and it
+> does so precisely in the place where confidence is least recoverable.
 
 **Cross-tenant, as tests not assertions** (each maps to a row of the §1 threat table, each fail-closed):
 
