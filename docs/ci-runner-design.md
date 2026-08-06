@@ -610,8 +610,35 @@ Layer 2 is the new one and the reason this design exists:
 step_key = H( pipeline_version, step_def_canonical, image_digest,
               subtree_digest(inputs_glob) …,          ← from keel, no file hashing
               env_allowlist_values,
+              author_class, isolation_tier,           ← added: see (1) below
               step_key(each dependency) )
 ```
+
+> **Six corrections, all found by implementing this.** The formula and the rules around it were wrong
+> in ways that only appear when something has to serve an answer from them.
+>
+> 1. **`author_class` and `isolation_tier` were missing, and their absence is exploitable.** A
+>    `member`'s `passed` is not evidence about an `outsider`'s run of a byte-identical step: the
+>    outsider gets no tenant secrets (§7.4) and different cache authority (§6.3), so serving the hit
+>    **skips the step that would have failed**. Both are hashed in.
+> 2. **The design never said which state a cached *failure* takes, and the obvious reading is a green
+>    build.** `fold` counts `cached` as a pass, so marking a remembered failure `cached` turns a red
+>    job green. It must be served as **`failed`**. This was the worst bug available in this layer, and
+>    it was available only because a state was left unspecified.
+> 3. **`subtree_digest(inputs)` is unsound on its own.** A glob that matches nothing folds an empty
+>    set — *the same digest on every tree that has ever existed*. That is the "no inputs" hazard
+>    wearing a plausible `inputs` list, so "selected nothing" is a second explicit refusal alongside
+>    "declared nothing". An empty directory counts too: its address is a constant.
+> 4. **Memoizing `(tree_id, glob) → digest` reintroduces the oracle §1 closes.** It is the right
+>    optimisation — trees are immutable — but a cross-tenant hit is a cheap "has anyone else built
+>    this tree" probe. Key it `(tenant, tree_id, glob)`.
+> 5. **Chaining was stated in one direction only.** A changed dependency invalidating its dependents
+>    is here; an *unkeyable* dependency making its dependents unkeyable is not, and is required —
+>    guessing past it caches a step against inputs nobody accounted for.
+> 6. **"No file hashing" is true of a digest but not of the first walk of a tree.** On a keel object
+>    store the ids already exist; from an extracted tarball somebody must walk it once. The honest
+>    claim is that the broker *retains what verification already computed*, which costs ~4% over
+>    verifying and discarding.
 
 `subtree_digest` resolves a path glob to keel content addresses **without ever hashing file contents** —
 keel's `Tree` is a Merkle node (`TreeEntry { name, mode, id }`), so a directory entry's `id` *is* that
@@ -629,10 +656,21 @@ shape, and the difference is worth designing around:
   draft claimed. Still far from the *seconds* of content hashing a non-content-addressed CI pays, so
   the economics hold; the mechanism is just less magical than stated.
 
-Two consequences: **prefer directory-prefix `inputs`** in `.hull/ci.star` (the linter D§8 asks for
-should say so — it is a real latency difference on large repos), and **memoize `(tree_id, glob) →
-digest`**, which is sound precisely because trees are immutable, so a repeated glob on a repeated tree
-is a map hit.
+**Now measured, on 100k files × 1 KiB (102,203 entries), release build:**
+
+| | |
+|---|---|
+| index the tree (walk + hash, structure retained) | **7.38 s** |
+| the same walk, discarding the structure (plain verification) | 7.11 s — so retaining it costs **~4%**, once per tree |
+| `crates/**` (prefix glob) | **464 ns** |
+| `**/*.rs` (pattern glob, 100k matched) | **23.9 ms** (~240 ns/entry) |
+| a real 67k-entry `node_modules`, pattern glob | 10.3 ms |
+
+Two consequences, and the first is larger than it reads: **prefer directory-prefix `inputs`** in
+`.hull/ci.star` — that is a **~51,000× difference**, not a stylistic preference, and the linter §8 asks
+for should say so in those terms. And **memoize `(tenant, tree_id, glob) → digest`**, sound because
+trees are immutable, so a repeated glob on a repeated tree is a map hit — tenant-scoped for the reason
+in correction (4) above.
 
 A step whose `step_key` has a recorded `passed` result is marked `cached` and never dispatched. If
 every step is cached, the job resolves without touching a node and the callback goes out in
@@ -991,6 +1029,33 @@ paths: revoke an outstanding capability, or crypto-shred a whole tenant by delet
 **Package auth still terminates at the proxy** where it can: the proxy holds upstream registry
 credentials and authenticates outbound; the job talks to it over a per-job URL with a per-job bearer
 that grants nothing but "resolve packages for this job, at this rate limit."
+
+> **Five corrections, from building the proxy against the broker.**
+>
+> 1. **`use` is authority, not just disclosure — and this section frames the whole gate around
+>    disclosure.** "Hostile code never receives the value" reads as though terminating auth at the
+>    proxy sidesteps the author-class question. It does not; it converts a disclosure into a **confused
+>    deputy**. A fork PR that can make the proxy fetch `@acme/private-lib` on the tenant's token has
+>    pulled that package into a build it controls and can read out of its own workspace. No token
+>    crosses the sandbox boundary and the tenant is robbed anyway. **So the `member`-only gate binds
+>    the proxy too**, per-upstream rather than per-job, so ordinary fork PRs still resolve public
+>    registries.
+> 2. **This section names no principal for the proxy.** "The proxy holds upstream registry
+>    credentials" is written as though it simply *has* them, next to a paragraph insisting a tenant
+>    secret only ever moves as a capability to an authenticated principal. Both cannot be true unless
+>    the proxy **is** a principal — so it gets the same Ed25519 enrolment keypair as a node, and its id
+>    is derived from a verified signature rather than read off a request.
+> 3. **The node-binding warning above applies verbatim to the proxy, and is worse there.** A node is
+>    one machine; a proxy is *one process serving every tenant on the fleet*, so "the credential
+>    belongs to the tenant whose job asked" is not a consequence of topology the way it is for a node.
+>    It has to be checked explicitly, at every layer that could get it wrong.
+> 4. **"Short-TTL" cannot be one number.** Placement→exec is short and known; package resolution
+>    happens at an unknown point inside a job. A proxy capability's expiry has to come from the job's
+>    grant, which is genuinely weaker than a node capability's 60 seconds and should be stated as such
+>    rather than averaged away.
+> 5. **"Plaintext never lands on a node's disk" is scoped to the wrong component.** The proxy is not a
+>    node. The invariant that actually holds — and the one worth writing — is *plaintext never lands on
+>    disk anywhere*, and at the proxy it is bounded by a **job** rather than by a spawn.
 
 **Environment is otherwise allowlist-only** — `PATH`, `HOME`, `LANG`, `CI=true`, declared non-secret
 pipeline vars, plus the injected tenant secrets. Everything else is dropped, not filtered, so an added

@@ -676,7 +676,9 @@ fn can_read_repo(app: &App, actor_id: Option<&str>, tenant: &str, repo: &str) ->
         return true;
     }
     let Some(aid) = actor_id else { return false };
-    let Some(acct) = app.store.accounts().into_iter().find(|a| a.handle == tenant) else { return false };
+    // Resolve the owning account the same way the write-side gate does (repo record's owner, falling
+    // back to handle==tenant), so read-side and write-side membership evaluate the same account.
+    let Some(acct) = repo_owner_account(app, tenant, repo) else { return false };
     if acct.members.iter().any(|m| m.actor == aid) {
         return true;
     }
@@ -2377,31 +2379,42 @@ fn accountable(app: &App, a: &Actor) -> Result<(), String> {
 async fn why(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let path = q.get("path").map(String::as_str).unwrap_or("");
     let prov = app.repos.why(&tenant, &repo, path, 10);
-    Json(json!({ "path": path, "provenance": prov }))
+    Json(json!({ "path": path, "provenance": prov })).into_response()
 }
 
 /// Branch names for a repo (`GET /api/repos/:tenant/:repo/branches`).
-async fn repo_branches(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "branches": app.repos.branches(&tenant, &repo) }))
+async fn repo_branches(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "branches": app.repos.branches(&tenant, &repo) })).into_response()
 }
 
 /// A directory listing at a branch (`GET /api/repos/:tenant/:repo/tree?ref=<branch>&path=<dir>`).
 async fn repo_tree(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
     // `?flat=1` → every file path in the branch (for the full file-tree view).
     if q.get("flat").is_some_and(|v| v == "1" || v == "true") {
-        return Json(json!({ "ref": ref_name, "paths": app.repos.all_paths(&tenant, &repo, ref_name) }));
+        return Json(json!({ "ref": ref_name, "paths": app.repos.all_paths(&tenant, &repo, ref_name) })).into_response();
     }
     let path = q.get("path").map(String::as_str).unwrap_or("");
-    Json(json!({ "ref": ref_name, "path": path, "entries": app.repos.list_tree(&tenant, &repo, ref_name, path) }))
+    Json(json!({ "ref": ref_name, "path": path, "entries": app.repos.list_tree(&tenant, &repo, ref_name, path) })).into_response()
 }
 
 /// A file's contents at a branch (`GET /api/repos/:tenant/:repo/blob?ref=<branch>&path=<file>`).
@@ -2409,8 +2422,12 @@ async fn repo_tree(
 async fn repo_blob(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
     let path = q.get("path").map(String::as_str).unwrap_or("");
     match app.repos.read_file_at(&tenant, &repo, ref_name, path) {
@@ -2418,9 +2435,9 @@ async fn repo_blob(
             let binary = bytes.iter().take(8000).any(|&b| b == 0);
             let size = bytes.len();
             let text = if binary { String::new() } else { String::from_utf8_lossy(&bytes).into_owned() };
-            Json(json!({ "path": path, "ref": ref_name, "size": size, "binary": binary, "text": text }))
+            Json(json!({ "path": path, "ref": ref_name, "size": size, "binary": binary, "text": text })).into_response()
         }
-        None => Json(json!({ "path": path, "ref": ref_name, "missing": true })),
+        None => Json(json!({ "path": path, "ref": ref_name, "missing": true })).into_response(),
     }
 }
 
@@ -2444,16 +2461,23 @@ async fn repo_graph(
 async fn repo_search(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
     let query = q.get("q").map(String::as_str).unwrap_or("");
-    Json(json!({ "q": query, "ref": ref_name, "hits": app.repos.search(&tenant, &repo, ref_name, query) }))
+    Json(json!({ "q": query, "ref": ref_name, "hits": app.repos.search(&tenant, &repo, ref_name, query) })).into_response()
 }
 
 /// A repo's code-owner rules (`GET /api/repos/:tenant/:repo/owners`).
-async fn owners_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "owners": app.store.owners(&format!("{tenant}/{repo}")) }))
+async fn owners_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "owners": app.store.owners(&format!("{tenant}/{repo}")) })).into_response()
 }
 
 /// Set a repo's code-owner rules (`POST …/owners` with `{rules: [{glob, owners:[actorId]}]}`),
@@ -2464,8 +2488,13 @@ async fn set_owners(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(resp) = require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
-        return resp;
+    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Code owners drive review routing and the merge gate — only a repo owner/admin may rewrite them.
+    if !is_repo_admin(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin can set code owners").into_response();
     }
     let rules: Vec<OwnerRule> = body
         .get("rules")
@@ -2545,14 +2574,20 @@ fn owners_for(app: &App, repo_key: &str, files: &[String]) -> Vec<String> {
 }
 
 /// Secret findings from the server-side push scan (`GET /api/repos/:tenant/:repo/security`).
-async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "secrets": app.repos.secrets(&format!("{tenant}/{repo}")) }))
+async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "secrets": app.repos.secrets(&format!("{tenant}/{repo}")) })).into_response()
 }
 
 /// The diff of a change (`GET /api/repos/:tenant/:repo/change/:id/diff`): per-file line hunks plus a
 /// semantic-operations summary — the review's diff viewer.
-async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
-    Json(json!({ "files": app.repos.diff(&tenant, &repo, &id) }))
+async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "files": app.repos.diff(&tenant, &repo, &id) })).into_response()
 }
 
 /// Full old + new text of one file at a change (`GET …/change/:id/file?path=…`). The diff viewer
@@ -2561,8 +2596,12 @@ async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(Str
 async fn change_file(
     State(app): State<App>,
     Path((tenant, repo, id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let Some(path) = q.get("path").map(|s| s.as_str()).filter(|s| !s.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "path is required").into_response();
     };
@@ -2575,8 +2614,11 @@ async fn change_file(
 /// The **content-addressed semantic summary** of a change (`GET …/change/:id/semantic`, B1): files
 /// purely moved (proven by an unchanged blob id, not guessed by similarity) vs really added/deleted/
 /// modified, and whether the whole change is a behavior-preserving `pure_move`.
-async fn change_semantic(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
-    Json(json!({ "semantic": app.repos.semantic_summary(&tenant, &repo, &id) }))
+async fn change_semantic(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "semantic": app.repos.semantic_summary(&tenant, &repo, &id) })).into_response()
 }
 
 /// **keel-native content-addressed source fetch** (`GET …/tree/:tree/tar`): the change's keel tree,
@@ -2584,7 +2626,10 @@ async fn change_semantic(State(app): State<App>, Path((tenant, repo, id)): Path<
 /// reviewer runner obtains source — by content address, over keel, **not** `git clone`. (Hull's git
 /// smart-HTTP endpoints exist only for interop/mirroring, never as the runner fetch path.) The
 /// archive is verifiable: re-hashing the tree reproduces `tree`.
-async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(String, String, String)>) -> Response {
+async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     // The scratch path must be unique **per request**, not per (tree, pid): two concurrent fetches of
     // the same tree — an ordinary occurrence once a CI shards a job or a re-check races a first
     // dispatch — would otherwise share a directory and `remove_dir_all` each other's checkout out
@@ -2639,9 +2684,12 @@ async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(
 /// unsupported** against the real facts of the change (touched files, semantic ops, keel
 /// verification, secret scan). This is the substance of a Hull review — does the code do what its
 /// author said it does — computed the same way every time (pure, content-addressable).
-async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
+async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let Some(info) = app.repos.change_info(&tenant, &repo, &id) else {
-        return Json(json!({ "ledger": null }));
+        return Json(json!({ "ledger": null })).into_response();
     };
     // Narrative: the change intent, plus the lesson from a native or ingested session.
     let lesson = info
@@ -2684,7 +2732,7 @@ async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(S
             }
         }
     }
-    Json(json!({ "ledger": val }))
+    Json(json!({ "ledger": val })).into_response()
 }
 
 /// Record a human judgment on a reconciliation claim (`POST …/change/:id/claims/:claim/resolve`) —
@@ -2700,6 +2748,10 @@ async fn resolve_claim(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Resolving a reconciliation claim is a review judgment on the repo — repo members only.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member may resolve claims").into_response();
+    }
     let judgment = match body.get("judgment").and_then(Value::as_str) {
         Some("verified") => "verified",
         Some("concern") => "concern",
@@ -2717,7 +2769,10 @@ async fn resolve_claim(
 
 /// Expand a keel change (`GET /api/repos/:tenant/:repo/change/:id`): intent, author, and the files
 /// it changed vs its parent — the keel-native "what does this touch" that anchors a review.
-async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>) -> Json<Value> {
+async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     match app.repos.change_info(&tenant, &repo, &id) {
         Some(mut info) => {
             // If the change carries no NATIVE keel session (e.g. it arrived over git), fall back to
@@ -2735,9 +2790,9 @@ async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(Str
                     });
                 }
             }
-            Json(json!({ "change": info }))
+            Json(json!({ "change": info })).into_response()
         }
-        None => Json(json!({ "change": null })),
+        None => Json(json!({ "change": null })).into_response(),
     }
 }
 
@@ -2751,8 +2806,14 @@ async fn run_check_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(resp) = require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
-        return resp;
+    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Running checks executes the change's own test command on the host — gate to repo members so an
+    // outsider can't drive the runner (or force-bust its memo) on a repo they don't belong to.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member may run checks").into_response();
     }
     let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
     match resolve_check(&app, &tenant, &repo, &id, force).await {
@@ -2767,9 +2828,14 @@ async fn run_check_handler(
             if matches!(o.status, hull_plugin::CiStatus::Red) {
                 let key = format!("{tenant}/{repo}");
                 if let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.changes.iter().any(|c| c.starts_with(&id) || id.starts_with(c.as_str()))) {
-                    if let Some(agent) = independent_agent_reviewer(&app, &pr.author) {
+                    if let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author) {
                         let (app2, t2, r2, n2) = (app.clone(), tenant.clone(), repo.clone(), pr.number);
                         tokio::spawn(async move { let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent, 0).await; });
+                    } else {
+                        eprintln!(
+                            "CI-red auto-review skipped for {tenant}/{repo} PR !{}: no org-member agent reviewer is registered",
+                            pr.number
+                        );
                     }
                 }
             }
@@ -2974,7 +3040,10 @@ async fn ci_result(
 /// A repo's CI endpoint config (`GET/PUT …/ci-config`). GET reports the effective endpoint and where
 /// it comes from (repo / instance default / none), never leaking the secret. PUT (owner-gated) sets
 /// or clears the repo's own endpoint.
-async fn get_ci_config(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+async fn get_ci_config(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let key = format!("{tenant}/{repo}");
     let (cfg, src) = app.ci_config.resolve(&key);
     let source = match src {
@@ -2986,7 +3055,7 @@ async fn get_ci_config(State(app): State<App>, Path((tenant, repo)): Path<(Strin
         "url": cfg.as_ref().map(|c| c.url.clone()),
         "has_secret": cfg.as_ref().map(|c| !c.secret.is_empty()).unwrap_or(false),
         "source": source,
-    }))
+    })).into_response()
 }
 
 async fn set_ci_config(
@@ -3032,6 +3101,30 @@ fn is_repo_admin(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The account that owns `tenant/repo`: the repo record's owner, or (no repo record yet) the org whose
+/// handle == `tenant`. Same resolution as `repo_account_id`, returning the full [`Account`].
+fn repo_owner_account(app: &App, tenant: &str, repo: &str) -> Option<Account> {
+    let owner = repo_account_id(app, tenant, repo)?;
+    app.store.accounts().into_iter().find(|a| a.id == owner)
+}
+
+/// The write-side membership gate: does `actor` belong to the account that owns `tenant/repo` — in ANY
+/// role (Owner/Admin/Write/Read) — or to a team that account has granted access to this repo? Unlike
+/// `can_read_repo`, this never short-circuits on visibility: a *public* repo is still only mutated by
+/// its members. `is_repo_admin` (Owner/Admin only) is the stricter peer used for repo-config changes.
+fn is_repo_member(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
+    let Some(acct) = repo_owner_account(app, tenant, repo) else { return false };
+    if acct.members.iter().any(|m| m.actor == actor) {
+        return true;
+    }
+    // A member of a team the repo grants access to counts as a member (teams carry a repo role).
+    let settings = app.repo_settings.get(&format!("{tenant}/{repo}"));
+    app.store
+        .teams(&acct.id)
+        .into_iter()
+        .any(|t| settings.team_access.iter().any(|ta| ta.team == t.id) && t.members.iter().any(|m| m.actor == actor))
+}
+
 /// Git push endpoint, wrapped so that **every successful push runs CI** on the new HEAD change —
 /// independent of autonomy tier (CI is a mechanical check, not an autonomous action). Fire-and-forget
 /// (memoized by tree, so an unchanged tree is a no-op); dispatched to the configured CI or the local
@@ -3073,14 +3166,17 @@ fn tier_from_str(s: &str) -> Option<hull_core::AutonomyTier> {
 
 /// The effective autonomy policy for a repo (`GET …/autonomy`) — the resolved tier, where it comes
 /// from, and the protected paths that always require a human.
-async fn get_repo_autonomy(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+async fn get_repo_autonomy(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let acct = repo_account_id(&app, &tenant, &repo);
     let e = app.autonomy.effective(&tenant, &repo, acct.as_deref());
     Json(json!({
         "tier": e.tier, "source": e.source, "protected_paths": e.protected_paths,
         "repo_override": app.autonomy.get_repo(&tenant, &repo).map(|p| p.tier),
         "account_tier": acct.as_deref().and_then(|a| app.autonomy.get_account(a)).map(|p| p.tier),
-    }))
+    })).into_response()
 }
 
 /// Set the repo's autonomy tier (`PUT …/autonomy` `{tier, protected_paths?}`) — owner/admin only.
@@ -3151,8 +3247,13 @@ async fn ingest_session(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(resp) = require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
-        return resp;
+    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // A session record is provenance attached to the repo's history — repo members only.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member may ingest a session").into_response();
     }
     // The task is authoritative from the CHANGE's own intent, never the caller — so a session
     // captured from a long multi-task agent run can't mislabel what a specific change did.
@@ -3216,6 +3317,10 @@ async fn request_reviewer(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Repo-op gate: requesting a reviewer is a repo operation, not public participation — members only.
+    if !is_repo_member(&app, &tenant, &repo, &requester.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member can request a reviewer").into_response();
+    }
     let reviewer = body.get("reviewer").and_then(Value::as_str).unwrap_or("").to_string();
     if app.store.actor(&reviewer).is_none() {
         return (StatusCode::UNPROCESSABLE_ENTITY, "reviewer must be a registered actor").into_response();
@@ -3250,6 +3355,11 @@ async fn merge_pr(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Repo-op gate: merging is a repo operation — members only. The independent-approval / green-verify
+    // gate inside `perform_merge` is preserved and still enforced on top of this.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member can merge").into_response();
+    }
     let force = _body.get("force").and_then(Value::as_bool).unwrap_or(false);
     match perform_merge(&app, &tenant, &repo, number, &actor, force).await {
         Ok((pr, closed)) => Json(json!({ "pr": pr, "closed_issues": closed })).into_response(),
@@ -3517,8 +3627,13 @@ async fn mirror_github_webhook(
 /// per-change idempotency guard so a re-sync always runs; loop-origin is still recorded.
 async fn mirror_push_now(State(app): State<App>, headers: axum::http::HeaderMap, Path((tenant, repo)): Path<(String, String)>) -> Response {
     let key = format!("{tenant}/{repo}");
-    if let Err(resp) = require_actor(&app, &headers, "") {
-        return resp;
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Repo-op gate: pushing to the mirror is a repo operation — members only.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member can push to the mirror").into_response();
     }
     let Some(target) = app.registry.mirror_target(&key) else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "no mirror target configured for this repo").into_response();
@@ -3590,7 +3705,10 @@ fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
 
 /// The repo's mirror status (`GET /api/repos/:tenant/:repo/mirror`): the external target it's linked
 /// to (if any) and the outbound pushes recorded, for the UI's mirror panel.
-async fn mirror_status(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
+async fn mirror_status(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
     let key = format!("{tenant}/{repo}");
     let inbound = app.mirror.inbound_for(&key);
     Json(json!({
@@ -3601,7 +3719,7 @@ async fn mirror_status(State(app): State<App>, Path((tenant, repo)): Path<(Strin
             "change": i.change, "git_author": i.git_author, "github_login": i.github_login,
             "attributed_actor": i.attributed_actor, "accountable": i.accountable(), "ts": i.ts,
         })).collect::<Vec<_>>(),
-    }))
+    })).into_response()
 }
 
 /// Inbound mirror (`POST /api/repos/:tenant/:repo/mirror/inbound`) — a forge → Hull delivery
@@ -3690,8 +3808,11 @@ async fn get_artifact(State(app): State<App>, Path((tenant, repo, id)): Path<(St
 
 /// Discussion comments for a repo (`GET /api/repos/:tenant/:repo/comments`); the client filters by
 /// `target` (e.g. `pr:1`). The conversation layer over the structured review.
-async fn comments_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>) -> Json<Value> {
-    Json(json!({ "comments": app.store.comments(&format!("{tenant}/{repo}")) }))
+async fn comments_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+        return r;
+    }
+    Json(json!({ "comments": app.store.comments(&format!("{tenant}/{repo}")) })).into_response()
 }
 
 /// Post a comment (`POST /api/repos/:tenant/:repo/comments`) — `{target, body}`. Authored by the
@@ -3708,6 +3829,11 @@ async fn create_comment(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
+    // lets people who can read it (its members) comment.
+    if !can_read_repo(&app, Some(&author.id), &tenant, &repo) {
+        return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
+    }
     let target = body.get("target").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let text = body.get("body").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if target.is_empty() || text.is_empty() {
@@ -3871,9 +3997,11 @@ async fn ai_answer_comment(app: &App, key: &str, pr_num: u64, path: &str, line: 
     let (tenant, repo) = key.split_once('/')?;
     let pr = app.store.prs(key).into_iter().find(|p| p.number == pr_num)?;
     let change = pr.changes.first().cloned()?;
-    // An accountable agent to author the reply — the org's reviewer, never the PR author.
-    let reviewer = app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.handle == "agent:reviewer" && a.id != pr.author)
-        .or_else(|| app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.id != pr.author && accountable(app, a).is_ok()))?;
+    // An accountable agent to author the reply — the org's reviewer, never the PR author. Same-org
+    // only: the selected agent must be a member of this repo (matching `independent_agent_reviewer`),
+    // so an agent from another tenant can't be picked to answer on a repo it isn't a member of.
+    let reviewer = app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.handle == "agent:reviewer" && a.id != pr.author && is_repo_member(app, tenant, repo, &a.id))
+        .or_else(|| app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.id != pr.author && accountable(app, a).is_ok() && is_repo_member(app, tenant, repo, &a.id)))?;
     // Code context from the change's diff hunks (the change is content-addressed, not a git ref):
     // walk the file's hunks tracking the NEW line number and keep the referenced span plus ~13 lines
     // of surrounding context, marking added lines with '+'.
@@ -3928,6 +4056,10 @@ async fn create_review(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // A review is an accountable act on the repo — only a member of the owning account may post one.
+    if !is_repo_member(&app, &tenant, &repo, &reviewer.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member may review").into_response();
+    }
     let target = body.get("target").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target is required (e.g. 'pr:1')").into_response();
@@ -4011,14 +4143,19 @@ async fn auto_review(
 ) -> Response {
     // Any signed-in accountable actor may *ask* for an agent review; the reviewer is never supplied
     // by the client (no impersonation) — the server picks an agent independent of the PR author.
-    if let Err(resp) = require_actor(&app, &headers, "") {
-        return resp;
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Repo-op gate: auto-review spawns agent compute — members only, not open participation.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member can request an auto-review").into_response();
     }
     let key = format!("{tenant}/{repo}");
     let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
         return (StatusCode::NOT_FOUND, "no such PR").into_response();
     };
-    let Some(agent) = independent_agent_reviewer(&app, &pr.author) else {
+    let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author) else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "no independent agent reviewer is registered").into_response();
     };
     match perform_auto_review(&app, &tenant, &repo, number, &agent, 0).await {
@@ -4487,14 +4624,19 @@ async fn fix_finding(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(resp) = require_actor(&app, &headers, "") {
-        return resp;
+    let actor = match require_actor(&app, &headers, "") {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Repo-op gate: requesting an AI fix spawns agent compute — members only, not open participation.
+    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo member can request an AI fix").into_response();
     }
     let key = format!("{tenant}/{repo}");
     let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
         return (StatusCode::NOT_FOUND, "no such PR").into_response();
     };
-    let Some(agent) = independent_agent_reviewer(&app, &pr.author) else {
+    let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author) else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "no agent available to fix").into_response();
     };
     let path = body.get("path").and_then(Value::as_str).unwrap_or("").to_string();
@@ -4510,11 +4652,18 @@ async fn fix_finding(
 /// Pick an agent actor that may independently review a PR by `author` — the reviewer for the on-open
 /// agent flow. `None` if no **accountable** agent other than the author is registered: an agent whose
 /// delegation doesn't cryptographically verify (NEW-1166) must not author, so it's never selected.
-fn independent_agent_reviewer(app: &App, author: &str) -> Option<hull_core::Actor> {
+fn independent_agent_reviewer(app: &App, tenant: &str, repo: &str, author: &str) -> Option<hull_core::Actor> {
     app.store
         .actors()
         .into_iter()
-        .find(|a| a.kind == hull_core::ActorKind::Agent && a.id != author && accountable(app, a).is_ok())
+        .find(|a| {
+            a.kind == hull_core::ActorKind::Agent
+                && a.id != author
+                && accountable(app, a).is_ok()
+                // Same-org only: an agent from another tenant must never be selected to review — and,
+                // at T3, auto-merge — a repo it isn't a member of (cross-tenant escalation).
+                && is_repo_member(app, tenant, repo, &a.id)
+        })
 }
 
 /// List pull requests for a hosted repo (`GET /api/repos/:tenant/:repo/prs`). Each PR's verification
@@ -4548,8 +4697,16 @@ async fn verify_change(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(resp) = require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
-        return resp;
+    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // Setting a change green/red IS the merge gate — a non-admin flipping it to green would defeat CI.
+    // The legitimate CI path writes verification through the secret-authed `ci-result` callback (and
+    // the local runner writes it directly), never this endpoint, so restrict manual overrides to a
+    // repo owner/admin.
+    if !is_repo_admin(&app, &tenant, &repo, &actor.id) {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin may set verification directly (CI reports via the ci-result callback)").into_response();
     }
     let green = body.get("green").and_then(Value::as_bool).unwrap_or(true);
     if app.repos.set_verification(&tenant, &repo, &id, green) {
@@ -4573,6 +4730,11 @@ async fn create_pr(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
+    // lets people who can read it (its members) open a PR.
+    if !can_read_repo(&app, Some(&actor.id), &tenant, &repo) {
+        return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
+    }
     let title = body.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title is required").into_response();
@@ -4650,11 +4812,15 @@ async fn create_pr(
     let acct = repo_account_id(&app, &tenant, &repo);
     let tier = app.autonomy.effective(&tenant, &repo, acct.as_deref()).tier;
     if tier >= hull_core::AutonomyTier::T1 {
-        if let Some(agent) = independent_agent_reviewer(&app, &pr.author) {
+        if let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author) {
             let (app2, t2, r2, n2) = (app.clone(), tenant.clone(), repo.clone(), number);
             tokio::spawn(async move {
                 let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent, 0).await;
             });
+        } else {
+            eprintln!(
+                "auto-review skipped for {tenant}/{repo} PR !{number}: no org-member agent reviewer is registered"
+            );
         }
     }
     (StatusCode::CREATED, Json(json!({ "pr": pr }))).into_response()
@@ -4685,6 +4851,11 @@ async fn create_issue(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
+    // lets people who can read it (its members) open an issue.
+    if !can_read_repo(&app, Some(&actor.id), &tenant, &repo) {
+        return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
+    }
     let title = body.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title is required").into_response();
@@ -4783,6 +4954,12 @@ async fn update_issue(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
+    // lets people who can read it (its members) transition an issue. The per-action author/admin
+    // checks below (edit = author-only, etc.) are still enforced ON TOP of this.
+    if !can_read_repo(&app, Some(&acting.id), &tenant, &repo) {
+        return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
+    }
     let Some(mut issue) = app.store.issues(&key).into_iter().find(|i| i.number == number) else {
         return (StatusCode::NOT_FOUND, "no such issue").into_response();
     };
@@ -5498,6 +5675,286 @@ mod tests {
         let resolved = app.claims.for_change("acme/site", "chg1");
         assert_eq!(resolved.get("claimA").map(|r| r.judgment.as_str()), Some("verified"), "the claim resolution re-keys to the new name");
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── authz-hardening: membership helpers + read/mutation gates ──────────────────────────────────
+    //
+    // Truth tables for the shared helpers (area A), the private-repo read gate (area B) driven through
+    // a real handler, and the mutation gates (area C) on `verify_change` / `set_owners` / a member-only
+    // endpoint plus the same-org scoping of `independent_agent_reviewer`.
+
+    /// Seed an org whose handle == `tenant`, owning `repo`, with the given members and visibility — the
+    /// exact shape `find_repo` / `repo_account_id` / `can_read_repo` read.
+    fn setup_org_repo(app: &App, tenant: &str, repo: &str, private: bool, members: &[(&str, Role)]) {
+        let acct_id = format!("acct-{tenant}");
+        app.store.put_account(Account {
+            id: acct_id.clone(),
+            kind: AccountKind::Organization,
+            handle: tenant.into(),
+            members: members.iter().map(|(a, r)| Membership { actor: (*a).into(), role: *r }).collect(),
+        });
+        app.store.put_repo(Repo { id: format!("repo-{tenant}-{repo}"), owner: acct_id, name: repo.into(), default_branch: "main".into() });
+        app.repo_settings.set(&format!("{tenant}/{repo}"), crate::reposettings::RepoSettings { private, ..Default::default() });
+    }
+
+    fn set_private(app: &App, key: &str, private: bool) {
+        app.repo_settings.set(key, crate::reposettings::RepoSettings { private, ..Default::default() });
+    }
+
+    #[test]
+    fn can_read_repo_truth_table() {
+        let (app, tmp) = build_test_app("can-read");
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
+        // PRIVATE: only members read; anonymous and outsiders are refused.
+        assert!(!can_read_repo(&app, None, "acme", "web"), "anonymous cannot read a private repo");
+        assert!(!can_read_repo(&app, Some("outsider"), "acme", "web"), "a non-member cannot read a private repo");
+        assert!(can_read_repo(&app, Some("member"), "acme", "web"), "a member can read a private repo");
+        // PUBLIC (and unlisted, which is `!private`): readable by anyone, including anonymous.
+        set_private(&app, "acme/web", false);
+        assert!(can_read_repo(&app, None, "acme", "web"), "anonymous CAN read a public repo");
+        assert!(can_read_repo(&app, Some("outsider"), "acme", "web"), "a non-member can read a public repo");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_repo_member_and_admin_truth_table() {
+        let (app, tmp) = build_test_app("is-member");
+        setup_org_repo(&app, "acme", "web", true, &[("owner", Role::Owner), ("dev", Role::Write), ("reader", Role::Read)]);
+        // is_repo_member: ANY role of the owning account.
+        assert!(is_repo_member(&app, "acme", "web", "owner"));
+        assert!(is_repo_member(&app, "acme", "web", "dev"));
+        assert!(is_repo_member(&app, "acme", "web", "reader"), "even a Read role is a member");
+        assert!(!is_repo_member(&app, "acme", "web", "outsider"));
+        // Visibility is irrelevant to membership: a public repo is still only *mutated* by members.
+        set_private(&app, "acme/web", false);
+        assert!(!is_repo_member(&app, "acme", "web", "outsider"), "a public repo does not make an outsider a member");
+        // is_repo_admin: Owner/Admin only, a strict subset of members.
+        assert!(is_repo_admin(&app, "acme", "web", "owner"));
+        assert!(!is_repo_admin(&app, "acme", "web", "dev"), "Write is a member but not an admin");
+        assert!(!is_repo_admin(&app, "acme", "web", "reader"), "Read is a member but not an admin");
+        assert!(!is_repo_admin(&app, "acme", "web", "outsider"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn private_repo_read_is_gated_but_public_stays_open() {
+        // Area B: drive a real gated handler (`change_diff`) — a private repo is hidden (404) from
+        // anonymous and non-members, visible to a member, and flips fully open once public.
+        let (app, tmp) = build_test_app("read-gate");
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
+        app.store.put_actor(actor("member", ActorKind::Human));
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        mint_token(&app, "tok-member", "member");
+        mint_token(&app, "tok-outsider", "outsider");
+        let t = ("acme".to_string(), "web".to_string(), "deadbeef".to_string());
+
+        let r = change_diff(State(app.clone()), Path(t.clone()), axum::http::HeaderMap::new()).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "anonymous read of a private repo is 404");
+        let r = change_diff(State(app.clone()), Path(t.clone()), bearer("tok-outsider")).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "a non-member (valid token) still gets 404 on a private repo");
+        let r = change_diff(State(app.clone()), Path(t.clone()), bearer("tok-member")).await;
+        assert_eq!(r.status(), StatusCode::OK, "a member reads a private repo");
+
+        set_private(&app, "acme/web", false);
+        let r = change_diff(State(app.clone()), Path(t.clone()), axum::http::HeaderMap::new()).await;
+        assert_eq!(r.status(), StatusCode::OK, "a public repo is readable by anyone, incl. anonymous");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn verify_change_is_repo_admin_only() {
+        // Area C: setting verification green/red directly is the merge gate — a plain member (Write) is
+        // refused; only an Owner/Admin may override. (CI reports via the secret-authed ci-result path.)
+        let (app, tmp) = build_test_app("verify-gate");
+        setup_org_repo(&app, "acme", "web", false, &[("boss", Role::Owner), ("dev", Role::Write)]);
+        let change = app.repos.test_commit("acme", "web", "", None, &[("notes.txt", "hi\n")]);
+        app.store.put_actor(actor("boss", ActorKind::Human));
+        app.store.put_actor(actor("dev", ActorKind::Human));
+        mint_token(&app, "tok-boss", "boss");
+        mint_token(&app, "tok-dev", "dev");
+        let t = ("acme".to_string(), "web".to_string(), change.clone());
+
+        // A member who is not an admin cannot flip verification.
+        let r = verify_change(State(app.clone()), Path(t.clone()), bearer("tok-dev"), Json(json!({ "green": true }))).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-admin member cannot set verification");
+        assert_ne!(app.repos.verification("acme", "web", &change).as_deref(), Some("green"), "the change stays un-green after a refused verify");
+        // An owner/admin may.
+        let r = verify_change(State(app.clone()), Path(t.clone()), bearer("tok-boss"), Json(json!({ "green": true }))).await;
+        assert_eq!(r.status(), StatusCode::OK, "an owner/admin may set verification");
+        assert_eq!(app.repos.verification("acme", "web", &change).as_deref(), Some("green"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn set_owners_is_repo_admin_only() {
+        // Area C: code owners drive routing + the merge gate — admin-only.
+        let (app, tmp) = build_test_app("owners-gate");
+        setup_org_repo(&app, "acme", "web", false, &[("boss", Role::Admin), ("dev", Role::Write)]);
+        app.store.put_actor(actor("boss", ActorKind::Human));
+        app.store.put_actor(actor("dev", ActorKind::Human));
+        mint_token(&app, "tok-boss", "boss");
+        mint_token(&app, "tok-dev", "dev");
+        let t = ("acme".to_string(), "web".to_string());
+        let rules = json!({ "rules": [{ "glob": "*.rs", "owners": ["boss"] }] });
+
+        let r = set_owners(State(app.clone()), Path(t.clone()), bearer("tok-dev"), Json(rules.clone())).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-admin member cannot rewrite code owners");
+        assert!(app.store.owners("acme/web").is_empty(), "no owners were written by a refused call");
+        let r = set_owners(State(app.clone()), Path(t.clone()), bearer("tok-boss"), Json(rules)).await;
+        assert_eq!(r.status(), StatusCode::CREATED, "an owner/admin may set code owners");
+        assert_eq!(app.store.owners("acme/web").len(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn create_review_requires_repo_membership() {
+        // Area C: a review is an accountable act on the repo — a non-member (even a valid, accountable
+        // actor) is refused; a member may review.
+        let (app, tmp) = build_test_app("review-gate");
+        setup_org_repo(&app, "acme", "web", false, &[("member", Role::Write)]);
+        app.store.put_actor(actor("member", ActorKind::Human));
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        mint_token(&app, "tok-member", "member");
+        mint_token(&app, "tok-outsider", "outsider");
+        put_pr(&app, "acme/web", 1, "author", "chg");
+        let t = ("acme".to_string(), "web".to_string());
+        let body = json!({ "target": "pr:1", "verdict": "comment", "summary": "looks fine" });
+
+        let r = create_review(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(body.clone())).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-member cannot review");
+        assert!(app.store.reviews("acme/web").is_empty(), "no review persisted for a refused call");
+        let r = create_review(State(app.clone()), Path(t.clone()), bearer("tok-member"), Json(body)).await;
+        assert_eq!(r.status(), StatusCode::CREATED, "a repo member may review");
+        assert_eq!(app.store.reviews("acme/web").len(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn independent_agent_reviewer_is_scoped_to_repo_members() {
+        // Area C: the auto-reviewer must be a MEMBER of the repo's owning account — never an agent from
+        // another tenant (which, at T3, could otherwise auto-merge cross-tenant). Uses real accountable
+        // agents (minted delegations), since an unaccountable agent is filtered out regardless.
+        let (app, tmp) = build_test_app("reviewer-scope");
+        let human = hull_core::identity::mint_human("boss");
+        let in_agent = hull_core::identity::mint_agent("agent:in", &human.actor, &human.secret_key, "*", Lifetime::Static).expect("mint in-org agent");
+        let out_agent = hull_core::identity::mint_agent("agent:out", &human.actor, &human.secret_key, "*", Lifetime::Static).expect("mint outsider agent");
+        app.store.put_actor(human.actor.clone());
+        app.store.put_actor(in_agent.actor.clone());
+        app.store.put_actor(out_agent.actor.clone());
+        // acme owns web; the human author + the in-org agent are members. `out_agent` is accountable but
+        // not a member of acme.
+        setup_org_repo(&app, "acme", "web", false, &[(human.actor.id.as_str(), Role::Owner), (in_agent.actor.id.as_str(), Role::Write)]);
+
+        let picked = independent_agent_reviewer(&app, "acme", "web", &human.actor.id);
+        assert_eq!(picked.map(|a| a.id), Some(in_agent.actor.id.clone()), "only the in-org accountable agent is eligible");
+
+        // Drop the in-org agent's membership ⇒ no eligible reviewer (the accountable outsider is never chosen).
+        app.store.put_account(Account {
+            id: "acct-acme".into(),
+            kind: AccountKind::Organization,
+            handle: "acme".into(),
+            members: vec![Membership { actor: human.actor.id.clone(), role: Role::Owner }],
+        });
+        assert!(independent_agent_reviewer(&app, "acme", "web", &human.actor.id).is_none(), "an out-of-org agent is never selected as reviewer");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn participation_is_gated_on_read_not_membership() {
+        // Area C (participation): comment/issue open uses `can_read_repo`, NOT `is_repo_member`. On a
+        // PRIVATE repo a non-reader (valid, accountable, but not a member) is refused; the SAME actor is
+        // ALLOWED once the repo is public — a public repo stays open to any authed actor (no regression).
+        let (app, tmp) = build_test_app("participation-gate");
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        mint_token(&app, "tok-outsider", "outsider");
+        let t = ("acme".to_string(), "web".to_string());
+        let comment = json!({ "target": "pr:1", "body": "hello" });
+        let issue = json!({ "title": "a bug" });
+
+        // PRIVATE: the non-reader is denied both.
+        let r = create_comment(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(comment.clone())).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-reader cannot comment on a PRIVATE repo");
+        assert!(app.store.comments("acme/web").is_empty(), "no comment persisted for a refused call");
+        let r = create_issue(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(issue.clone())).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-reader cannot open an issue on a PRIVATE repo");
+        assert!(app.store.issues("acme/web").is_empty(), "no issue persisted for a refused call");
+
+        // PUBLIC: the very same non-member actor may now participate freely.
+        set_private(&app, "acme/web", false);
+        let r = create_comment(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(comment)).await;
+        assert_eq!(r.status(), StatusCode::CREATED, "any authed actor may comment on a PUBLIC repo");
+        assert_eq!(app.store.comments("acme/web").len(), 1, "the public comment persisted");
+        let r = create_issue(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(issue)).await;
+        assert_eq!(r.status(), StatusCode::CREATED, "any authed actor may open an issue on a PUBLIC repo");
+        assert_eq!(app.store.issues("acme/web").len(), 1, "the public issue persisted");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn repo_ops_require_membership_even_on_public() {
+        // Area C (repo-ops): auto-review + request-reviewer are repo operations gated on `is_repo_member`
+        // — a non-member is refused even on a PUBLIC repo (unlike participation). A member is allowed
+        // past the gate (request_reviewer succeeds; auto_review reaches the "no agent" stage, i.e. it is
+        // NOT refused for membership).
+        let (app, tmp) = build_test_app("repo-op-gate");
+        setup_org_repo(&app, "acme", "web", false, &[("member", Role::Write)]);
+        app.store.put_actor(actor("member", ActorKind::Human));
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        app.store.put_actor(actor("rev", ActorKind::Human));
+        mint_token(&app, "tok-member", "member");
+        mint_token(&app, "tok-outsider", "outsider");
+        put_pr(&app, "acme/web", 1, "author", "chg");
+        let t = ("acme".to_string(), "web".to_string(), 1u64);
+
+        // request_reviewer: non-member refused, member allowed.
+        let rr = json!({ "reviewer": "rev" });
+        let r = request_reviewer(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(rr.clone())).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-member cannot request a reviewer, even on a public repo");
+        let r = request_reviewer(State(app.clone()), Path(t.clone()), bearer("tok-member"), Json(rr)).await;
+        assert_eq!(r.status(), StatusCode::OK, "a repo member may request a reviewer");
+
+        // auto_review: non-member refused with FORBIDDEN (membership), member passes the membership gate
+        // (then stops at UNPROCESSABLE_ENTITY because no independent agent is registered — not a 403).
+        let r = auto_review(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(json!({}))).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-member cannot request an auto-review");
+        let r = auto_review(State(app.clone()), Path(t.clone()), bearer("tok-member"), Json(json!({}))).await;
+        assert_ne!(r.status(), StatusCode::FORBIDDEN, "a member passes the auto-review membership gate");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn missed_reads_are_gated_on_private_but_open_on_public() {
+        // Area B (missed reads): `mirror_status` + `get_repo_autonomy` join the read sweep — a private
+        // repo is hidden (404) from anonymous/non-members and visible to a member; a public repo is open.
+        let (app, tmp) = build_test_app("missed-reads");
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
+        app.store.put_actor(actor("member", ActorKind::Human));
+        app.store.put_actor(actor("outsider", ActorKind::Human));
+        mint_token(&app, "tok-member", "member");
+        mint_token(&app, "tok-outsider", "outsider");
+        let t = ("acme".to_string(), "web".to_string());
+
+        for (label, run) in [
+            ("mirror_status", 0u8),
+            ("get_repo_autonomy", 1u8),
+        ] {
+            let call = |h: axum::http::HeaderMap| {
+                let (app, t) = (app.clone(), t.clone());
+                async move {
+                    if run == 0 { mirror_status(State(app), Path(t), h).await }
+                    else { get_repo_autonomy(State(app), Path(t), h).await }
+                }
+            };
+            assert_eq!(call(axum::http::HeaderMap::new()).await.status(), StatusCode::NOT_FOUND, "{label}: anonymous read of a private repo is 404");
+            assert_eq!(call(bearer("tok-outsider")).await.status(), StatusCode::NOT_FOUND, "{label}: a non-member still gets 404 on a private repo");
+            assert_eq!(call(bearer("tok-member")).await.status(), StatusCode::OK, "{label}: a member reads a private repo");
+        }
+
+        set_private(&app, "acme/web", false);
+        assert_eq!(mirror_status(State(app.clone()), Path(t.clone()), axum::http::HeaderMap::new()).await.status(), StatusCode::OK, "mirror_status: public repo is open to anonymous");
+        assert_eq!(get_repo_autonomy(State(app.clone()), Path(t.clone()), axum::http::HeaderMap::new()).await.status(), StatusCode::OK, "get_repo_autonomy: public repo is open to anonymous");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
