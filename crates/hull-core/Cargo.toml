@@ -12,3 +12,11 @@ serde_json = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 hex = "0.4"
+# Postgres domain store (M1). SYNCHRONOUS driver behind an r2d2 blocking connection pool, so the
+# ~40-method `Store` trait stays sync (making it async would churn ~39 call sites). Each method
+# checks out a pooled connection and runs blocking SQL. `with-serde_json-1` maps JSONB ⇆
+# serde_json::Value so domain objects round-trip through a `data` column. Deps are always compiled
+# (the backend is chosen at runtime by `HULL_DATABASE_URL`), not feature-gated.
+r2d2 = "0.8"
+r2d2_postgres = "0.18"
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
