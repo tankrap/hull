@@ -74,6 +74,21 @@ body { @apply font-sans text-ink bg-paper antialiased; text-wrap: pretty; }
 a { @apply text-steel-text no-underline; }
 a:hover { @apply underline; text-underline-offset: 2px; text-decoration-thickness: 1px; }
 
+/* Keyboard focus ring — only for keyboard nav, never mouse. Form fields and the shared Button manage
+   their own focus (border / Tailwind ring), so we suppress the outline there to avoid doubling up. */
+:focus-visible { outline: 2px solid var(--steel, #6b7280); outline-offset: 2px; }
+:where(input, select, textarea):focus-visible { outline: none; }
+
+/* Respect the OS "reduce motion" setting — neutralize animations and transitions app-wide. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* ── syntax highlighting (highlight.js token classes) — GitHub-style, theme-aware ── */
 .hljs-comment,.hljs-quote{color:#6e7781;font-style:italic}
 .hljs-keyword,.hljs-selector-tag,.hljs-doctag,.hljs-variable.language_{color:#cf222e}

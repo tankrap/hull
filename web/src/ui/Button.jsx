@@ -4,7 +4,7 @@ import React, { useEffect, useRef, useState } from 'react';
 const cx = (...a) => a.filter(Boolean).join(' ');
 
 // Every button: centered content, consistent icon spacing, a soft press, and a smooth hover.
-const BASE = 'inline-flex items-center justify-center gap-1.5 font-medium cursor-pointer select-none whitespace-nowrap';
+const BASE = 'inline-flex items-center justify-center gap-1.5 font-medium cursor-pointer select-none whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-steel focus-visible:ring-offset-2 focus-visible:ring-offset-surface';
 const PRESS = 'transition-[transform,box-shadow,background-color,border-color,color,filter] duration-150 active:translate-y-px active:scale-[0.99]';
 
 const VARIANT = {
