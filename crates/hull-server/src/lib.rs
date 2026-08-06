@@ -2681,11 +2681,23 @@ async fn resolve_check(app: &App, tenant: &str, repo: &str, change: &str, force:
         }
         None => {
             // No external CI configured: the built-in local runner (blocking — keep the runtime free).
+            // Guard against duplicate concurrent runs of the same (repo,tree) the same way the dispatch
+            // path does: `mark_inflight` atomically claims the tree, so a second inline run that races
+            // in gets `Pending` instead of doing redundant work. Cleared unconditionally when the run
+            // finishes. `force` still claims the slot (a forced run is a real run) but never yields to
+            // an outstanding one.
+            if !force && !app.ci_config.mark_inflight(&tree) {
+                return CiResolution::Pending;
+            }
+            if force {
+                app.ci_config.mark_inflight(&tree);
+            }
             let (repos, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
             let (t, r, c) = (tenant.to_string(), repo.to_string(), change.to_string());
             let outcome = tokio::task::spawn_blocking(move || ci::run_check(&repos, &registry, &ci, &t, &r, &c, force))
                 .await
                 .unwrap_or(hull_plugin::CiOutcome { status: hull_plugin::CiStatus::Errored, summary: "runner panicked".into(), memoized: false });
+            app.ci_config.clear_inflight(&tree);
             CiResolution::Done(outcome)
         }
     }

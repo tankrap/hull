@@ -19,6 +19,12 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// Process-local sequence appended to scratch checkout dir names (`hull-fix-*`, `hull-indep-*`) so
+/// every operation gets a unique directory, even when two concurrent requests materialize the same
+/// change/tree — otherwise they would share a dir and `remove_dir_all` each other's checkout mid-run.
+/// Deterministic (no RNG in this runtime); the tree/change id + pid + seq is uniqueness enough.
+static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Hosts keel repos under a root dir at `<root>/{tenant}/{repo}/.keel/store`. Opened stores are
 /// cached — an LMDB env is cheap to clone (shared handle) but expensive to open per request.
 /// A secret detected by the server-side scan of a push (the backstop layer).
@@ -1003,7 +1009,8 @@ impl RepoHost {
             Object::Change(c) => c.tree,
             _ => return None,
         };
-        let dir = std::env::temp_dir().join(format!("hull-fix-{}-{}", &change_hex[..change_hex.len().min(12)], std::process::id()));
+        let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("hull-fix-{}-{}-{seq}", &change_hex[..change_hex.len().min(12)], std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         if keel_store::snapshot::checkout(&store, tree, &dir).is_err() {
             return None;
@@ -1191,7 +1198,8 @@ impl RepoHost {
             _ => return None,
         };
 
-        let base = std::env::temp_dir().join(format!("hull-indep-{}-{}", &hex[..hex.len().min(12)], std::process::id()));
+        let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("hull-indep-{}-{}-{seq}", &hex[..hex.len().min(12)], std::process::id()));
         let newdir = base.join("new");
         let pdir = base.join("parent");
         let _ = std::fs::remove_dir_all(&base);
