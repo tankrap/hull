@@ -30,6 +30,9 @@ pub trait Store: Send + Sync {
     fn issues(&self, repo: &str) -> Vec<Issue>;
     /// Replace an existing issue, matched by `repo` + `number`. Returns true if one was replaced.
     fn replace_issue(&self, issue: Issue) -> bool;
+    /// Update an issue's title and/or body (and stamp `edited_unix`), matched by `repo` + `number`.
+    /// `None` leaves that field unchanged. Returns true if one was updated.
+    fn update_issue_content(&self, repo: &str, number: u64, title: Option<&str>, body: Option<&str>, edited_unix: u64) -> bool;
     fn put_pr(&self, pr: PullRequest);
     fn prs(&self, repo: &str) -> Vec<PullRequest>;
     /// Replace an existing PR, matched by `repo` + `number`. Returns true if one was replaced.
@@ -204,6 +207,21 @@ impl Store for InMemory {
                 true
             }
             None => false,
+        }
+    }
+    fn update_issue_content(&self, repo: &str, number: u64, title: Option<&str>, body: Option<&str>, edited_unix: u64) -> bool {
+        let mut g = self.issues.write().unwrap();
+        if let Some(i) = g.iter_mut().find(|i| i.repo == repo && i.number == number) {
+            if let Some(t) = title {
+                i.title = t.to_string();
+            }
+            if let Some(b) = body {
+                i.body = b.to_string();
+            }
+            i.edited_unix = Some(edited_unix);
+            true
+        } else {
+            false
         }
     }
     fn put_pr(&self, pr: PullRequest) {
@@ -508,6 +526,22 @@ impl Store for FileStore {
         }
         replaced
     }
+    fn update_issue_content(&self, repo: &str, number: u64, title: Option<&str>, body: Option<&str>, edited_unix: u64) -> bool {
+        let mut updated = false;
+        self.mutate(|s| {
+            if let Some(i) = s.issues.iter_mut().find(|i| i.repo == repo && i.number == number) {
+                if let Some(t) = title {
+                    i.title = t.to_string();
+                }
+                if let Some(b) = body {
+                    i.body = b.to_string();
+                }
+                i.edited_unix = Some(edited_unix);
+                updated = true;
+            }
+        });
+        updated
+    }
     fn put_pr(&self, pr: PullRequest) {
         self.mutate(|s| s.prs.push(pr));
     }
@@ -666,6 +700,7 @@ mod tests {
             linked_prs: vec![],
             resolved_by: None,
             created_unix: 0,
+            edited_unix: None,
         }
     }
 

@@ -4333,6 +4333,7 @@ async fn perform_auto_review(
                     linked_prs: vec![pr.id.clone()],
                     resolved_by: None,
                     created_unix: now(),
+                    edited_unix: None,
                 };
                 app.store.put_issue(issue);
                 app.registry.notify(&NotifyEvent {
@@ -4744,6 +4745,7 @@ async fn create_issue(
         linked_prs: vec![],
         resolved_by: None,
         created_unix: now(),
+        edited_unix: None,
     };
     app.store.put_issue(issue.clone());
     if !issue.assignees.is_empty() {
@@ -4766,7 +4768,9 @@ async fn create_issue(
 
 /// Transition an issue (`PATCH /api/repos/:tenant/:repo/issues/:number`) with
 /// `{"action":"close","reason":"completed|not_planned|cancelled|duplicate"}` or
-/// `{"action":"reopen"}`. Emits a tenant-scoped event so the change shows live.
+/// `{"action":"reopen"}`. Also `{"action":"edit","title":…,"body":…}` to rewrite the words —
+/// **author-only**, unlike close/label/assign which any accountable actor may do. Emits a
+/// tenant-scoped event so the change shows live.
 async fn update_issue(
     State(app): State<App>,
     Path((tenant, repo, number)): Path<(String, String, u64)>,
@@ -4814,7 +4818,32 @@ async fn update_issue(
                 issue.labels.push(label);
             }
         }
-        _ => return (StatusCode::BAD_REQUEST, "action must be close | reopen | assign | unassign | label | unlabel").into_response(),
+        "edit" => {
+            // Rewriting the title/body is **author-only** — unlike close/reopen/label/assign (any
+            // accountable actor), a repo admin can't rewrite the author's words, only manage state.
+            // Mirrors `edit_comment`.
+            if issue.author != acting.id {
+                return (StatusCode::FORBIDDEN, "only the issue's author can edit its title or body").into_response();
+            }
+            let new_title = body.get("title").and_then(Value::as_str).map(|t| t.trim().to_string());
+            let new_body = body.get("body").and_then(Value::as_str).map(str::to_string);
+            if let Some(t) = &new_title {
+                if t.is_empty() {
+                    return (StatusCode::UNPROCESSABLE_ENTITY, "issue title must not be empty").into_response();
+                }
+            }
+            if new_title.is_none() && new_body.is_none() {
+                return (StatusCode::BAD_REQUEST, "edit requires a title and/or body").into_response();
+            }
+            app.store.update_issue_content(&key, number, new_title.as_deref(), new_body.as_deref(), now());
+            let updated = app.store.issues(&key).into_iter().find(|i| i.number == number);
+            app.hub.publish(
+                &tenant,
+                ActivityEvent::Issue { repo, number, action: "edited".into(), actor: acting.handle, ts: now() },
+            );
+            return Json(json!({ "issue": updated })).into_response();
+        }
+        _ => return (StatusCode::BAD_REQUEST, "action must be close | reopen | assign | unassign | label | unlabel | edit").into_response(),
     }
     app.store.replace_issue(issue.clone());
     app.hub.publish(
@@ -4910,6 +4939,7 @@ fn seed(store: &dyn Store) {
         linked_prs: vec![],
         resolved_by: Some("blake3:eb17068".into()),
         created_unix: 0,
+        edited_unix: None,
     });
 }
 
@@ -5296,6 +5326,87 @@ mod tests {
         let c = app.store.comments("acme/web").into_iter().find(|c| c.id == "cm_1").unwrap();
         assert_eq!(c.body, "revised");
         assert!(c.edited_unix.is_some(), "an accepted edit stamps edited_unix");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── edit-issue authorization (`update_issue` action:"edit") ───────────────────────────────────
+
+    fn put_issue_fixture(app: &App, key: &str, number: u64, author: &str) {
+        app.store.put_issue(Issue {
+            id: format!("iss_{number}"),
+            repo: key.into(),
+            number,
+            title: "original title".into(),
+            body: "original body".into(),
+            author: author.into(),
+            assignees: vec![],
+            labels: vec![],
+            projects: vec![],
+            status: IssueStatus::Open,
+            code_refs: vec![],
+            referenced_actors: vec![],
+            linked_prs: vec![],
+            resolved_by: None,
+            created_unix: 0,
+            edited_unix: None,
+        });
+    }
+
+    #[tokio::test]
+    async fn edit_issue_title_and_body_is_author_only() {
+        let (app, tmp) = build_test_app("edit-issue");
+        // An org account with `intruder` as Owner (⇒ a repo admin) — to prove even an admin can't
+        // rewrite the author's words, unlike close/label which an admin may do.
+        app.store.put_account(Account {
+            id: "acct-acme".into(),
+            kind: AccountKind::Organization,
+            handle: "acme".into(),
+            members: vec![Membership { actor: "intruder".into(), role: Role::Owner }],
+        });
+        app.store.put_actor(actor("author", ActorKind::Human));
+        app.store.put_actor(actor("intruder", ActorKind::Human));
+        mint_token(&app, "tok-author", "author");
+        mint_token(&app, "tok-intruder", "intruder");
+        put_issue_fixture(&app, "acme/web", 1, "author");
+
+        // A non-author (even a repo admin) is rejected server-side, and the title/body are untouched.
+        let resp = update_issue(
+            State(app.clone()),
+            Path(("acme".into(), "web".into(), 1)),
+            bearer("tok-intruder"),
+            Json(json!({ "action": "edit", "title": "hijacked", "body": "hijacked" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a non-author (even an admin) must not edit an issue's words");
+        let i = app.store.issues("acme/web").into_iter().find(|i| i.number == 1).unwrap();
+        assert_eq!(i.title, "original title", "a rejected edit leaves the title unchanged");
+        assert_eq!(i.body, "original body", "a rejected edit leaves the body unchanged");
+
+        // An empty title is rejected even for the author.
+        let resp = update_issue(
+            State(app.clone()),
+            Path(("acme".into(), "web".into(), 1)),
+            bearer("tok-author"),
+            Json(json!({ "action": "edit", "title": "   " })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "an empty title must be rejected");
+        assert_eq!(app.store.issues("acme/web")[0].title, "original title", "a rejected edit leaves the title unchanged");
+
+        // The author can edit: title + body update and `edited_unix` is stamped.
+        let resp = update_issue(
+            State(app.clone()),
+            Path(("acme".into(), "web".into(), 1)),
+            bearer("tok-author"),
+            Json(json!({ "action": "edit", "title": "revised title", "body": "revised body" })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "the author may edit their own issue");
+        let i = app.store.issues("acme/web").into_iter().find(|i| i.number == 1).unwrap();
+        assert_eq!(i.title, "revised title");
+        assert_eq!(i.body, "revised body");
+        assert!(i.edited_unix.is_some(), "an accepted edit stamps edited_unix");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

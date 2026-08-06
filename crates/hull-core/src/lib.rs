@@ -381,6 +381,10 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<KeelId>,
     pub created_unix: u64,
+    /// When the author last edited this issue's title/body (unix seconds), if ever. Lets the UI show
+    /// an "edited" marker. Absent on issues that have never been edited (and on pre-edit data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_unix: Option<u64>,
 }
 
 /// Where a PR is in its lifecycle.
