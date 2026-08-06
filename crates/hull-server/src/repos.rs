@@ -175,6 +175,48 @@ impl RepoHost {
         self.store(tenant, repo, true)?;
         Ok(!existed)
     }
+
+    /// Delete a repo's on-disk directory (keel store + working tree) and evict it from the open-store
+    /// cache. Returns `true` if a directory was removed, `false` if nothing was on disk. Errors on an
+    /// invalid name.
+    pub fn delete_repo(&self, tenant: &str, repo: &str) -> io::Result<bool> {
+        if !safe_segment(tenant) || !safe_segment(repo) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid repo name"));
+        }
+        // Drop any cached store handle first so no LMDB mmap keeps the dir alive.
+        self.open.lock().unwrap().remove(&format!("{tenant}/{repo}"));
+        let dir = self.root.join(tenant).join(repo);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Rename a repo's on-disk directory (tenant unchanged), evicting cached store handles for both
+    /// names. A repo that was never pushed to (no dir yet) is a no-op. Errors on an invalid name or if
+    /// the destination already exists.
+    pub fn rename_repo(&self, tenant: &str, old: &str, new: &str) -> io::Result<()> {
+        if !safe_segment(tenant) || !safe_segment(old) || !safe_segment(new) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid repo name"));
+        }
+        {
+            let mut open = self.open.lock().unwrap();
+            open.remove(&format!("{tenant}/{old}"));
+            open.remove(&format!("{tenant}/{new}"));
+        }
+        let from = self.root.join(tenant).join(old);
+        let to = self.root.join(tenant).join(new);
+        if !from.exists() {
+            return Ok(()); // never pushed — nothing on disk to move
+        }
+        if to.exists() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination repo already exists"));
+        }
+        std::fs::rename(&from, &to)?;
+        Ok(())
+    }
 }
 
 /// A resolved content-addressed anchor: the keel blob id a path currently maps to at HEAD, plus the

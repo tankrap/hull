@@ -78,6 +78,23 @@ impl RepoSettingsStore {
         self.persist(&g);
     }
 
+    /// Drop a repo's settings entirely (on repo delete).
+    pub fn delete(&self, key: &str) {
+        let mut g = self.inner.lock().unwrap();
+        if g.remove(key).is_some() {
+            self.persist(&g);
+        }
+    }
+
+    /// Move a repo's settings from `old` to `new` key (on repo rename).
+    pub fn rename(&self, old: &str, new: &str) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(v) = g.remove(old) {
+            g.insert(new.to_string(), v);
+            self.persist(&g);
+        }
+    }
+
     fn persist(&self, map: &HashMap<String, RepoSettings>) {
         crate::jsonstore::persist_json_atomic(&self.path, map);
     }

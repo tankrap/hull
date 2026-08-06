@@ -169,6 +169,37 @@ impl MirrorLedger {
         v.reverse();
         v
     }
+
+    /// Re-key mirror-status history from `old` to `new` repo key (on repo rename). Only the
+    /// outbound/inbound records carry a `tenant/repo` key; origin/idempotency are keyed by change id
+    /// and stay put. Keeps the repo's mirror-status history reachable under its new name.
+    pub fn rekey_repo(&self, old: &str, new: &str) {
+        let mut l = self.inner.lock().unwrap();
+        let mut changed = false;
+        for o in l.outbound.iter_mut().filter(|o| o.repo == old) {
+            o.repo = new.to_string();
+            changed = true;
+        }
+        for i in l.inbound.iter_mut().filter(|i| i.repo == old) {
+            i.repo = new.to_string();
+            changed = true;
+        }
+        if changed {
+            self.persist(&l);
+        }
+    }
+
+    /// Drop a repo's mirror-status history (on repo delete), so it isn't orphaned pointing at a dead
+    /// repo. Origin/idempotency entries (keyed by change id) are left to age out.
+    pub fn remove_repo(&self, repo: &str) {
+        let mut l = self.inner.lock().unwrap();
+        let before = l.outbound.len() + l.inbound.len();
+        l.outbound.retain(|o| o.repo != repo);
+        l.inbound.retain(|i| i.repo != repo);
+        if l.outbound.len() + l.inbound.len() != before {
+            self.persist(&l);
+        }
+    }
 }
 
 #[cfg(test)]
