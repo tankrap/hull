@@ -1,5 +1,5 @@
 // keel/hull buttons — Tailwind. Every clickable presses: active:translate-y-px active:scale-[0.99].
-import React, { useEffect, useRef, useState } from 'react';
+import React from 'react';
 
 const cx = (...a) => a.filter(Boolean).join(' ');
 
@@ -42,80 +42,5 @@ export function LinkButton({ className, children, ...rest }) {
     <button className={cx('bg-transparent border-none p-0 text-[13.5px] font-medium text-steel-text cursor-pointer hover:underline hover:text-[oklch(0.42_0.12_248)] active:text-[oklch(0.35_0.12_248)]', className)} {...rest}>
       {children}
     </button>
-  );
-}
-
-function useClickAway(onAway) {
-  const ref = useRef(null);
-  useEffect(() => {
-    const h = (e) => { if (ref.current && !ref.current.contains(e.target)) onAway(); };
-    document.addEventListener('pointerdown', h, true);
-    return () => document.removeEventListener('pointerdown', h, true);
-  }, [onAway]);
-  return ref;
-}
-
-export function Menu({ items, onPick }) {
-  return (
-    <div className="absolute top-[calc(100%+4px)] left-0 min-w-[180px] z-30 bg-surface border border-rule rounded-[10px] shadow-menu p-1">
-      {items.map((it) => (
-        <div key={it.label} onClick={() => onPick(it)}
-          className={cx('px-2.5 py-[7px] rounded-chip text-[13.5px] cursor-pointer',
-            it.danger ? 'text-fault-text hover:bg-fault-wash' : 'text-body hover:bg-[oklch(0.96_0.003_250)]')}>
-          {it.label}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-const Chevron = ({ className }) => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="6 9 12 15 18 9" /></svg>
-);
-
-export function SplitButton({ label, onPrimary, items, onPick }) {
-  const [open, setOpen] = useState(false);
-  const ref = useClickAway(() => setOpen(false));
-  return (
-    <div ref={ref} className="relative inline-flex">
-      <Button className="rounded-r-none" onClick={onPrimary}>{label}</Button>
-      <Button className="rounded-l-none w-[30px] !px-0 border-l border-l-[oklch(0.38_0.02_250)] flex items-center justify-center" aria-label="More actions" onClick={() => setOpen(!open)}>
-        <Chevron />
-      </Button>
-      {open && <Menu items={items} onPick={(it) => { setOpen(false); onPick?.(it); }} />}
-    </div>
-  );
-}
-
-export function ComboButton({ label = 'Actions', items, onPick }) {
-  const [open, setOpen] = useState(false);
-  const ref = useClickAway(() => setOpen(false));
-  return (
-    <div ref={ref} className="relative inline-flex">
-      <Button variant="secondary" className="inline-flex items-center gap-[7px]" onClick={() => setOpen(!open)}>
-        {label} <Chevron className="text-dim" />
-      </Button>
-      {open && <Menu items={items} onPick={(it) => { setOpen(false); onPick?.(it); }} />}
-    </div>
-  );
-}
-
-export function ToggleButton({ on, children, ...rest }) {
-  return <Button variant={on ? 'primary' : 'secondary'} className="font-semibold" {...rest}>{children}</Button>;
-}
-
-// Bordered group of exclusive views (Chart | List | Timeline)
-export function ButtonGroup({ items, value, onChange }) {
-  return (
-    <div className="inline-flex border border-ctl rounded-ctl overflow-hidden">
-      {items.map((label, i) => (
-        <button key={label} onClick={() => onChange(i)}
-          className={cx('h-[30px] px-[13px] text-[13.5px] font-medium cursor-pointer transition-colors duration-150',
-            i && 'border-l border-rule',
-            value === i ? 'bg-ink text-surface' : 'bg-surface text-dim hover:bg-[oklch(0.97_0.003_250)] active:bg-[oklch(0.94_0.004_250)]')}>
-          {label}
-        </button>
-      ))}
-    </div>
   );
 }
