@@ -32,6 +32,8 @@ pub trait Store: Send + Sync {
     fn comments(&self, repo: &str) -> Vec<Comment>;
     /// Delete a comment by id. Returns true if one was removed.
     fn remove_comment(&self, repo: &str, id: &str) -> bool;
+    /// Update a comment's body (and stamp `edited_unix`) by id. Returns true if one was updated.
+    fn update_comment_body(&self, repo: &str, id: &str, body: &str, edited_unix: u64) -> bool;
     /// Associate an ingested keel session with a change (latest write wins per change).
     fn put_session_record(&self, record: SessionRecord);
     fn session_record(&self, repo: &str, change: &str) -> Option<SessionRecord>;
@@ -197,6 +199,16 @@ impl Store for InMemory {
         let before = g.len();
         g.retain(|c| !(c.repo == repo && c.id == id));
         g.len() != before
+    }
+    fn update_comment_body(&self, repo: &str, id: &str, body: &str, edited_unix: u64) -> bool {
+        let mut g = self.comments.write().unwrap();
+        if let Some(c) = g.iter_mut().find(|c| c.repo == repo && c.id == id) {
+            c.body = body.to_string();
+            c.edited_unix = Some(edited_unix);
+            true
+        } else {
+            false
+        }
     }
     fn put_session_record(&self, record: SessionRecord) {
         let mut g = self.sessions.write().unwrap();
@@ -455,6 +467,17 @@ impl Store for FileStore {
         let mut removed = false;
         self.mutate(|s| { let before = s.comments.len(); s.comments.retain(|c| !(c.repo == repo && c.id == id)); removed = s.comments.len() != before; });
         removed
+    }
+    fn update_comment_body(&self, repo: &str, id: &str, body: &str, edited_unix: u64) -> bool {
+        let mut updated = false;
+        self.mutate(|s| {
+            if let Some(c) = s.comments.iter_mut().find(|c| c.repo == repo && c.id == id) {
+                c.body = body.to_string();
+                c.edited_unix = Some(edited_unix);
+                updated = true;
+            }
+        });
+        updated
     }
     fn put_session_record(&self, record: SessionRecord) {
         self.mutate(|s| {

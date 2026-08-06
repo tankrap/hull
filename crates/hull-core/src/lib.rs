@@ -488,6 +488,10 @@ pub struct Comment {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    /// When the author last edited this comment's body (unix seconds), if ever. Lets the UI show an
+    /// "edited" marker. Absent on comments that have never been edited (and on pre-edit data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_unix: Option<u64>,
 }
 
 /// A specific issue a review raises, anchored to a file (and optionally a line). What turns a

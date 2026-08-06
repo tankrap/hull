@@ -219,7 +219,7 @@ mod tests {
 
         let n = NostrNotifier { secret_hex: SK.into(), relays: vec!["ws://127.0.0.1:1".into()], store: Arc::new(store) };
         // targets both owners, but only owner1 opted in → the note p-tags exactly owner1's key + change tag.
-        let ev = NotifyEvent { kind: "code_owner_referenced".into(), to: vec!["owner1".into(), "owner2".into()], summary: "crates/x touched".into(), change: Some("blake3:abc".into()) };
+        let ev = NotifyEvent { kind: "code_owner_referenced".into(), to: vec!["owner1".into(), "owner2".into()], summary: "crates/x touched".into(), change: Some("blake3:abc".into()), repo: None, target_kind: None, target_number: None };
         let note = n.event_for(&ev, 1_700_000_000).expect("an opted-in recipient yields a note");
         assert!(note.verify());
         assert!(note.tags.contains(&vec!["p".to_string(), pubkey_of(SK).unwrap()]));
@@ -227,7 +227,7 @@ mod tests {
         assert!(note.tags.contains(&vec!["change".to_string(), "blake3:abc".to_string()]));
 
         // nobody opted in → no note at all.
-        let none = NotifyEvent { kind: "x".into(), to: vec!["owner2".into()], summary: "y".into(), change: None };
+        let none = NotifyEvent { kind: "x".into(), to: vec!["owner2".into()], summary: "y".into(), change: None, repo: None, target_kind: None, target_number: None };
         assert!(n.event_for(&none, 1_700_000_000).is_none());
     }
 
