@@ -1677,6 +1677,9 @@ export function App() {
   const [issueBodyDraft, setIssueBodyDraft] = useState("");
   const startEditIssue = (it: Issue) => { setEditingIssue(it.number); setIssueTitleDraft(it.title); setIssueBodyDraft(it.body); };
   const cancelEditIssue = () => { setEditingIssue(null); setIssueTitleDraft(""); setIssueBodyDraft(""); };
+  // Drop any in-progress issue edit when the open issue/repo changes, so stale drafts can't be saved
+  // onto a different issue (numbers repeat across repos).
+  useEffect(() => { setEditingIssue(null); setIssueTitleDraft(""); setIssueBodyDraft(""); }, [openIssue, issueRepo]);
   const saveEditIssue = async (number: number) => {
     if (!canAct) return uiAlert("Sign in to act.");
     const title = issueTitleDraft.trim();
