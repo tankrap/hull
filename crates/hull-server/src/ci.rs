@@ -71,6 +71,10 @@ impl CiMemo {
     }
 }
 
+/// Process-local sequence appended to CI checkout dir names so every run gets a unique directory,
+/// even when two concurrent checks materialize the same tree (see `run_check` / `run_check_tree`).
+static CI_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn status_str(s: CiStatus) -> &'static str {
     match s {
         CiStatus::Green => "green",
@@ -107,10 +111,12 @@ pub fn run_check(
         }
     }
 
-    // Fresh run: materialize the tree and hand a checkout to the runner. The temp dir is unique per
-    // (tree, pid) so concurrent checks don't collide; cleaned up after. (No RNG available in this
-    // runtime — the tree id + pid is uniqueness enough.)
-    let dir = std::env::temp_dir().join(format!("hull-ci-{}-{}", &tree[..tree.len().min(16)], std::process::id()));
+    // Fresh run: materialize the tree and hand a checkout to the runner. The temp dir must be unique
+    // **per run**, not per (tree, pid): two concurrent checks of the same tree would otherwise share a
+    // directory and `remove_dir_all` each other's checkout mid-run. A process-local atomic counter is
+    // enough and stays deterministic (no RNG in this runtime). Cleaned up after.
+    let seq = CI_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("hull-ci-{}-{}-{seq}", &tree[..tree.len().min(16)], std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     if !repos.checkout_change(tenant, repo, change, &dir) {
         return CiOutcome { status: CiStatus::Errored, summary: "checkout failed".into(), memoized: false };
@@ -139,7 +145,8 @@ pub fn run_check_tree(repos: &RepoHost, registry: &Registry, memo: &CiMemo, tena
         };
         return CiOutcome { status, summary: hit.summary, memoized: true };
     }
-    let dir = std::env::temp_dir().join(format!("hull-ci-{}-{}", &tree[..tree.len().min(16)], std::process::id()));
+    let seq = CI_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("hull-ci-{}-{}-{seq}", &tree[..tree.len().min(16)], std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     if !repos.checkout_tree(tenant, repo, tree, &dir) {
         return CiOutcome { status: CiStatus::Errored, summary: "checkout failed".into(), memoized: false };
