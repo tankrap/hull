@@ -41,17 +41,12 @@ impl AutonomyStore {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(format!("{home}/.hull/autonomy.json"))
         });
-        let map = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let map = crate::jsonstore::load_json(&path);
         AutonomyStore { path, map: Mutex::new(map) }
     }
 
     fn persist(&self, m: &HashMap<String, AutonomyPolicy>) {
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(j) = serde_json::to_string_pretty(m) {
-            let _ = std::fs::write(&self.path, j);
-        }
+        crate::jsonstore::persist_json_atomic(&self.path, m);
     }
 
     pub fn get_repo(&self, tenant: &str, repo: &str) -> Option<AutonomyPolicy> {

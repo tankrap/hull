@@ -64,7 +64,7 @@ impl RepoSettingsStore {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(format!("{home}/.hull/repo-settings.json"))
         });
-        let inner = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let inner = crate::jsonstore::load_json(&path);
         RepoSettingsStore { path, inner: Mutex::new(inner) }
     }
 
@@ -79,11 +79,6 @@ impl RepoSettingsStore {
     }
 
     fn persist(&self, map: &HashMap<String, RepoSettings>) {
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(bytes) = serde_json::to_string_pretty(map) {
-            let _ = std::fs::write(&self.path, bytes);
-        }
+        crate::jsonstore::persist_json_atomic(&self.path, map);
     }
 }

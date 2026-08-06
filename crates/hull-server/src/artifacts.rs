@@ -25,7 +25,7 @@ impl ArtifactStore {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(format!("{home}/.hull/review-artifacts.json"))
         });
-        let map = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let map = crate::jsonstore::load_json(&path);
         ArtifactStore { path, map: Mutex::new(map) }
     }
 
@@ -36,12 +36,7 @@ impl ArtifactStore {
         let id = blake3::hash(&bytes).to_hex().to_string();
         let mut m = self.map.lock().unwrap();
         m.insert(id.clone(), artifact);
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(j) = serde_json::to_string_pretty(&*m) {
-            let _ = std::fs::write(&self.path, j);
-        }
+        crate::jsonstore::persist_json_atomic(&self.path, &*m);
         id
     }
 

@@ -17,6 +17,7 @@ pub mod connections;
 pub mod claims;
 pub mod reviewcache;
 pub mod ingress;
+pub mod jsonstore;
 pub mod keeld;
 pub mod mirror;
 pub mod nostr;
