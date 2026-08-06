@@ -289,6 +289,84 @@ pub fn finalize(repos: &RepoHost, memo: &CiMemo, config: &CiConfig, tenant: &str
     st
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memo_at(tag: &str) -> CiMemo {
+        let path = std::env::temp_dir().join(format!("hull-cimemo-test-{}-{tag}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        CiMemo { path, map: Mutex::new(HashMap::new()) }
+    }
+
+    fn config_at(tag: &str) -> CiConfig {
+        let path = std::env::temp_dir().join(format!("hull-ciconfig-test-{}-{tag}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        CiConfig { path, map: Mutex::new(HashMap::new()), inflight: Mutex::new(HashSet::new()) }
+    }
+
+    #[test]
+    fn memo_round_trips_green_and_red_by_tree() {
+        let memo = memo_at("rt");
+        // Unknown tree ⇒ nothing memoized ⇒ must re-run.
+        assert!(memo.get_memoized("tree-x").is_none());
+
+        memo.put("tree-green", MemoEntry { status: "green".into(), summary: "ok".into() });
+        memo.put("tree-red", MemoEntry { status: "red".into(), summary: "boom".into() });
+
+        let g = memo.get_memoized("tree-green").expect("green memoized");
+        assert!(matches!(g.status, CiStatus::Green));
+        assert_eq!(g.summary, "ok");
+        assert!(g.memoized, "a served verdict is flagged memoized");
+
+        let r = memo.get_memoized("tree-red").expect("red memoized");
+        assert!(matches!(r.status, CiStatus::Red));
+        assert!(r.memoized);
+    }
+
+    #[test]
+    fn finalize_never_memoizes_an_errored_verdict() {
+        // A real change so change_tree resolves. Isolated repo host under a temp dir.
+        let tmp = std::env::temp_dir().join(format!("hull-ci-finalize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let repos = RepoHost::new(&tmp);
+        let change = repos.test_commit("t", "r", "add file", None, &[("a.txt", "hi\n")]);
+        let tree = repos.change_tree("t", "r", &change).expect("tree resolves");
+
+        let memo = memo_at("errored");
+        let config = config_at("errored");
+
+        // An errored verdict is NOT a verdict about the tree — it must never be cached, so the tree
+        // re-runs next time; verification is left untouched.
+        let st = finalize(&repos, &memo, &config, "t", "r", &change, "errored", "flaky infra");
+        assert!(matches!(st, CiStatus::Errored));
+        assert!(memo.get_memoized(&tree).is_none(), "errored must not be memoized");
+        assert_eq!(repos.verification("t", "r", &change).as_deref(), Some("unverified"), "errored writes no verification");
+
+        // A green verdict, by contrast, IS memoized and reflected in keel verification.
+        let st2 = finalize(&repos, &memo, &config, "t", "r", &change, "green", "all pass");
+        assert!(matches!(st2, CiStatus::Green));
+        assert!(matches!(memo.get_memoized(&tree).map(|o| o.status), Some(CiStatus::Green)), "green is memoized by tree");
+        assert_eq!(repos.verification("t", "r", &change).as_deref(), Some("green"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn inflight_second_claim_is_rejected_until_cleared() {
+        let config = config_at("inflight");
+        assert!(config.mark_inflight("tree-1"), "first claim succeeds");
+        assert!(!config.mark_inflight("tree-1"), "a second claim on the same tree is rejected");
+        assert!(config.is_inflight("tree-1"));
+        // A different tree is independent.
+        assert!(config.mark_inflight("tree-2"));
+        // Clearing frees the slot so it can be claimed again.
+        config.clear_inflight("tree-1");
+        assert!(!config.is_inflight("tree-1"));
+        assert!(config.mark_inflight("tree-1"), "re-claimable after clear");
+    }
+}
+
 fn apply_verification(repos: &RepoHost, tenant: &str, repo: &str, change: &str, status: CiStatus) {
     match status {
         CiStatus::Green => {
