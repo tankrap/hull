@@ -1949,13 +1949,19 @@ async fn register_finish(State(app): State<App>, Json(body): Json<Value>) -> Res
     // The user drives a fresh human actor; Hull holds its key to sign delegations for them.
     let minted = identity::mint_human(&flow.username);
     let cred_id = b64u(pk.cred_id().as_ref());
+    // Serialize the passkey up front — if it can't be serialized we must NOT save the user with a Null
+    // credential (which would return success yet lock them out); fail the registration instead.
+    let pk_data = match serde_json::to_value(&pk) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("could not persist passkey: {e}")).into_response(),
+    };
     let user = User {
         id: flow.uuid.to_string(),
         username: flow.username.clone(),
         email: flow.email,
         actor: minted.actor.id.clone(),
         secret_key: minted.secret_key,
-        passkeys: vec![PasskeyCred { id: cred_id, name: "passkey".into(), created_unix: now(), data: serde_json::to_value(&pk).unwrap_or(Value::Null) }],
+        passkeys: vec![PasskeyCred { id: cred_id, name: "passkey".into(), created_unix: now(), data: pk_data }],
         created_unix: now(),
         bio: String::new(),
     };
@@ -2143,8 +2149,12 @@ fn verify_service_secret(headers: &axum::http::HeaderMap, header: &str, expected
     match expected {
         Some(s) if !s.is_empty() => {
             let presented = headers.get(header).and_then(|v| v.to_str().ok()).unwrap_or("");
-            let ok = presented.len() == s.len()
-                && presented.bytes().zip(s.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
+            // Compare fixed-size SHA-256 digests so the check is length-independent: a plain
+            // `len() == len()` short-circuit (or a byte-zip) leaks the secret's length via timing.
+            use sha2::{Digest, Sha256};
+            let ph = Sha256::digest(presented.as_bytes());
+            let sh = Sha256::digest(s.as_bytes());
+            let ok = ct_eq(&ph, &sh);
             if ok {
                 Ok(())
             } else {
@@ -2491,7 +2501,10 @@ async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(S
             .prs(&key)
             .into_iter()
             .filter(|p| p.changes.contains(&id))
-            .flat_map(|p| closing_issue_numbers(&p.title, &[]))
+            .flat_map(|p| {
+                let body = p.changes.iter().filter_map(|c| app.repos.change_info(&tenant, &repo, c).map(|i| i.intent)).collect::<Vec<_>>().join("\n");
+                closing_issue_numbers(&p.title, &body, &[])
+            })
             .filter_map(|n| issues.iter().find(|i| i.number == n).map(|i| format!("Closes #{}: {}. {}", i.number, i.title, i.body)))
             .collect();
         if acceptance.is_empty() { info.intent.clone() } else { format!("{}\n{}", info.intent, acceptance.join("\n")) }
@@ -2740,7 +2753,7 @@ async fn ci_result(
     if let Some(ci::RepoCi { secret, .. }) = cfg.as_ref() {
         if !secret.is_empty() {
             let presented = headers.get("X-Hull-CI-Secret").and_then(|v| v.to_str().ok()).unwrap_or("");
-            if presented != secret {
+            if !ct_eq(presented.as_bytes(), secret.as_bytes()) {
                 return (StatusCode::UNAUTHORIZED, "bad or missing X-Hull-CI-Secret").into_response();
             }
         }
@@ -2797,9 +2810,16 @@ async fn set_ci_config(
 }
 
 /// Is `actor` an Owner/Admin of the account that owns `tenant/repo`?
+/// Resolve the repo record for `tenant/repo`, matched by its **fully-qualified** identity: the bare
+/// `name` under the account that owns `tenant`. There is deliberately no bare-name fallback — a
+/// same-named repo under a *different* owner must never match (cross-tenant confusion).
+fn find_repo(app: &App, tenant: &str, repo: &str) -> Option<Repo> {
+    let tenant_acct = app.store.accounts().into_iter().find(|a| a.handle == tenant)?.id;
+    app.store.repos().into_iter().find(|r| r.name == repo && r.owner == tenant_acct)
+}
+
 fn is_repo_admin(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
-    let name = format!("{tenant}/{repo}");
-    let Some(owner) = app.store.repos().into_iter().find(|r| r.name == name || r.name == repo).map(|r| r.owner) else {
+    let Some(owner) = find_repo(app, tenant, repo).map(|r| r.owner) else {
         // No repo record — fall back to: any owner/admin of the tenant org.
         return app.store.accounts().iter().any(|a| a.handle == tenant && a.members.iter().any(|m| m.actor == actor && matches!(m.role, Role::Owner | Role::Admin)));
     };
@@ -2835,11 +2855,7 @@ async fn receive_pack_handler(
 
 /// The id of the account that owns `tenant/repo` (for the account-level policy fallback).
 fn repo_account_id(app: &App, tenant: &str, repo: &str) -> Option<String> {
-    let name = format!("{tenant}/{repo}");
-    app.store
-        .repos()
-        .into_iter()
-        .find(|r| r.name == name || r.name == repo)
+    find_repo(app, tenant, repo)
         .map(|r| r.owner)
         .or_else(|| app.store.accounts().into_iter().find(|a| a.handle == tenant).map(|a| a.id))
 }
@@ -3060,13 +3076,13 @@ async fn perform_merge(
     // An owner/admin may override the gate (merge despite red/unrun checks or no approval) — the
     // human-admin escape hatch for a wedged or misconfigured check.
     let override_ok = force && is_repo_admin(app, tenant, repo, actor.id.as_str());
-    // green keel verification of the proposed change
-    let green = pr
-        .changes
-        .first()
-        .and_then(|c| app.repos.verification(tenant, repo, c))
-        .map(|v| v == "green")
-        .unwrap_or(false);
+    // green keel verification of EVERY proposed change — a multi-change PR must not smuggle an
+    // unverified change at index ≥1 past a check that only inspected the first.
+    let green = !pr.changes.is_empty()
+        && pr
+            .changes
+            .iter()
+            .all(|c| app.repos.verification(tenant, repo, c).map(|v| v == "green").unwrap_or(false));
     if !green && !override_ok {
         return Err((StatusCode::CONFLICT, "cannot merge: change is not keel-verify green".into()));
     }
@@ -3086,15 +3102,31 @@ async fn perform_merge(
     // Autonomy policy: when may an AGENT's approve stand in for a human's?
     let acct = repo_account_id(app, tenant, repo);
     let eff = app.autonomy.effective(tenant, repo, acct.as_deref());
-    let change = pr.changes.first().cloned().unwrap_or_default();
-    let files: Vec<String> = app.repos.change_info(tenant, repo, &change).map(|i| i.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
+    // Inspect EVERY change in the PR, not just the first: protected-path and ledger gating must see a
+    // protected or un-reconciled change wherever it sits in the PR.
+    let files: Vec<String> = pr
+        .changes
+        .iter()
+        .flat_map(|c| {
+            app.repos
+                .change_info(tenant, repo, c)
+                .map(|i| i.files.into_iter().map(|f| f.path).collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .collect();
     let protected = autonomy::touches_protected(&files, &eff.protected_paths);
     let (contradicted, phantom) = {
-        let lesson = app.store.session_record(&key, &change).map(|s| s.lesson).unwrap_or_default();
-        let intent = app.repos.change_info(tenant, repo, &change).map(|i| i.intent).unwrap_or_default();
-        let facts = facts_with_independence(app, tenant, repo, &change).await;
-        let ledger = hull_core::reconcile::reconcile(&change, &intent, &lesson, &facts);
-        (ledger.contradicted() > 0, ledger.phantom() > 0)
+        let mut contradicted = false;
+        let mut phantom = false;
+        for change in &pr.changes {
+            let lesson = app.store.session_record(&key, change).map(|s| s.lesson).unwrap_or_default();
+            let intent = app.repos.change_info(tenant, repo, change).map(|i| i.intent).unwrap_or_default();
+            let facts = facts_with_independence(app, tenant, repo, change).await;
+            let ledger = hull_core::reconcile::reconcile(change, &intent, &lesson, &facts);
+            contradicted |= ledger.contradicted() > 0;
+            phantom |= ledger.phantom() > 0;
+        }
+        (contradicted, phantom)
     };
     // A change that did work its narrative never claimed (C5 phantom work) is NOT low-risk: it
     // includes unreviewed operations, so an agent's approve must not auto-merge it — a human looks.
@@ -3128,8 +3160,15 @@ async fn perform_merge(
     }
     // Auto-close the issues this PR fixes, stamping the resolving keel change as provenance.
     let resolving = pr.changes.first().cloned();
+    // Scan the change intent/body as well as the title for closing keywords.
+    let intent_body: String = pr
+        .changes
+        .iter()
+        .filter_map(|c| app.repos.change_info(tenant, repo, c).map(|i| i.intent))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut closed: Vec<u64> = Vec::new();
-    for num in closing_issue_numbers(&pr.title, &[]) {
+    for num in closing_issue_numbers(&pr.title, &intent_body, &[]) {
         if let Some(mut issue) = app.store.issues(&pr.repo).into_iter().find(|i| i.number == num) {
             if matches!(issue.status, hull_core::IssueStatus::Open) {
                 issue.status = hull_core::IssueStatus::Closed { reason: hull_core::CloseReason::Completed };
@@ -3157,17 +3196,20 @@ async fn perform_merge(
     Ok((pr, closed))
 }
 
-/// Issue numbers a PR closes: from closing keywords in the title (`fixes #12`, `closes #3`,
-/// `resolves #7`) plus any explicit `closes` list. Deduped.
-fn closing_issue_numbers(title: &str, explicit: &[u64]) -> Vec<u64> {
+/// Issue numbers a PR closes: from closing keywords (`fixes #12`, `closes #3`, `resolves #7`) in the
+/// title **and** the change intent/body, plus any explicit `closes` list. Deduped. Scanning the body
+/// too means a `Closes #12` written in the change message isn't silently ignored.
+fn closing_issue_numbers(title: &str, body: &str, explicit: &[u64]) -> Vec<u64> {
     let mut out: Vec<u64> = explicit.to_vec();
-    let lower = title.to_lowercase();
-    let words: Vec<&str> = lower.split(|c: char| c.is_whitespace() || c == ':' || c == ',' || c == '(').collect();
     const KW: &[&str] = &["fix", "fixes", "fixed", "close", "closes", "closed", "resolve", "resolves", "resolved"];
-    for pair in words.windows(2) {
-        if KW.contains(&pair[0]) {
-            if let Some(n) = pair[1].strip_prefix('#').and_then(|s| s.parse::<u64>().ok()) {
-                out.push(n);
+    for text in [title, body] {
+        let lower = text.to_lowercase();
+        let words: Vec<&str> = lower.split(|c: char| c.is_whitespace() || c == ':' || c == ',' || c == '(').collect();
+        for pair in words.windows(2) {
+            if KW.contains(&pair[0]) {
+                if let Some(n) = pair[1].strip_prefix('#').and_then(|s| s.parse::<u64>().ok()) {
+                    out.push(n);
+                }
             }
         }
     }
@@ -3856,7 +3898,7 @@ async fn perform_auto_review(
     // against **what the issue asked for**, not just what the change's own message claims.
     let review_intent = {
         let issues = app.store.issues(&key);
-        let acceptance: Vec<String> = closing_issue_numbers(&pr.title, &[])
+        let acceptance: Vec<String> = closing_issue_numbers(&pr.title, &info.intent, &[])
             .into_iter()
             .filter_map(|n| issues.iter().find(|i| i.number == n))
             .map(|i| format!("Closes #{}: {}. {}", i.number, i.title, i.body))
@@ -3947,12 +3989,11 @@ async fn perform_auto_review(
         }
     };
     // "Put the claims through AI to cut down the numbers": an independent agent just read the diff
-    // (the AI reviewer). Every intent claim it did NOT contradict or ask changes on is no longer an
-    // open question for a human — resolve those needs-judgment claims as verified, attributed to the
-    // agent (accountable; a human can still override). A request-changes/reject verdict, or a
-    // contradicted claim, leaves the real problems standing. So after a triage the reviewer sees only
-    // what genuinely remains, not a wall of mechanically-extracted intent restatements.
-    if reviewer.kind == hull_core::ActorKind::Agent && !matches!(verdict, Verdict::RequestChanges | Verdict::Reject) {
+    // (the AI reviewer). Only an **Approve** is an affirmative sign-off that the change does what it
+    // claims — so only then do we resolve the outstanding needs-judgment claims as verified, attributed
+    // to the agent (accountable; a human can still override). A Comment verdict is not sign-off: it
+    // must NOT silently verify every claim. RequestChanges/Reject obviously leave the problems standing.
+    if reviewer.kind == hull_core::ActorKind::Agent && verdict == Verdict::Approve {
         if let Some(l) = &ledger {
             for c in l.claims.iter().filter(|c| c.status == hull_core::reconcile::ClaimStatus::NeedsJudgment) {
                 app.claims.set(&key, &change, &c.id, claims::ClaimResolution {
@@ -4321,7 +4362,8 @@ async fn create_pr(
     // Link the issues this PR closes (from `fixes #N` in the title, or an explicit `closes` list) so
     // they show the incoming PR now and auto-close when it merges.
     let explicit: Vec<u64> = body.get("closes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
-    for num in closing_issue_numbers(&pr.title, &explicit) {
+    let intent_body: String = pr.changes.iter().filter_map(|c| app.repos.change_info(&tenant, &repo, c).map(|i| i.intent)).collect::<Vec<_>>().join("\n");
+    for num in closing_issue_numbers(&pr.title, &intent_body, &explicit) {
         if let Some(mut issue) = app.store.issues(&pr.repo).into_iter().find(|i| i.number == num) {
             if !issue.linked_prs.contains(&pr.id) {
                 issue.linked_prs.push(pr.id.clone());
@@ -4644,5 +4686,30 @@ fn stamp(ev: &mut ActivityEvent, t: u64) {
         | ActivityEvent::Lesson { ts, .. }
         | ActivityEvent::Push { ts, .. }
         | ActivityEvent::Issue { ts, .. } => *ts = t,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_issue_numbers_scans_title_and_body_with_keywords() {
+        // Keyword variants (fixes/closes/resolves) in the title.
+        assert_eq!(closing_issue_numbers("fixes #1 and closes #2", "", &[]), vec![1, 2]);
+        assert_eq!(closing_issue_numbers("resolves #7", "", &[]), vec![7]);
+        // A closing keyword in the BODY (change intent) is honored, not just the title.
+        assert_eq!(closing_issue_numbers("some title", "Closes #12", &[]), vec![12]);
+        // Title + body combine and dedup; the explicit list folds in too.
+        assert_eq!(closing_issue_numbers("fix #3", "also resolves #3 and fixes #4", &[5]), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn closing_issue_numbers_ignores_non_matches() {
+        // A bare "#9" with no keyword, and a keyword with no issue ref, must not match.
+        assert!(closing_issue_numbers("mentions #9 in passing", "nothing here", &[]).is_empty());
+        assert!(closing_issue_numbers("fixes the bug", "closes the loop", &[]).is_empty());
+        // "affixes #1" — the keyword must be its own word, not a suffix of another.
+        assert!(closing_issue_numbers("prefixes #1", "", &[]).is_empty());
     }
 }

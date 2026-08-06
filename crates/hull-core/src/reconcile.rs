@@ -340,7 +340,7 @@ fn judge(text: &str, source: ClaimSource, facts: &ChangeFacts) -> Claim {
         .iter()
         .filter(|op| {
             let opl = op.to_lowercase();
-            words.iter().any(|w| opl.contains(w.as_str()))
+            words.iter().any(|w| word_in(&opl, w))
         })
         .collect();
     matched_ops.sort();
@@ -407,6 +407,15 @@ fn judge(text: &str, source: ClaimSource, facts: &ChangeFacts) -> Claim {
 /// True if `haystack` contains any of the needles.
 fn mentions(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
+}
+
+/// True if `word` appears in `haystack` on **word boundaries** — as a whole alphanumeric/underscore
+/// token, not as a fragment of a larger word. Uses the same tokenizer as [`significant_words`], so a
+/// claim word like "test" matches the op "wrote test" but NOT "latest". Raw `contains` would conflate
+/// the two; word-boundary matching keeps a claim from being "supported" by an unrelated op that merely
+/// spells its letters.
+fn word_in(haystack: &str, word: &str) -> bool {
+    haystack.split(|c: char| !c.is_alphanumeric() && c != '_').any(|tok| tok == word)
 }
 
 /// Content words worth matching against the diff — drops short/stop words.
@@ -589,6 +598,32 @@ mod tests {
         let l = reconcile("c1", "add add_member and accounts_list handlers", "", &facts());
         assert!(l.unclaimed.is_empty(), "both ops are named in the intent");
         assert_eq!(l.phantom(), 0);
+    }
+
+    #[test]
+    fn claim_word_matches_op_on_word_boundary_not_substring() {
+        // "test" must NOT be corroborated by an op that merely contains the letters (e.g. "latest").
+        let mut f = facts();
+        f.ops = vec!["added fn latest_snapshot".into()];
+        f.verification = "unverified".into(); // don't let a verification claim carry it
+        let l = reconcile("c1", "renamed the test helper", "", &f);
+        let claim = l.claims.iter().find(|c| c.text.contains("test")).unwrap();
+        // No op named "test"; only "latest_snapshot" — substring matching would wrongly support it.
+        assert!(!claim.evidence.iter().any(|e| e.kind == "diff" && e.detail.contains("latest")),
+            "the 'test' claim must not match the 'latest_snapshot' op: {:?}", claim.evidence);
+    }
+
+    #[test]
+    fn claim_word_matches_whole_token_op() {
+        // The word-boundary match still corroborates a claim whose word is a real token in the op.
+        // (Avoid identifiers containing "test"/"verif"/etc. so this exercises the op-match path, not
+        // the verification path.)
+        let mut f = facts();
+        f.ops = vec!["added fn snapshot_writer".into()];
+        let l = reconcile("c1", "compute the snapshot_writer", "", &f);
+        let claim = l.claims.iter().find(|c| c.text.contains("snapshot_writer")).unwrap();
+        assert!(claim.evidence.iter().any(|e| e.kind == "diff" && e.detail.contains("snapshot_writer")));
+        assert_eq!(claim.status, ClaimStatus::VerifiedReadOnly);
     }
 
     #[test]

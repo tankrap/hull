@@ -63,16 +63,41 @@ pub trait Store: Send + Sync {
     fn delete_team(&self, id: &str);
 }
 
-/// Match a code-owner glob against a repo-relative path. Supports `dir/**` (prefix), `*.ext`
-/// (extension), and exact paths — enough for `.hull/owners`-style rules.
+/// Match a code-owner / protected-path glob against a repo-relative path. Supports:
+/// - a leading `**/` segment — `**/auth/**` matches an `auth` dir **anywhere** (`auth/x`, `db/auth/x`);
+///   `**/` can match zero leading segments;
+/// - `dir/**` (prefix — everything under `dir`);
+/// - `*.ext` (extension);
+/// - a bare directory or one with a trailing slash — `dir` and `dir/` both mean `dir/**` (this is why
+///   a protected entry like `auth/` matches `auth/login.rs`);
+/// - an exact path.
 pub fn glob_match(glob: &str, path: &str) -> bool {
+    // A leading `**/` matches any number of leading path segments, including none. Try the remainder
+    // at the start and after every segment boundary.
+    if let Some(rest) = glob.strip_prefix("**/") {
+        if glob_match(rest, path) {
+            return true;
+        }
+        let mut idx = 0;
+        while let Some(slash) = path[idx..].find('/') {
+            idx += slash + 1;
+            if glob_match(rest, &path[idx..]) {
+                return true;
+            }
+        }
+        return false;
+    }
     if let Some(dir) = glob.strip_suffix("/**") {
         return path == dir || path.starts_with(&format!("{dir}/"));
     }
     if let Some(ext) = glob.strip_prefix("*.") {
         return path.ends_with(&format!(".{ext}"));
     }
-    path == glob || path.starts_with(&format!("{glob}/"))
+    // Normalize a trailing slash away (`dir/` ⇒ `dir`), then treat a bare directory as a prefix match
+    // — `dir` covers `dir` itself and everything under `dir/`. An exact file path still matches via the
+    // `path == dir` arm.
+    let dir = glob.strip_suffix('/').unwrap_or(glob);
+    path == dir || path.starts_with(&format!("{dir}/"))
 }
 
 /// A thread-safe in-memory [`Store`] for the scaffold and tests.
@@ -542,6 +567,38 @@ mod tests {
             resolved_by: None,
             created_unix: 0,
         }
+    }
+
+    #[test]
+    fn glob_match_dir_prefix() {
+        // A bare directory or one with a trailing slash both mean "everything under it".
+        assert!(glob_match("auth", "auth/login.rs"));
+        assert!(glob_match("auth/", "auth/login.rs"));
+        assert!(glob_match("auth/", "auth")); // the directory itself
+        assert!(!glob_match("auth/", "authz/login.rs")); // not a prefix at a boundary
+        assert!(!glob_match("auth/", "src/auth/login.rs")); // prefix only, not "anywhere"
+    }
+
+    #[test]
+    fn glob_match_extension() {
+        assert!(glob_match("*.rs", "src/main.rs"));
+        assert!(!glob_match("*.rs", "src/main.py"));
+    }
+
+    #[test]
+    fn glob_match_exact() {
+        assert!(glob_match("src/main.rs", "src/main.rs"));
+        assert!(!glob_match("src/main.rs", "src/lib.rs"));
+    }
+
+    #[test]
+    fn glob_match_leading_globstar() {
+        // `**/auth/**` matches an `auth` directory at ANY depth, including the root.
+        assert!(glob_match("**/auth/**", "auth/login.rs"));
+        assert!(glob_match("**/auth/**", "db/auth/login.rs"));
+        assert!(glob_match("**/auth/**", "a/b/c/auth/x.rs"));
+        assert!(!glob_match("**/auth/**", "src/main.rs"));
+        assert!(!glob_match("**/migrations/**", "src/migration.rs")); // boundary, not substring
     }
 
     #[test]
