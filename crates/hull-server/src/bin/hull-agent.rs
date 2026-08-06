@@ -20,11 +20,14 @@ async fn main() {
     let hull = flag(&args, "--hull").unwrap_or_else(|| "127.0.0.1:8931".into());
     let tenant = flag(&args, "--tenant").unwrap_or_else(|| "local".into());
     let repo = flag(&args, "--repo").unwrap_or_else(|| "repo".into());
+    // Optional daemon token (matches the server's `HULL_INGRESS_TOKEN`): `--token` or env. Omitted →
+    // no `token` field in the header, which the server accepts when it has no token configured.
+    let token = flag(&args, "--token").or_else(|| std::env::var("HULL_INGRESS_TOKEN").ok()).filter(|t| !t.is_empty());
 
     eprintln!("hull-agent: {tenant}/{repo}  keeld={keeld}  hull={hull}");
     let mut backoff = 1u64;
     loop {
-        match run(&keeld, &hull, &tenant, &repo).await {
+        match run(&keeld, &hull, &tenant, &repo, token.as_deref()).await {
             Ok(()) => backoff = 1,
             Err(e) => eprintln!("hull-agent: link down ({e})"),
         }
@@ -33,7 +36,7 @@ async fn main() {
     }
 }
 
-async fn run(keeld: &str, hull: &str, tenant: &str, repo: &str) -> Result<(), BoxError> {
+async fn run(keeld: &str, hull: &str, tenant: &str, repo: &str, token: Option<&str>) -> Result<(), BoxError> {
     // 1. subscribe to the local keeld's coordination stream
     let client = keel_net::Client::connect(keeld.parse()?).await?;
     let mut events = client.subscribe().await?;
@@ -44,8 +47,11 @@ async fn run(keeld: &str, hull: &str, tenant: &str, repo: &str) -> Result<(), Bo
     let conn = endpoint.connect(hull.parse()?, "localhost")?.await?;
     let mut send = conn.open_uni().await?;
 
-    // 3. header, then forward every event verbatim
-    let header = serde_json::json!({ "tenant": tenant, "repo": repo });
+    // 3. header (with the daemon token when configured), then forward every event verbatim
+    let mut header = serde_json::json!({ "tenant": tenant, "repo": repo });
+    if let Some(tok) = token {
+        header["token"] = serde_json::Value::String(tok.to_string());
+    }
     write_frame(&mut send, &serde_json::to_vec(&header)?).await?;
     eprintln!("hull-agent: linked {tenant}/{repo} → {hull}");
 
