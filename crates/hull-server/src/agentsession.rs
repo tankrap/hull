@@ -31,9 +31,20 @@ pub fn sessions_root() -> PathBuf {
     base.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("agent-sessions")
 }
 
+/// Filename inside a Claude bundle holding the captured long-lived OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`).
+/// Codex bundles have no such file — they hold the CLI's own `auth.json` instead.
+pub const OAUTH_TOKEN_FILE: &str = "hull-oauth-token";
+
 /// The **plaintext** login-staging directory for a session (exists only between provision and seal).
 pub fn dir_for(session: &str) -> PathBuf {
     sessions_root().join(session)
+}
+
+/// Read the stored Claude OAuth token from an open (decrypted) bundle dir, if present.
+pub fn read_oauth_token(dir: &Path) -> Option<String> {
+    let t = std::fs::read_to_string(dir.join(OAUTH_TOKEN_FILE)).ok()?;
+    let t = t.trim().to_string();
+    (!t.is_empty()).then_some(t)
 }
 
 /// The **encrypted** at-rest bundle path.
