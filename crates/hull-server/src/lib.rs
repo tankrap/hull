@@ -47,6 +47,55 @@ use serde_json::{json, Value};
 use webauthn_rs::prelude::{Passkey, PublicKeyCredential, RegisterPublicKeyCredential, Uuid};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
+
+// ── HTTP hardening knobs ──────────────────────────────────────────────────────────────────────────
+/// Max time any single non-streaming API request may run before it's aborted (408). The SSE feed,
+/// git smart-HTTP, and the tar download are exempt (they legitimately run long / stream).
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Request-body cap for the normal JSON API surface. git push (packfiles) and the tar endpoint are
+/// exempt — they carry legitimately large bodies. A few MiB is ample for every JSON handler.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Global cap on concurrently in-flight (non-streaming) requests — coarse backpressure so a flood
+/// can't spawn unbounded work. High enough to never bind a single-user dogfood.
+const MAX_CONCURRENT_REQUESTS: usize = 1024;
+/// Outbound-HTTP timeouts (CI dispatch / mirror / GitHub) so a hung endpoint can't pin a task.
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
+const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Count of handler panics caught by the panic guard (observability only).
+static PANIC_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// One shared, timeout-bounded outbound HTTP client, built once and cloned (a `reqwest::Client` is
+/// internally ref-counted, so clones share the pool). Without connect + read timeouts a hung CI or
+/// GitHub endpoint would pin the calling task forever.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("hull: WARN could not build the configured HTTP client ({e}); using an un-timed default");
+            reqwest::Client::new()
+        })
+}
+
+/// The panic guard's response: log + count the panic and return a plain 500, instead of letting the
+/// worker unwind and reset the connection.
+fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    let detail = err
+        .downcast_ref::<String>()
+        .map(|s| s.as_str())
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic payload>");
+    let n = PANIC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    eprintln!("hull: ERROR handler panicked (count={n}): {detail}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+}
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
@@ -217,7 +266,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         review_cache: Arc::new(reviewcache::ReviewCache::from_env()),
         autonomy: Arc::new(autonomy::AutonomyStore::from_env()),
         ci_config: Arc::new(ci::CiConfig::from_env()),
-        http: reqwest::Client::new(),
+        http: build_http_client(),
         public_url: std::env::var("HULL_PUBLIC_URL").unwrap_or_else(|_| "http://127.0.0.1:8930".into()).into(),
         mirror: Arc::new(mirror::MirrorLedger::from_env()),
         webauthn: Arc::new(passkey::build()),
@@ -345,12 +394,36 @@ fn backfill_members(store: &dyn Store) {
     }
 }
 
+/// `/health` — 200 `ok` normally, 503 `degraded` when persistence has failed (see
+/// [`hull_core::PERSISTENCE_DEGRADED`]) so an orchestrator's health probe pulls the instance out of
+/// rotation instead of serving from state that has silently diverged from disk.
+async fn health() -> Response {
+    if hull_core::persistence_degraded() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "degraded: persistence is failing — in-memory state has diverged from disk",
+        )
+            .into_response();
+    }
+    (StatusCode::OK, "ok").into_response()
+}
+
 fn make_router(app: App) -> Router {
     eprintln!("hull-server: hosting keel repos under {}", app.repos.root().display());
-    Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/api/home", get(home))
+    // Long-lived / large-body routes are held OUT of the timeout, body-cap, and concurrency layers:
+    // the SSE feed streams indefinitely (a 30s timeout or a held concurrency permit would kill it and
+    // exhaust the pool), git smart-HTTP carries large packfiles on push, and the tar download can be
+    // large/slow. They still get the global panic guard (applied to the merged router below).
+    let streaming = Router::new()
         .route("/api/feed", get(feed))
+        .route("/api/repos/:tenant/:repo/tree/:tree/tar", get(tree_archive))
+        .route("/:tenant/:repo/info/refs", get(info_refs_handler))
+        .route("/:tenant/:repo/git-upload-pack", post(upload_pack_handler))
+        .route("/:tenant/:repo/git-receive-pack", post(receive_pack_handler));
+
+    let api = Router::new()
+        .route("/health", get(health))
+        .route("/api/home", get(home))
         .route("/api/actors", get(actors_list).post(register_actor))
         .route("/api/capabilities", get(capabilities))
         .route("/api/actors/:id/revoke", post(revoke_actor))
@@ -429,7 +502,6 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/change/:id/semantic", get(change_semantic))
         .route("/api/repos/:tenant/:repo/change/:id/ledger", get(change_ledger))
         .route("/api/repos/:tenant/:repo/change/:id/claims/:claim/resolve", post(resolve_claim))
-        .route("/api/repos/:tenant/:repo/tree/:tree/tar", get(tree_archive))
         .route("/api/repos/:tenant/:repo/change/:id/check", post(run_check_handler))
         .route("/api/repos/:tenant/:repo/change/:id/ci-result", post(ci_result))
         .route("/api/repos/:tenant/:repo/ci-config", get(get_ci_config).put(set_ci_config))
@@ -443,10 +515,16 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
-        // git smart-HTTP: host N keel repos at /{tenant}/{repo} (clone / fetch / push).
-        .route("/:tenant/:repo/info/refs", get(info_refs_handler))
-        .route("/:tenant/:repo/git-upload-pack", post(upload_pack_handler))
-        .route("/:tenant/:repo/git-receive-pack", post(receive_pack_handler))
+        // The normal API surface gets the request-body cap, per-request timeout, and a global
+        // concurrency ceiling. (Applied only here so the `streaming` routes stay exempt.)
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+        .layer(GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS));
+
+    api.merge(streaming)
+        // The panic guard wraps EVERY route (streaming included): a handler panic becomes a logged,
+        // counted 500 instead of a reset connection.
+        .layer(CatchPanicLayer::custom(handle_panic))
         .with_state(app)
 }
 
@@ -481,6 +559,9 @@ fn ingress_addr() -> Option<std::net::SocketAddr> {
 /// Run the server. `register_plugins` is the open-core hook: core built-ins are installed first,
 /// then this closure runs to add any extra (hosted) plugins.
 pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
+    // Fail fast in the prod profile: refuse to boot with an unsafe/missing security config rather than
+    // silently running open. A no-op unless `HULL_PROFILE=prod` / `HULL_PROD=1` is set (the default).
+    enforce_prod_profile();
     let registry = plugins::build_registry(register_plugins);
     eprintln!(
         "hull-server: {} plugin(s) loaded: {}",
@@ -491,6 +572,8 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     let activity_path = data_path().with_file_name("activity.json");
     let hub = Arc::new(ActivityHub::with_persistence(activity_path));
     wire_sources(&hub);
+    // Kept for a final flush on graceful shutdown (the timer below only flushes every 5s).
+    let hub_shutdown = hub.clone();
     {
         // Flush the ranking to disk on a timer (crash-only; the timer is the durability point).
         let hub_flush = hub.clone();
@@ -513,7 +596,93 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     let router = make_router(build_app(registry, hub, store));
     let listener = tokio::net::TcpListener::bind(&opts.addr).await.expect("bind");
     eprintln!("hull-server listening on http://{}", opts.addr);
-    axum::serve(listener, router).await.expect("serve");
+    // Graceful shutdown on SIGTERM/SIGINT: stop accepting, let in-flight requests drain, then flush
+    // the activity ranking one last time so a redeploy doesn't drop the last (≤5s) window of events.
+    axum::serve(listener, router).with_graceful_shutdown(shutdown_signal()).await.expect("serve");
+    eprintln!("hull-server: draining complete — flushing activity hub before exit");
+    hub_shutdown.flush();
+}
+
+/// Resolve when the process is asked to stop: SIGINT (Ctrl-C) or SIGTERM (the orchestrator's stop
+/// signal on a redeploy). On non-Unix, only Ctrl-C is wired.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    eprintln!("hull-server: shutdown signal received");
+}
+
+// ── prod-profile fail-fast config validation ─────────────────────────────────────────────────────
+
+/// Whether the prod profile is active: `HULL_PROFILE=prod` or a truthy `HULL_PROD`. Off by default,
+/// so nothing below changes behavior for the dogfood.
+fn prod_profile_active() -> bool {
+    let profile_prod = std::env::var("HULL_PROFILE").map(|v| v.trim().eq_ignore_ascii_case("prod")).unwrap_or(false);
+    let prod_flag = std::env::var("HULL_PROD")
+        .map(|v| {
+            let v = v.trim();
+            ["1", "true", "on", "yes", "enforce"].iter().any(|t| v.eq_ignore_ascii_case(t))
+        })
+        .unwrap_or(false);
+    profile_prod || prod_flag
+}
+
+/// Pure check of the security-critical config for a prod deployment. Returns the list of problems
+/// (empty ⇒ safe to start). Kept pure over its inputs (not env) so it is straightforward to unit-test.
+fn prod_config_problems(git_auth_enforced: bool, ingress_token: Option<&str>, session_key: Option<&str>, demo_mode: bool) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !git_auth_enforced {
+        problems.push("HULL_GIT_AUTH must be `enforce` (anonymous git push/fetch is unsafe in prod)".to_string());
+    }
+    if ingress_token.map(|t| t.trim().is_empty()).unwrap_or(true) {
+        problems.push("HULL_INGRESS_TOKEN must be set (an unauthenticated coordination ingress is unsafe in prod)".to_string());
+    }
+    // No on-disk key fallback in prod: the AEAD session key must be supplied explicitly (64 hex chars).
+    let key_ok = session_key
+        .map(|k| {
+            let k = k.trim();
+            k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())
+        })
+        .unwrap_or(false);
+    if !key_ok {
+        problems.push("HULL_SESSION_KEY must be set to 64 hex chars (no on-disk key fallback in prod)".to_string());
+    }
+    if demo_mode {
+        problems.push("HULL_DEMO_MODE must be off in prod (it enables a published-key owner backdoor)".to_string());
+    }
+    problems
+}
+
+/// Enforce the prod profile's requirements at startup. A no-op unless the prod profile is active
+/// (default). When active, any missing/unsafe setting aborts startup with a clear message rather than
+/// booting an insecure server.
+fn enforce_prod_profile() {
+    if !prod_profile_active() {
+        return;
+    }
+    let ingress = std::env::var("HULL_INGRESS_TOKEN").ok();
+    let session = std::env::var("HULL_SESSION_KEY").ok();
+    let problems = prod_config_problems(git_auth_enforced(), ingress.as_deref(), session.as_deref(), demo_mode_enabled());
+    if !problems.is_empty() {
+        eprintln!("hull: FATAL refusing to start under the prod profile — insecure configuration:");
+        for p in &problems {
+            eprintln!("  - {p}");
+        }
+        panic!("hull: prod-profile config validation failed ({} problem(s)); see the log above", problems.len());
+    }
+    eprintln!("hull-server: prod-profile security config validated");
 }
 
 /// Home for a tenant: `GET /api/home?tenant=acme` (defaults to `local`). The tenant will come from
@@ -5425,6 +5594,57 @@ mod tests {
 
     // Serialize the env-var writes that isolate each `App`'s file-backed side stores under a fresh HOME.
     static MERGE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn demo_owner_backdoor_is_gated_off_by_default() {
+        // Serialize the HULL_DEMO_MODE env mutation against the other env-touching tests.
+        let _g = MERGE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let demo_id = identity::human_from_secret("demo", DEMO_OWNER_SECRET).expect("demo id").actor.id;
+
+        // Default (unset): demo mode OFF — the published-key demo owner is neither minted nor granted
+        // ownership of any account. This is the whole point: reading the source can't make you owner.
+        std::env::remove_var("HULL_DEMO_MODE");
+        assert!(!demo_mode_enabled(), "demo mode is OFF by default");
+        let store = InMemory::new();
+        seed_if_empty(&store);
+        assert!(store.actor(&demo_id).is_none(), "demo actor is not minted when demo mode is off");
+        assert!(
+            store.accounts().iter().all(|a| !a.members.iter().any(|m| m.actor == demo_id)),
+            "demo owner must NOT be a member of any account when demo mode is off",
+        );
+
+        // Explicit opt-in: demo mode ON — the demo owner IS added as Owner on every account (the dev
+        // flow still works when you ask for it).
+        std::env::set_var("HULL_DEMO_MODE", "on");
+        assert!(demo_mode_enabled(), "truthy HULL_DEMO_MODE turns demo mode on");
+        let store2 = InMemory::new();
+        seed_if_empty(&store2);
+        assert!(
+            store2.accounts().iter().all(|a| a.members.iter().any(|m| m.actor == demo_id && matches!(m.role, Role::Owner))),
+            "demo owner is Owner on every account when demo mode is on",
+        );
+        std::env::remove_var("HULL_DEMO_MODE");
+    }
+
+    #[test]
+    fn prod_config_validation_flags_missing_and_unsafe_settings() {
+        let key = "a".repeat(64); // a valid 64-hex session key
+        // A complete, safe prod config passes with zero problems.
+        assert!(
+            prod_config_problems(true, Some("ingress-tok"), Some(&key), false).is_empty(),
+            "a complete, safe config must pass",
+        );
+        // Each requirement, violated in isolation, is caught.
+        assert!(!prod_config_problems(false, Some("t"), Some(&key), false).is_empty(), "anonymous git is rejected");
+        assert!(!prod_config_problems(true, None, Some(&key), false).is_empty(), "missing ingress token is rejected");
+        assert!(!prod_config_problems(true, Some("  "), Some(&key), false).is_empty(), "blank ingress token is rejected");
+        assert!(!prod_config_problems(true, Some("t"), None, false).is_empty(), "missing session key is rejected");
+        assert!(!prod_config_problems(true, Some("t"), Some("tooshort"), false).is_empty(), "a short session key is rejected");
+        assert!(!prod_config_problems(true, Some("t"), Some(&"z".repeat(64)), false).is_empty(), "a non-hex session key is rejected");
+        assert!(!prod_config_problems(true, Some("t"), Some(&key), true).is_empty(), "demo mode on is rejected in prod");
+        // Fail-fast reports every problem at once, not just the first.
+        assert_eq!(prod_config_problems(false, None, None, true).len(), 4, "all four problems reported together");
+    }
 
     fn build_test_app(tag: &str) -> (App, std::path::PathBuf) {
         let g = MERGE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
