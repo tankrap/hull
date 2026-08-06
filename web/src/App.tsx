@@ -1624,6 +1624,11 @@ export function App() {
   const [tab, setTab] = useState<RepoTab>(() => parseRoute(location.pathname).tab);
   useEffect(() => { if (tab === "settings") loadRepoSettings(); }, [tab, tenant, issueRepo]);
   const [issueView, setIssueView] = useState<"list" | "board">("list");
+  // Mobile-only: reveal the (desktop-always-visible) filter input via a small toggle.
+  const [filterOpen, setFilterOpen] = useState(false);
+  // Kanban drag-to-restatus: which issue is being dragged and which column it's hovering.
+  const [dragIssue, setDragIssue] = useState<number | null>(null);
+  const [dragOverCol, setDragOverCol] = useState<string | null>(null);
   type StateFilter = "open" | "closed" | "all";
   const [issueFilter, setIssueFilter] = useState<StateFilter>("open");
   const [prFilter, setPrFilter] = useState<StateFilter>("open");
@@ -1663,6 +1668,27 @@ export function App() {
     });
     if (res.ok) loadIssues();
     else uiAlert(await apiError(res));
+  };
+  // Board column → the issue action that lands a card in it. Every column maps to a supported
+  // transition (reopen, or close with a reason), so every column is a valid drop target.
+  const boardColAction = (k: string): [string, Record<string, unknown>] | null =>
+    k === "open" ? ["reopen", {}]
+      : k === "completed" ? ["close", { reason: "completed" }]
+      : k === "not_planned" ? ["close", { reason: "not_planned" }]
+      : k === "cancelled" ? ["close", { reason: "cancelled" }]
+      : k === "duplicate" ? ["close", { reason: "duplicate" }]
+      : null;
+  const dropIssueOnCol = (colKey: string) => {
+    const num = dragIssue;
+    setDragOverCol(null);
+    setDragIssue(null);
+    if (num == null) return;
+    const it = issues.find((i) => i.number === num);
+    if (!it) return;
+    const cur = it.status.state === "open" ? "open" : it.status.reason;
+    if (cur === colKey) return; // same column — no-op
+    const m = boardColAction(colKey);
+    if (m) issueAction(num, m[0], m[1]);
   };
   // Issue comment composer mode per target (Comment / Close with comment / Close as not planned / Reopen).
   const [issueMode, setIssueMode] = useState<Record<string, string>>({});
@@ -2971,12 +2997,14 @@ export function App() {
                         ))}
                       </div>
                       <div className="w-[240px] hidden sm:block"><SearchInput placeholder="Filter issues" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>
+                      <button className={`sm:hidden inline-flex items-center gap-1.5 px-2.5 py-1 rounded-ctl-sm border border-rule text-[13px] transition-colors ${filterOpen || q ? "text-ink border-ctl" : "text-muted hover:text-ink"}`} aria-expanded={filterOpen} onClick={() => setFilterOpen((v) => !v)}><IcoSearch size={13} />Filter</button>
                     </div>
                     <div className="flex items-center gap-2.5">
                       <Segmented items={["List", "Board"]} value={issueView === "list" ? 0 : 1} onChange={(i: number) => setIssueView(i === 0 ? "list" : "board")} />
                       {canAct && <Button size="sm" variant="ghost" className="inline-flex items-center gap-1.5" onClick={() => setNewIssueOpen(true)}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>New issue</Button>}
                     </div>
                   </div>
+                  {filterOpen && <div className="sm:hidden -mt-3 mb-5"><SearchInput placeholder="Filter issues" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>}
                   {issueView === "list" ? (
                     <div>
                       {issues.length === 0 && <div className="py-8 text-[13px] text-muted">no issues yet — open one with the New issue button</div>}
@@ -3024,17 +3052,33 @@ export function App() {
                         { k: "duplicate", label: "Duplicate" },
                       ].map((col) => {
                         const inCol = issues.filter((i) => (i.status.state === "open" ? "open" : i.status.reason) === col.k && matchQ(`${i.title} ${i.body} #${i.number} ${i.labels.join(" ")}`));
-                        if (col.k !== "open" && inCol.length === 0) return null;
+                        // Empty non-open columns are hidden to avoid clutter, but stay
+                        // rendered while a drag is in progress so they remain valid drop
+                        // targets (e.g. dragging an open card onto Completed to close it).
+                        if (col.k !== "open" && inCol.length === 0 && !dragIssue) return null;
+                        // A card can be dropped here only when the viewer can change status and the
+                        // column maps to a real transition (all current columns do).
+                        const droppable = canAct && !!boardColAction(col.k);
                         return (
-                          <div key={col.k} className="grid gap-2 content-start">
+                          <div key={col.k} className={`grid gap-2 content-start rounded-ctl transition-colors ${dragOverCol === col.k && droppable ? "bg-steel-wash ring-1 ring-steel-text/40" : ""}`}
+                            onDragOver={droppable ? (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; } : undefined}
+                            onDragEnter={droppable ? () => setDragOverCol(col.k) : undefined}
+                            onDragLeave={droppable ? (e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOverCol(null); } : undefined}
+                            onDrop={droppable ? (e) => { e.preventDefault(); dropIssueOnCol(col.k); } : undefined}>
                             <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted flex gap-1.5 mb-1">{col.label} <span className="text-faint">{inCol.length}</span></div>
                             {inCol.map((it) => (
-                              <button key={it.number} className="text-left bg-surface border border-rule rounded-ctl p-3 cursor-pointer hover:border-ctl transition-colors" onClick={() => navigate(`${repoBase()}/issues/${it.number}`)}>
+                              <button key={it.number} draggable={canAct}
+                                onDragStart={canAct ? (e) => { e.dataTransfer.effectAllowed = "move"; setDragIssue(it.number); } : undefined}
+                                onDragEnd={canAct ? () => { setDragIssue(null); setDragOverCol(null); } : undefined}
+                                className={`text-left bg-surface border border-rule rounded-ctl p-3 cursor-pointer hover:border-ctl transition-colors ${canAct ? "active:cursor-grabbing" : ""} ${dragIssue === it.number ? "opacity-50" : ""}`} onClick={() => navigate(`${repoBase()}/issues/${it.number}`)}>
                                 <div className="text-xs text-faint tabular-nums">#{it.number}</div>
                                 <div className="text-[13.5px] font-medium mt-0.5 leading-snug">{it.title}</div>
                                 {it.assignees.length > 0 && <div className="text-[11.5px] text-muted mt-1.5 inline-flex items-center gap-1.5"><Ico size={11} path={<><circle cx="12" cy="8" r="3.5" /><path d="M5 21a7 7 0 0 1 14 0" /></>} />{it.assignees.map((id) => handleOf(id)).join(", ")}</div>}
                               </button>
                             ))}
+                            {inCol.length === 0 && dragIssue && droppable && (
+                              <div className="text-[12px] text-muted border border-dashed border-rule rounded-ctl p-3 text-center pointer-events-none">Drop to mark {col.label}</div>
+                            )}
                           </div>
                         );
                       })}
@@ -3053,7 +3097,9 @@ export function App() {
                       })}
                     </div>
                     <div className="w-[240px] hidden sm:block"><SearchInput placeholder="Filter pull requests" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>
+                    <button className={`sm:hidden inline-flex items-center gap-1.5 px-2.5 py-1 rounded-ctl-sm border border-rule text-[13px] transition-colors ${filterOpen || q ? "text-ink border-ctl" : "text-muted hover:text-ink"}`} aria-expanded={filterOpen} onClick={() => setFilterOpen((v) => !v)}><IcoSearch size={13} />Filter</button>
                   </div>
+                  {filterOpen && <div className="sm:hidden -mt-3 mb-5"><SearchInput placeholder="Filter pull requests" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>}
                   <div>
                     {prs.length === 0 && <div className="py-8 text-[13px] text-muted">no pull requests yet — agents open these when they push a change for review</div>}
                     {[...prs].filter((p) => prFilter === "all" || (prFilter === "open" ? p.state === "open" : p.state !== "open")).filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
@@ -3406,6 +3452,8 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchHit[] | null>(null);
   const [allPaths, setAllPaths] = useState<string[] | null>(null);
+  // Below md the tree is a toggled drawer above the viewer; above md it's the fixed left column.
+  const [treeOpen, setTreeOpen] = useState(false);
 
   useEffect(() => {
     fetch(`${base}/branches`, { headers: authHeaders() }).then((r) => r.json()).then((d) => {
@@ -3484,8 +3532,10 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
           </div>
         </Card>
       ) : (
-        <div className="grid grid-cols-[minmax(190px,270px)_1fr] gap-4 items-start">
-          <Card className="overflow-hidden">
+        <div className="grid grid-cols-1 md:grid-cols-[minmax(190px,270px)_1fr] gap-4 items-start">
+          {/* Below md the tree is a toggled drawer; the button collapses (md:hidden) so the desktop split is unchanged. */}
+          <button className={`md:hidden inline-flex items-center gap-1.5 w-fit px-3 py-1.5 rounded-ctl border text-[13px] transition-colors ${treeOpen ? "text-ink border-ctl" : "text-muted border-rule hover:text-ink"}`} aria-expanded={treeOpen} onClick={() => setTreeOpen((v) => !v)}><FileIcon />Files</button>
+          <Card className={`overflow-hidden max-h-[55vh] overflow-y-auto md:max-h-none ${treeOpen ? "" : "hidden md:block"}`}>
             <SectionHeader label="Files" right={<span className="text-[11.5px] text-faint truncate max-w-[110px]">{branch}</span>} />
             <div className="py-1.5 pl-1.5 pr-1">
               {allPaths === null ? (
@@ -3494,7 +3544,7 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
                 <div className="px-3 py-4 text-[12.5px] text-muted">No files.</div>
               ) : (
                 <Suspense fallback={<div className="px-3 py-4 text-[12.5px] text-muted">Loading tree…</div>}>
-                  <RepoTree paths={allPaths} selected={file?.path ?? null} onSelect={openFile} />
+                  <RepoTree paths={allPaths} selected={file?.path ?? null} onSelect={(p: string) => { openFile(p); setTreeOpen(false); }} />
                 </Suspense>
               )}
             </div>
