@@ -7,9 +7,9 @@ const RepoTree = lazy(() => import("./RepoTree"));
 import * as ed from "@noble/ed25519";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
-import { SearchInput, Switch, Select } from "./ui/Field";
+import { SearchInput, Switch, Select, TextField } from "./ui/Field";
 import { StatusBadge, Tag } from "./ui/Badge";
-import { Drawer, Dialog, PromptModal } from "./ui/Overlay";
+import { Drawer, Dialog, PromptModal, ConfirmModal } from "./ui/Overlay";
 import { SemanticDiff, OldTok, NewTok } from "./ui/SemanticDiff";
 import { createPasskey, getPasskey } from "./webauthn";
 import { hlToHtml, wordDiff, type Seg } from "./highlight";
@@ -351,6 +351,96 @@ function LabelEditor({ labels, onChange }: { labels: RepoLabel[]; onChange: (l: 
         </div>
       </div>
     </div>
+  );
+}
+
+// Editor for a repo's code-owner rules (`glob → owners`), modeled on the default-reviewers editor.
+// Holds a local draft synced from the server set; Save persists the whole rule set at once (the
+// endpoint replaces, not merges). An empty set shows an actionable "add a rule" affordance, not dead
+// text.
+type OwnerRule = { glob: string; owners: string[] };
+function CodeOwnersEditor({ rules, actors, handleOf, onSave }: { rules: OwnerRule[]; actors: Actor[]; handleOf: (id: string) => string; onSave: (rules: OwnerRule[]) => Promise<void> }) {
+  const [draft, setDraft] = useState<OwnerRule[]>(rules);
+  const [newGlob, setNewGlob] = useState("");
+  const [newOwner, setNewOwner] = useState("");
+  const [saving, setSaving] = useState(false);
+  // Re-sync when the server set changes (settings reload / repo switch).
+  useEffect(() => { setDraft(rules); }, [rules]);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(rules);
+  const setRow = (i: number, patch: Partial<OwnerRule>) => setDraft((d) => d.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const addRow = () => {
+    const g = newGlob.trim();
+    if (!g) return;
+    setDraft((d) => [...d, { glob: g, owners: newOwner ? [newOwner] : [] }]);
+    setNewGlob(""); setNewOwner("");
+  };
+  const save = async () => { setSaving(true); try { await onSave(draft.map((r) => ({ glob: r.glob.trim(), owners: r.owners })).filter((r) => r.glob)); } finally { setSaving(false); } };
+  const ownerCandidates = (row: OwnerRule) => actors.filter((a) => !row.owners.includes(a.id)).map(actorOption);
+  return (
+    <div className="grid gap-3">
+      {draft.length === 0 && <span className="text-[12.5px] text-muted">No code-owner rules yet. Add one below to auto-notify owners when matching paths change.</span>}
+      {draft.map((r, i) => (
+        <div key={i} className="grid gap-2 border border-rule2 rounded-ctl p-3 bg-paper/40">
+          <div className="flex items-center gap-2">
+            <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-mono text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint flex-1 min-w-0" placeholder="path glob, e.g. crates/** or *.rs" value={r.glob} onChange={(e) => setRow(i, { glob: e.target.value })} />
+            <button className="text-muted hover:text-fault-text cursor-pointer px-1 flex-none" title="remove rule" onClick={() => setDraft((d) => d.filter((_, j) => j !== i))}>×</button>
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {r.owners.map((o) => (
+              <span key={o} className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-chip bg-paper border border-rule">
+                {handleOf(o)}
+                <button className="text-muted hover:text-fault-text cursor-pointer" onClick={() => setRow(i, { owners: r.owners.filter((x) => x !== o) })}>×</button>
+              </span>
+            ))}
+            {r.owners.length === 0 && <span className="text-[12px] text-faint">no owners</span>}
+            <div className="max-w-[220px]"><Picker size="sm" value="" placeholder="Add an owner…" onChange={(v) => { if (v && !r.owners.includes(v)) setRow(i, { owners: [...r.owners, v] }); }} options={ownerCandidates(r)} /></div>
+          </div>
+        </div>
+      ))}
+      <div className="flex items-center gap-2 flex-wrap border-t border-rule3 pt-3">
+        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-mono text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint w-[220px]" placeholder="add a rule: path glob…" value={newGlob} onChange={(e) => setNewGlob(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addRow(); }} />
+        <div className="w-[200px]"><Picker size="sm" block value={newOwner} placeholder="owner (optional)…" onChange={setNewOwner} options={actors.map(actorOption)} /></div>
+        <Button size="sm" variant="secondary" disabled={!newGlob.trim()} onClick={addRow}>Add rule</Button>
+        <Button size="sm" className="ml-auto" disabled={!dirty || saving} onClick={save}>{saving ? "Saving…" : "Save code owners"}</Button>
+      </div>
+    </div>
+  );
+}
+
+// Repo "Danger zone": rename (text field + confirm) and delete (typed-confirmation). Owner/admin only
+// — the server enforces the same gate, this UI is just the front door. Both callbacks hit the API and
+// navigate on success.
+function DangerZone({ repo, onRename, onDelete }: { repo: string; onRename: (name: string) => Promise<void>; onDelete: () => Promise<void> }) {
+  const [name, setName] = useState(repo);
+  const [renaming, setRenaming] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  useEffect(() => { setName(repo); }, [repo]);
+  const trimmed = name.trim();
+  const doRename = async () => { if (!trimmed || trimmed === repo) return; setRenaming(true); try { await onRename(trimmed); } finally { setRenaming(false); } };
+  return (
+    <Card className="!border-fault/50">
+      <div className="px-5 py-3.5 border-b border-fault/25 bg-fault/[0.04]">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-fault-text">Danger zone</span>
+      </div>
+      <div className="px-5 py-4 grid gap-5">
+        <div className="flex items-end justify-between gap-4 flex-wrap">
+          <div className="min-w-[240px] flex-1">
+            <div className="text-[13.5px] font-medium">Rename repository</div>
+            <div className="text-[12.5px] text-muted mb-2">Changes the repo's URL and clone path. Existing voyages, issues, and reviews move with it.</div>
+            <TextField value={name} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setName(e.target.value)} placeholder="new name" className="max-w-[280px]" />
+          </div>
+          <Button size="sm" variant="secondary" disabled={renaming || !trimmed || trimmed === repo} onClick={doRename}>{renaming ? "Renaming…" : "Rename"}</Button>
+        </div>
+        <div className="flex items-center justify-between gap-4 flex-wrap border-t border-rule3 pt-4">
+          <div className="min-w-[240px] flex-1">
+            <div className="text-[13.5px] font-medium">Delete this repository</div>
+            <div className="text-[12.5px] text-muted">Permanently removes the repo, its voyages, issues, reviews, comments, and hosted git store. This cannot be undone.</div>
+          </div>
+          <Button size="sm" variant="destructive" onClick={() => setConfirmDelete(true)}>Delete repository</Button>
+        </div>
+      </div>
+      <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} title="Delete this repository?" body={<>This permanently deletes <b>{repo}</b> and everything in it. Type the repo name to confirm.</>} confirmId={repo} actionLabel="Delete forever" onConfirm={() => { setConfirmDelete(false); onDelete(); }} />
+    </Card>
   );
 }
 
@@ -1470,6 +1560,26 @@ export function App() {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
     if (!res.ok) return uiAlert(await apiError(res));
     setRepoSettings(await res.json());
+  };
+  // Persist the full code-owner rule set (the endpoint replaces, not merges).
+  const saveOwners = async (rules: OwnerRule[]) => {
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/owners`, { method: "POST", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify({ rules, actor: actingAs }) });
+    if (!res.ok) return uiAlert(await apiError(res));
+    const d = await res.json();
+    setOwnerRules(d.owners ?? rules);
+  };
+  // Danger zone: rename re-keys the repo — hard-navigate to the new URL so no stale repo-name state
+  // lingers. Delete removes it and returns to the owning org's page.
+  const renameRepo = async (newName: string) => {
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}`, { method: "PATCH", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify({ name: newName }) });
+    if (!res.ok) { uiAlert(await apiError(res)); return; }
+    const d = await res.json();
+    window.location.href = `/${encodeURIComponent(tenant)}/${encodeURIComponent(d.name ?? newName)}/settings`;
+  };
+  const deleteRepo = async () => {
+    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}`, { method: "DELETE", headers: authHeaders() });
+    if (!res.ok) { uiAlert(await apiError(res)); return; }
+    navigate(`/orgs/${encodeURIComponent(tenant)}`);
   };
 
   // Registered actors (for display / handle resolution only — you cannot *act* as any of them).
@@ -3124,16 +3234,11 @@ export function App() {
               )}
               <Card>
                 <SectionHeader label="Code owners" right={<span className="text-[12.5px] text-muted">path → owners · also .hull/CODEOWNERS</span>} />
-                <div className="px-5 py-4 grid gap-2">
-                  {ownerRules.length === 0 && <span className="text-[12.5px] text-muted">no code-owner rules</span>}
-                  {ownerRules.map((r) => (
-                    <div key={r.glob} className="flex items-center gap-3 text-[13px]">
-                      <code className="text-body">{r.glob}</code>
-                      <span className="text-muted flex-1">{r.owners.map((o) => handleOf(o)).join(", ")}</span>
-                    </div>
-                  ))}
+                <div className="px-5 py-4">
+                  <CodeOwnersEditor rules={ownerRules} actors={actors} handleOf={handleOf} onSave={saveOwners} />
                 </div>
               </Card>
+              <DangerZone repo={issueRepo} onRename={renameRepo} onDelete={deleteRepo} />
             </div>
             );
           })()}
