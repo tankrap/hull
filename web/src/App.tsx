@@ -1,9 +1,7 @@
-import { Component, lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 // Code-split the heavy Shiki-powered @pierre viewers into their own chunk (kept out of the initial bundle).
-const PierreFile = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.File })));
 const PierrePatch = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.PatchDiff })));
-const RepoTree = lazy(() => import("./RepoTree"));
 import * as ed from "@noble/ed25519";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
@@ -12,12 +10,17 @@ import { StatusBadge, Tag } from "./ui/Badge";
 import { Drawer, Dialog, PromptModal, ConfirmModal } from "./ui/Overlay";
 import { SemanticDiff, OldTok, NewTok } from "./ui/SemanticDiff";
 import { createPasskey, getPasskey } from "./webauthn";
-import { hlToHtml, wordDiff, type Seg } from "./highlight";
+import { wordDiff, type Seg } from "./highlight";
 import { Markdown } from "./markdown";
 import { RichText } from "./ui/RichText";
+import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from "./api";
+import { Popover, Picker, SplitButton } from "./components/menus";
+import { CommandPalette, type CmdItem } from "./components/CommandPalette";
+import { ContributionHeatmap, type HeatDay } from "./components/ContributionHeatmap";
+import { RepoGraph } from "./components/RepoGraph";
+import { Boundary, Card, SectionHeader } from "./components/primitives";
+import { RepoFiles } from "./components/RepoFiles";
 
-// Syntax-highlighted code fragment (hljs HTML). Used across the diff viewer.
-const Hl = ({ text, path }: { text: string; path: string }) => <span dangerouslySetInnerHTML={{ __html: hlToHtml(text, path) }} />;
 
 const hexToBytes = (h: string) => Uint8Array.from((h.match(/../g) ?? []).map((x) => parseInt(x, 16)));
 const bytesToHex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -167,11 +170,6 @@ const Avatar = ({ id, handle, kind, size = 22 }: { id?: string; handle?: string;
 };
 // Renders children; on any render error, shows `fallback` instead (used to guard the third-party
 // @pierre/diffs renderer so a failure degrades to our built-in viewer rather than crashing the page).
-class Boundary extends Component<{ fallback: React.ReactNode; children: React.ReactNode }, { err: boolean }> {
-  state = { err: false };
-  static getDerivedStateFromError() { return { err: true }; }
-  render() { return this.state.err ? this.props.fallback : this.props.children; }
-}
 // A rich Picker option for a user/actor — avatar + username + email (or kind), so you pick the right person.
 const actorOption = (a: { id: string; handle: string; kind?: string; email?: string }) => ({
   value: a.id,
@@ -468,11 +466,11 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
   const [login, setLogin] = useState<{ provider: string; label: string; session: string; url: string; needsCode: boolean; userCode: string | null } | null>(null);
   const [code, setCode] = useState("");
   const [waiting, setWaiting] = useState(false);
-  const load = () => { fetch(`/api/accounts/${enc(accountId)}/ai`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) { setConns(d.connections || []); setRotate(!!d.rotate); } }).catch(() => {}); };
+  const load = () => { apiGet(`/api/accounts/${enc(accountId)}/ai`, authHeaders()).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) { setConns(d.connections || []); setRotate(!!d.rotate); } }).catch(() => {}); };
   useEffect(load, [accountId]); // eslint-disable-line
-  useEffect(() => { fetch(`/api/ai/agents`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) setAgents(d.agents || []); }).catch(() => {}); }, [accountId]); // eslint-disable-line
-  const post = (body: Record<string, unknown>) => fetch(`/api/accounts/${enc(accountId)}/ai`, { method: "POST", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify(body) });
-  const postPath = (path: string, body: Record<string, unknown>) => fetch(`/api/accounts/${enc(accountId)}/ai/${path}`, { method: "POST", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify(body) });
+  useEffect(() => { apiGet(`/api/ai/agents`, authHeaders()).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) setAgents(d.agents || []); }).catch(() => {}); }, [accountId]); // eslint-disable-line
+  const post = (body: Record<string, unknown>) => apiPost(`/api/accounts/${enc(accountId)}/ai`, body, authHeaders());
+  const postPath = (path: string, body: Record<string, unknown>) => apiPost(`/api/accounts/${enc(accountId)}/ai/${path}`, body, authHeaders());
   const add = async () => {
     if (!key.trim()) return;
     setBusy(true);
@@ -526,10 +524,10 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
   };
   const remove = async (id: string) => {
     if (!(await uiConfirm({ title: "Remove connection", body: "Disconnect this AI backend from the account?", danger: true, confirmLabel: "Remove" }))) return;
-    const r = await fetch(`/api/accounts/${enc(accountId)}/ai/${enc(id)}`, { method: "DELETE", headers: authHeaders() });
+    const r = await apiDelete(`/api/accounts/${enc(accountId)}/ai/${enc(id)}`, authHeaders());
     if (r.ok) load(); else uiAlert(await r.text());
   };
-  const toggleRotate = async (on: boolean) => { setRotate(on); await fetch(`/api/accounts/${enc(accountId)}/ai/rotate`, { method: "PUT", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify({ rotate: on }) }).catch(() => setRotate(!on)); };
+  const toggleRotate = async (on: boolean) => { setRotate(on); await apiPut(`/api/accounts/${enc(accountId)}/ai/rotate`, { rotate: on }, authHeaders()).catch(() => setRotate(!on)); };
   const PROVIDERS = [{ value: "anthropic", label: "Claude (Anthropic)" }, { value: "openai", label: "OpenAI" }, { value: "openrouter", label: "OpenRouter" }];
   const dot = (c: Conn) => (c.auth_kind === "agent" ? "bg-clear" : c.provider === "anthropic" ? "bg-brass" : c.provider === "openai" ? "bg-clear" : "bg-steel");
   const installed = agents.filter((a) => a.installed);
@@ -636,15 +634,6 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
 }
 
 // ── small token-only layout atoms (not controls — controls come from ./ui) ──────────
-const Card = ({ children, className = "", id }: { children: React.ReactNode; className?: string; id?: string }) => (
-  <div id={id} className={`bg-surface border border-rule rounded-card overflow-hidden ${className}`}>{children}</div>
-);
-const SectionHeader = ({ label, right }: { label: string; right?: React.ReactNode }) => (
-  <div className="flex items-center justify-between gap-3 px-5 py-3.5 border-b border-rule2">
-    <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">{label}</span>
-    {right}
-  </div>
-);
 // An eyebrow label that sits directly on the page ground (no card), above a section.
 const Eyebrow = ({ label, right }: { label: string; right?: React.ReactNode }) => (
   <div className="flex items-baseline justify-between gap-3 mb-2.5">
@@ -670,121 +659,6 @@ const Stat = ({ k, v }: { k: React.ReactNode; v: React.ReactNode }) => (
   </div>
 );
 
-// A click-to-open popover anchored under its trigger. Closes on outside-click or Escape. Used for the
-// header "checks" summary, so the landing gate is reachable from the top of the page.
-function Popover({ trigger, children, align = "left", width = 300, direction = "down", block = false, onToggle }: { trigger: (open: boolean) => React.ReactNode; children: React.ReactNode; align?: "left" | "right"; width?: number; direction?: "down" | "up"; block?: boolean; onToggle?: (open: boolean) => void }) {
-  const [open, setOpen] = useState(false);
-  const [rect, setRect] = useState<DOMRect | null>(null);
-  const wrapRef = useRef<HTMLSpanElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const set = (v: boolean) => { setOpen(v); onToggle?.(v); };
-  const measure = () => { if (wrapRef.current) setRect(wrapRef.current.getBoundingClientRect()); };
-  useLayoutEffect(() => { if (open) measure(); /* eslint-disable-next-line */ }, [open]);
-  useEffect(() => {
-    if (!open) return;
-    // Close on an outside click — but NOT when the click lands inside ANY popover panel (panels are
-    // portaled to <body>, so a nested menu's panel is a DOM sibling that would otherwise read as
-    // "outside" and wrongly close its parent). Menu items still close via the panel's own onClick.
-    const onDoc = (e: MouseEvent) => {
-      const t = e.target as HTMLElement;
-      if (wrapRef.current?.contains(t)) return;
-      if (t.closest?.("[data-popover-panel]")) return;
-      set(false);
-    };
-    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") set(false); };
-    const reflow = () => measure();
-    document.addEventListener("mousedown", onDoc);
-    document.addEventListener("keydown", onEsc);
-    window.addEventListener("scroll", reflow, true);
-    window.addEventListener("resize", reflow);
-    return () => { document.removeEventListener("mousedown", onDoc); document.removeEventListener("keydown", onEsc); window.removeEventListener("scroll", reflow, true); window.removeEventListener("resize", reflow); };
-  }, [open]);
-  // The panel renders in a body portal with FIXED positioning, so it escapes every ancestor's
-  // overflow-hidden / stacking context and always paints on top — no clipping, no z-index fights.
-  const style: React.CSSProperties = { position: "fixed", zIndex: 60, width: block ? (rect?.width ?? width) : width };
-  if (rect) {
-    if (direction === "up") { style.bottom = window.innerHeight - rect.top + 6; style.maxHeight = rect.top - 16; }
-    else { style.top = rect.bottom + 6; style.maxHeight = window.innerHeight - rect.bottom - 16; }
-    if (align === "right") style.right = window.innerWidth - rect.right; else style.left = rect.left;
-  }
-  return (
-    <span ref={wrapRef} className={`relative inline-flex ${block ? "w-full" : ""}`}>
-      {/* stopPropagation so a Popover nested inside another Popover's panel doesn't bubble its trigger
-          click up to the outer panel's close-on-click handler (which would shut everything). */}
-      <button type="button" onClick={(e) => { e.stopPropagation(); set(!open); }} className={`inline-flex ${block ? "w-full" : ""}`}>{trigger(open)}</button>
-      {open && rect && createPortal(
-        <div ref={panelRef} style={style} data-popover-panel onClick={() => set(false)}
-          className="bg-surface border border-rule rounded-card shadow-menu overflow-y-auto overflow-x-hidden animate-[bd-in_120ms_ease-out]">
-          {children}
-        </div>,
-        document.body,
-      )}
-    </span>
-  );
-}
-
-// Styled select (replaces native <select>). options: {value,label}[]. When value is "" it shows the
-// placeholder — used both for bound selects and "pick to act" menus.
-type PickerOption = { value: string; label: string; sub?: string; avatar?: React.ReactNode };
-function Picker({ value, onChange, options, placeholder = "Select…", width = 220, size = "md", block = false, direction = "down", className = "", searchable: searchableProp }: { value: string; onChange: (v: string) => void; options: PickerOption[]; placeholder?: string; width?: number; size?: "sm" | "md"; block?: boolean; direction?: "down" | "up"; className?: string; searchable?: boolean }) {
-  const cur = options.find((o) => o.value === value);
-  const h = size === "sm" ? "h-ctl-sm text-xs" : "h-ctl text-[13px]";
-  const [q, setQ] = useState("");
-  const searchable = searchableProp ?? options.length >= 8;
-  const ql = q.trim().toLowerCase();
-  const filtered = ql ? options.filter((o) => o.label.toLowerCase().includes(ql) || (o.sub ?? "").toLowerCase().includes(ql)) : options;
-  const rich = options.some((o) => o.avatar || o.sub);
-  return (
-    <Popover align="left" width={width} block={block} direction={direction} onToggle={(o) => { if (!o) setQ(""); }} trigger={(open) => (
-      <span className={`inline-flex items-center justify-between gap-2 ${h} px-2.5 rounded-ctl border bg-surface transition-colors ${block ? "w-full" : ""} ${open ? "border-body" : "border-ctl hover:border-dim"} ${className}`}>
-        <span className={`truncate ${cur ? "text-ink" : "text-faint"}`}>{cur?.label ?? placeholder}</span>
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`text-muted flex-none transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
-      </span>
-    )}>
-      {searchable && (
-        <div className="p-1.5 border-b border-rule2 sticky top-0 bg-surface" onClick={(e) => e.stopPropagation()}>
-          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…" className="w-full box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" />
-        </div>
-      )}
-      <div className="py-1 max-h-[280px] overflow-y-auto overflow-x-hidden">
-        {filtered.length === 0 && <div className="px-3 py-1.5 text-[12.5px] text-muted">{ql ? "no matches" : "none available"}</div>}
-        {filtered.map((o) => (rich ? (
-          <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:bg-paper ${o.value === value ? "bg-paper" : ""}`}>
-            {o.avatar ? <span className="flex-none">{o.avatar}</span> : null}
-            <span className="min-w-0 flex-1">
-              <span className={`block text-[13px] truncate ${o.value === value ? "font-medium text-ink" : "text-body"}`}>{o.label}</span>
-              {o.sub && <span className="block text-[11.5px] text-muted truncate">{o.sub}</span>}
-            </span>
-            {o.value === value && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
-          </button>
-        ) : (
-          <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-3 py-1.5 text-[13px] truncate hover:bg-paper ${o.value === value ? "bg-paper font-medium text-ink" : "text-body"}`}>{o.label}</button>
-        )))}
-      </div>
-    </Popover>
-  );
-}
-
-// A cohesive split button: a primary action + a dropdown, sharing ONE dark/muted skin so a disabled
-// submit never leaves a stray bright chevron. The chevron stays clickable while the submit is disabled
-// (to pick a verdict / mode / secondary action). Shared by every composer — issues AND pull requests.
-function SplitButton({ label, icon, disabled, onSubmit, menu, menuWidth = 252 }: { label: React.ReactNode; icon?: React.ReactNode; disabled?: boolean; onSubmit: () => void; menu: React.ReactNode; menuWidth?: number }) {
-  return (
-    <div className={`flex-none inline-flex h-ctl rounded-ctl overflow-hidden border ${disabled ? "border-ctl" : "border-ink"}`}>
-      <button type="button" disabled={disabled} onClick={onSubmit}
-        className={`inline-flex items-center gap-1.5 px-3.5 text-[13px] font-semibold whitespace-nowrap transition-colors ${disabled ? "bg-paper text-faint cursor-not-allowed" : "bg-ink text-surface hover:brightness-110"}`}>
-        {icon}{label}
-      </button>
-      <Popover align="right" width={menuWidth} direction="up" trigger={(open) => (
-        <span className={`inline-flex items-center h-full px-1.5 border-l cursor-pointer transition-[filter,background-color] ${disabled ? "bg-paper text-muted border-ctl hover:text-ink" : "bg-ink text-surface border-l-white/25 hover:brightness-110"} ${open ? "brightness-110" : ""}`}>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
-        </span>
-      )}>
-        {menu}
-      </Popover>
-    </div>
-  );
-}
 
 // Centered modal shell (backdrop + card + header). Closes on backdrop click / ✕ / Escape.
 function ModalShell({ title, onClose, children, width = 480 }: { title: string; onClose: () => void; children: React.ReactNode; width?: number }) {
@@ -1039,62 +913,6 @@ function IssueThread({ target, comments, issues, commentDraft, setCommentDraft, 
 }
 
 // ── ⌘K command palette: search or jump to repos / issues / voyages / actions ──────
-type CmdItem = { id: string; group: string; label: string; sublabel?: string; icon?: React.ReactNode; run: () => void };
-function CommandPalette({ open, items, onClose }: { open: boolean; items: CmdItem[]; onClose: () => void }) {
-  const [q, setQ] = useState("");
-  const [sel, setSel] = useState(0);
-  useEffect(() => { if (open) { setQ(""); setSel(0); } }, [open]);
-  const ql = q.trim().toLowerCase();
-  const matches = ql ? items.filter((it) => `${it.label} ${it.sublabel ?? ""} ${it.group}`.toLowerCase().includes(ql)) : items;
-  useEffect(() => { setSel(0); }, [ql]);
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "ArrowDown") { e.preventDefault(); setSel((s) => Math.min(matches.length - 1, s + 1)); }
-      else if (e.key === "ArrowUp") { e.preventDefault(); setSel((s) => Math.max(0, s - 1)); }
-      else if (e.key === "Enter") { e.preventDefault(); const m = matches[sel]; if (m) { m.run(); onClose(); } }
-      else if (e.key === "Escape") { e.preventDefault(); onClose(); }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, matches, sel, onClose]);
-  if (!open) return null;
-  const groups: string[] = [];
-  matches.forEach((m) => { if (!groups.includes(m.group)) groups.push(m.group); });
-  let idx = -1;
-  return (
-    <>
-      <div onClick={onClose} className="fixed inset-0 z-40 bg-ink/30 animate-bd-in" />
-      <div className="fixed left-1/2 top-[11vh] -translate-x-1/2 z-50 w-[580px] max-w-[92vw] bg-surface rounded-[13px] shadow-modal overflow-hidden animate-ov-in border border-rule">
-        <div className="flex items-center gap-2.5 px-4 h-[50px] border-b border-rule2">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
-          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search or jump to a repo, issue, pull request, or action…" className="flex-1 bg-transparent outline-none font-sans text-[14px] text-ink placeholder:text-faint" />
-          <span className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-1.5 py-0.5 bg-paper">esc</span>
-        </div>
-        <div className="max-h-[54vh] overflow-y-auto py-1.5">
-          {matches.length === 0 && <div className="px-4 py-8 text-[13px] text-muted text-center">no matches</div>}
-          {groups.map((g) => (
-            <div key={g}>
-              <div className="px-4 pt-2.5 pb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">{g}</div>
-              {matches.filter((m) => m.group === g).map((m) => {
-                idx++;
-                const i = idx;
-                return (
-                  <button key={m.id} onMouseEnter={() => setSel(i)} onClick={() => { m.run(); onClose(); }}
-                    className={`w-full text-left flex items-center gap-2.5 px-4 py-2 cursor-pointer ${sel === i ? "bg-steel-wash" : "hover:bg-paper"}`}>
-                    <span className="flex-none w-4 grid place-items-center text-muted">{m.icon ?? <span className="text-faint">›</span>}</span>
-                    <span className={`text-[13.5px] flex-1 truncate ${sel === i ? "text-steel-text font-medium" : "text-ink"}`}>{m.label}</span>
-                    {m.sublabel && <span className="text-[12px] text-faint truncate flex-none max-w-[40%]">{m.sublabel}</span>}
-                  </button>
-                );
-              })}
-            </div>
-          ))}
-        </div>
-      </div>
-    </>
-  );
-}
 // verification/state → StatusBadge kind
 /**
  * The home page IS a live projection of the fleet's coordination stream: repos rank by activity
@@ -1552,8 +1370,8 @@ export function App() {
   const [repoLabels, setRepoLabels] = useState<RepoLabel[]>([]);
   const labelColor = (name: string) => repoLabels.find((l) => l.name === name)?.color;
   const loadRepoSettings = () => {
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setRepoSettings(d)).catch(() => {});
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/owners`, { headers: authHeaders() }).then((r) => r.json()).then((d) => setOwnerRules(d.owners ?? [])).catch(() => {});
+    apiGet(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, authHeaders()).then((r) => (r.ok ? r.json() : null)).then((d) => d && setRepoSettings(d)).catch(() => {});
+    apiGet(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/owners`, authHeaders()).then((r) => r.json()).then((d) => setOwnerRules(d.owners ?? [])).catch(() => {});
     if (orgAccountFor(tenant)) loadTeams(orgAccountFor(tenant)!.id);
   };
   const orgAccountFor = (handle: string) => accounts.find((a) => a.handle === handle);
@@ -1572,7 +1390,7 @@ export function App() {
   // Danger zone: rename re-keys the repo — hard-navigate to the new URL so no stale repo-name state
   // lingers. Delete removes it and returns to the owning org's page.
   const renameRepo = async (newName: string) => {
-    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}`, { method: "PATCH", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify({ name: newName }) });
+    const res = await apiPatch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}`, { name: newName }, authHeaders());
     if (!res.ok) { uiAlert(await apiError(res)); return; }
     const d = await res.json();
     window.location.href = `/${encodeURIComponent(tenant)}/${encodeURIComponent(d.name ?? newName)}/settings`;
@@ -1651,7 +1469,7 @@ export function App() {
     setProv((p) => ({ ...p, [key]: d.provenance ?? [] }));
   };
   const loadIssues = () =>
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`, { headers: authHeaders() })
+    apiGet(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`, authHeaders())
       .then((r) => r.json())
       .then((d) => setIssues(d.issues ?? []))
       .catch(() => {});
@@ -1730,7 +1548,7 @@ export function App() {
   const orgAccount = accounts.find((a) => a.handle === (orgHandle ?? " "));
   // Org-level DEFAULT repo settings — inherited by every repo created afterward.
   const [orgDefaults, setOrgDefaults] = useState<RepoSettings | null>(null);
-  const loadOrgDefaults = (acctId: string) => fetch(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setOrgDefaults(d)).catch(() => {});
+  const loadOrgDefaults = (acctId: string) => apiGet(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, authHeaders()).then((r) => (r.ok ? r.json() : null)).then((d) => d && setOrgDefaults(d)).catch(() => {});
   const saveOrgDefaults = async (acctId: string, patch: Partial<{ visibility: string; require_review_to_land: boolean; labels: RepoLabel[] }>) => {
     const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
     if (res.ok) setOrgDefaults(await res.json()); else uiAlert(await apiError(res));
@@ -3337,320 +3155,8 @@ export function App() {
 // A GitHub-style contribution heatmap: ~53 weeks × 7 days. Each cell is split into TWO triangles —
 // top-left = your own contributions, bottom-right = your agents' — each shaded by its own intensity.
 // Columns flex to fill the width, so there's never a scrollbar.
-type HeatDay = { day: number; human: number; agent: number };
-const HEAT_EMPTY = "var(--rule2)"; // theme-aware neutral for days with no contributions
-const HEAT_YOU = [HEAT_EMPTY, "#9be9a8", "#40c463", "#30a14e", "#216e39"]; // green
-const HEAT_AGENT = [HEAT_EMPTY, "#a9c9f5", "#5a9bd4", "#2f6fb0", "#1b4d80"]; // blue
-function ContributionHeatmap({ days }: { days: HeatDay[] }) {
-  const byDay = new Map(days.map((d) => [d.day, d]));
-  const today = Math.floor(Date.now() / 86_400_000);
-  const start = today - 371;
-  const dow = (e: number) => ((e % 7) + 4) % 7; // epoch day 0 = Thursday; 0=Sun … 6=Sat
-  const gridStart = start - dow(start);
-  const maxH = Math.max(1, ...days.map((d) => d.human));
-  const maxA = Math.max(1, ...days.map((d) => d.agent));
-  const lvl = (c: number, m: number) => (c <= 0 ? 0 : c <= m * 0.25 ? 1 : c <= m * 0.5 ? 2 : c <= m * 0.75 ? 3 : 4);
-  const weeks: number[][] = [];
-  for (let w = 0; gridStart + w * 7 <= today; w++) {
-    const col: number[] = [];
-    for (let d = 0; d < 7; d++) { const e = gridStart + w * 7 + d; col.push(e >= start && e <= today ? e : -1); }
-    weeks.push(col);
-  }
-  const fmtFull = (e: number) => new Date(e * 86_400_000).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
-  // Hover reveals that day's specifics in a small cursor-anchored tooltip.
-  const [hover, setHover] = useState<{ x: number; y: number; e: number; h: number; a: number } | null>(null);
-  return (
-    <div className="grid gap-2">
-      <div className="flex gap-[2px] w-full">
-        {weeks.map((col, i) => (
-          <div key={i} className="grid gap-[2px] flex-1 min-w-0 content-start">
-            {col.map((e, j) => {
-              if (e < 0) return <span key={j} className="aspect-square" />;
-              const d = byDay.get(e); const h = d?.human ?? 0; const a = d?.agent ?? 0;
-              const bg = h === 0 && a === 0 ? HEAT_EMPTY : `linear-gradient(to bottom right, ${HEAT_YOU[lvl(h, maxH)]} 0 50%, ${HEAT_AGENT[lvl(a, maxA)]} 50% 100%)`;
-              return <span key={j}
-                onMouseEnter={(ev) => setHover({ x: ev.clientX, y: ev.clientY, e, h, a })}
-                onMouseMove={(ev) => setHover((prev) => (prev && prev.e === e ? { ...prev, x: ev.clientX, y: ev.clientY } : { x: ev.clientX, y: ev.clientY, e, h, a }))}
-                onMouseLeave={() => setHover((prev) => (prev && prev.e === e ? null : prev))}
-                className="aspect-square rounded-[2px] hover:ring-2 hover:ring-ink/25 transition-shadow" style={{ background: bg }} />;
-            })}
-          </div>
-        ))}
-      </div>
-      <div className="flex items-center gap-4 text-[11.5px] text-muted self-end">
-        <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />humans</span>
-        <span className="inline-flex items-center gap-1.5"><span className="w-3 h-3 rounded-[2px]" style={{ background: HEAT_AGENT[3] }} />agents</span>
-      </div>
-      {hover && (
-        <div className="fixed z-[80] pointer-events-none -translate-x-1/2 -translate-y-full" style={{ left: hover.x, top: hover.y - 10 }}>
-          <div className="rounded-ctl-sm bg-surface border border-rule2 shadow-modal px-2.5 py-1.5 text-[11.5px] whitespace-nowrap">
-            <div className="font-semibold text-body">{hover.h + hover.a === 0 ? "No contributions" : `${hover.h + hover.a} contribution${hover.h + hover.a === 1 ? "" : "s"}`}</div>
-            {hover.h + hover.a > 0 && (
-              <div className="mt-0.5 flex items-center gap-2 text-muted">
-                <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-[2px]" style={{ background: HEAT_YOU[3] }} />{hover.h} human{hover.h === 1 ? "" : "s"}</span>
-                <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-[2px]" style={{ background: HEAT_AGENT[3] }} />{hover.a} agents</span>
-              </div>
-            )}
-            <div className={`text-faint ${hover.h + hover.a > 0 ? "mt-0.5" : "mt-0.5"}`}>{fmtFull(hover.e)}</div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 
-// ── Graph tab: the codebase as a force-directed import graph, searchable ─────────────────────────
-type GNode = { path: string; dir: string; lang: string; size: number; deg: number };
-type GEdge = { from: string; to: string };
-const LANG_COLOR: Record<string, string> = { rust: "#dea584", ts: "#3178c6", js: "#f1e05a", python: "#3572A5", go: "#00ADD8" };
-function RepoGraph({ tenant, repo, authHeaders, onOpenFile }: { tenant: string; repo: string; authHeaders: () => Record<string, string>; onOpenFile: (path: string, branch: string) => void }) {
-  const base = `/api/repos/${encodeURIComponent(tenant)}/${repo}`;
-  const [branch, setBranch] = useState("main");
-  const [branches, setBranches] = useState<string[]>([]);
-  const [data, setData] = useState<{ nodes: GNode[]; edges: GEdge[] } | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [q, setQ] = useState("");
-  const [hover, setHover] = useState<string | null>(null);
-  useEffect(() => { fetch(`${base}/branches`, { headers: authHeaders() }).then((r) => r.json()).then((d) => { const bs = d.branches ?? []; setBranches(bs); setBranch((b) => (bs.length && !bs.includes(b) ? bs[0] : b)); }).catch(() => {}); }, [tenant, repo]);
-  useEffect(() => {
-    setLoading(true);
-    fetch(`${base}/graph?ref=${encodeURIComponent(branch)}`, { headers: authHeaders() }).then((r) => r.json()).then((d) => setData({ nodes: d.nodes ?? [], edges: d.edges ?? [] })).catch(() => setData({ nodes: [], edges: [] })).finally(() => setLoading(false));
-  }, [branch, tenant, repo]);
 
-  // Deterministic force-directed layout (seeded on a circle by index; no RNG). O(n²)·iters, capped.
-  const W = 900, H = 560;
-  const laid = useMemo(() => {
-    const nodes = data?.nodes ?? []; const edges = data?.edges ?? [];
-    const n = nodes.length; if (n === 0) return { pos: [] as { x: number; y: number }[], vb: `0 0 ${W} ${H}` };
-    const idx = new Map(nodes.map((nd, i) => [nd.path, i]));
-    const E = edges.map((e) => [idx.get(e.from), idx.get(e.to)]).filter(([a, b]) => a != null && b != null) as [number, number][];
-    const pos = nodes.map((_, i) => { const a = (i / n) * Math.PI * 2; return { x: W / 2 + Math.cos(a) * 200, y: H / 2 + Math.sin(a) * 160, vx: 0, vy: 0 }; });
-    const iters = n > 400 ? 120 : n > 150 ? 220 : 320;
-    for (let it = 0; it < iters; it++) {
-      for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) { const dx = pos[i].x - pos[j].x, dy = pos[i].y - pos[j].y; const d2 = dx * dx + dy * dy + 0.01; const d = Math.sqrt(d2); const f = 2600 / d2; pos[i].vx += (dx / d) * f; pos[i].vy += (dy / d) * f; pos[j].vx -= (dx / d) * f; pos[j].vy -= (dy / d) * f; }
-      for (const [a, b] of E) { const dx = pos[b].x - pos[a].x, dy = pos[b].y - pos[a].y; const d = Math.sqrt(dx * dx + dy * dy) + 0.01; const f = (d - 90) * 0.02; pos[a].vx += (dx / d) * f; pos[a].vy += (dy / d) * f; pos[b].vx -= (dx / d) * f; pos[b].vy -= (dy / d) * f; }
-      for (let i = 0; i < n; i++) { pos[i].vx += (W / 2 - pos[i].x) * 0.006; pos[i].vy += (H / 2 - pos[i].y) * 0.006; pos[i].x += pos[i].vx * 0.85; pos[i].y += pos[i].vy * 0.85; pos[i].vx *= 0.82; pos[i].vy *= 0.82; }
-    }
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const p of pos) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y); }
-    const pad = 40;
-    return { pos, vb: `${minX - pad} ${minY - pad} ${maxX - minX + pad * 2} ${maxY - minY + pad * 2}` };
-  }, [data]);
-
-  const nodes = data?.nodes ?? []; const edges = data?.edges ?? [];
-  const ql = q.trim().toLowerCase();
-  const match = (p: string) => ql !== "" && p.toLowerCase().includes(ql);
-  const anyMatch = ql !== "" && nodes.some((n) => match(n.path));
-  const posOf = new Map(nodes.map((n, i) => [n.path, laid.pos[i]]));
-  const base2 = (p: string) => p.split("/").pop() ?? p;
-
-  return (
-    <div className="grid gap-4">
-      <div className="flex items-center gap-3 flex-wrap">
-        <div className="min-w-[220px]"><Picker value={branch} onChange={setBranch} options={branches.map((b) => ({ value: b, label: b }))} placeholder="branch" width={340} size="sm" block searchable /></div>
-        <span className="text-[12.5px] text-muted">{nodes.length} files · {edges.length} imports</span>
-        <div className="flex-1 min-w-[220px] max-w-[420px] ml-auto"><SearchInput placeholder="Search the graph…" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>
-      </div>
-      <Card>
-        <div className="relative">
-          {loading && <div className="absolute inset-0 grid place-items-center text-[13px] text-muted z-10">Building graph…</div>}
-          {!loading && nodes.length === 0 && <div className="py-16 text-center text-[13px] text-muted">No source files with resolvable imports on this branch.</div>}
-          {nodes.length > 0 && (
-            <svg viewBox={laid.vb} className="w-full" style={{ height: 620 }} preserveAspectRatio="xMidYMid meet">
-              {edges.map((e, i) => { const a = posOf.get(e.from), b = posOf.get(e.to); if (!a || !b) return null; const dim = anyMatch && !(match(e.from) || match(e.to)); return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="currentColor" className={dim ? "text-rule3" : "text-rule"} strokeWidth={1} opacity={dim ? 0.3 : 0.7} />; })}
-              {nodes.map((n, i) => {
-                const p = laid.pos[i]; if (!p) return null;
-                const r = 4 + Math.min(9, n.deg * 1.4);
-                const on = !anyMatch || match(n.path);
-                const showLabel = hover === n.path || n.deg >= 4 || match(n.path);
-                return (
-                  <g key={n.path} transform={`translate(${p.x} ${p.y})`} onMouseEnter={() => setHover(n.path)} onMouseLeave={() => setHover(null)} onClick={() => onOpenFile(n.path, branch)} style={{ cursor: "pointer" }} opacity={on ? 1 : 0.25}>
-                    <circle r={r} fill={LANG_COLOR[n.lang] || "#8b949e"} stroke={match(n.path) ? "#111827" : "#ffffff"} strokeWidth={match(n.path) ? 2 : 1} />
-                    {showLabel && <text x={r + 3} y={4} className="fill-body" style={{ fontSize: 11, paintOrder: "stroke", stroke: "var(--surface)", strokeWidth: 3 }}>{base2(n.path)}</text>}
-                    <title>{n.path} · {n.deg} imports</title>
-                  </g>
-                );
-              })}
-            </svg>
-          )}
-        </div>
-      </Card>
-      <div className="flex items-center gap-4 text-[12px] text-muted flex-wrap">
-        {Object.entries(LANG_COLOR).map(([l, c]) => nodes.some((n) => n.lang === l) && <span key={l} className="inline-flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full" style={{ background: c }} />{l}</span>)}
-        <span className="text-faint">· node size = how many files import it · drag-free force layout</span>
-      </div>
-    </div>
-  );
-}
-
-// ── Files tab: a branch-aware file browser with fuzzy/full-text search ──────────────────────────
-type SearchHit = { path: string; line: number; text: string; kind: "path" | "content" };
-function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo: string; authHeaders: () => Record<string, string>; theme: string }) {
-  const base = `/api/repos/${encodeURIComponent(tenant)}/${repo}`;
-  const [branches, setBranches] = useState<string[]>([]);
-  const [branch, setBranch] = useState("main");
-  const [file, setFile] = useState<{ path: string; text: string; binary: boolean; size: number } | null>(null);
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState<SearchHit[] | null>(null);
-  const [allPaths, setAllPaths] = useState<string[] | null>(null);
-  // Below md the tree is a toggled drawer above the viewer; above md it's the fixed left column.
-  const [treeOpen, setTreeOpen] = useState(false);
-
-  useEffect(() => {
-    fetch(`${base}/branches`, { headers: authHeaders() }).then((r) => r.json()).then((d) => {
-      const bs: string[] = d.branches ?? [];
-      setBranches(bs);
-      setBranch((b) => (bs.length && !bs.includes(b) ? bs[0] : b));
-    }).catch(() => {});
-  }, [tenant, repo]);
-
-  // Every file path in the branch — feeds the @pierre/trees sidebar.
-  useEffect(() => {
-    setAllPaths(null);
-    fetch(`${base}/tree?ref=${encodeURIComponent(branch)}&flat=1`, { headers: authHeaders() })
-      .then((r) => r.json()).then((d) => setAllPaths(d.paths ?? [])).catch(() => setAllPaths([]));
-  }, [branch, tenant, repo]);
-
-  const openFile = (p: string, ref: string = branch) => {
-    setResults(null); setQuery("");
-    fetch(`${base}/blob?ref=${encodeURIComponent(ref)}&path=${encodeURIComponent(p)}`, { headers: authHeaders() })
-      .then((r) => r.json()).then((d) => setFile({ path: p, text: d.text ?? "", binary: !!d.binary, size: d.size ?? 0 })).catch(() => {});
-  };
-  // Clear any open file / search when the branch changes (the tree reloads via the paths effect).
-  useEffect(() => { setResults(null); setQuery(""); setFile(null); /* eslint-disable-next-line */ }, [branch]);
-  // Deep-link: /…/files?path=<p>&branch=<b> (e.g. from a dependency-graph node) opens that file once
-  // branches settle. The optional branch param pins the file to the ref it was linked from (the graph
-  // renders a specific branch); without it we honor whatever branch the picker settled on.
-  const [pendingPath, setPendingPath] = useState<string | null>(() => new URLSearchParams(location.search).get("path"));
-  const [pendingBranch] = useState<string | null>(() => new URLSearchParams(location.search).get("branch"));
-  useEffect(() => {
-    if (pendingPath && branches.length) {
-      const ref = pendingBranch && branches.includes(pendingBranch) ? pendingBranch : branch;
-      if (ref !== branch) setBranch(ref);
-      openFile(pendingPath, ref);
-      setPendingPath(null);
-    }
-    /* eslint-disable-next-line */
-  }, [pendingPath, branches]);
-  // Debounced fuzzy/full-text search.
-  useEffect(() => {
-    if (!query.trim()) { setResults(null); return; }
-    const t = setTimeout(() => {
-      fetch(`${base}/search?ref=${encodeURIComponent(branch)}&q=${encodeURIComponent(query)}`, { headers: authHeaders() })
-        .then((r) => r.json()).then((d) => setResults(d.hits ?? [])).catch(() => setResults([]));
-    }, 250);
-    return () => clearTimeout(t);
-  }, [query, branch]);
-
-  const FileIcon = () => <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="text-muted flex-none"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /></svg>;
-  const fmtSize = (n: number) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
-  const LINE_CAP = 1500;
-  const lines = file ? file.text.replace(/\n$/, "").split("\n") : [];
-
-  return (
-    <div className="grid gap-4">
-      <div className="flex items-center gap-3 flex-wrap">
-        <div className="min-w-[240px]"><Picker value={branch} onChange={setBranch} options={branches.map((b) => ({ value: b, label: b }))} placeholder="branch" width={340} size="sm" block searchable /></div>
-        <div className="flex-1 min-w-[220px] max-w-[440px] ml-auto">
-          <SearchInput placeholder="Search files & content…" shortcut="" value={query} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQuery(e.target.value)} />
-        </div>
-      </div>
-
-      {results !== null ? (
-        <Card>
-          <SectionHeader label="Search" right={<span className="text-[12.5px] text-muted">{results.length} hit{results.length === 1 ? "" : "s"} · {branch}</span>} />
-          <div className="max-h-[560px] overflow-y-auto">
-            {results.length === 0 && <div className="px-5 py-6 text-[13px] text-muted">No matches for “{query}”.</div>}
-            {results.map((h, i) => (
-              <button key={i} onClick={() => openFile(h.path)} className="w-full text-left px-5 py-2 border-b border-rule3 hover:bg-paper/60 flex items-start gap-3">
-                <span className="text-[11px] font-bold uppercase tracking-[0.05em] mt-0.5 flex-none w-[52px] text-right">{h.kind === "path" ? <span className="text-steel-text">name</span> : <span className="text-faint tabular-nums">L{h.line}</span>}</span>
-                <span className="min-w-0">
-                  <span className="block text-[12.5px] text-body font-medium truncate">{h.path}</span>
-                  {h.kind === "content" && <span className="block text-[12px] text-muted truncate"><Hl text={h.text} path={h.path} /></span>}
-                </span>
-              </button>
-            ))}
-          </div>
-        </Card>
-      ) : (
-        <div className="grid grid-cols-1 md:grid-cols-[minmax(190px,270px)_1fr] gap-4 items-start">
-          {/* Below md the tree is a toggled drawer; the button collapses (md:hidden) so the desktop split is unchanged. */}
-          <button className={`md:hidden inline-flex items-center gap-1.5 w-fit px-3 py-1.5 rounded-ctl border text-[13px] transition-colors ${treeOpen ? "text-ink border-ctl" : "text-muted border-rule hover:text-ink"}`} aria-expanded={treeOpen} onClick={() => setTreeOpen((v) => !v)}><FileIcon />Files</button>
-          <Card className={`overflow-hidden max-h-[55vh] overflow-y-auto md:max-h-none ${treeOpen ? "" : "hidden md:block"}`}>
-            <SectionHeader label="Files" right={<span className="text-[11.5px] text-faint truncate max-w-[110px]">{branch}</span>} />
-            <div className="py-1.5 pl-1.5 pr-1">
-              {allPaths === null ? (
-                <div className="px-3 py-4 text-[12.5px] text-muted">Loading…</div>
-              ) : allPaths.length === 0 ? (
-                <div className="px-3 py-4 text-[12.5px] text-muted">No files.</div>
-              ) : (
-                <Suspense fallback={<div className="px-3 py-4 text-[12.5px] text-muted">Loading tree…</div>}>
-                  <RepoTree paths={allPaths} selected={file?.path ?? null} onSelect={(p: string) => { openFile(p); setTreeOpen(false); }} />
-                </Suspense>
-              )}
-            </div>
-          </Card>
-          <div className="min-w-0">
-      {file ? (
-        <Card>
-          <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
-            <div className="flex items-center gap-1.5 text-[13px] min-w-0">
-              <FileIcon /><span className="font-medium truncate">{file.path}</span>
-            </div>
-            <span className="text-[12px] text-faint flex-none tabular-nums">{fmtSize(file.size)}</span>
-          </div>
-          {file.binary ? (
-            <div className="px-5 py-8 text-[13px] text-muted">Binary file · {fmtSize(file.size)} — not shown.</div>
-          ) : (
-            // Primary: Shiki-powered @pierre/diffs viewer. Falls back to our built-in line viewer.
-            <Boundary fallback={
-              <div className="text-[12.5px] leading-[1.6] overflow-x-auto">
-                {lines.slice(0, LINE_CAP).map((ln, i) => (
-                  <div key={i} className="grid grid-cols-[52px_1fr] hover:bg-paper/50">
-                    <span className="pr-3 py-0.5 text-right text-faint bg-paper/40 border-r border-rule3 select-none tabular-nums text-[11px]">{i + 1}</span>
-                    <span className="px-3 py-0.5 whitespace-pre-wrap break-words"><Hl text={ln} path={file.path} /></span>
-                  </div>
-                ))}
-                {lines.length > LINE_CAP && <div className="px-5 py-3 text-[12.5px] text-muted border-t border-rule2">{lines.length - LINE_CAP} more lines not shown ({fmtSize(file.size)} file).</div>}
-              </div>
-            }>
-              <Suspense fallback={<div className="px-5 py-8 text-[13px] text-muted">Loading viewer…</div>}>
-                {/* @pierre/diffs `--diffs-*` vars cascade into its shadow DOM — map them onto hull tokens so
-                    the gutter, separators and numbers read as native chrome and follow the theme toggle. */}
-                <div className="text-[13px] overflow-x-auto max-h-[72vh] overflow-y-auto" style={{
-                  "--diffs-bg": "var(--surface)",
-                  "--diffs-fg-number": "var(--faint)",
-                  "--diffs-font-size": "12.5px",
-                  "--diffs-line-height": "1.7",
-                  "--diffs-min-number-column-width": "2.75rem",
-                } as React.CSSProperties}>
-                  <PierreFile file={{ name: file.path, contents: file.text }} disableWorkerPool
-                    options={{ theme: { light: "github-light", dark: "github-dark" }, themeType: theme === "dark" ? "dark" : "light", overflow: "scroll", disableFileHeader: true, lineHoverHighlight: "line", tokenizeMaxLength: 400_000,
-                      // The gutter/number bg is a theme-computed var we can't override cleanly, so tint it
-                      // directly in the shadow DOM (inherited hull tokens resolve inside `unsafeCSS`).
-                      unsafeCSS: "[data-gutter]{background:var(--paper);border-right:1px solid var(--rule2)}[data-line-number-content]{padding-right:14px;opacity:.85}" }} />
-                </div>
-              </Suspense>
-            </Boundary>
-          )}
-        </Card>
-      ) : (
-        <Card className="grid place-items-center min-h-[420px] text-center">
-          <div className="px-6 py-10 max-w-[320px]">
-            <div className="mx-auto w-11 h-11 grid place-items-center rounded-full bg-paper text-dim mb-3">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /></svg>
-            </div>
-            <div className="text-[14px] font-medium text-body">Select a file</div>
-            <div className="text-[12.5px] text-muted mt-1 leading-[1.5]">Pick a file from the tree on the left to view its contents, or search across the branch above.</div>
-          </div>
-        </Card>
-      )}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
 // Annotation payload carried on a pierre diff line: an AI finding, a human line comment, or the open
 // composer. renderAnnotation switches on `kind` to draw the right thing inline in the diff.
 type DiffAnno =

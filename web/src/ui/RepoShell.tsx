@@ -1,11 +1,20 @@
 // keel/hull RepoShell — Tailwind. The hull repo page frame: top bar (mark, breadcrumb,
 // nav tabs), left sidebar (VRail filters + fusion stats), content slot.
-import React from 'react';
-import { HTabs, VRail } from './Tabs.jsx';
-import { SearchInput } from './Field.jsx';
-import { Button } from './Button.jsx';
+import { HTabs, VRail } from './Tabs';
+import { SearchInput } from './Field';
+import { Button } from './Button';
 
-export function RepoShell({ org, repo, nav, onNav, filters, filter, onFilter, stats, children }) {
+export function RepoShell({ org, repo, nav, onNav, filters, filter, onFilter, stats, children }: {
+  org?: React.ReactNode;
+  repo?: React.ReactNode;
+  nav: string[];
+  onNav?: (i: number) => void;
+  filters: { label: string; count?: number | null }[];
+  filter?: number;
+  onFilter?: (i: number) => void;
+  stats?: string[];
+  children?: React.ReactNode;
+}) {
   return (
     <div className="border border-rule bg-surface rounded-card overflow-hidden">
       {/* top bar */}
@@ -19,7 +28,9 @@ export function RepoShell({ org, repo, nav, onNav, filters, filter, onFilter, st
           <span className="font-medium">{repo}</span>
         </div>
         <div className="ml-auto">
-          <HTabs items={nav} value={nav.indexOf ? undefined : 0} {...{ value: onNav ? undefined : 0 }} />
+          {/* original source had a duplicate `value` prop; object-spread last-wins made the
+              effective value exactly `onNav ? undefined : 0` — preserved verbatim here. */}
+          <HTabs items={nav} value={onNav ? undefined : 0} />
         </div>
       </div>
       <div className="grid grid-cols-[210px_1fr] min-h-[260px]">

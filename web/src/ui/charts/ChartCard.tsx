@@ -1,9 +1,8 @@
 // keel/hull ChartCard — shared frame for every data graphic (Tailwind).
 // White card in a #F7F8FA frame, header row, hero number, optional PillSwitcher footer.
-import React from 'react';
-import { PillSwitcher } from '../Tabs.jsx';
+import { PillSwitcher } from '../Tabs';
 
-export function ChartFrame({ children, footer }) {
+export function ChartFrame({ children, footer }: { children?: React.ReactNode; footer?: React.ReactNode }) {
   return (
     <div className="bg-frame border border-[oklch(0.92_0.004_250)] rounded-frame p-1.5 flex flex-col gap-1.5">
       {children}
@@ -12,7 +11,16 @@ export function ChartFrame({ children, footer }) {
   );
 }
 
-export function ChartCard({ icon, title, context, hero, heroUnit, delta, deltaTone = 'text-[#2563EB]', children }) {
+export function ChartCard({ icon, title, context, hero, heroUnit, delta, deltaTone = 'text-[#2563EB]', children }: {
+  icon?: React.ReactNode;
+  title?: React.ReactNode;
+  context?: React.ReactNode;
+  hero?: React.ReactNode;
+  heroUnit?: React.ReactNode;
+  delta?: React.ReactNode;
+  deltaTone?: string;
+  children?: React.ReactNode;
+}) {
   return (
     <div className="bg-white rounded-[10px] shadow-chart-card p-4">
       <div className="flex justify-between items-center">
@@ -41,7 +49,12 @@ export const RAMP = ['#2563EB', '#4C7BEF', '#6E96F3', '#93B4F6', '#C7D8FA'];
 export const REST = '#EEF0F3';
 
 // Hover readout bubble (position it absolutely inside a relative plot).
-export function Readout({ x, y, visible, children }) {
+export function Readout({ x, y, visible, children }: {
+  x?: number | string;
+  y?: number | string;
+  visible?: boolean;
+  children?: React.ReactNode;
+}) {
   return (
     <div style={{ left: x, top: y }}
       className={`absolute -translate-x-1/2 -translate-y-[135%] bg-white border border-[#E5E7EB] rounded-[10px]

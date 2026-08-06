@@ -1,17 +1,21 @@
 // keel/hull PinInput — Tailwind. Segmented code entry, paste-aware.
-import React, { useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 
-const cx = (...a) => a.filter(Boolean).join(' ');
+const cx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(' ');
 
 // mode: 'digits' | 'alnum'
-export function PinInput({ length = 6, mode = 'digits', onComplete }) {
-  const [vals, setVals] = useState(Array(length).fill(''));
-  const refs = useRef([]);
-  const ok = (ch) => (mode === 'digits' ? /^[0-9]$/ : /^[a-zA-Z0-9]$/).test(ch);
-  const norm = (ch) => (mode === 'alnum' ? ch.toUpperCase() : ch);
-  const commit = (next) => { setVals(next); if (next.every(Boolean)) onComplete?.(next.join('')); };
+export function PinInput({ length = 6, mode = 'digits', onComplete }: {
+  length?: number;
+  mode?: 'digits' | 'alnum';
+  onComplete?: (code: string) => void;
+}) {
+  const [vals, setVals] = useState<string[]>(Array(length).fill(''));
+  const refs = useRef<(HTMLInputElement | null)[]>([]);
+  const ok = (ch: string) => (mode === 'digits' ? /^[0-9]$/ : /^[a-zA-Z0-9]$/).test(ch);
+  const norm = (ch: string) => (mode === 'alnum' ? ch.toUpperCase() : ch);
+  const commit = (next: string[]) => { setVals(next); if (next.every(Boolean)) onComplete?.(next.join('')); };
 
-  const handleKey = (i, e) => {
+  const handleKey = (i: number, e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Backspace') {
       e.preventDefault();
       const next = [...vals];
@@ -26,7 +30,7 @@ export function PinInput({ length = 6, mode = 'digits', onComplete }) {
     }
   };
 
-  const handlePaste = (i, e) => {
+  const handlePaste = (i: number, e: React.ClipboardEvent<HTMLInputElement>) => {
     e.preventDefault();
     const chars = [...e.clipboardData.getData('text')].filter(ok).map(norm);
     if (!chars.length) return;

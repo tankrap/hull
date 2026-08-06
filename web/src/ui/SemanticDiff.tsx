@@ -1,35 +1,53 @@
 // keel/hull SemanticDiff — Tailwind. The flagship review surface.
 // Structure + state machine; op detail bodies are data-driven (see building blocks below).
 import React, { useState, useEffect } from 'react';
-import { Button } from './Button.jsx';
-import { OpBadge } from './Badge.jsx';
+import { Button } from './Button';
+import { OpBadge } from './Badge';
 
-const cx = (...a) => a.filter(Boolean).join(' ');
+const cx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(' ');
 
 // Reviewed-state persistence. Keyed by the change so a reload (or navigating away and back) keeps
 // the "mark reviewed" checkmarks the reviewer already earned.
-const loadReviewed = (key, n) => {
+const loadReviewed = (key: string | undefined, n: number): boolean[] | null => {
   if (!key) return null;
   try { const a = JSON.parse(localStorage.getItem(key) || 'null'); return Array.isArray(a) && a.length === n ? a : null; } catch { return null; }
 };
 
+type ReviewCtx = { accepted: boolean[]; accept: (p: number) => void };
+
+type Op = {
+  kind: string;
+  title: React.ReactNode;
+  meta?: React.ReactNode;
+  body: React.ReactNode | ((ctx: ReviewCtx) => React.ReactNode);
+  proposals?: unknown[];
+};
+
+type SemanticVoyage = { title: React.ReactNode; id: React.ReactNode; meta?: React.ReactNode };
+
 // op: { kind, title, meta, body: ReactNode | (ctx)=>ReactNode, proposals?: [...] }
-export function SemanticDiff({ voyage, ops, onMerge, showMerge = true, storageKey }) {
+export function SemanticDiff({ voyage, ops, onMerge, showMerge = true, storageKey }: {
+  voyage: SemanticVoyage;
+  ops: Op[];
+  onMerge?: () => void;
+  showMerge?: boolean;
+  storageKey?: string;
+}) {
   const [sel, setSel] = useState(0);
   const [full, setFull] = useState(false);
   const [railW, setRailW] = useState(236);
   // Drag the divider to resize the file/findings rail.
-  const startResize = (e) => {
+  const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.clientX, startW = railW;
-    const onMove = (ev) => setRailW(Math.max(170, Math.min(520, startW + ev.clientX - startX)));
+    const onMove = (ev: MouseEvent) => setRailW(Math.max(170, Math.min(520, startW + ev.clientX - startX)));
     const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); document.body.style.userSelect = ''; };
     document.body.style.userSelect = 'none';
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   };
-  const [reviewed, setReviewed] = useState(() => loadReviewed(storageKey, ops.length) ?? ops.map(() => false));
-  const [accepted, setAccepted] = useState(ops.map((o) => (o.proposals || []).map(() => false)));
+  const [reviewed, setReviewed] = useState<boolean[]>(() => loadReviewed(storageKey, ops.length) ?? ops.map(() => false));
+  const [accepted, setAccepted] = useState<boolean[][]>(ops.map((o) => (o.proposals || []).map(() => false)));
   const done = reviewed.filter(Boolean).length;
   const allDone = done === ops.length;
 
@@ -38,16 +56,16 @@ export function SemanticDiff({ voyage, ops, onMerge, showMerge = true, storageKe
   // Esc leaves fullscreen.
   useEffect(() => {
     if (!full) return;
-    const onKey = (e) => { if (e.key === 'Escape') setFull(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFull(false); };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [full]);
   // j/k step through files while reviewing (GitHub-style). Ignored while typing a comment or with a
   // modifier held, so it never fights the composer or a browser shortcut.
   useEffect(() => {
-    const onKey = (e) => {
+    const onKey = (e: KeyboardEvent) => {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const t = e.target;
+      const t = e.target as HTMLElement | null;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
       if (e.key === 'j') { setSel((s) => Math.min(ops.length - 1, s + 1)); e.preventDefault(); }
       else if (e.key === 'k') { setSel((s) => Math.max(0, s - 1)); e.preventDefault(); }
@@ -65,7 +83,7 @@ export function SemanticDiff({ voyage, ops, onMerge, showMerge = true, storageKe
     const nextIdx = [...order.slice(sel + 1), ...order.slice(0, sel)].find((i) => !next[i]);
     if (nextIdx !== undefined) setSel(nextIdx);
   };
-  const acceptProposal = (opIdx, pIdx) => {
+  const acceptProposal = (opIdx: number, pIdx: number) => {
     setAccepted((a) => {
       const next = a.map((row) => [...row]);
       next[opIdx][pIdx] = true;
@@ -74,6 +92,7 @@ export function SemanticDiff({ voyage, ops, onMerge, showMerge = true, storageKe
     });
   };
 
+  const selBody = ops[sel].body;
   const body = (
     <div className={cx('grid', full && 'flex-1 min-h-0')} style={{ gridTemplateColumns: `${railW}px 7px 1fr` }}>
       {/* rail */}
@@ -101,9 +120,9 @@ export function SemanticDiff({ voyage, ops, onMerge, showMerge = true, storageKe
       {/* detail */}
       <div className={cx('flex flex-col min-w-0', full ? 'overflow-auto' : '')}>
         <div className={cx('flex-1 min-w-0', full ? 'px-6 py-5' : 'px-5 py-4')}>
-          {typeof ops[sel].body === 'function'
-            ? ops[sel].body({ accepted: accepted[sel], accept: (p) => acceptProposal(sel, p) })
-            : ops[sel].body}
+          {typeof selBody === 'function'
+            ? selBody({ accepted: accepted[sel], accept: (p) => acceptProposal(sel, p) })
+            : selBody}
         </div>
         <div className="flex justify-between items-center gap-3 px-5 py-3 border-t border-rule2 bg-paper/60 sticky bottom-0">
           <Button size="sm" variant="secondary" onClick={() => setSel((s) => Math.max(0, s - 1))}
@@ -170,7 +189,7 @@ export function SemanticDiff({ voyage, ops, onMerge, showMerge = true, storageKe
 
 // ---- building blocks for op detail bodies --------------------------------
 
-export function LocationBar({ crumbs, right }) {
+export function LocationBar({ crumbs, right }: { crumbs: React.ReactNode[]; right?: React.ReactNode }) {
   return (
     <div className="flex items-center gap-[7px] text-[12px] text-muted bg-paper border border-rule2 rounded-t-ctl border-b-0 px-3 py-[6px]">
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-faint flex-none">
@@ -191,11 +210,27 @@ export function LocationBar({ crumbs, right }) {
 // A row with `note` renders a full-width annotation (inline finding / line comment / composer).
 // A row with `marker` shows a labelled pill in the gutter to reopen a collapsed finding.
 // filePath + selectedLine/onSelectLine/onCommentLine drive line selection and line-level comments.
-const MARK = { bad: 'bg-fault', warn: 'bg-brass', info: 'bg-steel' };
+const MARK: Record<string, string> = { bad: 'bg-fault', warn: 'bg-brass', info: 'bg-steel' };
 const CommentIcon = () => (
   <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2z" /></svg>
 );
-export function CodePanel({ lines, filePath, selectedLine, onSelectLine, onCommentLine, highlightLine }) {
+
+type CodeLine = {
+  n?: React.ReactNode;
+  code?: React.ReactNode;
+  sign?: '+' | '-';
+  note?: React.ReactNode;
+  marker?: { tone: string; onClick: () => void; title?: string };
+};
+
+export function CodePanel({ lines, filePath, selectedLine, onSelectLine, onCommentLine, highlightLine }: {
+  lines: CodeLine[];
+  filePath?: string;
+  selectedLine?: number | null;
+  onSelectLine?: (n: number | null) => void;
+  onCommentLine?: (n: number) => void;
+  highlightLine?: number | null;
+}) {
   return (
     <div className="border border-rule2 rounded-b-ctl overflow-hidden text-[12.5px] leading-[1.6]">
       {lines.map((l, i) => l.note ? (
@@ -216,14 +251,14 @@ export function CodePanel({ lines, filePath, selectedLine, onSelectLine, onComme
               highlighted ? 'line-highlight' : selected ? 'bg-steel-wash' : l.sign === '-' ? 'bg-fault-wash' : l.sign === '+' ? 'bg-clear-wash' : 'hover:bg-paper/60')}>
             {l.sign && <span className={cx('pl-3 py-1 font-bold select-none', l.sign === '-' ? 'text-fault-text' : 'text-clear-text')}>{l.sign}</span>}
             <span className={cx('relative flex items-center justify-end gap-1 pr-2 py-1 text-faint bg-paper/50 border-r border-rule3 text-[11px] select-none tabular-nums', canComment && 'cursor-pointer')}
-              onClick={canComment ? () => onSelectLine(selected ? null : ln) : undefined}>
+              onClick={canComment ? () => onSelectLine?.(selected ? null : ln) : undefined}>
               {l.marker ? (
-                <button onClick={(e) => { e.stopPropagation(); l.marker.onClick(); }} title={l.marker.title}
+                <button onClick={(e) => { e.stopPropagation(); l.marker!.onClick(); }} title={l.marker.title}
                   className={cx('absolute left-1 top-1/2 -translate-y-1/2 inline-flex items-center gap-0.5 h-[15px] px-1 rounded-[3px] text-white text-[9px] font-bold ring-1 ring-surface hover:brightness-110 transition', MARK[l.marker.tone] || 'bg-brass')}>
                   <CommentIcon />
                 </button>
               ) : canComment && (
-                <button onClick={(e) => { e.stopPropagation(); onCommentLine(ln); }} title="Comment on this line (or press C when selected)"
+                <button onClick={(e) => { e.stopPropagation(); onCommentLine(ln!); }} title="Comment on this line (or press C when selected)"
                   className="absolute left-1 top-1/2 -translate-y-1/2 w-[17px] h-[17px] grid place-items-center rounded-[4px] bg-steel text-white opacity-0 group-hover:opacity-100 hover:brightness-110 transition shadow-sm">
                   <CommentIcon />
                 </button>
@@ -238,14 +273,21 @@ export function CodePanel({ lines, filePath, selectedLine, onSelectLine, onComme
   );
 }
 
-export const OldTok = ({ children }) => (
+export const OldTok = ({ children }: { children?: React.ReactNode }) => (
   <span className="bg-fault/25 text-fault-text line-through rounded-[3px] px-[3px]">{children}</span>
 );
-export const NewTok = ({ children }) => (
+export const NewTok = ({ children }: { children?: React.ReactNode }) => (
   <span className="bg-clear/25 text-clear-text rounded-[3px] px-[3px] font-semibold">{children}</span>
 );
 
-export function ProposalRow({ file, before, arg, accepted, onAccept, first }) {
+export function ProposalRow({ file, before, arg, accepted, onAccept, first }: {
+  file: React.ReactNode;
+  before?: React.ReactNode;
+  arg?: React.ReactNode;
+  accepted?: boolean;
+  onAccept?: () => void;
+  first?: boolean;
+}) {
   return (
     <div className={cx('flex items-center gap-3 px-3.5 py-[9px] text-[13px] font-medium', !first && 'border-t border-rule3')}>
       <span className="text-[11.5px] font-semibold px-2 py-0.5 rounded-full border border-rule text-dim flex-none">{file}</span>
@@ -263,4 +305,3 @@ export function ProposalRow({ file, before, arg, accepted, onAccept, first }) {
     </div>
   );
 }
-

@@ -1,12 +1,12 @@
 // keel/hull DOM charts — Tailwind: Gauges, Heatmap, Composition.
 // (Donut / stacked bars / area field / line are canvas engines; see engines.md.)
-import React, { useState } from 'react';
-import { ChartCard, RAMP, REST } from './ChartCard.jsx';
+import { useState } from 'react';
+import { ChartCard, RAMP, REST } from './ChartCard';
 
-const cx = (...a) => a.filter(Boolean).join(' ');
+const cx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(' ');
 
 // rows: [{ label, value (0-100) }], threshold: 0-100
-export function Gauges({ rows, threshold = 85 }) {
+export function Gauges({ rows, threshold = 85 }: { rows: { label: string; value: number }[]; threshold?: number }) {
   return (
     <div className="grid gap-3.5 mt-[18px]">
       {rows.map((r, i) => (
@@ -26,9 +26,9 @@ export function Gauges({ rows, threshold = 85 }) {
 }
 
 // GitHub-style activity grid. levels: number[weeks][7], 0-4.
-export function Heatmap({ levels, onHover }) {
+export function Heatmap({ levels, onHover }: { levels: number[][]; onHover?: (w: number, d: number) => void }) {
   const ramp = [REST, ...RAMP.slice(0, 4).reverse()];
-  const [hov, setHov] = useState(null);
+  const [hov, setHov] = useState<[number, number] | null>(null);
   return (
     <div className="flex gap-[3px] mt-4">
       {levels.map((week, w) => (
@@ -48,8 +48,8 @@ export function Heatmap({ levels, onHover }) {
 }
 
 // GitHub-style segmented breakdown line + legend chips. items: [{ name, pct }]
-export function Composition({ title, items }) {
-  const [hov, setHov] = useState(null);
+export function Composition({ title, items }: { title: React.ReactNode; items: { name: string; pct: number }[] }) {
+  const [hov, setHov] = useState<number | null>(null);
   return (
     <div>
       <div className="text-[12.5px] font-semibold text-[#171717]">{title}</div>
