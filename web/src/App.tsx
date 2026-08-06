@@ -3406,6 +3406,8 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchHit[] | null>(null);
   const [allPaths, setAllPaths] = useState<string[] | null>(null);
+  // Below md the tree is a toggled drawer above the viewer; above md it's the fixed left column.
+  const [treeOpen, setTreeOpen] = useState(false);
 
   useEffect(() => {
     fetch(`${base}/branches`, { headers: authHeaders() }).then((r) => r.json()).then((d) => {
@@ -3484,8 +3486,10 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
           </div>
         </Card>
       ) : (
-        <div className="grid grid-cols-[minmax(190px,270px)_1fr] gap-4 items-start">
-          <Card className="overflow-hidden">
+        <div className="grid grid-cols-1 md:grid-cols-[minmax(190px,270px)_1fr] gap-4 items-start">
+          {/* Below md the tree is a toggled drawer; the button collapses (md:hidden) so the desktop split is unchanged. */}
+          <button className={`md:hidden inline-flex items-center gap-1.5 w-fit px-3 py-1.5 rounded-ctl border text-[13px] transition-colors ${treeOpen ? "text-ink border-ctl" : "text-muted border-rule hover:text-ink"}`} aria-expanded={treeOpen} onClick={() => setTreeOpen((v) => !v)}><FileIcon />Files</button>
+          <Card className={`overflow-hidden max-h-[55vh] overflow-y-auto md:max-h-none ${treeOpen ? "" : "hidden md:block"}`}>
             <SectionHeader label="Files" right={<span className="text-[11.5px] text-faint truncate max-w-[110px]">{branch}</span>} />
             <div className="py-1.5 pl-1.5 pr-1">
               {allPaths === null ? (
@@ -3494,7 +3498,7 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
                 <div className="px-3 py-4 text-[12.5px] text-muted">No files.</div>
               ) : (
                 <Suspense fallback={<div className="px-3 py-4 text-[12.5px] text-muted">Loading tree…</div>}>
-                  <RepoTree paths={allPaths} selected={file?.path ?? null} onSelect={openFile} />
+                  <RepoTree paths={allPaths} selected={file?.path ?? null} onSelect={(p: string) => { openFile(p); setTreeOpen(false); }} />
                 </Suspense>
               )}
             </div>
