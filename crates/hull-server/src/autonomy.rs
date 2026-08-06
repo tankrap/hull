@@ -145,4 +145,65 @@ mod tests {
     fn touches_protected_is_false_when_nothing_matches() {
         assert!(!touches_protected(&["a.rs".into(), "b/c.rs".into()], &defaults()));
     }
+
+    // A store with an isolated temp persist path (constructed directly — the test module sees the
+    // private fields), so set_repo/set_account don't touch the real ~/.hull.
+    fn store_at(tag: &str) -> AutonomyStore {
+        let path = std::env::temp_dir().join(format!("hull-autonomy-test-{}-{tag}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        AutonomyStore { path, map: Mutex::new(HashMap::new()) }
+    }
+
+    fn policy(tier: AutonomyTier, protected: &[&str]) -> AutonomyPolicy {
+        AutonomyPolicy { tier, protected_paths: protected.iter().map(|s| s.to_string()).collect() }
+    }
+
+    #[test]
+    fn effective_repo_overrides_account_overrides_instance_for_tier() {
+        let s = store_at("prec");
+        s.set_account("acct", policy(AutonomyTier::T2, &["acct/"]));
+        s.set_repo("tnt", "repo", policy(AutonomyTier::T3, &["repo/"]));
+        // Repo policy present ⇒ its tier wins, and `source` says so.
+        let eff = s.effective("tnt", "repo", Some("acct"));
+        assert_eq!(eff.tier, AutonomyTier::T3);
+        assert_eq!(eff.source, "repo");
+    }
+
+    #[test]
+    fn effective_falls_back_to_account_then_instance() {
+        let s = store_at("fallback");
+        s.set_account("acct", policy(AutonomyTier::T2, &["acct/"]));
+        // No repo policy ⇒ account tier + source.
+        let acc = s.effective("tnt", "repo", Some("acct"));
+        assert_eq!(acc.tier, AutonomyTier::T2);
+        assert_eq!(acc.source, "account");
+        // Neither repo nor account ⇒ instance default (env-derived; compared to the same source so the
+        // assertion is independent of HULL_DEFAULT_AUTONOMY in the test environment).
+        let inst = s.effective("other", "repo", None);
+        assert_eq!(inst.source, "instance");
+        assert_eq!(inst.tier, AutonomyStore::instance_tier());
+        // With no policies, protected paths are exactly the instance defaults (sorted + deduped).
+        let mut want: Vec<String> = DEFAULT_PROTECTED.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        want.dedup();
+        assert_eq!(inst.protected_paths, want);
+    }
+
+    #[test]
+    fn effective_protected_paths_accumulate_across_all_three_levels() {
+        let s = store_at("union");
+        s.set_account("acct", policy(AutonomyTier::T1, &["account-only/"]));
+        s.set_repo("tnt", "repo", policy(AutonomyTier::T3, &["repo-only/"]));
+        let eff = s.effective("tnt", "repo", Some("acct"));
+        // The repo tier won, but protected paths are the UNION of instance defaults + account + repo:
+        // a path protected at ANY level stays protected regardless of which level set the tier (D11).
+        assert!(eff.protected_paths.contains(&"repo-only/".to_string()), "repo-level protected kept");
+        assert!(eff.protected_paths.contains(&"account-only/".to_string()), "account-level protected kept even though repo won the tier");
+        assert!(eff.protected_paths.contains(&"auth/".to_string()), "instance default protected kept");
+        // Deduped + sorted.
+        let mut sorted = eff.protected_paths.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(eff.protected_paths, sorted);
+    }
 }
