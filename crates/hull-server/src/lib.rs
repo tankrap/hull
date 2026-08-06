@@ -239,9 +239,28 @@ fn seed_if_empty(store: &dyn Store) {
     if store.accounts().is_empty() {
         seed(store);
     }
-    ensure_demo_owner(store);
+    // The demo owner is a PUBLISHED-key backdoor (anyone can sign in as owner of every org with it),
+    // so it is gated behind an explicit `HULL_DEMO_MODE` opt-in and is OFF by default. Same for the
+    // `backfill_accountability` re-rooting, which signs delegations with that same public demo key.
+    if demo_mode_enabled() {
+        ensure_demo_owner(store);
+    }
     backfill_members(store);
     backfill_accountability(store);
+}
+
+/// Whether the local/demo affordances are enabled. Truthy values (`enforce`/`on`/`true`/`1`/`yes`,
+/// case-insensitive) turn it ON; unset or a falsey value keeps it OFF — the safe production default.
+/// When OFF, the published [`DEMO_OWNER_SECRET`] has ZERO effect: no auto-owner, no demo-key
+/// delegation re-rooting. Mirrors the truthy parsing of [`git_auth_enforced`].
+fn demo_mode_enabled() -> bool {
+    match std::env::var("HULL_DEMO_MODE") {
+        Ok(v) => {
+            let v = v.trim();
+            ["enforce", "on", "true", "1", "yes"].iter().any(|t| v.eq_ignore_ascii_case(t))
+        }
+        Err(_) => false,
+    }
 }
 
 /// Migration for the crypto-delegation milestone (NEW-1166): any agent whose delegation doesn't
@@ -252,6 +271,12 @@ fn seed_if_empty(store: &dyn Store) {
 /// key is known); a real deployment re-delegates through the owning human instead.
 fn backfill_accountability(store: &dyn Store) {
     use hull_core::{ActorKind, Delegation, DelegationHop};
+    // Re-rooting on the published demo key is a demo-only affordance (see `seed_if_empty`). In prod
+    // there are no pre-crypto legacy agents to migrate, and we must not sign anything with a public
+    // key, so this is a no-op unless demo mode is explicitly enabled.
+    if !demo_mode_enabled() {
+        return;
+    }
     let Some(demo) = identity::human_from_secret("demo", DEMO_OWNER_SECRET) else { return };
     let demo_id = demo.actor.id;
     let no_rev = |_: &str| false;
