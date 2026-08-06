@@ -2292,23 +2292,14 @@ export function App() {
     </header>
   );
 
-  // A notification's PR/issue lives only in its summary text ("… PR !12", "… issue #7") — the payload
-  // carries no tenant/repo, so we can resolve a target only while a repo is open. Issue-kinds prefer
-  // the issue number (their summary can name both an issue and the PR that closed it).
-  const openNotif = (n: { kind: string; summary: string }) => {
-    setShowNotifs(false);
-    if (view !== "repo") return;
-    const issue = n.summary.match(/#(\d+)/)?.[1];
-    const voyage = n.summary.match(/!(\d+)/)?.[1];
-    if (n.kind.startsWith("issue") && issue) navigate(`${repoBase()}/issues/${issue}`);
-    else if (voyage) navigate(`${repoBase()}/voyages/${voyage}`);
-    else if (issue) navigate(`${repoBase()}/issues/${issue}`);
-  };
+  // The inbox is a global per-actor feed across all repos, but a notification's payload carries no
+  // tenant/repo — so its target repo is genuinely unrecoverable here and the rows cannot navigate
+  // correctly frontend-only. Render them as static rows (an actionable inbox awaits a backend payload).
   const notifDrawer = (
     <Drawer open={showNotifs} onClose={() => setShowNotifs(false)} title={`inbox · ${handleOf(actingAs)}`}>
       {notifs.length === 0 && <div className="text-[13px] text-muted">nothing yet</div>}
       {notifs.slice(0, 20).map((n, i) => (
-        <button key={`${n.ts}-${n.kind}-${i}`} onClick={() => openNotif(n)} className="w-full text-left flex items-start gap-2 py-2 border-b border-rule3 last:border-0 -mx-1 px-1 rounded-ctl hover:bg-paper/60 transition-colors">
+        <div key={`${n.ts}-${n.kind}-${i}`} className="flex items-start gap-2 py-2 border-b border-rule3 last:border-0">
           <span className={`w-1.5 h-1.5 rounded-full mt-1.5 flex-none ${n.ts > seenTs ? "bg-steel" : "bg-rule"}`} />
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
@@ -2317,7 +2308,7 @@ export function App() {
             </div>
             <div className="text-[12.5px] text-muted mt-0.5">{n.summary}</div>
           </div>
-        </button>
+        </div>
       ))}
     </Drawer>
   );
@@ -2495,7 +2486,7 @@ export function App() {
                   <div className="grid gap-2">
                     <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">Code references</span>
                     {it.code_refs.map((c) => {
-                      const key = `${it.number}:${c.path}`;
+                      const key = `${it.number}:${c.path}:${c.line_start}:${c.line_end}`;
                       return (
                         <div key={key} className="border border-rule2 rounded-ctl overflow-hidden">
                           <button className="w-full flex items-center gap-2 px-3 py-2.5 bg-paper hover:bg-surface transition-colors text-left" onClick={() => showWhy(key, c.path)}>
@@ -2991,7 +2982,7 @@ export function App() {
           )}
 
           {tab === "graph" && (
-            <RepoGraph tenant={tenant} repo={issueRepo} authHeaders={authHeaders} onOpenFile={(p) => navigate(`${repoBase()}/files?path=${encodeURIComponent(p)}`)} />
+            <RepoGraph tenant={tenant} repo={issueRepo} authHeaders={authHeaders} onOpenFile={(p, branch) => navigate(`${repoBase()}/files?path=${encodeURIComponent(p)}&branch=${encodeURIComponent(branch)}`)} />
           )}
 
           {tab === "settings" && !isTenantOwner && (
@@ -3198,7 +3189,7 @@ function ContributionHeatmap({ days }: { days: HeatDay[] }) {
 type GNode = { path: string; dir: string; lang: string; size: number; deg: number };
 type GEdge = { from: string; to: string };
 const LANG_COLOR: Record<string, string> = { rust: "#dea584", ts: "#3178c6", js: "#f1e05a", python: "#3572A5", go: "#00ADD8" };
-function RepoGraph({ tenant, repo, authHeaders, onOpenFile }: { tenant: string; repo: string; authHeaders: () => Record<string, string>; onOpenFile: (path: string) => void }) {
+function RepoGraph({ tenant, repo, authHeaders, onOpenFile }: { tenant: string; repo: string; authHeaders: () => Record<string, string>; onOpenFile: (path: string, branch: string) => void }) {
   const base = `/api/repos/${encodeURIComponent(tenant)}/${repo}`;
   const [branch, setBranch] = useState("main");
   const [branches, setBranches] = useState<string[]>([]);
@@ -3259,7 +3250,7 @@ function RepoGraph({ tenant, repo, authHeaders, onOpenFile }: { tenant: string; 
                 const on = !anyMatch || match(n.path);
                 const showLabel = hover === n.path || n.deg >= 4 || match(n.path);
                 return (
-                  <g key={n.path} transform={`translate(${p.x} ${p.y})`} onMouseEnter={() => setHover(n.path)} onMouseLeave={() => setHover(null)} onClick={() => onOpenFile(n.path)} style={{ cursor: "pointer" }} opacity={on ? 1 : 0.25}>
+                  <g key={n.path} transform={`translate(${p.x} ${p.y})`} onMouseEnter={() => setHover(n.path)} onMouseLeave={() => setHover(null)} onClick={() => onOpenFile(n.path, branch)} style={{ cursor: "pointer" }} opacity={on ? 1 : 0.25}>
                     <circle r={r} fill={LANG_COLOR[n.lang] || "#8b949e"} stroke={match(n.path) ? "#111827" : "#ffffff"} strokeWidth={match(n.path) ? 2 : 1} />
                     {showLabel && <text x={r + 3} y={4} className="fill-body" style={{ fontSize: 11, paintOrder: "stroke", stroke: "var(--surface)", strokeWidth: 3 }}>{base2(n.path)}</text>}
                     <title>{n.path} · {n.deg} imports</title>
@@ -3304,17 +3295,25 @@ function RepoFiles({ tenant, repo, authHeaders, theme }: { tenant: string; repo:
       .then((r) => r.json()).then((d) => setAllPaths(d.paths ?? [])).catch(() => setAllPaths([]));
   }, [branch, tenant, repo]);
 
-  const openFile = (p: string) => {
+  const openFile = (p: string, ref: string = branch) => {
     setResults(null); setQuery("");
-    fetch(`${base}/blob?ref=${encodeURIComponent(branch)}&path=${encodeURIComponent(p)}`, { headers: authHeaders() })
+    fetch(`${base}/blob?ref=${encodeURIComponent(ref)}&path=${encodeURIComponent(p)}`, { headers: authHeaders() })
       .then((r) => r.json()).then((d) => setFile({ path: p, text: d.text ?? "", binary: !!d.binary, size: d.size ?? 0 })).catch(() => {});
   };
   // Clear any open file / search when the branch changes (the tree reloads via the paths effect).
   useEffect(() => { setResults(null); setQuery(""); setFile(null); /* eslint-disable-next-line */ }, [branch]);
-  // Deep-link: /…/files?path=<p> (e.g. from a dependency-graph node) opens that file once branches settle.
+  // Deep-link: /…/files?path=<p>&branch=<b> (e.g. from a dependency-graph node) opens that file once
+  // branches settle. The optional branch param pins the file to the ref it was linked from (the graph
+  // renders a specific branch); without it we honor whatever branch the picker settled on.
   const [pendingPath, setPendingPath] = useState<string | null>(() => new URLSearchParams(location.search).get("path"));
+  const [pendingBranch] = useState<string | null>(() => new URLSearchParams(location.search).get("branch"));
   useEffect(() => {
-    if (pendingPath && branches.length) { openFile(pendingPath); setPendingPath(null); }
+    if (pendingPath && branches.length) {
+      const ref = pendingBranch && branches.includes(pendingBranch) ? pendingBranch : branch;
+      if (ref !== branch) setBranch(ref);
+      openFile(pendingPath, ref);
+      setPendingPath(null);
+    }
     /* eslint-disable-next-line */
   }, [pendingPath, branches]);
   // Debounced fuzzy/full-text search.
