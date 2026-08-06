@@ -92,12 +92,19 @@ impl Notifier for RecordingNotifier {
     }
 }
 
-/// Login challenges (nonce → issue time) and issued session tokens (token → actor id). In-memory
-/// (crash-only); a hosted deployment would back this with the domain store / a cache.
+/// How long an issued session token stays valid. A token older than this is rejected on use and
+/// dropped — bounding both the blast radius of a leaked token and the unbounded growth of the token
+/// map (nothing else ever evicts a token besides expiry and explicit logout).
+const SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60; // 30 days
+
+/// Login challenges (nonce → issue time) and issued session tokens (token → (actor id, issued time)).
+/// In-memory (crash-only); a hosted deployment would back this with the domain store / a cache.
 #[derive(Default)]
 struct AuthState {
     challenges: HashMap<String, u64>,
-    tokens: HashMap<String, String>,
+    /// token → (actor id, issued-at unix seconds). The issued time drives TTL expiry (see
+    /// [`SESSION_TTL_SECS`] and [`authed_actor`]).
+    tokens: HashMap<String, (String, u64)>,
     /// In-flight passkey ceremonies, keyed by an opaque flow id handed to the client.
     reg_flows: HashMap<String, passkey::RegFlow>,
     add_flows: HashMap<String, passkey::AddFlow>,
@@ -305,6 +312,7 @@ fn make_router(app: App) -> Router {
         .route("/api/auth/challenge", get(auth_challenge))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/me", get(auth_me))
+        .route("/api/auth/session", axum::routing::delete(auth_logout))
         // passkey (WebAuthn) accounts — passwordless signup + login
         .route("/api/auth/register/start", post(register_start))
         .route("/api/auth/register/finish", post(register_finish))
@@ -1837,7 +1845,7 @@ async fn auth_login(State(app): State<App>, Json(body): Json<Value>) -> Response
         return (StatusCode::UNAUTHORIZED, "signature verification failed").into_response();
     }
     let token = identity::random_hex(24);
-    app.auth.lock().unwrap().tokens.insert(token.clone(), actor.clone());
+    app.auth.lock().unwrap().tokens.insert(token.clone(), (actor.clone(), now()));
     (StatusCode::CREATED, Json(json!({ "token": token, "actor": actor }))).into_response()
 }
 
@@ -1854,6 +1862,21 @@ async fn auth_me(State(app): State<App>, headers: axum::http::HeaderMap) -> Resp
         }
         None => (StatusCode::UNAUTHORIZED, "not signed in").into_response(),
     }
+}
+
+/// `DELETE /api/auth/session` (Bearer token) — log out by dropping the presented session token, so a
+/// client can proactively invalidate its own credential rather than wait for TTL expiry. Idempotent:
+/// an already-absent (or missing) token still returns success. No 401 gate — logging out with a bad
+/// token is a no-op, not an error.
+async fn auth_logout(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    if let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        app.auth.lock().unwrap().tokens.remove(token);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// The signed-in actor's full profile (`GET /api/me`): identity, **accountability chain** (for an
@@ -1974,7 +1997,7 @@ async fn register_finish(State(app): State<App>, Json(body): Json<Value>) -> Res
         members: vec![Membership { actor: user.actor.clone(), role: Role::Owner }],
     });
     let token = identity::random_hex(24);
-    app.auth.lock().unwrap().tokens.insert(token.clone(), user.actor.clone());
+    app.auth.lock().unwrap().tokens.insert(token.clone(), (user.actor.clone(), now()));
     (StatusCode::CREATED, Json(json!({ "token": token, "actor": user.actor, "username": user.username }))).into_response()
 }
 
@@ -2027,7 +2050,7 @@ async fn passkey_finish(State(app): State<App>, Json(body): Json<Value>) -> Resp
     }
     app.store.put_user(user.clone());
     let token = identity::random_hex(24);
-    app.auth.lock().unwrap().tokens.insert(token.clone(), user.actor.clone());
+    app.auth.lock().unwrap().tokens.insert(token.clone(), (user.actor.clone(), now()));
     Json(json!({ "token": token, "actor": user.actor, "username": user.username })).into_response()
 }
 
@@ -2165,13 +2188,22 @@ fn verify_service_secret(headers: &axum::http::HeaderMap, header: &str, expected
     }
 }
 
-/// Resolve the `Authorization: Bearer <token>` header to its actor, if valid.
+/// Resolve the `Authorization: Bearer <token>` header to its actor, if valid. A token older than
+/// [`SESSION_TTL_SECS`] is rejected and dropped; expired entries are pruned opportunistically on the
+/// same lock so the map can't grow without bound.
 fn authed_actor(app: &App, headers: &axum::http::HeaderMap) -> Option<Actor> {
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))?;
-    let actor_id = app.auth.lock().unwrap().tokens.get(token).cloned()?;
+    let now = now();
+    let actor_id = {
+        let mut a = app.auth.lock().unwrap();
+        // Opportunistic prune: drop every expired token while we hold the lock.
+        a.tokens.retain(|_, (_, issued)| now.saturating_sub(*issued) < SESSION_TTL_SECS);
+        // The presented token survives the prune iff it's present and unexpired.
+        a.tokens.get(token).map(|(actor, _)| actor.clone())?
+    };
     app.store.actor(&actor_id)
 }
 
@@ -4723,5 +4755,26 @@ mod tests {
         assert!(closing_issue_numbers("fixes the bug", "closes the loop", &[]).is_empty());
         // "affixes #1" — the keyword must be its own word, not a suffix of another.
         assert!(closing_issue_numbers("prefixes #1", "", &[]).is_empty());
+    }
+
+    #[test]
+    fn session_tokens_expire_after_ttl() {
+        // Mirrors the opportunistic prune in `authed_actor`: a token is kept iff its age is under
+        // `SESSION_TTL_SECS`. Drive the exact retain predicate against a synthetic token map so the
+        // TTL boundary is pinned without standing up a full `App`.
+        let now = 1_000_000_000u64;
+        let mut tokens: HashMap<String, (String, u64)> = HashMap::new();
+        tokens.insert("fresh".into(), ("actor_a".into(), now)); // issued now
+        tokens.insert("recent".into(), ("actor_b".into(), now - (SESSION_TTL_SECS - 1))); // just inside TTL
+        tokens.insert("stale".into(), ("actor_c".into(), now - SESSION_TTL_SECS)); // exactly at TTL → expired
+        tokens.insert("ancient".into(), ("actor_d".into(), now - (SESSION_TTL_SECS + 10_000))); // well past
+
+        tokens.retain(|_, (_, issued)| now.saturating_sub(*issued) < SESSION_TTL_SECS);
+
+        assert!(tokens.contains_key("fresh"), "a just-issued token must survive");
+        assert!(tokens.contains_key("recent"), "a token one second inside the TTL must survive");
+        assert!(!tokens.contains_key("stale"), "a token exactly at the TTL boundary must be dropped");
+        assert!(!tokens.contains_key("ancient"), "a long-expired token must be dropped");
+        assert_eq!(tokens.len(), 2, "only unexpired tokens remain — the map cannot grow unbounded");
     }
 }
