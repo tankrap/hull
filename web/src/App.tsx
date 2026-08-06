@@ -1072,7 +1072,7 @@ export function App() {
   const [prov, setProv] = useState<Record<string, { change: string; intent: string; author: string }[]>>({});
 
   // Notifications recorded by the core Notifier plugin capability (poll).
-  const [notifs, setNotifs] = useState<{ kind: string; to: string[]; summary: string; ts: number; broadcast?: boolean }[]>([]);
+  const [notifs, setNotifs] = useState<{ kind: string; to: string[]; summary: string; ts: number; broadcast?: boolean; repo?: string | null; target_kind?: string | null; target_number?: number | null }[]>([]);
   const [showNotifs, setShowNotifs] = useState(false);
   // Unread tracking: the badge counts only notifications newer than what you've last opened.
   const [seenTs, setSeenTs] = useState<number>(() => Number(localStorage.getItem("hull_notif_seen") ?? 0));
@@ -2292,24 +2292,46 @@ export function App() {
     </header>
   );
 
-  // The inbox is a global per-actor feed across all repos, but a notification's payload carries no
-  // tenant/repo — so its target repo is genuinely unrecoverable here and the rows cannot navigate
-  // correctly frontend-only. Render them as static rows (an actionable inbox awaits a backend payload).
+  // The inbox is a global per-actor feed across all repos. A notification now carries its own
+  // `repo` + structured target, so each row can link to the exact repo+PR/issue it's about — never
+  // guessing from the current view. Rows without a resolvable target render static (no false link).
+  const notifHref = (n: (typeof notifs)[number]): string | null => {
+    if (!n.repo || !n.target_kind || n.target_number == null) return null;
+    const [tn, rp] = n.repo.split("/");
+    if (!tn || !rp) return null;
+    const base = `/${encodeURIComponent(tn)}/${encodeURIComponent(rp)}`;
+    if (n.target_kind === "pr") return `${base}/voyages/${n.target_number}`;
+    if (n.target_kind === "issue") return `${base}/issues/${n.target_number}`;
+    return null;
+  };
   const notifDrawer = (
     <Drawer open={showNotifs} onClose={() => setShowNotifs(false)} title={`inbox · ${handleOf(actingAs)}`}>
       {notifs.length === 0 && <div className="text-[13px] text-muted">nothing yet</div>}
-      {notifs.slice(0, 20).map((n, i) => (
-        <div key={`${n.ts}-${n.kind}-${i}`} className="flex items-start gap-2 py-2 border-b border-rule3 last:border-0">
-          <span className={`w-1.5 h-1.5 rounded-full mt-1.5 flex-none ${n.ts > seenTs ? "bg-steel" : "bg-rule"}`} />
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="text-[12.5px] font-semibold text-body">{n.kind.replace(/_/g, " ")}</span>
-              {n.broadcast && <Tag>team</Tag>}
+      {notifs.slice(0, 20).map((n, i) => {
+        const href = notifHref(n);
+        const body = (
+          <>
+            <span className={`w-1.5 h-1.5 rounded-full mt-1.5 flex-none ${n.ts > seenTs ? "bg-steel" : "bg-rule"}`} />
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[12.5px] font-semibold text-body">{n.kind.replace(/_/g, " ")}</span>
+                {n.broadcast && <Tag>team</Tag>}
+                {n.repo && <span className="text-[11px] text-faint truncate">{n.repo}</span>}
+              </div>
+              <div className="text-[12.5px] text-muted mt-0.5">{n.summary}</div>
             </div>
-            <div className="text-[12.5px] text-muted mt-0.5">{n.summary}</div>
+          </>
+        );
+        return href ? (
+          <button key={`${n.ts}-${n.kind}-${i}`} onClick={() => { setShowNotifs(false); navigate(href); }} className="w-full text-left flex items-start gap-2 py-2 border-b border-rule3 last:border-0 hover:bg-paper cursor-pointer">
+            {body}
+          </button>
+        ) : (
+          <div key={`${n.ts}-${n.kind}-${i}`} className="flex items-start gap-2 py-2 border-b border-rule3 last:border-0">
+            {body}
           </div>
-        </div>
-      ))}
+        );
+      })}
     </Drawer>
   );
 
@@ -3767,7 +3789,7 @@ function ReviewPage({
   }, []);
 
   // Discussion thread — the same PR thread as the compact view, followed into the deep review page.
-  type Cmt = { id: string; target: string; author: string; body: string; created_unix: number; path?: string; line?: number };
+  type Cmt = { id: string; target: string; author: string; body: string; created_unix: number; path?: string; line?: number; edited_unix?: number };
   const [thread, setThread] = useState<Cmt[]>([]);
   const [draft, setDraft] = useState("");
   const loadThread = () =>
@@ -3885,6 +3907,9 @@ function ReviewPage({
   }, []);
   const [lineDraft, setLineDraft] = useState("");
   const [askingAI, setAskingAI] = useState(false);
+  // Inline comment editing: the id of the comment currently being edited, plus its working draft.
+  const [editingComment, setEditingComment] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
   const postLineComment = async (askAI = false) => {
     if (!canAct || !pr || !commenting || !lineDraft.trim()) return;
     if (askAI) setAskingAI(true);
@@ -3902,6 +3927,18 @@ function ReviewPage({
     if (!(await uiConfirm({ title: "Delete comment", body: "Delete this comment? This can't be undone.", danger: true, confirmLabel: "Delete" }))) return;
     const r = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/comments/${encodeURIComponent(id)}`, { method: "DELETE", headers: authHeaders() });
     if (r.ok) loadThread(); else uiAlert(await r.text());
+  };
+  const startEditComment = (c: Cmt) => { setEditingComment(c.id); setEditDraft(c.body); };
+  const cancelEditComment = () => { setEditingComment(null); setEditDraft(""); };
+  const saveEditComment = async (id: string) => {
+    const body = editDraft.trim();
+    if (!body) return;
+    const r = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/comments/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ body }),
+    });
+    if (r.ok) { setEditingComment(null); setEditDraft(""); loadThread(); } else uiAlert(await r.text());
   };
   // Press "c" to comment on the currently-selected line(s) — the pierre selection drives it.
   useEffect(() => {
@@ -4276,9 +4313,25 @@ function ReviewPage({
                   <b className={kindOf(c.author) === "agent" ? "text-steel-text" : ""}>{handleOf(c.author)}</b>
                   <span className="text-faint tabular-nums" title={new Date(c.created_unix * 1000).toLocaleString()}>{timeAgo(c.created_unix)}</span>
                   <span className="text-[11px] text-faint">on line {c.line}</span>
-                  {me?.id === c.author && <button onClick={() => deleteComment(c.id)} title="Delete this comment" className="ml-auto opacity-0 group-hover/cmt:opacity-100 text-faint hover:text-fault-text transition-opacity"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg></button>}
+                  {c.edited_unix ? <span className="text-[11px] text-faint" title={`edited ${new Date(c.edited_unix * 1000).toLocaleString()}`}>· edited</span> : null}
+                  {me?.id === c.author && editingComment !== c.id && (
+                    <span className="ml-auto flex items-center gap-1.5">
+                      <button onClick={() => startEditComment(c)} title="Edit this comment" className="opacity-0 group-hover/cmt:opacity-100 text-faint hover:text-steel-text transition-opacity"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg></button>
+                      <button onClick={() => deleteComment(c.id)} title="Delete this comment" className="opacity-0 group-hover/cmt:opacity-100 text-faint hover:text-fault-text transition-opacity"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg></button>
+                    </span>
+                  )}
                 </div>
-                <Markdown text={c.body} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} className="text-[13.5px] text-body mt-0.5" />
+                {editingComment === c.id ? (
+                  <div className="mt-1 grid gap-2">
+                    <RichText value={editDraft} onChange={setEditDraft} rows={2} autoFocus minimal mentions={mentions} onSubmit={() => saveEditComment(c.id)} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} placeholder="Edit your comment…  (⌘↵ to save)" />
+                    <div className="flex gap-2">
+                      <Button size="sm" disabled={!editDraft.trim()} onClick={() => saveEditComment(c.id)}>Save</Button>
+                      <Button size="sm" variant="ghost" onClick={cancelEditComment}>Cancel</Button>
+                    </div>
+                  </div>
+                ) : (
+                  <Markdown text={c.body} linkBase={`/${encodeURIComponent(tenant)}/${repo}`} className="text-[13.5px] text-body mt-0.5" />
+                )}
               </div>
             </div>
           );
