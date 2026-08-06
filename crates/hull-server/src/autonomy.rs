@@ -110,3 +110,39 @@ impl AutonomyStore {
 pub fn touches_protected(files: &[String], protected: &[String]) -> bool {
     files.iter().any(|f| protected.iter().any(|g| hull_core::store::glob_match(g, f)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults() -> Vec<String> {
+        DEFAULT_PROTECTED.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn default_protected_matches_real_files() {
+        let p = defaults();
+        // Root-level protected dirs.
+        assert!(touches_protected(&["auth/login.rs".into()], &p));
+        assert!(touches_protected(&[".hull/CODEOWNERS".into()], &p));
+        assert!(touches_protected(&["migrations/0001.sql".into()], &p));
+        // Nested `auth` / `migrations` dirs, caught by the `**/…/**` entries.
+        assert!(touches_protected(&["db/migrations/1.sql".into()], &p));
+        assert!(touches_protected(&["crates/api/auth/token.rs".into()], &p));
+    }
+
+    #[test]
+    fn default_protected_does_not_match_ordinary_files() {
+        let p = defaults();
+        assert!(!touches_protected(&["src/main.rs".into()], &p));
+        assert!(!touches_protected(&["README.md".into()], &p));
+        // A same-prefix-but-different word must not match.
+        assert!(!touches_protected(&["authz/policy.rs".into()], &p));
+        assert!(!touches_protected(&["src/migration_helper.rs".into()], &p));
+    }
+
+    #[test]
+    fn touches_protected_is_false_when_nothing_matches() {
+        assert!(!touches_protected(&["a.rs".into(), "b/c.rs".into()], &defaults()));
+    }
+}
