@@ -2666,6 +2666,30 @@ enum CiResolution {
     Failed(String),
 }
 
+/// RAII release of a built-in-local-runner inflight slot. The local runner executes on a
+/// `spawn_blocking` task and the handler `.await`s its completion; if the axum handler future is
+/// cancelled (client disconnects while parked on that `.await`), the blocking task keeps running to
+/// completion but the handler code after the `.await` never runs. Clearing the slot in `Drop`
+/// guarantees release on EVERY exit — success, error, panic, and cancellation — so a cancelled run
+/// can no longer wedge the tree in the inflight set until process restart. The cancelled run's
+/// orphan simply finishes into its own unique `CI_SEQ` dir, so releasing the slot for a subsequent
+/// run causes no collision. `active` is set to whether THIS invocation actually claimed the slot
+/// (`mark_inflight` returned true): a `force` run that ran while another run already held the claim
+/// must not clear that other run's slot.
+struct InflightGuard {
+    ci_config: Arc<ci::CiConfig>,
+    tree: String,
+    active: bool,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.ci_config.clear_inflight(&self.tree);
+        }
+    }
+}
+
 /// Trigger a change's checks. If the repo (or the instance) configures an external CI endpoint, POST
 /// the standard job payload there and return — Hull owns no queue and waits for a callback.
 /// Otherwise run the built-in local runner inline. A content-addressed memo hit short-circuits both.
@@ -2715,21 +2739,23 @@ async fn resolve_check(app: &App, tenant: &str, repo: &str, change: &str, force:
             // No external CI configured: the built-in local runner (blocking — keep the runtime free).
             // Guard against duplicate concurrent runs of the same (repo,tree) the same way the dispatch
             // path does: `mark_inflight` atomically claims the tree, so a second inline run that races
-            // in gets `Pending` instead of doing redundant work. Cleared unconditionally when the run
-            // finishes. `force` still claims the slot (a forced run is a real run) but never yields to
-            // an outstanding one.
-            if !force && !app.ci_config.mark_inflight(&tree) {
+            // in gets `Pending` instead of doing redundant work. `force` still runs even when the tree
+            // is already claimed by another run, but must never release that other run's slot.
+            let claimed = app.ci_config.mark_inflight(&tree);
+            if !force && !claimed {
                 return CiResolution::Pending;
             }
-            if force {
-                app.ci_config.mark_inflight(&tree);
-            }
+            // Release the slot via RAII so it clears on EVERY exit path — including cancellation of
+            // this handler future while parked on the `.await` below. `active = claimed` means the
+            // guard only clears the slot when THIS invocation was the claimer (a forced run that
+            // piggybacked on another run's outstanding claim leaves that claim intact).
+            let _inflight = InflightGuard { ci_config: app.ci_config.clone(), tree: tree.clone(), active: claimed };
             let (repos, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
             let (t, r, c) = (tenant.to_string(), repo.to_string(), change.to_string());
             let outcome = tokio::task::spawn_blocking(move || ci::run_check(&repos, &registry, &ci, &t, &r, &c, force))
                 .await
                 .unwrap_or(hull_plugin::CiOutcome { status: hull_plugin::CiStatus::Errored, summary: "runner panicked".into(), memoized: false });
-            app.ci_config.clear_inflight(&tree);
+            // `_inflight` drops here (or when the future is cancelled), clearing the slot iff claimed.
             CiResolution::Done(outcome)
         }
     }
@@ -4736,6 +4762,27 @@ fn stamp(ev: &mut ActivityEvent, t: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inflight_guard_releases_slot_on_drop_only_when_active() {
+        let cfg = Arc::new(ci::CiConfig::from_env());
+        // A live claim released by an active guard drop (models normal completion AND cancellation:
+        // both simply drop the guard).
+        assert!(cfg.mark_inflight("tree-a"), "first claim should succeed");
+        assert!(cfg.is_inflight("tree-a"));
+        {
+            let _g = InflightGuard { ci_config: cfg.clone(), tree: "tree-a".into(), active: true };
+        }
+        assert!(!cfg.is_inflight("tree-a"), "active guard drop must clear the slot");
+
+        // A force run that did NOT claim (another run holds the slot) must leave the slot intact.
+        assert!(cfg.mark_inflight("tree-b"), "owner claims tree-b");
+        {
+            let _g = InflightGuard { ci_config: cfg.clone(), tree: "tree-b".into(), active: false };
+        }
+        assert!(cfg.is_inflight("tree-b"), "inactive guard must not clear another run's slot");
+        cfg.clear_inflight("tree-b");
+    }
 
     #[test]
     fn closing_issue_numbers_scans_title_and_body_with_keywords() {
