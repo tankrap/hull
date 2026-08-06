@@ -39,6 +39,20 @@ async fn serve(addr: SocketAddr, hub: Arc<ActivityHub>) -> Result<(), BoxError> 
     Ok(())
 }
 
+// ⚠️ AUTHORIZATION — DEFERRED (authz-hardening, area D). This QUIC ingress is UNAUTHENTICATED: the
+// TLS layer uses a self-signed server cert with `with_no_client_auth` (see `quic::server_config`),
+// and `handle_conn` trusts the `{tenant,repo}` header verbatim — any peer that can reach the socket
+// can publish coordination events into ANY tenant's situation room (spoofing ref moves / merge
+// verdicts). There is **no existing daemon-credential mechanism to require** here today (the
+// `hull-agent` uplink sends no token, and `handle_conn` is handed only the `ActivityHub`, not the
+// auth/token store), so it is documented rather than half-gated.
+//
+// What a correct fix needs: (a) a daemon credential — either QUIC **mTLS** with a per-tenant client
+// cert pinned to a real CA (the `quic.rs` module header already notes a hosted deploy should do this,
+// tying into the NEW-1166 auth work), or (b) an auth token carried in the first `{tenant,repo,token}`
+// header frame, verified against a shared daemon-token store threaded into `serve`/`handle_conn`
+// (which today only receives the hub). Then reject the connection when the credential is
+// missing/invalid or doesn't authorize the claimed `tenant`, before publishing any event.
 async fn handle_conn(incoming: quinn::Incoming, hub: Arc<ActivityHub>) -> Result<(), BoxError> {
     let conn = incoming.await?;
     let peer = conn.remote_address();
