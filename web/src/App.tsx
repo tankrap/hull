@@ -15,6 +15,7 @@ import { createPasskey, getPasskey } from "./webauthn";
 import { hlToHtml, wordDiff, type Seg } from "./highlight";
 import { Markdown } from "./markdown";
 import { RichText } from "./ui/RichText";
+import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from "./api";
 
 // Syntax-highlighted code fragment (hljs HTML). Used across the diff viewer.
 const Hl = ({ text, path }: { text: string; path: string }) => <span dangerouslySetInnerHTML={{ __html: hlToHtml(text, path) }} />;
@@ -468,11 +469,11 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
   const [login, setLogin] = useState<{ provider: string; label: string; session: string; url: string; needsCode: boolean; userCode: string | null } | null>(null);
   const [code, setCode] = useState("");
   const [waiting, setWaiting] = useState(false);
-  const load = () => { fetch(`/api/accounts/${enc(accountId)}/ai`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) { setConns(d.connections || []); setRotate(!!d.rotate); } }).catch(() => {}); };
+  const load = () => { apiGet(`/api/accounts/${enc(accountId)}/ai`, authHeaders()).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) { setConns(d.connections || []); setRotate(!!d.rotate); } }).catch(() => {}); };
   useEffect(load, [accountId]); // eslint-disable-line
-  useEffect(() => { fetch(`/api/ai/agents`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) setAgents(d.agents || []); }).catch(() => {}); }, [accountId]); // eslint-disable-line
-  const post = (body: Record<string, unknown>) => fetch(`/api/accounts/${enc(accountId)}/ai`, { method: "POST", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify(body) });
-  const postPath = (path: string, body: Record<string, unknown>) => fetch(`/api/accounts/${enc(accountId)}/ai/${path}`, { method: "POST", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify(body) });
+  useEffect(() => { apiGet(`/api/ai/agents`, authHeaders()).then((r) => (r.ok ? r.json() : null)).then((d) => { if (d) setAgents(d.agents || []); }).catch(() => {}); }, [accountId]); // eslint-disable-line
+  const post = (body: Record<string, unknown>) => apiPost(`/api/accounts/${enc(accountId)}/ai`, body, authHeaders());
+  const postPath = (path: string, body: Record<string, unknown>) => apiPost(`/api/accounts/${enc(accountId)}/ai/${path}`, body, authHeaders());
   const add = async () => {
     if (!key.trim()) return;
     setBusy(true);
@@ -526,10 +527,10 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
   };
   const remove = async (id: string) => {
     if (!(await uiConfirm({ title: "Remove connection", body: "Disconnect this AI backend from the account?", danger: true, confirmLabel: "Remove" }))) return;
-    const r = await fetch(`/api/accounts/${enc(accountId)}/ai/${enc(id)}`, { method: "DELETE", headers: authHeaders() });
+    const r = await apiDelete(`/api/accounts/${enc(accountId)}/ai/${enc(id)}`, authHeaders());
     if (r.ok) load(); else uiAlert(await r.text());
   };
-  const toggleRotate = async (on: boolean) => { setRotate(on); await fetch(`/api/accounts/${enc(accountId)}/ai/rotate`, { method: "PUT", headers: { ...authHeaders(), "content-type": "application/json" }, body: JSON.stringify({ rotate: on }) }).catch(() => setRotate(!on)); };
+  const toggleRotate = async (on: boolean) => { setRotate(on); await apiPut(`/api/accounts/${enc(accountId)}/ai/rotate`, { rotate: on }, authHeaders()).catch(() => setRotate(!on)); };
   const PROVIDERS = [{ value: "anthropic", label: "Claude (Anthropic)" }, { value: "openai", label: "OpenAI" }, { value: "openrouter", label: "OpenRouter" }];
   const dot = (c: Conn) => (c.auth_kind === "agent" ? "bg-clear" : c.provider === "anthropic" ? "bg-brass" : c.provider === "openai" ? "bg-clear" : "bg-steel");
   const installed = agents.filter((a) => a.installed);
@@ -1552,8 +1553,8 @@ export function App() {
   const [repoLabels, setRepoLabels] = useState<RepoLabel[]>([]);
   const labelColor = (name: string) => repoLabels.find((l) => l.name === name)?.color;
   const loadRepoSettings = () => {
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setRepoSettings(d)).catch(() => {});
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/owners`, { headers: authHeaders() }).then((r) => r.json()).then((d) => setOwnerRules(d.owners ?? [])).catch(() => {});
+    apiGet(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, authHeaders()).then((r) => (r.ok ? r.json() : null)).then((d) => d && setRepoSettings(d)).catch(() => {});
+    apiGet(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/owners`, authHeaders()).then((r) => r.json()).then((d) => setOwnerRules(d.owners ?? [])).catch(() => {});
     if (orgAccountFor(tenant)) loadTeams(orgAccountFor(tenant)!.id);
   };
   const orgAccountFor = (handle: string) => accounts.find((a) => a.handle === handle);
@@ -1572,7 +1573,7 @@ export function App() {
   // Danger zone: rename re-keys the repo — hard-navigate to the new URL so no stale repo-name state
   // lingers. Delete removes it and returns to the owning org's page.
   const renameRepo = async (newName: string) => {
-    const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}`, { method: "PATCH", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify({ name: newName }) });
+    const res = await apiPatch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}`, { name: newName }, authHeaders());
     if (!res.ok) { uiAlert(await apiError(res)); return; }
     const d = await res.json();
     window.location.href = `/${encodeURIComponent(tenant)}/${encodeURIComponent(d.name ?? newName)}/settings`;
@@ -1651,7 +1652,7 @@ export function App() {
     setProv((p) => ({ ...p, [key]: d.provenance ?? [] }));
   };
   const loadIssues = () =>
-    fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`, { headers: authHeaders() })
+    apiGet(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/issues`, authHeaders())
       .then((r) => r.json())
       .then((d) => setIssues(d.issues ?? []))
       .catch(() => {});
@@ -1730,7 +1731,7 @@ export function App() {
   const orgAccount = accounts.find((a) => a.handle === (orgHandle ?? " "));
   // Org-level DEFAULT repo settings — inherited by every repo created afterward.
   const [orgDefaults, setOrgDefaults] = useState<RepoSettings | null>(null);
-  const loadOrgDefaults = (acctId: string) => fetch(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : null)).then((d) => d && setOrgDefaults(d)).catch(() => {});
+  const loadOrgDefaults = (acctId: string) => apiGet(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, authHeaders()).then((r) => (r.ok ? r.json() : null)).then((d) => d && setOrgDefaults(d)).catch(() => {});
   const saveOrgDefaults = async (acctId: string, patch: Partial<{ visibility: string; require_review_to_land: boolean; labels: RepoLabel[] }>) => {
     const res = await fetch(`/api/accounts/${encodeURIComponent(acctId)}/repo-defaults`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
     if (res.ok) setOrgDefaults(await res.json()); else uiAlert(await apiError(res));
