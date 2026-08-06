@@ -10,8 +10,13 @@
 //! (`<session>.enc`, ChaCha20-Poly1305 under the server key). It is only ever plaintext transiently:
 //!   - during **login**, in `dir_for(session)` while `setup-token` writes into it, then [`seal`]ed;
 //!   - during a **run**, [`open`]ed into a throwaway dir that is wiped when the [`BundleGuard`] drops.
-//! `setup-token` mints a *long-lived* token, so runs are read-only against the bundle — we decrypt,
-//! run, and discard, never re-sealing (no per-run mutation to persist, so no lock/race).
+//! A run is **not** read-only against the bundle: the CLI rotates its own access/refresh tokens as it
+//! runs, and those rotations must survive to the next run or the credential goes stale. So on drop the
+//! guard **re-seals** the (possibly mutated) dir back to `<session>.enc`, then wipes the plaintext.
+//! A per-session lock (see [`lock_for`]) serializes runs against the same bundle, so two runs never
+//! decrypt-mutate-reseal concurrently and clobber each other's rotated refresh token. If a re-seal
+//! ever fails, the guard logs loudly and keeps the *prior* sealed bundle (a stale-but-valid credential
+//! is better than none) while still wiping the plaintext, so unencrypted creds never linger on disk.
 
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
@@ -156,8 +161,13 @@ impl Drop for BundleGuard {
         // dir was somehow emptied, in which case keep the last good sealed bundle rather than clobber.
         let populated = std::fs::read_dir(&self.dir).map(|mut it| it.next().is_some()).unwrap_or(false);
         if populated {
+            // Re-seal atomically (seal_dir writes to a temp file then renames), so a failure leaves the
+            // PRIOR sealed bundle intact — never a half-written one. On failure we can only log loudly:
+            // the run's token rotation is lost and the next run decrypts the stale-but-valid bundle. We
+            // still wipe the plaintext below regardless, so a failed re-seal never leaves unencrypted
+            // credentials on disk (exposing them would be worse than losing a refresh).
             if let Err(e) = seal_dir(&self.session, &self.dir) {
-                eprintln!("hull: could not re-seal agent bundle {}: {e}", self.session);
+                eprintln!("hull: could not re-seal agent bundle {} (keeping prior sealed bundle; token refresh lost): {e}", self.session);
             }
         }
         let _ = std::fs::remove_dir_all(&self.dir);
