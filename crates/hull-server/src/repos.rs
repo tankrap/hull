@@ -235,6 +235,14 @@ impl RepoHost {
         store.get_ref("main").ok()?.map(|id| id.to_hex())
     }
 
+    /// The change a named `branch` ref points at (hex), or `None` if the repo/branch is absent. Unlike
+    /// [`Self::head_change`] this isn't hard-wired to `main` — the protected-branch land reads the
+    /// repo's configured default branch through it.
+    pub fn branch_head(&self, tenant: &str, repo: &str, branch: &str) -> Option<String> {
+        let store = self.store(tenant, repo, false).ok()??;
+        store.get_ref(branch).ok()?.map(|id| id.to_hex())
+    }
+
     /// Resolve a pushed git commit (full 40-hex SHA-1) to the keel change it was bridged into — the
     /// glue that lets a voyage be opened from a pushed branch's HEAD, not just `main`.
     /// The `gchange` aux namespace (git-commit-oid(20) → keel change id(32)) is written by the bridge
@@ -1268,6 +1276,258 @@ impl RepoHost {
         // Keep the composed tree reachable so it survives GC between compose and CI run.
         let _ = store.set_ref(&format!("hull/indep/{}", composed.to_hex()), &composed);
         Some(composed.to_hex())
+    }
+}
+
+// ── protected-branch merge queue ─────────────────────────────────────────────────────────────────
+//
+// When a repo's default branch is protected (`require_review_to_land`), a PR lands not by flipping
+// metadata but by *synthesizing* the merge server-side (fast-forward or a real 3-way), speculatively
+// re-verifying the merged tree, and advancing the branch by compare-and-swap. These helpers do the
+// tree math; the App layer (`perform_merge`) drives verify + retry around them.
+
+/// The plan for landing a PR onto a protected branch, produced by [`RepoHost::plan_merge`].
+pub(crate) enum MergeOutcome {
+    /// The PR's head is already contained in the branch — nothing to land (idempotent success).
+    AlreadyMerged,
+    /// A merged tree id, ready to speculatively verify and land. A fast-forward yields the head's own
+    /// tree; a divergent land yields a synthesized 3-way tree. Pinned reachable (`hull/merge/<tree>`)
+    /// so GC can't sweep it during the verify + advance window.
+    Tree(String),
+}
+
+/// Why a protected-branch land could not proceed.
+#[derive(Debug)]
+pub(crate) enum MergeError {
+    /// A real content conflict — both sides changed the same path incompatibly (incl. add/add and
+    /// delete/modify). v1 does no line-level auto-merge, so this **rejects** the land. User-facing.
+    Conflict(String),
+    /// A store/IO failure while synthesizing or committing the merge.
+    Internal(String),
+}
+
+impl RepoHost {
+    /// The tree id of a change, or `None` if it isn't a change / can't be read.
+    fn change_tree_id(store: &Store, change: ObjectId) -> Option<ObjectId> {
+        match store.get(&change).ok()?? {
+            Object::Change(c) => Some(c.tree),
+            _ => None,
+        }
+    }
+
+    /// All ancestors of `id` (including `id`) over every parent edge, nearest-first (BFS). Used for
+    /// fast-forward detection and picking a near merge-base.
+    fn ancestors_bfs(store: &Store, id: ObjectId) -> Vec<ObjectId> {
+        let mut seen = std::collections::HashSet::new();
+        let mut order = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        seen.insert(id);
+        queue.push_back(id);
+        while let Some(x) = queue.pop_front() {
+            order.push(x);
+            if let Some(Object::Change(c)) = store.get(&x).ok().flatten() {
+                for p in c.parents {
+                    if seen.insert(p) {
+                        queue.push_back(p);
+                    }
+                }
+            }
+        }
+        order
+    }
+
+    /// The **head** change of a PR — the tip among its proposed `changes` (the one whose ancestry
+    /// contains all the others). A single-change PR is trivially that change; diverging changes with no
+    /// single tip fall back to the last proposed change. This is the change landed onto the branch.
+    pub(crate) fn pr_head(&self, tenant: &str, repo: &str, changes: &[String]) -> Option<String> {
+        match changes {
+            [] => None,
+            [only] => Some(only.clone()),
+            _ => {
+                let store = self.store(tenant, repo, false).ok()??;
+                let ids: Vec<ObjectId> = changes.iter().filter_map(|h| ObjectId::from_hex(h)).collect();
+                for &cand in &ids {
+                    let anc: std::collections::HashSet<ObjectId> = Self::ancestors_bfs(&store, cand).into_iter().collect();
+                    if ids.iter().all(|o| anc.contains(o)) {
+                        return Some(cand.to_hex());
+                    }
+                }
+                changes.last().cloned()
+            }
+        }
+    }
+
+    /// Pin a tree reachable (so a concurrent GC can't sweep it between synthesis and land) and wrap it.
+    fn pin_merge_tree(store: &Store, tree: ObjectId) -> MergeOutcome {
+        let _ = store.set_ref(&format!("hull/merge/{}", tree.to_hex()), &tree);
+        MergeOutcome::Tree(tree.to_hex())
+    }
+
+    /// Plan the land of `head_hex` onto the protected branch `branch` whose current tip is `base_hex`
+    /// (`None` = an unborn branch — the first land is a trivial fast-forward). Fast-forward when the
+    /// base is an ancestor of the head; already-contained when the head is an ancestor of the base;
+    /// otherwise a per-path 3-way merge against a near common ancestor. Returns the merged tree id
+    /// (pinned reachable) to verify + land, or a conflict/internal error. NO line-level merge: any
+    /// path both sides changed incompatibly is a hard conflict.
+    pub(crate) fn plan_merge(&self, tenant: &str, repo: &str, branch: &str, base_hex: Option<&str>, head_hex: &str) -> Result<MergeOutcome, MergeError> {
+        let store = self
+            .store(tenant, repo, false)
+            .map_err(|e| MergeError::Internal(e.to_string()))?
+            .ok_or_else(|| MergeError::Internal("no such repo".into()))?;
+        let head = ObjectId::from_hex(head_hex).ok_or_else(|| MergeError::Internal("bad head change id".into()))?;
+        let head_tree = Self::change_tree_id(&store, head).ok_or_else(|| MergeError::Internal("head change not found".into()))?;
+        // Unborn branch: the first land is a trivial fast-forward to the head's tree.
+        let Some(base_hex) = base_hex else {
+            return Ok(Self::pin_merge_tree(&store, head_tree));
+        };
+        let base = ObjectId::from_hex(base_hex).ok_or_else(|| MergeError::Internal("bad base change id".into()))?;
+        if base == head {
+            return Ok(MergeOutcome::AlreadyMerged);
+        }
+        let base_anc: std::collections::HashSet<ObjectId> = Self::ancestors_bfs(&store, base).into_iter().collect();
+        if base_anc.contains(&head) {
+            return Ok(MergeOutcome::AlreadyMerged); // head already in the branch's history
+        }
+        let head_anc = Self::ancestors_bfs(&store, head);
+        if head_anc.contains(&base) {
+            // base ∈ ancestors(head) ⇒ fast-forward: the merged tree IS the head's tree, no synthesis.
+            return Ok(Self::pin_merge_tree(&store, head_tree));
+        }
+        // 3-way: near common ancestor = first of head's ancestors (BFS/nearest-first) also under base.
+        let mergebase = head_anc
+            .into_iter()
+            .find(|a| base_anc.contains(a))
+            .ok_or_else(|| MergeError::Internal("no common ancestor for 3-way merge".into()))?;
+        let base_tree = Self::change_tree_id(&store, base).ok_or_else(|| MergeError::Internal("base change not found".into()))?;
+        let mb_tree = Self::change_tree_id(&store, mergebase).ok_or_else(|| MergeError::Internal("merge-base change not found".into()))?;
+        let merged = self.synthesize_three_way(&store, branch, mb_tree, base_tree, head_tree)?;
+        Ok(Self::pin_merge_tree(&store, merged))
+    }
+
+    /// Per-path 3-way merge of `base_tree` (ours) and `head_tree` (theirs) against common ancestor
+    /// `mb_tree`, producing a merged tree id. Per path: both sides equal ⇒ take it; a side unchanged
+    /// from the ancestor ⇒ take the other side (covers add / modify / delete on one side); both sides
+    /// changed the same path to different content (incl. add/add-differing and delete/modify) ⇒
+    /// CONFLICT. The merge is applied on top of a base checkout so unchanged files keep their mode.
+    fn synthesize_three_way(&self, store: &Store, branch: &str, mb_tree: ObjectId, base_tree: ObjectId, head_tree: ObjectId) -> Result<ObjectId, MergeError> {
+        let mut mb = HashMap::new();
+        flatten_tree(store, mb_tree, "", &mut mb, 0);
+        let mut ours = HashMap::new();
+        flatten_tree(store, base_tree, "", &mut ours, 0);
+        let mut theirs = HashMap::new();
+        flatten_tree(store, head_tree, "", &mut theirs, 0);
+        let mut paths: Vec<&String> = ours.keys().chain(theirs.keys()).chain(mb.keys()).collect();
+        paths.sort();
+        paths.dedup();
+        // Only paths whose resolved blob DIFFERS from `ours` become edits applied on top of the base
+        // checkout — so unchanged files (the vast majority) retain their mode from the checkout.
+        let mut edits: Vec<(String, Option<ObjectId>)> = Vec::new();
+        for p in paths {
+            let b = mb.get(p).copied();
+            let o = ours.get(p).copied();
+            let t = theirs.get(p).copied();
+            let resolved: Option<ObjectId> = if o == t {
+                o // both sides agree (incl. both-absent)
+            } else if o == b {
+                t // ours unchanged from the ancestor ⇒ take theirs (add / modify / delete)
+            } else if t == b {
+                o // theirs unchanged ⇒ take ours
+            } else {
+                return Err(MergeError::Conflict(format!("CONFLICT: merge conflict in {p}; update your change against {branch}")));
+            };
+            if resolved != o {
+                edits.push((p.clone(), resolved));
+            }
+        }
+        self.materialize_merge(store, base_tree, &edits)
+    }
+
+    /// Materialize a merged tree: check out `base_tree`, apply the resolved edits (write a blob, or
+    /// delete a path), then snapshot. Mirrors [`RepoHost::compose_independence_tree`]'s checkout+patch.
+    fn materialize_merge(&self, store: &Store, base_tree: ObjectId, edits: &[(String, Option<ObjectId>)]) -> Result<ObjectId, MergeError> {
+        let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("hull-merge-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        if keel_store::snapshot::checkout(store, base_tree, &dir).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(MergeError::Internal("checkout of base tree failed".into()));
+        }
+        for (path, blob) in edits {
+            let fp = dir.join(path);
+            match blob {
+                Some(id) => {
+                    let bytes = match store.get(id) {
+                        Ok(Some(Object::Blob(b))) => b,
+                        _ => {
+                            let _ = std::fs::remove_dir_all(&dir);
+                            return Err(MergeError::Internal(format!("missing merged blob for {path}")));
+                        }
+                    };
+                    if let Some(parent) = fp.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::write(&fp, &bytes).is_err() {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return Err(MergeError::Internal(format!("write failed for {path}")));
+                    }
+                }
+                None => {
+                    let _ = std::fs::remove_file(&fp);
+                }
+            }
+        }
+        let tree = keel_store::snapshot::snapshot_uncached(store, &dir).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        tree.ok_or_else(|| MergeError::Internal("snapshot of merged tree failed".into()))
+    }
+
+    /// Commit the two-parent merge change (`parents = [base, head]`, or `[head]` on an unborn branch)
+    /// carrying `merged_tree`, and advance `branch` to it by **compare-and-swap** from `base`. Returns
+    /// `Some(change_hex)` on success, `None` if the branch moved under us (caller re-plans + retries),
+    /// or an internal error.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn land_merge(
+        &self,
+        tenant: &str,
+        repo: &str,
+        branch: &str,
+        base_hex: Option<&str>,
+        head_hex: &str,
+        merged_tree_hex: &str,
+        intent: &str,
+        author: &str,
+        timestamp: u64,
+    ) -> Result<Option<String>, MergeError> {
+        let store = self
+            .store(tenant, repo, false)
+            .map_err(|e| MergeError::Internal(e.to_string()))?
+            .ok_or_else(|| MergeError::Internal("no such repo".into()))?;
+        let merged_tree = ObjectId::from_hex(merged_tree_hex).ok_or_else(|| MergeError::Internal("bad merged tree id".into()))?;
+        let head = ObjectId::from_hex(head_hex).ok_or_else(|| MergeError::Internal("bad head change id".into()))?;
+        let expected = match base_hex {
+            Some(h) => Some(ObjectId::from_hex(h).ok_or_else(|| MergeError::Internal("bad base change id".into()))?),
+            None => None,
+        };
+        let parents: Vec<ObjectId> = match expected {
+            Some(b) => vec![b, head],
+            None => vec![head],
+        };
+        let change = keel_store::Change {
+            parents,
+            tree: merged_tree,
+            session: None,
+            intent: intent.to_string(),
+            author: author.to_string(),
+            timestamp,
+            verification: keel_store::Verification::Unverified,
+        };
+        let obj = Object::Change(change);
+        let id = obj.id();
+        match store.apply_cas(std::slice::from_ref(&obj), branch, expected, id) {
+            Ok(keel_store::store::Applied::Committed) => Ok(Some(id.to_hex())),
+            Ok(keel_store::store::Applied::Conflict(_)) => Ok(None),
+            Err(e) => Err(MergeError::Internal(e.to_string())),
+        }
     }
 }
 

@@ -3942,15 +3942,72 @@ async fn perform_merge(
         };
         return Err((StatusCode::CONFLICT, format!("cannot merge: {why}")));
     }
+    // Landing. On a PROTECTED default branch this advances the branch through a synthesized,
+    // speculatively re-verified merge (the merge queue). When protection is off it stays exactly
+    // today's metadata-only flip — the config-off no-op that keeps every un-opted repo unchanged.
+    let default_branch = find_repo(app, tenant, repo).await.map(|r| r.default_branch).unwrap_or_else(|| "main".into());
+    let mut landed_change: Option<String> = None;
+    if app.repo_settings.get(&key).protects_default_branch() {
+        let Some(head) = app.repos.pr_head(tenant, repo, &pr.changes) else {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "PR has no landable change".into()));
+        };
+        let intent = format!("Merge PR !{number}: {}", pr.title);
+        let mut done = false;
+        // CAS-advance with bounded retry: a concurrent land moves the branch, so we re-read the base
+        // and re-plan (and re-verify the fresh merged tree) rather than clobber the other land.
+        for _ in 0..8 {
+            let base = app.repos.branch_head(tenant, repo, &default_branch);
+            match app.repos.plan_merge(tenant, repo, &default_branch, base.as_deref(), &head) {
+                Ok(repos::MergeOutcome::AlreadyMerged) => {
+                    done = true; // head already on the branch — nothing to advance
+                    break;
+                }
+                Ok(repos::MergeOutcome::Tree(tree)) => {
+                    // Speculative verify of the MERGED tree — catches semantic conflicts two
+                    // independently-green changes create. An admin override may bypass the green gate
+                    // (a wedged/misconfigured check) but STILL lands through this merge path — there is
+                    // no git-push escape hatch. A real content conflict already errored out of `plan_merge`.
+                    if !override_ok {
+                        let (rh, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
+                        let (t, r, tr) = (tenant.to_string(), repo.to_string(), tree.clone());
+                        let outcome = tokio::task::spawn_blocking(move || ci::run_check_tree(&rh, &registry, &ci, &t, &r, &tr))
+                            .await
+                            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "merge verification panicked".to_string()))?;
+                        if !matches!(outcome.status, hull_plugin::CiStatus::Green) {
+                            return Err((StatusCode::CONFLICT, "CONFLICT: merged result fails checks".into()));
+                        }
+                    }
+                    match app.repos.land_merge(tenant, repo, &default_branch, base.as_deref(), &head, &tree, &intent, &actor.id, now()) {
+                        Ok(Some(new_change)) => {
+                            landed_change = Some(new_change);
+                            done = true;
+                            break;
+                        }
+                        Ok(None) => continue, // CAS miss: branch moved — re-read + re-plan
+                        Err(repos::MergeError::Conflict(m)) => return Err((StatusCode::CONFLICT, m)),
+                        Err(repos::MergeError::Internal(m)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, m)),
+                    }
+                }
+                Err(repos::MergeError::Conflict(m)) => return Err((StatusCode::CONFLICT, m)),
+                Err(repos::MergeError::Internal(m)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, m)),
+            }
+        }
+        if !done {
+            return Err((StatusCode::CONFLICT, "branch moved during merge; retry".into()));
+        }
+    }
     pr.state = PrState::Merged;
     pr.merged_by = Some(actor.id.clone());
     app.store.replace_pr(pr.clone()).await;
+    // Announce the change that now sits at the branch tip — the synthesized merge change on a
+    // protected land, else the PR's head change (today's behavior).
+    let announced = landed_change.clone().or_else(|| pr.changes.first().cloned()).unwrap_or_default();
     app.hub.publish(
         tenant,
-        ActivityEvent::Push { actor: actor.handle.clone(), repo: repo.to_string(), change: pr.changes.first().cloned().unwrap_or_default(), ts: now() },
+        ActivityEvent::Push { actor: actor.handle.clone(), repo: repo.to_string(), change: announced.clone(), ts: now() },
     );
     // Outbound mirror on change-land — guarded by loop prevention + idempotency.
-    if let Some(change) = pr.changes.first() {
+    if let Some(change) = landed_change.as_ref().or_else(|| pr.changes.first()) {
         mirror_out(app, tenant, repo, change).await;
     }
     // Auto-close the issues this PR fixes, stamping the resolving keel change as provenance.
