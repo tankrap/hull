@@ -1,0 +1,31 @@
+# Keep the build context small — only the Rust workspace is needed to build hull-server.
+.git
+.gitignore
+
+# Rust build output (rebuilt inside the image; huge).
+target
+**/*.rs.bk
+
+# The web frontend is a separate deploy; the server build never reads it.
+web/node_modules
+web/dist
+web/.vite
+web
+
+# Local env / secrets / dbs — never bake into an image.
+.env
+.env.*
+*.db
+*.sqlite
+
+# Docker + docs (not build inputs).
+Dockerfile
+.dockerignore
+docker-compose.yml
+docs
+*.md
+
+# keel/editor/OS cruft.
+.keel
+.DS_Store
+scripts
