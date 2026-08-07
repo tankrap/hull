@@ -975,9 +975,13 @@ mod tests {
         // Apply the fix (normally done at server startup by `harden_server_process`).
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0, "PR_SET_DUMPABLE(0) should succeed");
 
-        // The server still reads its OWN /proc/self (operation unaffected) and /proc/self/exe resolves.
-        assert!(std::fs::read(format!("/proc/{pid}/environ")).is_ok(), "self-read of own environ must still work");
-        assert!(std::fs::read_link("/proc/self/exe").is_ok(), "/proc/self/exe must still resolve (toolchains)");
+        // `current_exe()` (readlink /proc/self/exe) MUST still work for the server itself — the
+        // `same_thread_group` self-bypass in the kernel's `ptrace_may_access` permits it even when
+        // non-dumpable, so the sandbox can still resolve its helper binary. (The numeric
+        // /proc/<pid>/environ *file* becomes root-owned 0400 and is unreadable even by self now —
+        // that open() hits the inode-permission gate before any self-bypass, and is irrelevant to
+        // the server's operation, which reads its environment from memory via std::env, not /proc.)
+        assert!(std::fs::read_link("/proc/self/exe").is_ok(), "/proc/self/exe must still resolve (current_exe/toolchains)");
 
         // The fix in action: the same-uid child can no longer read our environ.
         let denied = child_reads();
