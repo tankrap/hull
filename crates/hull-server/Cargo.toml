@@ -72,3 +72,20 @@ chacha20poly1305 = "0.10"
 # from the observability middleware; startup lines go through tracing too.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ── CI sandbox (Phase 3) ────────────────────────────────────────────────────────────────────────
+# The built-in CI runner is the one place Hull executes attacker-controlled repo code. The
+# `SandboxedCiRunner` re-execs the current binary as a `ci-sandbox` helper that drops resource
+# limits (libc setrlimit) and, on Linux, a Landlock filesystem jail before exec'ing the test command.
+# `libc` (setrlimit + group-kill) is unix-only; `landlock` is Linux-only — both are gated so non-unix
+# builds pull neither.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
+[dev-dependencies]
+# The sandbox tests re-exec the *test* binary as the `ci-sandbox` helper (via `current_exe`). A
+# constructor lets that helper dispatch before libtest's main would otherwise swallow the argv.
+ctor = "0.2"
