@@ -240,12 +240,12 @@ impl App {
 /// Build the router with an already-assembled registry (handy for tests / embedding). Wires a
 /// coordination source (real keeld bridge or the demo) but NOT the QUIC ingress — [`run`] starts
 /// that, so tests don't bind a UDP port.
-pub fn router(registry: Registry) -> Router {
+pub async fn router(registry: Registry) -> Router {
     let hub = Arc::new(ActivityHub::new());
     wire_sources(&hub);
     // Tests/embedding use an ephemeral in-memory store; `run` uses the durable FileStore.
     let store: Arc<dyn Store> = Arc::new(InMemory::new());
-    seed_if_empty(&*store);
+    seed_if_empty(&*store).await;
     make_router(build_app(registry, hub, store))
 }
 
@@ -295,36 +295,32 @@ fn data_path() -> std::path::PathBuf {
 /// Reads `HULL_DATABASE_URL` (required) and the same `store.json` path `run` would use. Idempotent —
 /// the domain tables are replaced with the snapshot. Invoked by the `import-postgres` subcommand.
 /// Returns `Err` (never panics on the operator's behalf) so the binary can print + exit non-zero.
-pub fn import_postgres() -> Result<(), String> {
-    // The blocking `postgres` client spins its OWN tokio runtime; run the whole import on a dedicated
-    // OS thread so it never nests inside a caller's runtime (the bin's `#[tokio::main]`), which panics.
-    std::thread::scope(|s| s.spawn(import_postgres_inner).join().map_err(|_| "hull: import thread panicked".to_string())?)
-}
-
-fn import_postgres_inner() -> Result<(), String> {
+pub async fn import_postgres() -> Result<(), String> {
+    // The async `tokio-postgres` client runs directly on the caller's runtime (the bin's
+    // `#[tokio::main]`), so no dedicated OS thread / nested runtime is needed anymore — just `.await`.
     let url = std::env::var("HULL_DATABASE_URL")
         .ok()
         .filter(|u| !u.is_empty())
         .ok_or("hull: set HULL_DATABASE_URL to the target Postgres before importing")?;
     let path = data_path();
-    let pg = PostgresStore::connect(&url)?;
-    let stats = hull_core::store::import_store_json(&pg, &path)?;
+    let pg = PostgresStore::connect(&url).await?;
+    let stats = hull_core::store::import_store_json(&pg, &path).await?;
     eprintln!("hull: imported {stats} from {} into Postgres", path.display());
     Ok(())
 }
 
-fn seed_if_empty(store: &dyn Store) {
-    if store.accounts().is_empty() {
-        seed(store);
+async fn seed_if_empty(store: &dyn Store) {
+    if store.accounts().await.is_empty() {
+        seed(store).await;
     }
     // The demo owner is a PUBLISHED-key backdoor (anyone can sign in as owner of every org with it),
     // so it is gated behind an explicit `HULL_DEMO_MODE` opt-in and is OFF by default. Same for the
     // `backfill_accountability` re-rooting, which signs delegations with that same public demo key.
     if demo_mode_enabled() {
-        ensure_demo_owner(store);
+        ensure_demo_owner(store).await;
     }
-    backfill_members(store);
-    backfill_accountability(store);
+    backfill_members(store).await;
+    backfill_accountability(store).await;
 }
 
 /// Whether the local/demo affordances are enabled. Truthy values (`enforce`/`on`/`true`/`1`/`yes`,
@@ -347,7 +343,7 @@ fn demo_mode_enabled() -> bool {
 /// [`Delegation::verify`] at the authoring gate would lock out agents seeded by an earlier build.
 /// Idempotent: already-verifiable agents are skipped. Only the demo human can be signed for here (its
 /// key is known); a real deployment re-delegates through the owning human instead.
-fn backfill_accountability(store: &dyn Store) {
+async fn backfill_accountability(store: &dyn Store) {
     use hull_core::{ActorKind, Delegation, DelegationHop};
     // Re-rooting on the published demo key is a demo-only affordance (see `seed_if_empty`). In prod
     // there are no pre-crypto legacy agents to migrate, and we must not sign anything with a public
@@ -358,7 +354,7 @@ fn backfill_accountability(store: &dyn Store) {
     let Some(demo) = identity::human_from_secret("demo", DEMO_OWNER_SECRET) else { return };
     let demo_id = demo.actor.id;
     let no_rev = |_: &str| false;
-    for mut a in store.actors() {
+    for mut a in store.actors().await {
         if a.kind != ActorKind::Agent {
             continue;
         }
@@ -374,7 +370,7 @@ fn backfill_accountability(store: &dyn Store) {
             ],
         });
         eprintln!("hull: backfilled a signed delegation for agent {} (rooted at demo)", a.handle);
-        store.put_actor(a);
+        store.put_actor(a).await;
     }
 }
 
@@ -386,17 +382,17 @@ const DEMO_OWNER_SECRET: &str = "68756c6c2d64656d6f2d6f776e65722d6b65792d64656d6
 
 /// Ensure the demo owner exists and owns every org, so a fresh login lands on a usable account.
 /// Idempotent.
-fn ensure_demo_owner(store: &dyn Store) {
+async fn ensure_demo_owner(store: &dyn Store) {
     use hull_core::{Membership, Role};
     let Some(minted) = identity::human_from_secret("demo", DEMO_OWNER_SECRET) else { return };
     let id = minted.actor.id.clone();
-    if store.actor(&id).is_none() {
-        store.put_actor(minted.actor);
+    if store.actor(&id).await.is_none() {
+        store.put_actor(minted.actor).await;
     }
-    for mut acct in store.accounts() {
+    for mut acct in store.accounts().await {
         if !acct.members.iter().any(|m| m.actor == id) {
             acct.members.push(Membership { actor: id.clone(), role: Role::Owner });
-            store.put_account(acct);
+            store.put_account(acct).await;
         }
     }
 }
@@ -405,20 +401,20 @@ fn ensure_demo_owner(store: &dyn Store) {
 /// `members` list. Backfill the canonical org members (the human `justin` as Owner, `agent:reviewer`
 /// as Write) by handle, without wiping the durable demo store or sweeping in every actor ever
 /// registered. Skips a handle that isn't present.
-fn backfill_members(store: &dyn Store) {
+async fn backfill_members(store: &dyn Store) {
     use hull_core::{Membership, Role};
     const CANONICAL: &[(&str, Role)] = &[("justin", Role::Owner), ("agent:reviewer", Role::Write)];
-    for mut acct in store.accounts() {
+    for mut acct in store.accounts().await {
         if !acct.members.is_empty() {
             continue;
         }
         for (handle, role) in CANONICAL {
-            if let Some(actor) = store.actors().into_iter().find(|a| &a.handle == handle) {
+            if let Some(actor) = store.actors().await.into_iter().find(|a| &a.handle == handle) {
                 acct.members.push(Membership { actor: actor.id, role: *role });
             }
         }
         if !acct.members.is_empty() {
-            store.put_account(acct);
+            store.put_account(acct).await;
         }
     }
 }
@@ -634,7 +630,7 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     let store: Arc<dyn Store> = match std::env::var("HULL_DATABASE_URL") {
         Ok(url) if !url.is_empty() => {
             eprintln!("hull-server: domain store = Postgres");
-            Arc::new(PostgresStore::connect(&url).expect("hull-server: Postgres store"))
+            Arc::new(PostgresStore::connect(&url).await.expect("hull-server: Postgres store"))
         }
         _ => {
             let store = Arc::new(FileStore::open(data_path()));
@@ -642,7 +638,7 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
             store
         }
     };
-    seed_if_empty(&*store);
+    seed_if_empty(&*store).await;
     let router = make_router(build_app(registry, hub, store));
     let listener = tokio::net::TcpListener::bind(&opts.addr).await.expect("bind");
     eprintln!("hull-server listening on http://{}", opts.addr);
@@ -748,10 +744,10 @@ fn enforce_prod_profile() {
 async fn home(State(app): State<App>, headers: axum::http::HeaderMap, Query(_q): Query<HashMap<String, String>>) -> Json<Value> {
     // Personalized: the signed-in user's repos across EVERY account they belong to, ranked by
     // activity (active repos first, then their quiet repos). Not a global tenant. Logged out → empty.
-    let Some(actor) = authed_actor(&app, &headers) else {
+    let Some(actor) = authed_actor(&app, &headers).await else {
         return Json(json!({ "repos": [], "accounts": [] }));
     };
-    let accts = member_accounts(&app, &actor.id);
+    let accts = member_accounts(&app, &actor.id).await;
     let mut items: Vec<Value> = Vec::new();
     for acct in &accts {
         let ranked = app.hub.home(&acct.handle);
@@ -761,7 +757,7 @@ async fn home(State(app): State<App>, headers: axum::http::HeaderMap, Query(_q):
             items.push(json!({ "tenant": acct.handle, "repo": r.repo, "score": r.score, "last_ts": r.last_ts, "active_actors": r.active_actors, "hot_files": r.hot_files }));
         }
         // Include the account's repos that have no recent activity, so created/imported repos show.
-        for repo in app.store.repos().into_iter().filter(|rp| rp.owner == acct.id) {
+        for repo in app.store.repos().await.into_iter().filter(|rp| rp.owner == acct.id) {
             if !seen.contains(&repo.name) {
                 items.push(json!({ "tenant": acct.handle, "repo": repo.name, "score": 0.0, "last_ts": 0, "active_actors": [], "hot_files": [] }));
             }
@@ -779,14 +775,14 @@ async fn home(State(app): State<App>, headers: axum::http::HeaderMap, Query(_q):
     let mut rel_issues: Vec<Value> = Vec::new();
     let mut rel_prs: Vec<Value> = Vec::new();
     for acct in &accts {
-        for repo in app.store.repos().into_iter().filter(|rp| rp.owner == acct.id) {
+        for repo in app.store.repos().await.into_iter().filter(|rp| rp.owner == acct.id) {
             let key = format!("{}/{}", acct.handle, repo.name);
-            for is in app.store.issues(&key) {
+            for is in app.store.issues(&key).await {
                 if !matches!(is.status, IssueStatus::Open) { continue; }
                 let reason = if is.author == me { "you opened" } else if is.assignees.iter().any(|a| a == me) { "assigned to you" } else if is.referenced_actors.iter().any(|a| a == me) { "you're mentioned" } else { continue };
                 rel_issues.push(json!({ "tenant": acct.handle, "repo": repo.name, "number": is.number, "title": is.title, "author": is.author, "reason": reason, "ts": is.created_unix }));
             }
-            for pr in app.store.prs(&key) {
+            for pr in app.store.prs(&key).await {
                 if pr.state != PrState::Open { continue; }
                 let reason = if pr.reviewers.iter().any(|a| a == me) { "review requested" } else if pr.author == me { "you opened" } else { continue };
                 rel_prs.push(json!({ "tenant": acct.handle, "repo": repo.name, "number": pr.number, "title": pr.title, "author": pr.author, "reason": reason, "verification": pr.verification }));
@@ -803,17 +799,17 @@ async fn home(State(app): State<App>, headers: axum::http::HeaderMap, Query(_q):
 /// `GET /api/profile` — the signed-in user's profile: bio + a year of contributions (their own and
 /// their accountable agents'), bucketed by day, across every repo they belong to. Powers the heatmap.
 async fn profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
-    let Some(me) = authed_actor(&app, &headers) else {
+    let Some(me) = authed_actor(&app, &headers).await else {
         return (StatusCode::UNAUTHORIZED, "not signed in").into_response();
     };
-    let bio = app.store.user_by_actor(&me.id).map(|u| u.bio).unwrap_or_default();
+    let bio = app.store.user_by_actor(&me.id).await.map(|u| u.bio).unwrap_or_default();
     let since = now().saturating_sub(371 * 86_400);
     // A change's author is the git author string ("handle <email> ..."), so we attribute by HANDLE:
     // mine = my own handle + every agent handle whose accountability roots at me.
     let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
     mine.insert(me.handle.clone());
     let mut agent_handles: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for a in app.store.actors() {
+    for a in app.store.actors().await {
         if a.id != me.id && a.human_principal().map(|h| h == &me.id).unwrap_or(false) {
             mine.insert(a.handle.clone());
             agent_handles.insert(a.handle.clone());
@@ -829,10 +825,10 @@ async fn profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Resp
     // Token usage over time: per day, sum tokens in / out of the sessions behind my changes.
     let mut tok_days: HashMap<u64, (u64, u64)> = HashMap::new();
     let (mut tok_in, mut tok_out) = (0u64, 0u64);
-    for acct in member_accounts(&app, &me.id) {
-        for repo in app.store.repos().into_iter().filter(|r| r.owner == acct.id) {
+    for acct in member_accounts(&app, &me.id).await {
+        for repo in app.store.repos().await.into_iter().filter(|r| r.owner == acct.id) {
             let key = format!("{}/{}", acct.handle, repo.name);
-            let roots: Vec<String> = app.store.prs(&key).into_iter().flat_map(|p| p.changes).collect();
+            let roots: Vec<String> = app.store.prs(&key).await.into_iter().flat_map(|p| p.changes).collect();
             for (author, ts, id) in app.repos.history(&acct.handle, &repo.name, &roots, since) {
                 let h = handle_of(&author);
                 if mine.contains(&h) {
@@ -840,7 +836,7 @@ async fn profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Resp
                     if agent_handles.contains(&h) { e.1 += 1; } else { e.0 += 1; }
                     *by_handle.entry(h).or_default() += 1;
                     total += 1;
-                    if let Some(sr) = app.store.session_record(&key, &id) {
+                    if let Some(sr) = app.store.session_record(&key, &id).await {
                         let te = tok_days.entry(ts / 86_400).or_default();
                         te.0 += sr.tokens_in; te.1 += sr.tokens_out;
                         tok_in += sr.tokens_in; tok_out += sr.tokens_out;
@@ -867,13 +863,13 @@ async fn profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Resp
 /// **everyone** who works in its repos (humans and their agents), bucketed by day, plus token usage
 /// over time. The org page is public, so this needs no auth; it only reads repos the org owns.
 async fn org_profile(State(app): State<App>, axum::extract::Path(handle): axum::extract::Path<String>) -> Response {
-    let Some(acct) = app.store.accounts().into_iter().find(|a| a.handle == handle) else {
+    let Some(acct) = app.store.accounts().await.into_iter().find(|a| a.handle == handle) else {
         return (StatusCode::NOT_FOUND, "no such organization").into_response();
     };
     let since = now().saturating_sub(371 * 86_400);
     // An author handle counts as an agent if any actor bearing that handle is an agent.
     let mut agent_handles: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for a in app.store.actors() {
+    for a in app.store.actors().await {
         if a.kind == hull_core::ActorKind::Agent { agent_handles.insert(a.handle.clone()); }
     }
     let handle_of = |author: &str| -> String { author.split_once(" <").map(|(n, _)| n.trim().to_string()).unwrap_or_else(|| author.trim().to_string()) };
@@ -882,16 +878,16 @@ async fn org_profile(State(app): State<App>, axum::extract::Path(handle): axum::
     let mut total = 0u64;
     let mut tok_days: HashMap<u64, (u64, u64)> = HashMap::new();
     let (mut tok_in, mut tok_out) = (0u64, 0u64);
-    for repo in app.store.repos().into_iter().filter(|r| r.owner == acct.id) {
+    for repo in app.store.repos().await.into_iter().filter(|r| r.owner == acct.id) {
         let key = format!("{}/{}", acct.handle, repo.name);
-        let roots: Vec<String> = app.store.prs(&key).into_iter().flat_map(|p| p.changes).collect();
+        let roots: Vec<String> = app.store.prs(&key).await.into_iter().flat_map(|p| p.changes).collect();
         for (author, ts, id) in app.repos.history(&acct.handle, &repo.name, &roots, since) {
             let h = handle_of(&author);
             let e = days.entry(ts / 86_400).or_default();
             if agent_handles.contains(&h) { e.1 += 1; } else { e.0 += 1; }
             *by_handle.entry(h.clone()).or_default() += 1;
             total += 1;
-            if let Some(sr) = app.store.session_record(&key, &id) {
+            if let Some(sr) = app.store.session_record(&key, &id).await {
                 let te = tok_days.entry(ts / 86_400).or_default();
                 te.0 += sr.tokens_in; te.1 += sr.tokens_out;
                 tok_in += sr.tokens_in; tok_out += sr.tokens_out;
@@ -908,7 +904,7 @@ async fn org_profile(State(app): State<App>, axum::extract::Path(handle): axum::
         .collect();
     contributors.sort_by(|a, b| b["count"].as_u64().unwrap_or(0).cmp(&a["count"].as_u64().unwrap_or(0)));
     // Public repo names, so a signed-out visitor can still browse the org (private repos are omitted).
-    let repo_names: Vec<String> = app.store.repos().into_iter()
+    let repo_names: Vec<String> = app.store.repos().await.into_iter()
         .filter(|r| r.owner == acct.id && !app.repo_settings.get(&format!("{}/{}", acct.handle, r.name)).private)
         .map(|r| r.name).collect();
     Json(json!({ "handle": acct.handle, "members": acct.members.len(), "repos": repo_names.len(), "repo_names": repo_names,
@@ -917,14 +913,14 @@ async fn org_profile(State(app): State<App>, axum::extract::Path(handle): axum::
 }
 
 /// The accounts an actor is a member of.
-fn member_accounts(app: &App, actor_id: &str) -> Vec<Account> {
-    app.store.accounts().into_iter().filter(|a| a.members.iter().any(|m| m.actor == actor_id)).collect()
+async fn member_accounts(app: &App, actor_id: &str) -> Vec<Account> {
+    app.store.accounts().await.into_iter().filter(|a| a.members.iter().any(|m| m.actor == actor_id)).collect()
 }
 
 /// Visibility gate: may `actor` (or an anonymous caller) read this repo? Public repos are readable by
 /// anyone; a private repo only by a member of its owning account, or a member of a team the repo
 /// grants access to.
-fn can_read_repo(app: &App, actor_id: Option<&str>, tenant: &str, repo: &str) -> bool {
+async fn can_read_repo(app: &App, actor_id: Option<&str>, tenant: &str, repo: &str) -> bool {
     let key = format!("{tenant}/{repo}");
     let settings = app.repo_settings.get(&key);
     if !settings.private {
@@ -933,21 +929,22 @@ fn can_read_repo(app: &App, actor_id: Option<&str>, tenant: &str, repo: &str) ->
     let Some(aid) = actor_id else { return false };
     // Resolve the owning account the same way the write-side gate does (repo record's owner, falling
     // back to handle==tenant), so read-side and write-side membership evaluate the same account.
-    let Some(acct) = repo_owner_account(app, tenant, repo) else { return false };
+    let Some(acct) = repo_owner_account(app, tenant, repo).await else { return false };
     if acct.members.iter().any(|m| m.actor == aid) {
         return true;
     }
     app.store
         .teams(&acct.id)
+        .await
         .into_iter()
         .any(|t| settings.team_access.iter().any(|ta| ta.team == t.id) && t.members.iter().any(|m| m.actor == aid))
 }
 
 /// A 404 for repos the caller can't see — used so a private repo doesn't even reveal its existence.
 #[allow(clippy::result_large_err)]
-fn require_repo_read(app: &App, headers: &axum::http::HeaderMap, tenant: &str, repo: &str) -> Result<(), Response> {
-    let actor = authed_actor(app, headers).map(|a| a.id);
-    if can_read_repo(app, actor.as_deref(), tenant, repo) {
+async fn require_repo_read(app: &App, headers: &axum::http::HeaderMap, tenant: &str, repo: &str) -> Result<(), Response> {
+    let actor = authed_actor(app, headers).await.map(|a| a.id);
+    if can_read_repo(app, actor.as_deref(), tenant, repo).await {
         Ok(())
     } else {
         Err((StatusCode::NOT_FOUND, "not found").into_response())
@@ -962,7 +959,7 @@ async fn capabilities(State(app): State<App>) -> Json<Value> {
 
 /// The repos actually hosted on disk (the filesystem registry), plus the seeded domain repos.
 async fn repos_list(State(app): State<App>) -> Json<Value> {
-    Json(json!({ "hosted": app.repos.list(), "repos": app.store.repos() }))
+    Json(json!({ "hosted": app.repos.list(), "repos": app.store.repos().await }))
 }
 
 /// Recent notifications recorded by the core `Notifier` capability (newest first). Demonstrates the
@@ -979,43 +976,41 @@ async fn notifications_list(
     if let Some(actor) = q.get("actor").filter(|a| !a.is_empty()) {
         n.retain(|x| x.to.is_empty() || x.to.contains(actor));
     }
-    // Resolve recipient handles for display.
-    let items: Vec<Value> = n
-        .iter()
-        .map(|x| {
-            let to_handles: Vec<String> = x.to.iter().map(|id| app.store.actor(id).map(|a| a.handle).unwrap_or_else(|| id.chars().take(8).collect())).collect();
-            json!({ "kind": x.kind, "summary": x.summary, "change": x.change, "ts": x.ts, "to": to_handles, "broadcast": x.to.is_empty(), "repo": x.repo, "target_kind": x.target_kind, "target_number": x.target_number })
-        })
-        .collect();
+    // Resolve recipient handles for display. Explicit loops rather than `.map(async)` — the handle
+    // lookups now `.await`.
+    let mut items: Vec<Value> = Vec::new();
+    for x in n.iter() {
+        let mut to_handles: Vec<String> = Vec::new();
+        for id in &x.to {
+            to_handles.push(app.store.actor(id).await.map(|a| a.handle).unwrap_or_else(|| id.chars().take(8).collect()));
+        }
+        items.push(json!({ "kind": x.kind, "summary": x.summary, "change": x.change, "ts": x.ts, "to": to_handles, "broadcast": x.to.is_empty(), "repo": x.repo, "target_kind": x.target_kind, "target_number": x.target_number }));
+    }
     Json(json!({ "notifications": items }))
 }
 
 /// Accounts (orgs / personal) with their members (handle + role) and owned repos.
 async fn accounts_list(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<Value> {
-    let repos = app.store.repos();
+    let repos = app.store.repos().await;
     // Only the accounts the caller belongs to — an org you're not a member of is not yours to see.
-    let visible = match authed_actor(&app, &headers) {
-        Some(a) => member_accounts(&app, &a.id),
+    let visible = match authed_actor(&app, &headers).await {
+        Some(a) => member_accounts(&app, &a.id).await,
         None => Vec::new(),
     };
-    let accounts: Vec<Value> = visible
-        .into_iter()
-        .map(|a| {
-            let members: Vec<Value> = a
-                .members
-                .iter()
-                .map(|m| {
-                    json!({
-                        "actor": m.actor,
-                        "handle": app.store.actor(&m.actor).map(|x| x.handle).unwrap_or_default(),
-                        "role": m.role,
-                    })
-                })
-                .collect();
-            let owned: Vec<String> = repos.iter().filter(|r| r.owner == a.id).map(|r| r.name.clone()).collect();
-            json!({ "id": a.id, "handle": a.handle, "kind": a.kind, "members": members, "repos": owned })
-        })
-        .collect();
+    // Explicit loops rather than `.map(async)` — the member-handle lookups now `.await`.
+    let mut accounts: Vec<Value> = Vec::new();
+    for a in visible.into_iter() {
+        let mut members: Vec<Value> = Vec::new();
+        for m in a.members.iter() {
+            members.push(json!({
+                "actor": m.actor,
+                "handle": app.store.actor(&m.actor).await.map(|x| x.handle).unwrap_or_default(),
+                "role": m.role,
+            }));
+        }
+        let owned: Vec<String> = repos.iter().filter(|r| r.owner == a.id).map(|r| r.name.clone()).collect();
+        accounts.push(json!({ "id": a.id, "handle": a.handle, "kind": a.kind, "members": members, "repos": owned }));
+    }
     Json(json!({ "accounts": accounts }))
 }
 
@@ -1027,33 +1022,33 @@ async fn add_member(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let acting = match require_actor(&app, &headers, body.get("by").and_then(Value::as_str).unwrap_or("")) {
+    let acting = match require_actor(&app, &headers, body.get("by").and_then(Value::as_str).unwrap_or("")).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let Some(mut acct) = app.store.accounts().into_iter().find(|a| a.id == id) else {
+    let Some(mut acct) = app.store.accounts().await.into_iter().find(|a| a.id == id) else {
         return (StatusCode::NOT_FOUND, "no such account").into_response();
     };
     let is_admin = acct.members.iter().any(|m| m.actor == acting.id && matches!(m.role, Role::Owner | Role::Admin));
     if !is_admin {
         return (StatusCode::FORBIDDEN, "only an org owner/admin can manage members").into_response();
     }
-    let Some(actor) = resolve_actor_ref(&app, &body) else {
+    let Some(actor) = resolve_actor_ref(&app, &body).await else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "unknown actor or username").into_response();
     };
     let role = parse_role(body.get("role").and_then(Value::as_str));
     acct.members.retain(|m| m.actor != actor);
     acct.members.push(Membership { actor, role });
-    app.store.put_account(acct.clone());
+    app.store.put_account(acct.clone()).await;
     (StatusCode::CREATED, Json(json!({ "account": acct }))).into_response()
 }
 
 /// Gate an org-management action: the caller must be an Owner or Admin of the account. Returns the
 /// loaded account + the acting actor.
 #[allow(clippy::result_large_err)]
-fn require_account_admin(app: &App, headers: &axum::http::HeaderMap, account_id: &str) -> Result<(Account, Actor), Response> {
-    let acting = require_actor(app, headers, "")?;
-    let Some(acct) = app.store.accounts().into_iter().find(|a| a.id == account_id) else {
+async fn require_account_admin(app: &App, headers: &axum::http::HeaderMap, account_id: &str) -> Result<(Account, Actor), Response> {
+    let acting = require_actor(app, headers, "").await?;
+    let Some(acct) = app.store.accounts().await.into_iter().find(|a| a.id == account_id) else {
         return Err((StatusCode::NOT_FOUND, "no such account").into_response());
     };
     let is_admin = acct.members.iter().any(|m| m.actor == acting.id && matches!(m.role, Role::Owner | Role::Admin));
@@ -1065,14 +1060,14 @@ fn require_account_admin(app: &App, headers: &axum::http::HeaderMap, account_id:
 
 /// Resolve a member reference in a body to an actor id: `{actor}` (existing actor) or `{username}`
 /// (a hosted account's driving actor).
-fn resolve_actor_ref(app: &App, body: &Value) -> Option<String> {
+async fn resolve_actor_ref(app: &App, body: &Value) -> Option<String> {
     if let Some(a) = body.get("actor").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        if app.store.actor(a).is_some() {
+        if app.store.actor(a).await.is_some() {
             return Some(a.to_string());
         }
     }
     if let Some(un) = body.get("username").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        return app.store.user_by_username(un).map(|u| u.actor);
+        return app.store.user_by_username(un).await.map(|u| u.actor);
     }
     None
 }
@@ -1095,7 +1090,7 @@ fn sanitize_handle(s: &str) -> String {
 /// `GET /api/accounts/available?handle=X` — is an org/account handle free? Returns the sanitized form.
 async fn account_available(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
     let handle = sanitize_handle(q.get("handle").map(String::as_str).unwrap_or(""));
-    let taken = handle.is_empty() || app.store.accounts().iter().any(|a| a.handle.eq_ignore_ascii_case(&handle));
+    let taken = handle.is_empty() || app.store.accounts().await.iter().any(|a| a.handle.eq_ignore_ascii_case(&handle));
     Json(json!({ "handle": handle, "available": !handle.is_empty() && !taken }))
 }
 
@@ -1103,26 +1098,23 @@ async fn account_available(State(app): State<App>, Query(q): Query<HashMap<Strin
 async fn repo_available(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
     let account = q.get("account").map(String::as_str).unwrap_or("");
     let name = sanitize_handle(q.get("name").map(String::as_str).unwrap_or(""));
-    let taken = app
-        .store
-        .accounts()
-        .into_iter()
-        .find(|a| a.handle.eq_ignore_ascii_case(account))
-        .map(|acct| app.store.repos().into_iter().any(|r| r.owner == acct.id && r.name.eq_ignore_ascii_case(&name)))
-        .unwrap_or(false);
+    let taken = match app.store.accounts().await.into_iter().find(|a| a.handle.eq_ignore_ascii_case(account)) {
+        Some(acct) => app.store.repos().await.into_iter().any(|r| r.owner == acct.id && r.name.eq_ignore_ascii_case(&name)),
+        None => false,
+    };
     Json(json!({ "name": name, "available": !name.is_empty() && !taken }))
 }
 
 /// `GET /api/auth/available?username=X` — is a username free? Returns the sanitized form.
 async fn username_available(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
     let username = sanitize_handle(q.get("username").map(String::as_str).unwrap_or(""));
-    let taken = username.is_empty() || app.store.user_by_username(&username).is_some();
+    let taken = username.is_empty() || app.store.user_by_username(&username).await.is_some();
     Json(json!({ "username": username, "available": !username.is_empty() && !taken }))
 }
 
 /// `POST /api/accounts` — create an organization (the caller becomes its Owner).
 async fn create_account(State(app): State<App>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let acting = match require_actor(&app, &headers, "") {
+    let acting = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -1130,7 +1122,7 @@ async fn create_account(State(app): State<App>, headers: axum::http::HeaderMap, 
     if handle.is_empty() {
         return (StatusCode::BAD_REQUEST, "handle is required").into_response();
     }
-    if app.store.accounts().iter().any(|a| a.handle.eq_ignore_ascii_case(&handle)) {
+    if app.store.accounts().await.iter().any(|a| a.handle.eq_ignore_ascii_case(&handle)) {
         return (StatusCode::CONFLICT, "that handle is taken").into_response();
     }
     let kind = match body.get("kind").and_then(Value::as_str) {
@@ -1143,13 +1135,13 @@ async fn create_account(State(app): State<App>, headers: axum::http::HeaderMap, 
         handle,
         members: vec![Membership { actor: acting.id.clone(), role: Role::Owner }],
     };
-    app.store.put_account(acct.clone());
+    app.store.put_account(acct.clone()).await;
     (StatusCode::CREATED, Json(json!({ "account": acct }))).into_response()
 }
 
 /// `DELETE /api/accounts/:id/members/:actor` — remove a member (never the last owner).
 async fn remove_member(State(app): State<App>, Path((id, actor)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    let (mut acct, _) = match require_account_admin(&app, &headers, &id) {
+    let (mut acct, _) = match require_account_admin(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1159,31 +1151,27 @@ async fn remove_member(State(app): State<App>, Path((id, actor)): Path<(String, 
         return (StatusCode::BAD_REQUEST, "cannot remove the last owner").into_response();
     }
     acct.members.retain(|m| m.actor != actor);
-    app.store.put_account(acct.clone());
+    app.store.put_account(acct.clone()).await;
     Json(json!({ "account": acct })).into_response()
 }
 
 /// `GET /api/accounts/:id/teams` — the org's teams and their members (public read).
 async fn teams_list(State(app): State<App>, Path(id): Path<String>) -> Json<Value> {
-    let teams: Vec<Value> = app
-        .store
-        .teams(&id)
-        .into_iter()
-        .map(|t| {
-            let members: Vec<Value> = t
-                .members
-                .iter()
-                .map(|m| json!({ "actor": m.actor, "handle": app.store.actor(&m.actor).map(|a| a.handle).unwrap_or_default(), "role": m.role }))
-                .collect();
-            json!({ "id": t.id, "name": t.name, "members": members })
-        })
-        .collect();
+    // Explicit loops rather than `.map(async)` — resolving each member's handle now `.await`s.
+    let mut teams: Vec<Value> = Vec::new();
+    for t in app.store.teams(&id).await.into_iter() {
+        let mut members: Vec<Value> = Vec::new();
+        for m in t.members.iter() {
+            members.push(json!({ "actor": m.actor, "handle": app.store.actor(&m.actor).await.map(|a| a.handle).unwrap_or_default(), "role": m.role }));
+        }
+        teams.push(json!({ "id": t.id, "name": t.name, "members": members }));
+    }
     Json(json!({ "teams": teams }))
 }
 
 /// `POST /api/accounts/:id/teams` — create a team (`{name}`).
 async fn create_team(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    if let Err(resp) = require_account_admin(&app, &headers, &id) {
+    if let Err(resp) = require_account_admin(&app, &headers, &id).await {
         return resp;
     }
     let name = body.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -1191,65 +1179,66 @@ async fn create_team(State(app): State<App>, Path(id): Path<String>, headers: ax
         return (StatusCode::BAD_REQUEST, "team name is required").into_response();
     }
     let team = Team { id: format!("team_{}", identity::random_hex(8)), account: id, name, members: vec![] };
-    app.store.put_team(team.clone());
+    app.store.put_team(team.clone()).await;
     (StatusCode::CREATED, Json(json!({ "team": team }))).into_response()
 }
 
 /// `DELETE /api/accounts/:id/teams/:team` — remove a team.
 async fn delete_team(State(app): State<App>, Path((id, team)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(resp) = require_account_admin(&app, &headers, &id) {
+    if let Err(resp) = require_account_admin(&app, &headers, &id).await {
         return resp;
     }
-    if app.store.team(&team).map(|t| t.account != id).unwrap_or(true) {
+    if app.store.team(&team).await.map(|t| t.account != id).unwrap_or(true) {
         return (StatusCode::NOT_FOUND, "no such team").into_response();
     }
-    app.store.delete_team(&team);
+    app.store.delete_team(&team).await;
     Json(json!({ "ok": true })).into_response()
 }
 
 /// `POST /api/accounts/:id/teams/:team/members` — add a member (`{actor|username, role}`).
 async fn team_add_member(State(app): State<App>, Path((id, team)): Path<(String, String)>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    if let Err(resp) = require_account_admin(&app, &headers, &id) {
+    if let Err(resp) = require_account_admin(&app, &headers, &id).await {
         return resp;
     }
-    let Some(mut t) = app.store.team(&team).filter(|t| t.account == id) else {
+    let Some(mut t) = app.store.team(&team).await.filter(|t| t.account == id) else {
         return (StatusCode::NOT_FOUND, "no such team").into_response();
     };
-    let Some(actor) = resolve_actor_ref(&app, &body) else {
+    let Some(actor) = resolve_actor_ref(&app, &body).await else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "unknown actor or username").into_response();
     };
     let role = parse_role(body.get("role").and_then(Value::as_str));
     t.members.retain(|m| m.actor != actor);
     t.members.push(Membership { actor, role });
-    app.store.put_team(t.clone());
+    app.store.put_team(t.clone()).await;
     (StatusCode::CREATED, Json(json!({ "team": t }))).into_response()
 }
 
 /// `DELETE /api/accounts/:id/teams/:team/members/:actor` — remove a team member.
 async fn team_remove_member(State(app): State<App>, Path((id, team, actor)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(resp) = require_account_admin(&app, &headers, &id) {
+    if let Err(resp) = require_account_admin(&app, &headers, &id).await {
         return resp;
     }
-    let Some(mut t) = app.store.team(&team).filter(|t| t.account == id) else {
+    let Some(mut t) = app.store.team(&team).await.filter(|t| t.account == id) else {
         return (StatusCode::NOT_FOUND, "no such team").into_response();
     };
     t.members.retain(|m| m.actor != actor);
-    app.store.put_team(t.clone());
+    app.store.put_team(t.clone()).await;
     Json(json!({ "team": t })).into_response()
 }
 
 /// Build the settings JSON (no auth — callers gate).
-fn repo_settings_value(app: &App, tenant: &str, repo: &str) -> Value {
-    settings_value(app, &app.repo_settings.get(&format!("{tenant}/{repo}")))
+async fn repo_settings_value(app: &App, tenant: &str, repo: &str) -> Value {
+    settings_value(app, &app.repo_settings.get(&format!("{tenant}/{repo}"))).await
 }
 
 /// Serialize a RepoSettings to the JSON the UI reads (shared by repo settings + org defaults).
-fn settings_value(app: &App, s: &reposettings::RepoSettings) -> Value {
-    let reviewers: Vec<Value> = s
-        .default_reviewers
-        .iter()
-        .map(|id| json!({ "actor": id, "handle": app.store.actor(id).map(|a| a.handle).unwrap_or_default() }))
-        .collect();
+async fn settings_value(app: &App, s: &reposettings::RepoSettings) -> Value {
+    // Explicit loop rather than `.map(async)` — resolving each reviewer's handle now `.await`s.
+    let mut reviewers: Vec<Value> = Vec::new();
+    for id in &s.default_reviewers {
+        let handle = app.store.actor(id).await.map(|a| a.handle).unwrap_or_default();
+        reviewers.push(json!({ "actor": id, "handle": handle }));
+    }
     let teams: Vec<Value> = s.team_access.iter().map(|t| json!({ "team": t.team, "role": t.role })).collect();
     let labels: Vec<Value> = s.labels.iter().map(|l| json!({ "name": l.name, "color": l.color, "icon": l.icon })).collect();
     json!({
@@ -1267,7 +1256,7 @@ fn settings_value(app: &App, s: &reposettings::RepoSettings) -> Value {
 /// `GET /api/repos/:tenant/:repo/labels` — the repo's configured issue labels (name + color). Readable
 /// by anyone who can read the repo, so the new-issue form can offer them.
 async fn repo_labels(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(resp) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(resp) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return resp;
     }
     let s = app.repo_settings.get(&format!("{tenant}/{repo}"));
@@ -1278,34 +1267,34 @@ async fn repo_labels(State(app): State<App>, Path((tenant, repo)): Path<(String,
 /// `GET /api/repos/:tenant/:repo/settings` — repo settings. **Owner/admin only** (settings expose
 /// access grants, so they are not public).
 async fn get_repo_settings(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    let acting = match require_actor(&app, &headers, "") {
+    let acting = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    if !is_repo_admin(&app, &tenant, &repo, &acting.id) {
+    if !is_repo_admin(&app, &tenant, &repo, &acting.id).await {
         return (StatusCode::FORBIDDEN, "only a repo owner/admin can view settings").into_response();
     }
-    Json(repo_settings_value(&app, &tenant, &repo)).into_response()
+    Json(repo_settings_value(&app, &tenant, &repo).await).into_response()
 }
 
 /// `PUT /api/repos/:tenant/:repo/settings` — update repo settings (owner/admin only).
 async fn set_repo_settings(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let acting = match require_actor(&app, &headers, "") {
+    let acting = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    if !is_repo_admin(&app, &tenant, &repo, &acting.id) {
+    if !is_repo_admin(&app, &tenant, &repo, &acting.id).await {
         return (StatusCode::FORBIDDEN, "only a repo owner/admin can change settings").into_response();
     }
     let key = format!("{tenant}/{repo}");
     let mut s = app.repo_settings.get(&key);
-    apply_settings_patch(&app, &mut s, &body);
+    apply_settings_patch(&app, &mut s, &body).await;
     app.repo_settings.set(&key, s);
-    Json(repo_settings_value(&app, &tenant, &repo)).into_response()
+    Json(repo_settings_value(&app, &tenant, &repo).await).into_response()
 }
 
 /// Apply a settings JSON patch (shared by repo settings + org defaults).
-fn apply_settings_patch(app: &App, s: &mut reposettings::RepoSettings, body: &Value) {
+async fn apply_settings_patch(app: &App, s: &mut reposettings::RepoSettings, body: &Value) {
     // Accept either a `visibility` enum ("public"|"private"|"unlisted") or the legacy `private` bool.
     if let Some(vis) = body.get("visibility").and_then(Value::as_str) {
         s.private = vis == "private";
@@ -1324,7 +1313,14 @@ fn apply_settings_patch(app: &App, s: &mut reposettings::RepoSettings, body: &Va
         s.allow_self_approve = !ai;
     }
     if let Some(arr) = body.get("default_reviewers").and_then(Value::as_array) {
-        s.default_reviewers = arr.iter().filter_map(|v| v.as_str()).filter(|id| app.store.actor(id).is_some()).map(str::to_string).collect();
+        // Explicit loop rather than `.filter(async)` — the existence check now `.await`s.
+        let mut ids = Vec::new();
+        for id in arr.iter().filter_map(|v| v.as_str()) {
+            if app.store.actor(id).await.is_some() {
+                ids.push(id.to_string());
+            }
+        }
+        s.default_reviewers = ids;
     }
     if let Some(arr) = body.get("team_access").and_then(Value::as_array) {
         s.team_access = arr
@@ -1352,9 +1348,9 @@ fn apply_settings_patch(app: &App, s: &mut reposettings::RepoSettings, body: &Va
 
 /// Resolve an account by id or handle and require the caller be its owner/admin.
 #[allow(clippy::result_large_err)]
-fn require_account_admin_ref(app: &App, headers: &axum::http::HeaderMap, acct_ref: &str) -> Result<(Account, Actor), Response> {
-    let acting = require_actor(app, headers, "")?;
-    let Some(acct) = app.store.accounts().into_iter().find(|a| a.id == acct_ref || a.handle.eq_ignore_ascii_case(acct_ref)) else {
+async fn require_account_admin_ref(app: &App, headers: &axum::http::HeaderMap, acct_ref: &str) -> Result<(Account, Actor), Response> {
+    let acting = require_actor(app, headers, "").await?;
+    let Some(acct) = app.store.accounts().await.into_iter().find(|a| a.id == acct_ref || a.handle.eq_ignore_ascii_case(acct_ref)) else {
         return Err((StatusCode::NOT_FOUND, "no such account").into_response());
     };
     let is_admin = acct.members.iter().any(|m| m.actor == acting.id && matches!(m.role, Role::Owner | Role::Admin));
@@ -1368,7 +1364,7 @@ fn require_account_admin_ref(app: &App, headers: &axum::http::HeaderMap, acct_re
 /// (`account` = an account id or handle). The repo can then be cloned + pushed to.
 async fn create_repo_handler(State(app): State<App>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
     let acct_ref = body.get("account").and_then(Value::as_str).unwrap_or("").trim();
-    let (acct, _) = match require_account_admin_ref(&app, &headers, acct_ref) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, acct_ref).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1380,14 +1376,14 @@ async fn create_repo_handler(State(app): State<App>, headers: axum::http::Header
     // Case-INSENSITIVE, matching the `rename` guard and the PG `repos_owner_lower_name` unique
     // index — so a case-variant duplicate (`web` next to `Web`) is rejected here with CONFLICT
     // rather than passing the guard and panicking on the index violation under Postgres.
-    if app.store.repos().iter().any(|r| r.owner == acct.id && r.name.eq_ignore_ascii_case(&name)) {
+    if app.store.repos().await.iter().any(|r| r.owner == acct.id && r.name.eq_ignore_ascii_case(&name)) {
         return (StatusCode::CONFLICT, "a repo with that name already exists").into_response();
     }
     if let Err(e) = app.repos.create_repo(&tenant, &name) {
         return (StatusCode::UNPROCESSABLE_ENTITY, format!("could not create repo: {e}")).into_response();
     }
     let repo = Repo { id: format!("repo_{tenant}_{name}"), owner: acct.id.clone(), name: name.clone(), default_branch: "main".into() };
-    app.store.put_repo(repo.clone());
+    app.store.put_repo(repo.clone()).await;
     // Inherit the org's default repo settings, if it has configured any.
     let defaults = app.repo_settings.get(&repo_defaults_key(&acct.id));
     app.repo_settings.set(&format!("{tenant}/{name}"), defaults);
@@ -1407,14 +1403,14 @@ async fn rename_repo_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let acting = match require_actor(&app, &headers, "") {
+    let acting = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    if !is_repo_admin(&app, &tenant, &repo, &acting.id) {
+    if !is_repo_admin(&app, &tenant, &repo, &acting.id).await {
         return (StatusCode::FORBIDDEN, "only a repo owner/admin can rename this repo").into_response();
     }
-    let Some(existing) = find_repo(&app, &tenant, &repo) else {
+    let Some(existing) = find_repo(&app, &tenant, &repo).await else {
         return (StatusCode::NOT_FOUND, "no such repo").into_response();
     };
     let new_name = sanitize_handle(body.get("name").and_then(Value::as_str).unwrap_or(""));
@@ -1425,7 +1421,7 @@ async fn rename_repo_handler(
         // No-op rename — nothing to move.
         return Json(json!({ "repo": existing, "tenant": tenant, "name": new_name })).into_response();
     }
-    if app.store.repos().iter().any(|r| r.owner == existing.owner && r.name.eq_ignore_ascii_case(&new_name)) {
+    if app.store.repos().await.iter().any(|r| r.owner == existing.owner && r.name.eq_ignore_ascii_case(&new_name)) {
         return (StatusCode::CONFLICT, "a repo with that name already exists").into_response();
     }
     // Move the on-disk keel repo first — if that fails, leave all domain state untouched.
@@ -1436,9 +1432,9 @@ async fn rename_repo_handler(
     let new_key = format!("{tenant}/{new_name}");
     // Re-key the repo record (its id embeds the name) and all domain state.
     let renamed = Repo { id: format!("repo_{tenant}_{new_name}"), name: new_name.clone(), ..existing.clone() };
-    app.store.remove_repo(&existing.id);
-    app.store.put_repo(renamed.clone());
-    app.store.rekey_repo_data(&old_key, &new_key);
+    app.store.remove_repo(&existing.id).await;
+    app.store.put_repo(renamed.clone()).await;
+    app.store.rekey_repo_data(&old_key, &new_key).await;
     app.repo_settings.rename(&old_key, &new_key);
     app.autonomy.rename_repo(&tenant, &repo, &new_name);
     app.ci_config.rename(&old_key, &new_key);
@@ -1461,19 +1457,19 @@ async fn delete_repo_handler(
     Path((tenant, repo)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let acting = match require_actor(&app, &headers, "") {
+    let acting = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    if !is_repo_admin(&app, &tenant, &repo, &acting.id) {
+    if !is_repo_admin(&app, &tenant, &repo, &acting.id).await {
         return (StatusCode::FORBIDDEN, "only a repo owner/admin can delete this repo").into_response();
     }
-    let Some(existing) = find_repo(&app, &tenant, &repo) else {
+    let Some(existing) = find_repo(&app, &tenant, &repo).await else {
         return (StatusCode::NOT_FOUND, "no such repo").into_response();
     };
     let key = format!("{tenant}/{repo}");
-    app.store.remove_repo(&existing.id);
-    app.store.purge_repo_data(&key);
+    app.store.remove_repo(&existing.id).await;
+    app.store.purge_repo_data(&key).await;
     app.repo_settings.delete(&key);
     app.autonomy.delete_repo(&tenant, &repo);
     app.ci_config.delete(&key);
@@ -1495,25 +1491,25 @@ fn repo_defaults_key(acct_id: &str) -> String {
 
 /// `GET /api/accounts/:id/repo-defaults` — the org's default repo settings (owner/admin only).
 async fn repo_defaults_get(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
-    Json(settings_value(&app, &app.repo_settings.get(&repo_defaults_key(&acct.id)))).into_response()
+    Json(settings_value(&app, &app.repo_settings.get(&repo_defaults_key(&acct.id))).await).into_response()
 }
 
 /// `PUT /api/accounts/:id/repo-defaults` — set the org's default repo settings (owner/admin only).
 /// These are copied into every repo created afterward.
 async fn repo_defaults_set(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
     let key = repo_defaults_key(&acct.id);
     let mut s = app.repo_settings.get(&key);
-    apply_settings_patch(&app, &mut s, &body);
+    apply_settings_patch(&app, &mut s, &body).await;
     app.repo_settings.set(&key, s.clone());
-    Json(settings_value(&app, &s)).into_response()
+    Json(settings_value(&app, &s).await).into_response()
 }
 
 /// Default API base for a provider.
@@ -1531,20 +1527,22 @@ fn ai_default_base(provider: &str) -> String {
 /// access to Hull's AI functions; a repo's reviews use its owning org's connections (else the
 /// triggerer's own), rotating when enabled.
 async fn ai_connections_get(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
-    let conns: Vec<Value> = app.store.ai_connections(&acct.id).into_iter().map(|c| {
+    // Explicit loop rather than `.map(async)` — each connection's usage tally now `.await`s.
+    let mut conns: Vec<Value> = Vec::new();
+    for c in app.store.ai_connections(&acct.id).await.into_iter() {
         let kind = match &c.auth { hull_core::AiAuth::Key { .. } => "key", hull_core::AiAuth::AgentCli { .. } => "agent" };
-        let u = app.store.ai_usage(&c.id);
-        json!({
+        let u = app.store.ai_usage(&c.id).await;
+        conns.push(json!({
             "id": c.id, "provider": c.provider, "label": c.label, "base_url": c.base_url, "auth_kind": kind,
             "hint": c.auth.hint(), "created_unix": c.created_unix, "token_expires_unix": c.token_expires_unix,
             "usage": { "input_tokens": u.input_tokens, "output_tokens": u.output_tokens, "cost_micros": u.cost_micros, "runs": u.runs, "updated_unix": u.updated_unix },
-        })
-    }).collect();
-    Json(json!({ "connections": conns, "rotate": app.store.ai_rotate(&acct.id) })).into_response()
+        }));
+    }
+    Json(json!({ "connections": conns, "rotate": app.store.ai_rotate(&acct.id).await })).into_response()
 }
 
 /// `POST /api/accounts/:id/ai` — connect a backend. Either an API key
@@ -1552,12 +1550,12 @@ async fn ai_connections_get(State(app): State<App>, Path(id): Path<String>, head
 /// **agent CLI** run with the user's own subscription (`{provider: claude-code|codex, label?}`).
 /// Owner/admin only.
 async fn ai_connection_add(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
     let provider = body.get("provider").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
-    let n = app.store.ai_connections(&acct.id).len();
+    let n = app.store.ai_connections(&acct.id).await.len();
     // Agent-CLI connection: uses the user's own Claude Code / Codex login, no key.
     let (base_url, auth, def_label) = if let Some(cmd) = agent_command(&provider) {
         let command = body.get("command").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or(cmd).to_string();
@@ -1577,14 +1575,14 @@ async fn ai_connection_add(State(app): State<App>, Path(id): Path<String>, heade
     };
     let label = body.get("label").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(def_label);
     let conn = hull_core::AiConnection { id: format!("ai_{}_{}", acct.id, n + 1), owner: acct.id.clone(), provider, label, base_url, auth, created_unix: now(), token_expires_unix: None };
-    app.store.put_ai_connection(conn.clone());
+    app.store.put_ai_connection(conn.clone()).await;
     (StatusCode::CREATED, Json(json!({ "id": conn.id }))).into_response()
 }
 
 /// `GET /api/ai/agents` — which local agent CLIs are installed on this Hull host (so the settings UI
 /// only offers the ones present). Any signed-in actor may query.
 async fn ai_agents_detect(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
-    if authed_actor(&app, &headers).is_none() {
+    if authed_actor(&app, &headers).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "sign in required").into_response();
     }
     let agents: Vec<Value> = [("claude-code", "claude", "Claude Code"), ("codex", "codex", "Codex")]
@@ -1599,15 +1597,15 @@ async fn ai_agents_detect(State(app): State<App>, headers: axum::http::HeaderMap
 
 /// `DELETE /api/accounts/:id/ai/:cid` — remove a connection (owner/admin only).
 async fn ai_connection_delete(State(app): State<App>, Path((id, cid)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
     // Wipe the per-user credential bundle for an agent session, if this connection had one.
-    if let Some(hull_core::AiAuth::AgentCli { session, .. }) = app.store.ai_connections(&acct.id).into_iter().find(|c| c.id == cid).map(|c| c.auth) {
+    if let Some(hull_core::AiAuth::AgentCli { session, .. }) = app.store.ai_connections(&acct.id).await.into_iter().find(|c| c.id == cid).map(|c| c.auth) {
         agentsession::remove(&session);
     }
-    Json(json!({ "deleted": app.store.remove_ai_connection(&acct.id, &cid) })).into_response()
+    Json(json!({ "deleted": app.store.remove_ai_connection(&acct.id, &cid).await })).into_response()
 }
 
 /// `POST /api/accounts/:id/ai/agent/start` — `{provider: claude-code|codex}`: begin a per-user
@@ -1615,7 +1613,7 @@ async fn ai_connection_delete(State(app): State<App>, Path((id, cid)): Path<(Str
 /// returns `{session, login_url}` — the browser opens `login_url`, the user approves and pastes the
 /// code back to `/complete`. Owner/admin only. Runs the PTY work off the async runtime.
 async fn ai_agent_login_start(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let (_acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (_acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1654,7 +1652,7 @@ async fn ai_agent_login_start(State(app): State<App>, Path(id): Path<String>, he
 /// feeding the pasted code to the parked CLI, then verify with `<cli> auth status --json` and persist
 /// the connection with the introspected identity. Owner/admin only.
 async fn ai_agent_login_complete(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1716,7 +1714,7 @@ async fn ai_agent_login_complete(State(app): State<App>, Path(id): Path<String>,
             return (StatusCode::INTERNAL_SERVER_ERROR, "login task panicked").into_response();
         }
     };
-    let n = app.store.ai_connections(&acct.id).len();
+    let n = app.store.ai_connections(&acct.id).await.len();
     let email = identity.get("email").and_then(Value::as_str).unwrap_or("").to_string();
     let plan = identity.get("plan").and_then(Value::as_str).unwrap_or("").to_string();
     let label = body.get("label").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| {
@@ -1732,13 +1730,13 @@ async fn ai_agent_login_complete(State(app): State<App>, Path(id): Path<String>,
         created_unix: now(),
         token_expires_unix: identity.get("expires_unix").and_then(Value::as_u64),
     };
-    app.store.put_ai_connection(conn.clone());
+    app.store.put_ai_connection(conn.clone()).await;
     (StatusCode::CREATED, Json(json!({ "id": conn.id, "identity": identity }))).into_response()
 }
 
 /// `POST /api/accounts/:id/ai/agent/cancel` — `{session}`: discard an in-flight login (owner/admin).
 async fn ai_agent_login_cancel(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    if let Err(resp) = require_account_admin_ref(&app, &headers, &id) {
+    if let Err(resp) = require_account_admin_ref(&app, &headers, &id).await {
         return resp;
     }
     let session = body.get("session").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -1828,19 +1826,19 @@ fn jwt_email(jwt: &str) -> Option<String> {
 /// `PUT /api/accounts/:id/ai/rotate` — `{rotate: bool}`: cycle across the account's connections per
 /// request instead of always using the first. Owner/admin only.
 async fn ai_rotate_set(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
     let on = body.get("rotate").and_then(Value::as_bool).unwrap_or(false);
-    app.store.set_ai_rotate(&acct.id, on);
+    app.store.set_ai_rotate(&acct.id, on).await;
     Json(json!({ "rotate": on })).into_response()
 }
 
 /// `GET /api/accounts/:id/github` — the account's GitHub connection status (admin only). Never
 /// exposes anything unless the caller administers the account.
 async fn github_status(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1857,7 +1855,7 @@ async fn github_status(State(app): State<App>, Path(id): Path<String>, headers: 
 /// This is what makes it impossible to connect (or even see) an org you don't administer: we never
 /// list the App's installations; you only ever get back the one YOU just authorized on GitHub.
 async fn github_connect_url(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1893,7 +1891,7 @@ async fn github_setup(State(app): State<App>, Query(q): Query<HashMap<String, St
     if now() > exp || installation.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "This GitHub install link has expired.").into_response();
     }
-    let handle = app.store.accounts().into_iter().find(|a| a.id == acct_id).map(|a| a.handle).unwrap_or_default();
+    let handle = app.store.accounts().await.into_iter().find(|a| a.id == acct_id).map(|a| a.handle).unwrap_or_default();
     let reg = app.registry.clone();
     let inst = installation.clone();
     let login = tokio::task::spawn_blocking(move || reg.mirror_verify_connection(&inst)).await.ok().flatten();
@@ -1908,7 +1906,7 @@ async fn github_setup(State(app): State<App>, Query(q): Query<HashMap<String, St
 /// `POST /api/accounts/:id/github/connect` — `{installation}`. Verifies the App installation is real
 /// (returns its GitHub login) and stores it against the account. Admin only.
 async fn github_connect(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1928,7 +1926,7 @@ async fn github_connect(State(app): State<App>, Path(id): Path<String>, headers:
 
 /// `DELETE /api/accounts/:id/github` — disconnect the account's GitHub connection (admin only).
 async fn github_disconnect(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1939,7 +1937,7 @@ async fn github_disconnect(State(app): State<App>, Path(id): Path<String>, heade
 /// `GET /api/accounts/:id/github/importable` — repos importable via THIS account's connection. Admin
 /// only, and only when the account has explicitly connected — never a global list.
 async fn github_importable(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1954,7 +1952,7 @@ async fn github_importable(State(app): State<App>, Path(id): Path<String>, heade
 /// `POST /api/accounts/:id/repos/import` — `{source, name?}`. Import a GitHub repo through the
 /// account's own connection. Admin only, connection required.
 async fn import_repo_handler(State(app): State<App>, Path(id): Path<String>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let (acct, _) = match require_account_admin_ref(&app, &headers, &id) {
+    let (acct, _) = match require_account_admin_ref(&app, &headers, &id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -1973,7 +1971,7 @@ async fn import_repo_handler(State(app): State<App>, Path(id): Path<String>, hea
         .map(str::to_string)
         .unwrap_or_else(|| source.rsplit('/').next().unwrap_or(&source).to_string());
     let tenant = acct.handle.clone();
-    if app.store.repos().iter().any(|r| r.owner == acct.id && r.name.eq_ignore_ascii_case(&name)) {
+    if app.store.repos().await.iter().any(|r| r.owner == acct.id && r.name.eq_ignore_ascii_case(&name)) {
         return (StatusCode::CONFLICT, "a repo with that name already exists").into_response();
     }
     let dest = format!("{tenant}/{name}");
@@ -1990,30 +1988,29 @@ async fn import_repo_handler(State(app): State<App>, Path(id): Path<String>, hea
         return (StatusCode::UNPROCESSABLE_ENTITY, format!("import failed: {}", res.detail)).into_response();
     }
     let repo = Repo { id: format!("repo_{tenant}_{name}"), owner: acct.id.clone(), name: name.clone(), default_branch: "main".into() };
-    app.store.put_repo(repo.clone());
+    app.store.put_repo(repo.clone()).await;
     (StatusCode::CREATED, Json(json!({ "repo": repo, "tenant": tenant, "name": name, "detail": res.detail }))).into_response()
 }
 
 /// Registered actors (public — no secret keys), each with its accountability root.
 async fn actors_list(State(app): State<App>) -> Json<Value> {
-    let actors: Vec<Value> = app
-        .store
-        .actors()
-        .into_iter()
-        .map(|a| {
-            json!({
-                "id": a.id,
-                "handle": a.handle,
-                "kind": a.kind,
-                "email": app.store.user_by_actor(&a.id).map(|u| u.email).unwrap_or_default(),
-                // Reflect the real gate: cryptographic verification + revocation, not just structure.
-                "accountable": accountable(&app, &a).is_ok(),
-                "revoked": a.revoked,
-                "human_root": a.human_principal(),
-                "github": app.mirror.github_for(&a.id),
-            })
-        })
-        .collect();
+    // Explicit loop rather than `.map(async)` — the email lookup + accountability check now `.await`.
+    let mut actors: Vec<Value> = Vec::new();
+    for a in app.store.actors().await.into_iter() {
+        let email = app.store.user_by_actor(&a.id).await.map(|u| u.email).unwrap_or_default();
+        // Reflect the real gate: cryptographic verification + revocation, not just structure.
+        let is_accountable = accountable(&app, &a).await.is_ok();
+        actors.push(json!({
+            "id": a.id,
+            "handle": a.handle,
+            "kind": a.kind,
+            "email": email,
+            "accountable": is_accountable,
+            "revoked": a.revoked,
+            "human_root": a.human_principal(),
+            "github": app.mirror.github_for(&a.id),
+        }));
+    }
     Json(json!({ "actors": actors }))
 }
 
@@ -2036,7 +2033,7 @@ async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, 
         // and signs `child_pub`, so Hull never sees the agent's secret), with a demo-owner fallback
         // where Hull holds the key.
         "agent" => {
-            let parent = match require_actor(&app, &headers, "") {
+            let parent = match require_actor(&app, &headers, "").await {
                 Ok(a) => a,
                 Err(resp) => return resp,
             };
@@ -2052,7 +2049,7 @@ async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, 
                 let Ok(sig) = hex::decode(sig_hex) else { return (StatusCode::BAD_REQUEST, "delegation_sig must be hex").into_response() };
                 match identity::delegate(&handle, &parent, child_pub, scope, lifetime, sig) {
                     Some(actor) => {
-                        app.store.put_actor(actor.clone());
+                        app.store.put_actor(actor.clone()).await;
                         return (StatusCode::CREATED, Json(json!({ "actor": actor }))).into_response();
                     }
                     None => return (StatusCode::UNPROCESSABLE_ENTITY, "delegation did not verify — bad signature, widened scope, or unaccountable parent").into_response(),
@@ -2068,7 +2065,7 @@ async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, 
                     Some(m) => m,
                     None => return (StatusCode::UNPROCESSABLE_ENTITY, "could not mint — parent is not accountable").into_response(),
                 }
-            } else if let Some(user) = app.store.user_by_actor(&parent.id) {
+            } else if let Some(user) = app.store.user_by_actor(&parent.id).await {
                 match identity::mint_agent(&handle, &parent, &user.secret_key, scope, lifetime) {
                     Some(m) => m,
                     None => return (StatusCode::UNPROCESSABLE_ENTITY, "could not mint — parent is not accountable").into_response(),
@@ -2079,7 +2076,7 @@ async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, 
         }
         _ => return (StatusCode::BAD_REQUEST, "kind must be 'human' or 'agent'").into_response(),
     };
-    app.store.put_actor(minted.actor.clone());
+    app.store.put_actor(minted.actor.clone()).await;
     (StatusCode::CREATED, Json(json!({ "actor": minted.actor, "secret_key": minted.secret_key }))).into_response()
 }
 
@@ -2088,11 +2085,11 @@ async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, 
 /// an intermediate agent). Revocation propagates: because the revoked id sits in every descendant's
 /// chain, [`accountable`] then rejects the whole subtree. Blast radius = the subtree.
 async fn revoke_actor(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>) -> Response {
-    let caller = match require_actor(&app, &headers, "") {
+    let caller = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let Some(mut target) = app.store.actor(&id) else {
+    let Some(mut target) = app.store.actor(&id).await else {
         return (StatusCode::NOT_FOUND, "no such actor").into_response();
     };
     let ancestor = target.id == caller.id
@@ -2101,7 +2098,7 @@ async fn revoke_actor(State(app): State<App>, headers: axum::http::HeaderMap, Pa
         return (StatusCode::FORBIDDEN, "you may only revoke an actor in your own delegation subtree").into_response();
     }
     target.revoked = true;
-    app.store.put_actor(target);
+    app.store.put_actor(target).await;
     Json(json!({ "revoked": id, "by": caller.handle })).into_response()
 }
 
@@ -2113,11 +2110,11 @@ async fn revoke_actor(State(app): State<App>, headers: axum::http::HeaderMap, Pa
 /// it, and the parent can simply stop renewing to let it expire.
 async fn renew_delegation(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
     use hull_core::{ActorKind, Delegation, DelegationHop};
-    let caller = match require_actor(&app, &headers, "") {
+    let caller = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let Some(mut target) = app.store.actor(&id) else {
+    let Some(mut target) = app.store.actor(&id).await else {
         return (StatusCode::NOT_FOUND, "no such actor").into_response();
     };
     let Some(chain) = target.delegation.as_ref().map(|d| d.chain.clone()) else {
@@ -2148,7 +2145,7 @@ async fn renew_delegation(State(app): State<App>, headers: axum::http::HeaderMap
     }
     target.lifetime = if expires_unix > 0 { Lifetime::Ephemeral { expires_unix } } else { Lifetime::Static };
     target.delegation = Some(deleg);
-    app.store.put_actor(target);
+    app.store.put_actor(target).await;
     Json(json!({ "renewed": id, "expires_unix": expires_unix })).into_response()
 }
 
@@ -2157,7 +2154,7 @@ async fn renew_delegation(State(app): State<App>, headers: axum::http::HeaderMap
 /// GitHub, imported into Hull, then resolve to **you** (an accountable hull actor) instead of an
 /// anonymous external identity. `login: ""` clears the link.
 async fn link_github(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
-    let caller = match require_actor(&app, &headers, "") {
+    let caller = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -2178,7 +2175,7 @@ async fn link_github(State(app): State<App>, headers: axum::http::HeaderMap, Pat
 /// Opt an actor into nostr notifications (`POST /api/actors/:id/nostr` `{pubkey}`). Self-only: you
 /// set your **own** nostr pubkey (32-byte x-only hex). Code you own then pings you over nostr.
 async fn set_nostr_key(State(app): State<App>, headers: axum::http::HeaderMap, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
-    let caller = match require_actor(&app, &headers, "") {
+    let caller = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -2190,11 +2187,11 @@ async fn set_nostr_key(State(app): State<App>, headers: axum::http::HeaderMap, P
     if !pubkey.is_empty() && (pubkey.len() != 64 || hex::decode(&pubkey).is_err()) {
         return (StatusCode::BAD_REQUEST, "pubkey must be a 32-byte hex nostr key (or empty to clear)").into_response();
     }
-    let Some(mut actor) = app.store.actor(&id) else {
+    let Some(mut actor) = app.store.actor(&id).await else {
         return (StatusCode::NOT_FOUND, "no such actor").into_response();
     };
     actor.nostr_pubkey = (!pubkey.is_empty()).then_some(pubkey);
-    app.store.put_actor(actor);
+    app.store.put_actor(actor).await;
     Json(json!({ "id": id, "nostr": true })).into_response()
 }
 
@@ -2216,7 +2213,7 @@ async fn auth_login(State(app): State<App>, Json(body): Json<Value>) -> Response
     let actor = body.get("actor").and_then(Value::as_str).unwrap_or("").to_string();
     let nonce = body.get("nonce").and_then(Value::as_str).unwrap_or("").to_string();
     let signature = body.get("signature").and_then(Value::as_str).unwrap_or("");
-    match app.store.actor(&actor) {
+    match app.store.actor(&actor).await {
         None => return (StatusCode::UNAUTHORIZED, "unknown actor").into_response(),
         Some(a) if a.revoked => return (StatusCode::UNAUTHORIZED, "this actor has been revoked").into_response(),
         Some(_) => {}
@@ -2239,9 +2236,9 @@ async fn auth_login(State(app): State<App>, Json(body): Json<Value>) -> Response
 
 /// `GET /api/auth/me` (Bearer token) — the authenticated actor, or 401.
 async fn auth_me(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
-    match authed_actor(&app, &headers) {
+    match authed_actor(&app, &headers).await {
         Some(a) => {
-            let user = app.store.user_by_actor(&a.id);
+            let user = app.store.user_by_actor(&a.id).await;
             Json(json!({
                 "id": a.id, "handle": a.handle, "kind": a.kind, "accountable": a.is_accountable(),
                 "username": user.as_ref().map(|u| u.username.clone()),
@@ -2272,29 +2269,27 @@ async fn auth_logout(State(app): State<App>, headers: axum::http::HeaderMap) -> 
 /// "who am I and what am I allowed to be" — read-only; there is no key rotation because the actor id
 /// *is* the public key (rotating it would be a different actor).
 async fn me_profile(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
-    let Some(a) = authed_actor(&app, &headers) else {
+    let Some(a) = authed_actor(&app, &headers).await else {
         return (StatusCode::UNAUTHORIZED, "not signed in").into_response();
     };
-    let handle_of = |id: &str| app.store.actor(id).map(|x| x.handle).unwrap_or_else(|| id.chars().take(10).collect());
-    let chain: Vec<Value> = a
-        .delegation
-        .as_ref()
-        .map(|d| {
-            d.chain
-                .iter()
-                .map(|h| json!({ "principal": h.principal, "handle": handle_of(&h.principal), "kind": h.kind, "scope": h.scope }))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Explicit loop rather than a `.map` over a closure that `.await`s the handle lookup.
+    let mut chain: Vec<Value> = Vec::new();
+    if let Some(d) = a.delegation.as_ref() {
+        for h in d.chain.iter() {
+            let handle = app.store.actor(&h.principal).await.map(|x| x.handle).unwrap_or_else(|| h.principal.chars().take(10).collect());
+            chain.push(json!({ "principal": h.principal, "handle": handle, "kind": h.kind, "scope": h.scope }));
+        }
+    }
     let memberships: Vec<Value> = app
         .store
         .accounts()
+        .await
         .into_iter()
         .filter_map(|acct| {
             acct.members.iter().find(|m| m.actor == a.id).map(|m| json!({ "account": acct.handle, "role": m.role }))
         })
         .collect();
-    let user = app.store.user_by_actor(&a.id);
+    let user = app.store.user_by_actor(&a.id).await;
     Json(json!({
         "id": a.id,
         "handle": a.handle,
@@ -2327,7 +2322,7 @@ async fn register_start(State(app): State<App>, Json(body): Json<Value>) -> Resp
     if username.is_empty() || email.is_empty() {
         return (StatusCode::BAD_REQUEST, "username and email are required").into_response();
     }
-    if app.store.user_by_username(&username).is_some() {
+    if app.store.user_by_username(&username).await.is_some() {
         return (StatusCode::CONFLICT, "that username is taken").into_response();
     }
     let uuid = Uuid::new_v4();
@@ -2376,14 +2371,14 @@ async fn register_finish(State(app): State<App>, Json(body): Json<Value>) -> Res
         created_unix: now(),
         bio: String::new(),
     };
-    app.store.put_actor(minted.actor.clone());
-    app.store.put_user(user.clone());
+    app.store.put_actor(minted.actor.clone()).await;
+    app.store.put_user(user.clone()).await;
     app.store.put_account(Account {
         id: format!("acct_{}", flow.uuid),
         kind: AccountKind::Personal,
         handle: user.username.clone(),
         members: vec![Membership { actor: user.actor.clone(), role: Role::Owner }],
-    });
+    }).await;
     let token = identity::random_hex(24);
     app.auth.lock().unwrap().tokens.insert(token.clone(), (user.actor.clone(), now()));
     (StatusCode::CREATED, Json(json!({ "token": token, "actor": user.actor, "username": user.username }))).into_response()
@@ -2392,7 +2387,7 @@ async fn register_finish(State(app): State<App>, Json(body): Json<Value>) -> Res
 /// `POST /api/auth/passkey/start` — `{username}` → a WebAuthn assertion challenge for that account.
 async fn passkey_start(State(app): State<App>, Json(body): Json<Value>) -> Response {
     let username = body.get("username").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    let Some(user) = app.store.user_by_username(&username) else {
+    let Some(user) = app.store.user_by_username(&username).await else {
         return (StatusCode::NOT_FOUND, "no account with that username").into_response();
     };
     let passkeys: Vec<Passkey> = user.passkeys.iter().filter_map(|p| serde_json::from_value(p.data.clone()).ok()).collect();
@@ -2424,7 +2419,7 @@ async fn passkey_finish(State(app): State<App>, Json(body): Json<Value>) -> Resp
         Ok(r) => r,
         Err(e) => return (StatusCode::UNAUTHORIZED, format!("passkey login failed: {e}")).into_response(),
     };
-    let Some(mut user) = app.store.user(&flow.user_id) else {
+    let Some(mut user) = app.store.user(&flow.user_id).await else {
         return (StatusCode::UNAUTHORIZED, "account no longer exists").into_response();
     };
     // Update the used credential's counter (clone/replay detection lives in the Passkey).
@@ -2436,7 +2431,7 @@ async fn passkey_finish(State(app): State<App>, Json(body): Json<Value>) -> Resp
             }
         }
     }
-    app.store.put_user(user.clone());
+    app.store.put_user(user.clone()).await;
     let token = identity::random_hex(24);
     app.auth.lock().unwrap().tokens.insert(token.clone(), (user.actor.clone(), now()));
     Json(json!({ "token": token, "actor": user.actor, "username": user.username })).into_response()
@@ -2444,8 +2439,8 @@ async fn passkey_finish(State(app): State<App>, Json(body): Json<Value>) -> Resp
 
 /// `GET /api/account` — the signed-in user's hosted account (username, email, passkeys).
 async fn account_get(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
-    let Some(a) = authed_actor(&app, &headers) else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
-    let Some(user) = app.store.user_by_actor(&a.id) else {
+    let Some(a) = authed_actor(&app, &headers).await else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
+    let Some(user) = app.store.user_by_actor(&a.id).await else {
         return (StatusCode::NOT_FOUND, "this actor is a legacy key login, not a hosted account").into_response();
     };
     let passkeys: Vec<Value> = user.passkeys.iter().map(|p| json!({ "id": p.id, "name": p.name, "created_unix": p.created_unix })).collect();
@@ -2454,26 +2449,26 @@ async fn account_get(State(app): State<App>, headers: axum::http::HeaderMap) -> 
 
 /// `PUT /api/account` — change username and/or email. Keeps the actor + personal-account handle in sync.
 async fn account_update(State(app): State<App>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let Some(a) = authed_actor(&app, &headers) else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
-    let Some(mut user) = app.store.user_by_actor(&a.id) else {
+    let Some(a) = authed_actor(&app, &headers).await else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
+    let Some(mut user) = app.store.user_by_actor(&a.id).await else {
         return (StatusCode::NOT_FOUND, "not a hosted account").into_response();
     };
     if let Some(un) = body.get("username").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(other) = app.store.user_by_username(un) {
+        if let Some(other) = app.store.user_by_username(un).await {
             if other.id != user.id {
                 return (StatusCode::CONFLICT, "that username is taken").into_response();
             }
         }
         user.username = un.to_string();
         // keep the display handle on the actor + personal account aligned with the username
-        if let Some(mut actor) = app.store.actor(&user.actor) {
+        if let Some(mut actor) = app.store.actor(&user.actor).await {
             actor.handle = un.to_string();
-            app.store.put_actor(actor);
+            app.store.put_actor(actor).await;
         }
         let acct_id = format!("acct_{}", user.id);
-        if let Some(mut acct) = app.store.accounts().into_iter().find(|x| x.id == acct_id) {
+        if let Some(mut acct) = app.store.accounts().await.into_iter().find(|x| x.id == acct_id) {
             acct.handle = un.to_string();
-            app.store.put_account(acct);
+            app.store.put_account(acct).await;
         }
     }
     if let Some(em) = body.get("email").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
@@ -2482,14 +2477,14 @@ async fn account_update(State(app): State<App>, headers: axum::http::HeaderMap, 
     if let Some(bio) = body.get("bio").and_then(Value::as_str) {
         user.bio = bio.chars().take(280).collect();
     }
-    app.store.put_user(user.clone());
+    app.store.put_user(user.clone()).await;
     Json(json!({ "username": user.username, "email": user.email, "bio": user.bio })).into_response()
 }
 
 /// `POST /api/account/passkeys/start` — begin adding another passkey to the signed-in account.
 async fn account_passkey_start(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
-    let Some(a) = authed_actor(&app, &headers) else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
-    let Some(user) = app.store.user_by_actor(&a.id) else { return (StatusCode::NOT_FOUND, "not a hosted account").into_response(); };
+    let Some(a) = authed_actor(&app, &headers).await else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
+    let Some(user) = app.store.user_by_actor(&a.id).await else { return (StatusCode::NOT_FOUND, "not a hosted account").into_response(); };
     let Ok(uuid) = Uuid::parse_str(&user.id) else { return (StatusCode::INTERNAL_SERVER_ERROR, "bad user id").into_response(); };
     let exclude: Vec<_> = user.passkeys.iter().filter_map(|p| serde_json::from_value::<Passkey>(p.data.clone()).ok().map(|pk| pk.cred_id().clone())).collect();
     match app.webauthn.start_passkey_registration(uuid, &user.username, &user.username, Some(exclude)) {
@@ -2504,14 +2499,14 @@ async fn account_passkey_start(State(app): State<App>, headers: axum::http::Head
 
 /// `POST /api/account/passkeys/finish` — `{flow_id, credential, name?}` → store the new passkey.
 async fn account_passkey_finish(State(app): State<App>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
-    let Some(a) = authed_actor(&app, &headers) else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
+    let Some(a) = authed_actor(&app, &headers).await else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
     let flow_id = body.get("flow_id").and_then(Value::as_str).unwrap_or("").to_string();
     let name = body.get("name").and_then(Value::as_str).unwrap_or("passkey").trim().to_string();
     let cred = body.get("credential").cloned().unwrap_or(Value::Null);
     let Some(flow) = app.auth.lock().unwrap().add_flows.remove(&flow_id) else {
         return (StatusCode::BAD_REQUEST, "unknown or expired flow").into_response();
     };
-    let Some(mut user) = app.store.user_by_actor(&a.id) else { return (StatusCode::NOT_FOUND, "not a hosted account").into_response(); };
+    let Some(mut user) = app.store.user_by_actor(&a.id).await else { return (StatusCode::NOT_FOUND, "not a hosted account").into_response(); };
     if user.id != flow.user_id {
         return (StatusCode::FORBIDDEN, "flow does not belong to you").into_response();
     }
@@ -2529,15 +2524,15 @@ async fn account_passkey_finish(State(app): State<App>, headers: axum::http::Hea
         created_unix: now(),
         data: serde_json::to_value(&pk).unwrap_or(Value::Null),
     });
-    app.store.put_user(user.clone());
+    app.store.put_user(user.clone()).await;
     let passkeys: Vec<Value> = user.passkeys.iter().map(|p| json!({ "id": p.id, "name": p.name, "created_unix": p.created_unix })).collect();
     Json(json!({ "passkeys": passkeys })).into_response()
 }
 
 /// `DELETE /api/account/passkeys/:cred` — remove a passkey (never the last one).
 async fn account_passkey_delete(State(app): State<App>, headers: axum::http::HeaderMap, Path(cred): Path<String>) -> Response {
-    let Some(a) = authed_actor(&app, &headers) else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
-    let Some(mut user) = app.store.user_by_actor(&a.id) else { return (StatusCode::NOT_FOUND, "not a hosted account").into_response(); };
+    let Some(a) = authed_actor(&app, &headers).await else { return (StatusCode::UNAUTHORIZED, "not signed in").into_response(); };
+    let Some(mut user) = app.store.user_by_actor(&a.id).await else { return (StatusCode::NOT_FOUND, "not a hosted account").into_response(); };
     if user.passkeys.len() <= 1 {
         return (StatusCode::BAD_REQUEST, "cannot remove your only passkey").into_response();
     }
@@ -2546,7 +2541,7 @@ async fn account_passkey_delete(State(app): State<App>, headers: axum::http::Hea
     if user.passkeys.len() == before {
         return (StatusCode::NOT_FOUND, "no such passkey").into_response();
     }
-    app.store.put_user(user.clone());
+    app.store.put_user(user.clone()).await;
     let passkeys: Vec<Value> = user.passkeys.iter().map(|p| json!({ "id": p.id, "name": p.name, "created_unix": p.created_unix })).collect();
     Json(json!({ "passkeys": passkeys })).into_response()
 }
@@ -2579,18 +2574,18 @@ fn verify_service_secret(headers: &axum::http::HeaderMap, header: &str, expected
 /// Resolve the `Authorization: Bearer <token>` header to its actor, if valid. A token older than
 /// [`SESSION_TTL_SECS`] is rejected and dropped; expired entries are pruned opportunistically on the
 /// same lock so the map can't grow without bound.
-fn authed_actor(app: &App, headers: &axum::http::HeaderMap) -> Option<Actor> {
+async fn authed_actor(app: &App, headers: &axum::http::HeaderMap) -> Option<Actor> {
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))?;
-    actor_for_token(app, token)
+    actor_for_token(app, token).await
 }
 
 /// Resolve a **raw** session token (no scheme prefix) to its actor, applying the same expiry prune
 /// as [`authed_actor`]. Factored out so non-`Bearer` credential paths (git HTTP Basic, where the
 /// token arrives as the Basic password) resolve identity through the exact same token map.
-fn actor_for_token(app: &App, token: &str) -> Option<Actor> {
+async fn actor_for_token(app: &App, token: &str) -> Option<Actor> {
     let now = now();
     let actor_id = {
         let mut a = app.auth.lock().unwrap();
@@ -2599,7 +2594,7 @@ fn actor_for_token(app: &App, token: &str) -> Option<Actor> {
         // The presented token survives the prune iff it's present and unexpired.
         a.tokens.get(token).map(|(actor, _)| actor.clone())?
     };
-    app.store.actor(&actor_id)
+    app.store.actor(&actor_id).await
 }
 
 /// The authoring identity: the **authenticated** actor (Bearer token) when signed in, else the
@@ -2610,9 +2605,9 @@ fn actor_for_token(app: &App, token: &str) -> Option<Actor> {
 /// what makes "act as anyone" impossible: you are whoever you signed in as, nobody else. The
 /// `_actor_id` argument (a body field some handlers still pass) is ignored, kept only so call sites
 /// don't churn.
-fn require_actor(app: &App, headers: &axum::http::HeaderMap, _actor_id: &str) -> Result<Actor, Response> {
-    match authed_actor(app, headers) {
-        Some(a) => match accountable(app, &a) {
+async fn require_actor(app: &App, headers: &axum::http::HeaderMap, _actor_id: &str) -> Result<Actor, Response> {
+    match authed_actor(app, headers).await {
+        Some(a) => match accountable(app, &a).await {
             Ok(()) => Ok(a),
             Err(why) => Err((StatusCode::FORBIDDEN, why).into_response()),
         },
@@ -2624,7 +2619,7 @@ fn require_actor(app: &App, headers: &axum::http::HeaderMap, _actor_id: &str) ->
 /// its own root (must not be revoked); an agent's delegation must fully verify — every hop signed by
 /// its parent, scope only narrowing, within the depth cap and TTL, and no principal in the chain
 /// revoked. Revocation of any ancestor propagates here automatically. `Ok(())` means "may author".
-fn accountable(app: &App, a: &Actor) -> Result<(), String> {
+async fn accountable(app: &App, a: &Actor) -> Result<(), String> {
     if a.revoked {
         return Err("this actor has been revoked".into());
     }
@@ -2632,7 +2627,16 @@ fn accountable(app: &App, a: &Actor) -> Result<(), String> {
         hull_core::ActorKind::Human => Ok(()),
         hull_core::ActorKind::Agent => {
             let deleg = a.delegation.as_ref().ok_or("agent carries no delegation — unaccountable")?;
-            let is_revoked = |id: &str| app.store.actor(id).map(|x| x.revoked).unwrap_or(false);
+            // `Delegation::verify` takes a SYNC revocation-check closure, but the store is now async.
+            // Pre-fetch the revoked status of every principal in the chain (the only ids `verify`
+            // queries), then hand `verify` a closure that reads from that set — identical semantics.
+            let mut revoked = std::collections::HashSet::new();
+            for hop in &deleg.chain {
+                if app.store.actor(&hop.principal).await.map(|x| x.revoked).unwrap_or(false) {
+                    revoked.insert(hop.principal.clone());
+                }
+            }
+            let is_revoked = |id: &str| revoked.contains(id);
             deleg.verify(&a.id, now(), &is_revoked).map(|_| ()).map_err(|e| format!("agent delegation does not verify: {e}"))
         }
     }
@@ -2647,7 +2651,7 @@ async fn why(
     headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     let path = q.get("path").map(String::as_str).unwrap_or("");
@@ -2657,7 +2661,7 @@ async fn why(
 
 /// Branch names for a repo (`GET /api/repos/:tenant/:repo/branches`).
 async fn repo_branches(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     Json(json!({ "branches": app.repos.branches(&tenant, &repo) })).into_response()
@@ -2670,7 +2674,7 @@ async fn repo_tree(
     headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
@@ -2690,7 +2694,7 @@ async fn repo_blob(
     headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
@@ -2714,7 +2718,7 @@ async fn repo_graph(
     headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(resp) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(resp) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return resp;
     }
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
@@ -2729,7 +2733,7 @@ async fn repo_search(
     headers: axum::http::HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     let ref_name = q.get("ref").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("main");
@@ -2739,10 +2743,10 @@ async fn repo_search(
 
 /// A repo's code-owner rules (`GET /api/repos/:tenant/:repo/owners`).
 async fn owners_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
-    Json(json!({ "owners": app.store.owners(&format!("{tenant}/{repo}")) })).into_response()
+    Json(json!({ "owners": app.store.owners(&format!("{tenant}/{repo}")).await })).into_response()
 }
 
 /// Set a repo's code-owner rules (`POST …/owners` with `{rules: [{glob, owners:[actorId]}]}`),
@@ -2753,12 +2757,12 @@ async fn set_owners(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Code owners drive review routing and the merge gate — only a repo owner/admin may rewrite them.
-    if !is_repo_admin(&app, &tenant, &repo, &actor.id) {
+    if !is_repo_admin(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo owner/admin can set code owners").into_response();
     }
     let rules: Vec<OwnerRule> = body
@@ -2779,7 +2783,7 @@ async fn set_owners(
                 .collect()
         })
         .unwrap_or_default();
-    app.store.set_owners(&format!("{tenant}/{repo}"), rules.clone());
+    app.store.set_owners(&format!("{tenant}/{repo}"), rules.clone()).await;
     (StatusCode::CREATED, Json(json!({ "owners": rules }))).into_response()
 }
 
@@ -2798,9 +2802,9 @@ fn parse_mentions(text: &str) -> Vec<String> {
     out
 }
 
-fn owners_for(app: &App, repo_key: &str, files: &[String]) -> Vec<String> {
+async fn owners_for(app: &App, repo_key: &str, files: &[String]) -> Vec<String> {
     let mut set: Vec<String> = Vec::new();
-    for rule in app.store.owners(repo_key) {
+    for rule in app.store.owners(repo_key).await {
         if files.iter().any(|f| hull_core::store::glob_match(&rule.glob, f)) {
             for o in rule.owners {
                 if !set.contains(&o) {
@@ -2814,7 +2818,7 @@ fn owners_for(app: &App, repo_key: &str, files: &[String]) -> Vec<String> {
     if let Some((tenant, repo)) = repo_key.split_once('/') {
         if let Some(bytes) = app.repos.read_file(tenant, repo, ".hull/CODEOWNERS") {
             let text = String::from_utf8_lossy(&bytes);
-            let actors = app.store.actors();
+            let actors = app.store.actors().await;
             for line in text.lines() {
                 let line = line.split('#').next().unwrap_or("").trim();
                 if line.is_empty() {
@@ -2840,7 +2844,7 @@ fn owners_for(app: &App, repo_key: &str, files: &[String]) -> Vec<String> {
 
 /// Secret findings from the server-side push scan (`GET /api/repos/:tenant/:repo/security`).
 async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     Json(json!({ "secrets": app.repos.secrets(&format!("{tenant}/{repo}")) })).into_response()
@@ -2849,7 +2853,7 @@ async fn repo_security(State(app): State<App>, Path((tenant, repo)): Path<(Strin
 /// The diff of a change (`GET /api/repos/:tenant/:repo/change/:id/diff`): per-file line hunks plus a
 /// semantic-operations summary — the review's diff viewer.
 async fn change_diff(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     Json(json!({ "files": app.repos.diff(&tenant, &repo, &id) })).into_response()
@@ -2864,7 +2868,7 @@ async fn change_file(
     headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     let Some(path) = q.get("path").map(|s| s.as_str()).filter(|s| !s.is_empty()) else {
@@ -2880,7 +2884,7 @@ async fn change_file(
 /// purely moved (proven by an unchanged blob id, not guessed by similarity) vs really added/deleted/
 /// modified, and whether the whole change is a behavior-preserving `pure_move`.
 async fn change_semantic(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     Json(json!({ "semantic": app.repos.semantic_summary(&tenant, &repo, &id) })).into_response()
@@ -2892,7 +2896,7 @@ async fn change_semantic(State(app): State<App>, Path((tenant, repo, id)): Path<
 /// smart-HTTP endpoints exist only for interop/mirroring, never as the runner fetch path.) The
 /// archive is verifiable: re-hashing the tree reproduces `tree`.
 async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     // The scratch path must be unique **per request**, not per (tree, pid): two concurrent fetches of
@@ -2950,28 +2954,27 @@ async fn tree_archive(State(app): State<App>, Path((tenant, repo, tree)): Path<(
 /// verification, secret scan). This is the substance of a Hull review — does the code do what its
 /// author said it does — computed the same way every time (pure, content-addressable).
 async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     let Some(info) = app.repos.change_info(&tenant, &repo, &id) else {
         return Json(json!({ "ledger": null })).into_response();
     };
     // Narrative: the change intent, plus the lesson from a native or ingested session.
-    let lesson = info
-        .session
-        .as_ref()
-        .map(|s| s.lesson.clone())
-        .or_else(|| app.store.session_record(&format!("{tenant}/{repo}"), &id).map(|s| s.lesson))
-        .unwrap_or_default();
+    let lesson = match info.session.as_ref().map(|s| s.lesson.clone()) {
+        Some(l) => l,
+        None => app.store.session_record(&format!("{tenant}/{repo}"), &id).await.map(|s| s.lesson).unwrap_or_default(),
+    };
     let facts = facts_with_independence(&app, &tenant, &repo, &id).await;
     // C1 — fold in the acceptance criteria of any issue a PR proposing this change closes, so the
     // standalone ledger matches what the review reconciled against.
     let key = format!("{tenant}/{repo}");
     let review_intent = {
-        let issues = app.store.issues(&key);
+        let issues = app.store.issues(&key).await;
         let acceptance: Vec<String> = app
             .store
             .prs(&key)
+            .await
             .into_iter()
             .filter(|p| p.changes.contains(&id))
             .flat_map(|p| {
@@ -2991,7 +2994,7 @@ async fn change_ledger(State(app): State<App>, Path((tenant, repo, id)): Path<(S
         for claim in arr {
             if let Some(cid) = claim.get("id").and_then(Value::as_str) {
                 if let Some(r) = resolutions.get(cid) {
-                    let handle = app.store.actor(&r.by).map(|a| a.handle).unwrap_or_else(|| r.by.chars().take(8).collect());
+                    let handle = app.store.actor(&r.by).await.map(|a| a.handle).unwrap_or_else(|| r.by.chars().take(8).collect());
                     claim["resolution"] = json!({ "judgment": r.judgment, "note": r.note, "by": handle, "ts": r.ts });
                 }
             }
@@ -3009,12 +3012,12 @@ async fn resolve_claim(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match require_actor(&app, &headers, "") {
+    let actor = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Resolving a reconciliation claim is a review judgment on the repo — repo members only.
-    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+    if !is_repo_member(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo member may resolve claims").into_response();
     }
     let judgment = match body.get("judgment").and_then(Value::as_str) {
@@ -3035,7 +3038,7 @@ async fn resolve_claim(
 /// Expand a keel change (`GET /api/repos/:tenant/:repo/change/:id`): intent, author, and the files
 /// it changed vs its parent — the keel-native "what does this touch" that anchors a review.
 async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     match app.repos.change_info(&tenant, &repo, &id) {
@@ -3044,7 +3047,7 @@ async fn change_info(State(app): State<App>, Path((tenant, repo, id)): Path<(Str
             // a session ingested for it (`keel capture` → POST …/session) — the session-carrying
             // bridge across the git boundary.
             if info.session.is_none() {
-                if let Some(sr) = app.store.session_record(&format!("{tenant}/{repo}"), &id) {
+                if let Some(sr) = app.store.session_record(&format!("{tenant}/{repo}"), &id).await {
                     info.session = Some(repos::SessionSummary {
                         task: sr.task,
                         model: sr.model,
@@ -3071,13 +3074,13 @@ async fn run_check_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Running checks executes the change's own test command on the host — gate to repo members so an
     // outsider can't drive the runner (or force-bust its memo) on a repo they don't belong to.
-    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+    if !is_repo_member(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo member may run checks").into_response();
     }
     let force = body.get("force").and_then(Value::as_bool).unwrap_or(false);
@@ -3092,8 +3095,8 @@ async fn run_check_handler(
             // verdict makes the agent's own check run instant.
             if matches!(o.status, hull_plugin::CiStatus::Red) {
                 let key = format!("{tenant}/{repo}");
-                if let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.changes.iter().any(|c| c.starts_with(&id) || id.starts_with(c.as_str()))) {
-                    if let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author) {
+                if let Some(pr) = app.store.prs(&key).await.into_iter().find(|p| p.changes.iter().any(|c| c.starts_with(&id) || id.starts_with(c.as_str()))) {
+                    if let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author).await {
                         let (app2, t2, r2, n2) = (app.clone(), tenant.clone(), repo.clone(), pr.number);
                         tokio::spawn(async move { let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent, 0).await; });
                     } else {
@@ -3306,7 +3309,7 @@ async fn ci_result(
 /// it comes from (repo / instance default / none), never leaking the secret. PUT (owner-gated) sets
 /// or clears the repo's own endpoint.
 async fn get_ci_config(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     let key = format!("{tenant}/{repo}");
@@ -3330,12 +3333,12 @@ async fn set_ci_config(
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
-    let acting = match require_actor(&app, &headers, body.get("by").and_then(Value::as_str).unwrap_or("")) {
+    let acting = match require_actor(&app, &headers, body.get("by").and_then(Value::as_str).unwrap_or("")).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Owner-gated: only an owner/admin of the repo's account may point it at a CI system.
-    if !is_repo_admin(&app, &tenant, &repo, &acting.id) {
+    if !is_repo_admin(&app, &tenant, &repo, &acting.id).await {
         return (StatusCode::FORBIDDEN, "only a repo owner/admin can set the CI endpoint").into_response();
     }
     let url = body.get("url").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -3348,18 +3351,19 @@ async fn set_ci_config(
 /// Resolve the repo record for `tenant/repo`, matched by its **fully-qualified** identity: the bare
 /// `name` under the account that owns `tenant`. There is deliberately no bare-name fallback — a
 /// same-named repo under a *different* owner must never match (cross-tenant confusion).
-fn find_repo(app: &App, tenant: &str, repo: &str) -> Option<Repo> {
-    let tenant_acct = app.store.accounts().into_iter().find(|a| a.handle == tenant)?.id;
-    app.store.repos().into_iter().find(|r| r.name == repo && r.owner == tenant_acct)
+async fn find_repo(app: &App, tenant: &str, repo: &str) -> Option<Repo> {
+    let tenant_acct = app.store.accounts().await.into_iter().find(|a| a.handle == tenant)?.id;
+    app.store.repos().await.into_iter().find(|r| r.name == repo && r.owner == tenant_acct)
 }
 
-fn is_repo_admin(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
-    let Some(owner) = find_repo(app, tenant, repo).map(|r| r.owner) else {
+async fn is_repo_admin(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
+    let Some(owner) = find_repo(app, tenant, repo).await.map(|r| r.owner) else {
         // No repo record — fall back to: any owner/admin of the tenant org.
-        return app.store.accounts().iter().any(|a| a.handle == tenant && a.members.iter().any(|m| m.actor == actor && matches!(m.role, Role::Owner | Role::Admin)));
+        return app.store.accounts().await.iter().any(|a| a.handle == tenant && a.members.iter().any(|m| m.actor == actor && matches!(m.role, Role::Owner | Role::Admin)));
     };
     app.store
         .accounts()
+        .await
         .into_iter()
         .find(|a| a.id == owner)
         .map(|a| a.members.iter().any(|m| m.actor == actor && matches!(m.role, Role::Owner | Role::Admin)))
@@ -3368,17 +3372,17 @@ fn is_repo_admin(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
 
 /// The account that owns `tenant/repo`: the repo record's owner, or (no repo record yet) the org whose
 /// handle == `tenant`. Same resolution as `repo_account_id`, returning the full [`Account`].
-fn repo_owner_account(app: &App, tenant: &str, repo: &str) -> Option<Account> {
-    let owner = repo_account_id(app, tenant, repo)?;
-    app.store.accounts().into_iter().find(|a| a.id == owner)
+async fn repo_owner_account(app: &App, tenant: &str, repo: &str) -> Option<Account> {
+    let owner = repo_account_id(app, tenant, repo).await?;
+    app.store.accounts().await.into_iter().find(|a| a.id == owner)
 }
 
 /// The write-side membership gate: does `actor` belong to the account that owns `tenant/repo` — in ANY
 /// role (Owner/Admin/Write/Read) — or to a team that account has granted access to this repo? Unlike
 /// `can_read_repo`, this never short-circuits on visibility: a *public* repo is still only mutated by
 /// its members. `is_repo_admin` (Owner/Admin only) is the stricter peer used for repo-config changes.
-fn is_repo_member(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
-    let Some(acct) = repo_owner_account(app, tenant, repo) else { return false };
+async fn is_repo_member(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
+    let Some(acct) = repo_owner_account(app, tenant, repo).await else { return false };
     if acct.members.iter().any(|m| m.actor == actor) {
         return true;
     }
@@ -3386,6 +3390,7 @@ fn is_repo_member(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
     let settings = app.repo_settings.get(&format!("{tenant}/{repo}"));
     app.store
         .teams(&acct.id)
+        .await
         .into_iter()
         .any(|t| settings.team_access.iter().any(|ta| ta.team == t.id) && t.members.iter().any(|m| m.actor == actor))
 }
@@ -3395,7 +3400,7 @@ fn is_repo_member(app: &App, tenant: &str, repo: &str, actor: &str) -> bool {
 // Enforcement is CONFIG-GATED by `HULL_GIT_AUTH` so the credential-free dogfood keeps working: the
 // DEFAULT (`off`, or unset) is a byte-for-byte no-op — every request is `Allow` and the handlers run
 // exactly as before. Set `HULL_GIT_AUTH=enforce` to require credentials:
-//   · FETCH (upload-pack): anonymous OK for public/unlisted repos (`can_read_repo(None)`), a private
+//   · FETCH (upload-pack): anonymous OK for public/unlisted repos (`can_read_repo(None).await`), a private
 //     repo needs a token whose actor can read it — else 401 (so git prompts / a credential helper runs).
 //   · PUSH  (receive-pack): always needs a token whose actor is a repo member; non-member → 403,
 //     missing/invalid creds → 401. This also gates auto-create-on-push, because `is_repo_member`
@@ -3461,23 +3466,27 @@ enum GitAuthDecision {
 /// service, token) so it can be unit-tested exhaustively. When `enforce` is false this is ALWAYS
 /// `Allow` — the config-off no-op. `service` is `git-upload-pack` (fetch) or `git-receive-pack`
 /// (push); `token` is the raw session token extracted from the request, if any.
-fn git_auth_decision(app: &App, enforce: bool, tenant: &str, repo: &str, service: &str, token: Option<&str>) -> GitAuthDecision {
+async fn git_auth_decision(app: &App, enforce: bool, tenant: &str, repo: &str, service: &str, token: Option<&str>) -> GitAuthDecision {
     if !enforce {
         return GitAuthDecision::Allow;
     }
-    let actor = token.and_then(|t| actor_for_token(app, t)).map(|a| a.id);
+    let actor = match token {
+        Some(t) => actor_for_token(app, t).await,
+        None => None,
+    }
+    .map(|a| a.id);
     if service == "git-receive-pack" {
         // Push: always require a member. This also gates auto-create-on-push (an anonymous or
         // non-member actor can neither push to nor provision a repo).
         match actor {
             None => GitAuthDecision::Unauthorized,
-            Some(aid) if is_repo_member(app, tenant, repo, &aid) => GitAuthDecision::Allow,
+            Some(aid) if is_repo_member(app, tenant, repo, &aid).await => GitAuthDecision::Allow,
             Some(_) => GitAuthDecision::Forbidden,
         }
     } else {
         // Fetch: public/unlisted stays anonymous; a private repo needs a read-authorized actor.
         // Any shortfall is 401 (not 403) so git re-tries with a credential helper.
-        if can_read_repo(app, actor.as_deref(), tenant, repo) {
+        if can_read_repo(app, actor.as_deref(), tenant, repo).await {
             GitAuthDecision::Allow
         } else {
             GitAuthDecision::Unauthorized
@@ -3486,9 +3495,9 @@ fn git_auth_decision(app: &App, enforce: bool, tenant: &str, repo: &str, service
 }
 
 /// Run the git-auth gate for a request. `Some(resp)` = reject with that response; `None` = proceed.
-fn git_gate(app: &App, tenant: &str, repo: &str, service: &str, headers: &HeaderMap) -> Option<Response> {
+async fn git_gate(app: &App, tenant: &str, repo: &str, service: &str, headers: &HeaderMap) -> Option<Response> {
     let token = git_token_from_headers(headers);
-    match git_auth_decision(app, git_auth_enforced(), tenant, repo, service, token.as_deref()) {
+    match git_auth_decision(app, git_auth_enforced(), tenant, repo, service, token.as_deref()).await {
         GitAuthDecision::Allow => None,
         GitAuthDecision::Unauthorized => Some(
             (StatusCode::UNAUTHORIZED, [(axum::http::header::WWW_AUTHENTICATE, "Basic realm=\"hull\"")], "authentication required").into_response(),
@@ -3515,7 +3524,7 @@ async fn info_refs_handler(
 ) -> Response {
     let service = info_refs_service(query.as_deref());
     if service == "git-upload-pack" || service == "git-receive-pack" {
-        if let Some(resp) = git_gate(&app, &tenant, &repo, &service, &headers) {
+        if let Some(resp) = git_gate(&app, &tenant, &repo, &service, &headers).await {
             return resp;
         }
     }
@@ -3529,7 +3538,7 @@ async fn upload_pack_handler(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Some(resp) = git_gate(&app, &tenant, &repo, "git-upload-pack", &headers) {
+    if let Some(resp) = git_gate(&app, &tenant, &repo, "git-upload-pack", &headers).await {
         return resp;
     }
     repos::upload_pack(State(app), Path((tenant, repo)), headers, body).await
@@ -3546,7 +3555,7 @@ async fn receive_pack_handler(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Some(resp) = git_gate(&app, &tenant, &repo, "git-receive-pack", &headers) {
+    if let Some(resp) = git_gate(&app, &tenant, &repo, "git-receive-pack", &headers).await {
         return resp;
     }
     let resp = repos::receive_pack(State(app.clone()), Path((tenant.clone(), repo.clone())), headers, body).await;
@@ -3562,10 +3571,11 @@ async fn receive_pack_handler(
 }
 
 /// The id of the account that owns `tenant/repo` (for the account-level policy fallback).
-fn repo_account_id(app: &App, tenant: &str, repo: &str) -> Option<String> {
-    find_repo(app, tenant, repo)
-        .map(|r| r.owner)
-        .or_else(|| app.store.accounts().into_iter().find(|a| a.handle == tenant).map(|a| a.id))
+async fn repo_account_id(app: &App, tenant: &str, repo: &str) -> Option<String> {
+    match find_repo(app, tenant, repo).await.map(|r| r.owner) {
+        Some(owner) => Some(owner),
+        None => app.store.accounts().await.into_iter().find(|a| a.handle == tenant).map(|a| a.id),
+    }
 }
 
 fn tier_from_str(s: &str) -> Option<hull_core::AutonomyTier> {
@@ -3581,10 +3591,10 @@ fn tier_from_str(s: &str) -> Option<hull_core::AutonomyTier> {
 /// The effective autonomy policy for a repo (`GET …/autonomy`) — the resolved tier, where it comes
 /// from, and the protected paths that always require a human.
 async fn get_repo_autonomy(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
-    let acct = repo_account_id(&app, &tenant, &repo);
+    let acct = repo_account_id(&app, &tenant, &repo).await;
     let e = app.autonomy.effective(&tenant, &repo, acct.as_deref());
     Json(json!({
         "tier": e.tier, "source": e.source, "protected_paths": e.protected_paths,
@@ -3600,11 +3610,11 @@ async fn set_repo_autonomy(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match require_actor(&app, &headers, "") {
+    let actor = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    if !is_repo_admin(&app, &tenant, &repo, &actor.id) {
+    if !is_repo_admin(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo owner/admin can set autonomy").into_response();
     }
     let Some(tier) = body.get("tier").and_then(Value::as_str).and_then(tier_from_str) else {
@@ -3626,13 +3636,14 @@ async fn set_account_autonomy(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match require_actor(&app, &headers, "") {
+    let actor = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     let is_admin = app
         .store
         .accounts()
+        .await
         .into_iter()
         .find(|a| a.id == id)
         .map(|a| a.members.iter().any(|m| m.actor == actor.id && matches!(m.role, Role::Owner | Role::Admin)))
@@ -3661,12 +3672,12 @@ async fn ingest_session(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // A session record is provenance attached to the repo's history — repo members only.
-    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+    if !is_repo_member(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo member may ingest a session").into_response();
     }
     // The task is authoritative from the CHANGE's own intent, never the caller — so a session
@@ -3684,7 +3695,7 @@ async fn ingest_session(
         tokens_in: body.get("tokens_in").and_then(Value::as_u64).unwrap_or(0),
         tokens_out: body.get("tokens_out").and_then(Value::as_u64).unwrap_or(0),
     };
-    app.store.put_session_record(record.clone());
+    app.store.put_session_record(record.clone()).await;
     (StatusCode::CREATED, Json(json!({ "session": record }))).into_response()
 }
 
@@ -3699,22 +3710,22 @@ async fn close_pr(
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
-    let actor = match require_actor(&app, &headers, "") {
+    let actor = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let Some(mut pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+    let Some(mut pr) = app.store.prs(&key).await.into_iter().find(|p| p.number == number) else {
         return (StatusCode::NOT_FOUND, "no such PR").into_response();
     };
     if pr.state == PrState::Merged {
         return (StatusCode::CONFLICT, "a merged PR can't be closed or reopened").into_response();
     }
-    if pr.author != actor.id && !is_repo_admin(&app, &tenant, &repo, &actor.id) {
+    if pr.author != actor.id && !is_repo_admin(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only the PR author or a repo owner/admin can close it").into_response();
     }
     let reopen = body.get("reopen").and_then(Value::as_bool).unwrap_or(false);
     pr.state = if reopen { PrState::Open } else { PrState::Closed };
-    app.store.replace_pr(pr.clone());
+    app.store.replace_pr(pr.clone()).await;
     Json(json!({ "pr": pr })).into_response()
 }
 
@@ -3727,24 +3738,24 @@ async fn request_reviewer(
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
-    let requester = match require_actor(&app, &headers, "") {
+    let requester = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Repo-op gate: requesting a reviewer is a repo operation, not public participation — members only.
-    if !is_repo_member(&app, &tenant, &repo, &requester.id) {
+    if !is_repo_member(&app, &tenant, &repo, &requester.id).await {
         return (StatusCode::FORBIDDEN, "only a repo member can request a reviewer").into_response();
     }
     let reviewer = body.get("reviewer").and_then(Value::as_str).unwrap_or("").to_string();
-    if app.store.actor(&reviewer).is_none() {
+    if app.store.actor(&reviewer).await.is_none() {
         return (StatusCode::UNPROCESSABLE_ENTITY, "reviewer must be a registered actor").into_response();
     }
-    let Some(mut pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+    let Some(mut pr) = app.store.prs(&key).await.into_iter().find(|p| p.number == number) else {
         return (StatusCode::NOT_FOUND, "no such PR").into_response();
     };
     if !pr.reviewers.contains(&reviewer) {
         pr.reviewers.push(reviewer.clone());
-        app.store.replace_pr(pr.clone());
+        app.store.replace_pr(pr.clone()).await;
     }
     app.registry.notify(&NotifyEvent {
         kind: "review_requested".into(),
@@ -3765,13 +3776,13 @@ async fn merge_pr(
     headers: axum::http::HeaderMap,
     Json(_body): Json<Value>,
 ) -> Response {
-    let actor = match require_actor(&app, &headers, "") {
+    let actor = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Repo-op gate: merging is a repo operation — members only. The independent-approval / green-verify
     // gate inside `perform_merge` is preserved and still enforced on top of this.
-    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+    if !is_repo_member(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo member can merge").into_response();
     }
     let force = _body.get("force").and_then(Value::as_bool).unwrap_or(false);
@@ -3795,7 +3806,7 @@ async fn perform_merge(
     force: bool,
 ) -> Result<(PullRequest, Vec<u64>), (StatusCode, String)> {
     let key = format!("{tenant}/{repo}");
-    let Some(mut pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+    let Some(mut pr) = app.store.prs(&key).await.into_iter().find(|p| p.number == number) else {
         return Err((StatusCode::NOT_FOUND, "no such PR".into()));
     };
     if pr.state == PrState::Merged {
@@ -3803,7 +3814,7 @@ async fn perform_merge(
     }
     // An owner/admin may override the gate (merge despite red/unrun checks or no approval) — the
     // human-admin escape hatch for a wedged or misconfigured check.
-    let override_ok = force && is_repo_admin(app, tenant, repo, actor.id.as_str());
+    let override_ok = force && is_repo_admin(app, tenant, repo, actor.id.as_str()).await;
     // green keel verification of EVERY proposed change — a multi-change PR must not smuggle an
     // unverified change at index ≥1 past a check that only inspected the first.
     let green = !pr.changes.is_empty()
@@ -3820,15 +3831,30 @@ async fn perform_merge(
     let approvals: Vec<ActorId> = app
         .store
         .reviews(&key)
+        .await
         .into_iter()
         .filter(|r| r.target == format!("pr:{number}") && r.verdict == Verdict::Approve && (allow_self || r.reviewer != pr.author))
         .map(|r| r.reviewer)
         .collect();
-    let human_approval = approvals.iter().any(|a| app.store.actor(a).map(|x| x.kind == hull_core::ActorKind::Human).unwrap_or(false));
-    let agent_approval = approvals.iter().any(|a| app.store.actor(a).map(|x| x.kind == hull_core::ActorKind::Agent).unwrap_or(false));
+    // Explicit loop rather than `.any(async)` — the actor-kind lookup now `.await`s.
+    let mut human_approval = false;
+    for a in approvals.iter() {
+        if app.store.actor(a).await.map(|x| x.kind == hull_core::ActorKind::Human).unwrap_or(false) {
+            human_approval = true;
+            break;
+        }
+    }
+    // Explicit loop rather than `.any(async)` — the actor-kind lookup now `.await`s.
+    let mut agent_approval = false;
+    for a in approvals.iter() {
+        if app.store.actor(a).await.map(|x| x.kind == hull_core::ActorKind::Agent).unwrap_or(false) {
+            agent_approval = true;
+            break;
+        }
+    }
 
     // Autonomy policy: when may an AGENT's approve stand in for a human's?
-    let acct = repo_account_id(app, tenant, repo);
+    let acct = repo_account_id(app, tenant, repo).await;
     let eff = app.autonomy.effective(tenant, repo, acct.as_deref());
     // Inspect EVERY change in the PR, not just the first: protected-path and ledger gating must see a
     // protected or un-reconciled change wherever it sits in the PR.
@@ -3847,7 +3873,7 @@ async fn perform_merge(
         let mut contradicted = false;
         let mut phantom = false;
         for change in &pr.changes {
-            let lesson = app.store.session_record(&key, change).map(|s| s.lesson).unwrap_or_default();
+            let lesson = app.store.session_record(&key, change).await.map(|s| s.lesson).unwrap_or_default();
             let intent = app.repos.change_info(tenant, repo, change).map(|i| i.intent).unwrap_or_default();
             let facts = facts_with_independence(app, tenant, repo, change).await;
             let ledger = hull_core::reconcile::reconcile(change, &intent, &lesson, &facts);
@@ -3877,7 +3903,7 @@ async fn perform_merge(
     }
     pr.state = PrState::Merged;
     pr.merged_by = Some(actor.id.clone());
-    app.store.replace_pr(pr.clone());
+    app.store.replace_pr(pr.clone()).await;
     app.hub.publish(
         tenant,
         ActivityEvent::Push { actor: actor.handle.clone(), repo: repo.to_string(), change: pr.changes.first().cloned().unwrap_or_default(), ts: now() },
@@ -3897,7 +3923,7 @@ async fn perform_merge(
         .join("\n");
     let mut closed: Vec<u64> = Vec::new();
     for num in closing_issue_numbers(&pr.title, &intent_body, &[]) {
-        if let Some(mut issue) = app.store.issues(&pr.repo).into_iter().find(|i| i.number == num) {
+        if let Some(mut issue) = app.store.issues(&pr.repo).await.into_iter().find(|i| i.number == num) {
             if matches!(issue.status, hull_core::IssueStatus::Open) {
                 issue.status = hull_core::IssueStatus::Closed { reason: hull_core::CloseReason::Completed };
                 issue.resolved_by = resolving.clone();
@@ -3906,7 +3932,7 @@ async fn perform_merge(
                 }
                 let assignees = issue.assignees.clone();
                 let author = issue.author.clone();
-                app.store.replace_issue(issue);
+                app.store.replace_issue(issue).await;
                 closed.push(num);
                 let mut to = assignees;
                 if !to.contains(&author) {
@@ -4041,12 +4067,12 @@ async fn mirror_github_webhook(
 /// per-change idempotency guard so a re-sync always runs; loop-origin is still recorded.
 async fn mirror_push_now(State(app): State<App>, headers: axum::http::HeaderMap, Path((tenant, repo)): Path<(String, String)>) -> Response {
     let key = format!("{tenant}/{repo}");
-    let actor = match require_actor(&app, &headers, "") {
+    let actor = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Repo-op gate: pushing to the mirror is a repo operation — members only.
-    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+    if !is_repo_member(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo member can push to the mirror").into_response();
     }
     let Some(target) = app.registry.mirror_target(&key) else {
@@ -4120,7 +4146,7 @@ fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
 /// The repo's mirror status (`GET /api/repos/:tenant/:repo/mirror`): the external target it's linked
 /// to (if any) and the outbound pushes recorded, for the UI's mirror panel.
 async fn mirror_status(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
     let key = format!("{tenant}/{repo}");
@@ -4173,7 +4199,10 @@ async fn mirror_inbound(
     let git_author = body.get("author").and_then(Value::as_str).unwrap_or("mirror").to_string();
     let github_login = body.get("github_login").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let attributed = if github_login.is_empty() { None } else { app.mirror.resolve_github(&github_login) };
-    let attributed_handle = attributed.as_ref().and_then(|id| app.store.actor(id).map(|a| a.handle));
+    let attributed_handle = match attributed.as_ref() {
+        Some(id) => app.store.actor(id).await.map(|a| a.handle),
+        None => None,
+    };
     let key = format!("{tenant}/{repo}");
     app.mirror.record_inbound(mirror::Inbound {
         repo: key.clone(),
@@ -4199,10 +4228,10 @@ async fn mirror_inbound(
 /// List reviews for a hosted repo (`GET /api/repos/:tenant/:repo/reviews`); the client filters by
 /// target (e.g. `pr:1`).
 async fn reviews(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
-    Json(json!({ "reviews": app.store.reviews(&format!("{tenant}/{repo}")) })).into_response()
+    Json(json!({ "reviews": app.store.reviews(&format!("{tenant}/{repo}")).await })).into_response()
 }
 
 /// The content-addressed review **audit artifact** (`GET …/artifacts/:id`) — the immutable record of
@@ -4223,10 +4252,10 @@ async fn get_artifact(State(app): State<App>, Path((tenant, repo, id)): Path<(St
 /// Discussion comments for a repo (`GET /api/repos/:tenant/:repo/comments`); the client filters by
 /// `target` (e.g. `pr:1`). The conversation layer over the structured review.
 async fn comments_list(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
-    Json(json!({ "comments": app.store.comments(&format!("{tenant}/{repo}")) })).into_response()
+    Json(json!({ "comments": app.store.comments(&format!("{tenant}/{repo}")).await })).into_response()
 }
 
 /// Post a comment (`POST /api/repos/:tenant/:repo/comments`) — `{target, body}`. Authored by the
@@ -4239,13 +4268,13 @@ async fn create_comment(
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
-    let author = match require_actor(&app, &headers, "") {
+    let author = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
     // lets people who can read it (its members) comment.
-    if !can_read_repo(&app, Some(&author.id), &tenant, &repo) {
+    if !can_read_repo(&app, Some(&author.id), &tenant, &repo).await {
         return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
     }
     let target = body.get("target").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -4253,7 +4282,7 @@ async fn create_comment(
     if target.is_empty() || text.is_empty() {
         return (StatusCode::BAD_REQUEST, "target and body are required").into_response();
     }
-    let count = app.store.comments(&key).len();
+    let count = app.store.comments(&key).await.len();
     let path = body.get("path").and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let line = body.get("line").and_then(Value::as_u64).map(|n| n as u32);
     let line_end = body.get("line_end").and_then(Value::as_u64).map(|n| n as u32).unwrap_or(line.unwrap_or(0));
@@ -4269,12 +4298,12 @@ async fn create_comment(
         line,
         edited_unix: None,
     };
-    app.store.put_comment(comment.clone());
+    app.store.put_comment(comment.clone()).await;
     // Notify the people watching the target (not the commenter): a PR's author + reviewers, or an
     // issue's author + assignees.
     let (mut to, summary, change): (Vec<String>, String, Option<String>) =
         if let Some(num) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
-            match app.store.prs(&key).into_iter().find(|p| p.number == num) {
+            match app.store.prs(&key).await.into_iter().find(|p| p.number == num) {
                 Some(pr) => {
                     let mut to = pr.reviewers.clone();
                     to.push(pr.author.clone());
@@ -4283,7 +4312,7 @@ async fn create_comment(
                 None => (vec![], String::new(), None),
             }
         } else if let Some(num) = target.strip_prefix("issue:").and_then(|s| s.parse::<u64>().ok()) {
-            match app.store.issues(&key).into_iter().find(|i| i.number == num) {
+            match app.store.issues(&key).await.into_iter().find(|i| i.number == num) {
                 Some(issue) => {
                     let mut to = issue.assignees.clone();
                     to.push(issue.author.clone());
@@ -4304,10 +4333,10 @@ async fn create_comment(
     // @mentions in a comment add the mentioned actor as a reviewer (on a PR) or assignee (on an issue).
     let mentioned = parse_mentions(&comment.body);
     if !mentioned.is_empty() {
-        let actors = app.store.actors();
+        let actors = app.store.actors().await;
         let ids: Vec<String> = mentioned.iter().filter_map(|h| actors.iter().find(|a| &a.handle == h).map(|a| a.id.clone())).collect();
         if let Some(num) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
-            if let Some(mut pr) = app.store.prs(&key).into_iter().find(|p| p.number == num) {
+            if let Some(mut pr) = app.store.prs(&key).await.into_iter().find(|p| p.number == num) {
                 let mut added = vec![];
                 for id in &ids {
                     if id != &pr.author && !pr.reviewers.contains(id) {
@@ -4316,12 +4345,12 @@ async fn create_comment(
                     }
                 }
                 if !added.is_empty() {
-                    app.store.replace_pr(pr.clone());
+                    app.store.replace_pr(pr.clone()).await;
                     app.registry.notify(&NotifyEvent { kind: "review_requested".into(), to: added, summary: format!("{} mentioned you as a reviewer on PR !{num}", author.handle), change: pr.changes.first().cloned(), repo: Some(key.clone()), target_kind: Some("pr".into()), target_number: Some(num) });
                 }
             }
         } else if let Some(num) = target.strip_prefix("issue:").and_then(|s| s.parse::<u64>().ok()) {
-            if let Some(mut issue) = app.store.issues(&key).into_iter().find(|i| i.number == num) {
+            if let Some(mut issue) = app.store.issues(&key).await.into_iter().find(|i| i.number == num) {
                 let mut added = vec![];
                 for id in &ids {
                     if !issue.assignees.contains(id) {
@@ -4330,7 +4359,7 @@ async fn create_comment(
                     }
                 }
                 if !added.is_empty() {
-                    app.store.replace_issue(issue.clone());
+                    app.store.replace_issue(issue.clone()).await;
                     app.registry.notify(&NotifyEvent { kind: "issue_assigned".into(), to: added, summary: format!("{} mentioned you on issue #{num}", author.handle), change: None, repo: Some(key.clone()), target_kind: Some("issue".into()), target_number: Some(num) });
                 }
             }
@@ -4342,7 +4371,7 @@ async fn create_comment(
         if let (Some(p), Some(ln)) = (comment.path.clone(), line) {
             if let Some(num) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
                 if let Some(reply) = ai_answer_comment(&app, &key, num, &p, ln, line_end, &comment.body).await {
-                    app.store.put_comment(reply);
+                    app.store.put_comment(reply).await;
                 }
             }
         }
@@ -4366,17 +4395,17 @@ fn notify_target(target: &str) -> (Option<String>, Option<u64>) {
 /// may delete it — you can't erase someone else's words.
 async fn delete_comment(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
     let key = format!("{tenant}/{repo}");
-    let actor = match require_actor(&app, &headers, "") {
+    let actor = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let Some(comment) = app.store.comments(&key).into_iter().find(|c| c.id == id) else {
+    let Some(comment) = app.store.comments(&key).await.into_iter().find(|c| c.id == id) else {
         return (StatusCode::NOT_FOUND, "no such comment").into_response();
     };
-    if comment.author != actor.id && !is_repo_admin(&app, &tenant, &repo, &actor.id) {
+    if comment.author != actor.id && !is_repo_admin(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only the comment's author or a repo owner/admin can delete it").into_response();
     }
-    let removed = app.store.remove_comment(&key, &id);
+    let removed = app.store.remove_comment(&key, &id).await;
     Json(json!({ "deleted": removed, "id": id })).into_response()
 }
 
@@ -4385,7 +4414,7 @@ async fn delete_comment(State(app): State<App>, Path((tenant, repo, id)): Path<(
 /// and stamps `edited_unix`.
 async fn edit_comment(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
     let key = format!("{tenant}/{repo}");
-    let actor = match require_actor(&app, &headers, "") {
+    let actor = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -4393,14 +4422,14 @@ async fn edit_comment(State(app): State<App>, Path((tenant, repo, id)): Path<(St
     if new_body.is_empty() {
         return (StatusCode::UNPROCESSABLE_ENTITY, "comment body must not be empty").into_response();
     }
-    let Some(comment) = app.store.comments(&key).into_iter().find(|c| c.id == id) else {
+    let Some(comment) = app.store.comments(&key).await.into_iter().find(|c| c.id == id) else {
         return (StatusCode::NOT_FOUND, "no such comment").into_response();
     };
     if comment.author != actor.id {
         return (StatusCode::FORBIDDEN, "only the comment's author can edit it").into_response();
     }
-    app.store.update_comment_body(&key, &id, &new_body, now());
-    let updated = app.store.comments(&key).into_iter().find(|c| c.id == id);
+    app.store.update_comment_body(&key, &id, &new_body, now()).await;
+    let updated = app.store.comments(&key).await.into_iter().find(|c| c.id == id);
     Json(json!({ "comment": updated })).into_response()
 }
 
@@ -4409,13 +4438,31 @@ async fn edit_comment(State(app): State<App>, Path((tenant, repo, id)): Path<(St
 /// missing (no change, no reviewer actor, model declined).
 async fn ai_answer_comment(app: &App, key: &str, pr_num: u64, path: &str, line: u32, line_end: u32, question: &str) -> Option<Comment> {
     let (tenant, repo) = key.split_once('/')?;
-    let pr = app.store.prs(key).into_iter().find(|p| p.number == pr_num)?;
+    let pr = app.store.prs(key).await.into_iter().find(|p| p.number == pr_num)?;
     let change = pr.changes.first().cloned()?;
     // An accountable agent to author the reply — the org's reviewer, never the PR author. Same-org
     // only: the selected agent must be a member of this repo (matching `independent_agent_reviewer`),
     // so an agent from another tenant can't be picked to answer on a repo it isn't a member of.
-    let reviewer = app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.handle == "agent:reviewer" && a.id != pr.author && is_repo_member(app, tenant, repo, &a.id))
-        .or_else(|| app.store.actors().into_iter().find(|a| a.kind == hull_core::ActorKind::Agent && a.id != pr.author && accountable(app, a).is_ok() && is_repo_member(app, tenant, repo, &a.id)))?;
+    // Explicit loops rather than `.find(async)` — the predicate `.await`s (is_repo_member +
+    // accountable). Prefer the named `agent:reviewer`; fall back to any accountable member agent.
+    let reviewer = {
+        let mut found = None;
+        for a in app.store.actors().await {
+            if a.kind == hull_core::ActorKind::Agent && a.handle == "agent:reviewer" && a.id != pr.author && is_repo_member(app, tenant, repo, &a.id).await {
+                found = Some(a);
+                break;
+            }
+        }
+        if found.is_none() {
+            for a in app.store.actors().await {
+                if a.kind == hull_core::ActorKind::Agent && a.id != pr.author && accountable(app, &a).await.is_ok() && is_repo_member(app, tenant, repo, &a.id).await {
+                    found = Some(a);
+                    break;
+                }
+            }
+        }
+        found
+    }?;
     // Code context from the change's diff hunks (the change is content-addressed, not a git ref):
     // walk the file's hunks tracking the NEW line number and keep the referenced span plus ~13 lines
     // of surrounding context, marking added lines with '+'.
@@ -4442,7 +4489,7 @@ async fn ai_answer_comment(app: &App, key: &str, pr_num: u64, path: &str, line: 
     let app2 = app.clone();
     // `_bundle` (the decrypted per-user bundle, if any) stays alive across the call, then wipes.
     let answer = tokio::task::spawn_blocking(move || app2.registry.answer(&req)).await.ok().flatten()?;
-    let count = app.store.comments(key).len();
+    let count = app.store.comments(key).await.len();
     Some(Comment {
         id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
         repo: key.to_string(),
@@ -4466,12 +4513,12 @@ async fn create_review(
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
-    let reviewer = match require_actor(&app, &headers, body.get("reviewer").and_then(Value::as_str).unwrap_or("")) {
+    let reviewer = match require_actor(&app, &headers, body.get("reviewer").and_then(Value::as_str).unwrap_or("")).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // A review is an accountable act on the repo — only a member of the owning account may post one.
-    if !is_repo_member(&app, &tenant, &repo, &reviewer.id) {
+    if !is_repo_member(&app, &tenant, &repo, &reviewer.id).await {
         return (StatusCode::FORBIDDEN, "only a repo member may review").into_response();
     }
     let target = body.get("target").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -4487,7 +4534,7 @@ async fn create_review(
     // Independent-review rule: you can't approve your own PR.
     if verdict == Verdict::Approve {
         if let Some(num) = target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
-            if let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == num) {
+            if let Some(pr) = app.store.prs(&key).await.into_iter().find(|p| p.number == num) {
                 if pr.author == reviewer.id {
                     return (StatusCode::CONFLICT, "a PR author cannot approve their own PR — review must be independent").into_response();
                 }
@@ -4511,7 +4558,7 @@ async fn create_review(
                 .collect()
         })
         .unwrap_or_default();
-    let count = app.store.reviews(&key).len();
+    let count = app.store.reviews(&key).await.len();
     let review = Review {
         id: format!("rv_{}_{}", key.replace('/', "_"), count + 1),
         repo: key,
@@ -4524,11 +4571,11 @@ async fn create_review(
         artifact_id: None,
         created_unix: now(),
     };
-    app.store.put_review(review.clone());
+    app.store.put_review(review.clone()).await;
     // Notify the PR's author via the Notifier plugin capability (core records + logs it; a hosted
     // plugin would also deliver over Slack/email/nostr).
     if let Some(num) = review.target.strip_prefix("pr:").and_then(|s| s.parse::<u64>().ok()) {
-        if let Some(pr) = app.store.prs(&review.repo).into_iter().find(|p| p.number == num) {
+        if let Some(pr) = app.store.prs(&review.repo).await.into_iter().find(|p| p.number == num) {
             app.registry.notify(&NotifyEvent {
                 kind: "review_posted".into(),
                 to: vec![pr.author.clone()],
@@ -4557,19 +4604,19 @@ async fn auto_review(
 ) -> Response {
     // Any signed-in accountable actor may *ask* for an agent review; the reviewer is never supplied
     // by the client (no impersonation) — the server picks an agent independent of the PR author.
-    let actor = match require_actor(&app, &headers, "") {
+    let actor = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Repo-op gate: auto-review spawns agent compute — members only, not open participation.
-    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+    if !is_repo_member(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo member can request an auto-review").into_response();
     }
     let key = format!("{tenant}/{repo}");
-    let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+    let Some(pr) = app.store.prs(&key).await.into_iter().find(|p| p.number == number) else {
         return (StatusCode::NOT_FOUND, "no such PR").into_response();
     };
-    let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author) else {
+    let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author).await else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "no independent agent reviewer is registered").into_response();
     };
     match perform_auto_review(&app, &tenant, &repo, number, &agent, 0).await {
@@ -4604,20 +4651,20 @@ async fn resolve_ai_credential(app: &App, repo: &str, fallback_actor: Option<&st
     let tenant = repo.split_once('/').map(|(t, _)| t).unwrap_or(repo);
     let mut owner: Option<String> = None;
     let mut conns: Vec<hull_core::AiConnection> = Vec::new();
-    if let Some(org) = app.store.accounts().into_iter().find(|a| a.handle == tenant) {
-        let c = app.store.ai_connections(&org.id);
+    if let Some(org) = app.store.accounts().await.into_iter().find(|a| a.handle == tenant) {
+        let c = app.store.ai_connections(&org.id).await;
         if !c.is_empty() { owner = Some(org.id.clone()); conns = c; }
     }
     if conns.is_empty() {
         if let Some(aid) = fallback_actor {
-            if let Some(pa) = app.store.accounts().into_iter().find(|a| a.kind == hull_core::AccountKind::Personal && a.members.iter().any(|m| m.actor == aid)) {
-                let c = app.store.ai_connections(&pa.id);
+            if let Some(pa) = app.store.accounts().await.into_iter().find(|a| a.kind == hull_core::AccountKind::Personal && a.members.iter().any(|m| m.actor == aid)) {
+                let c = app.store.ai_connections(&pa.id).await;
                 if !c.is_empty() { owner = Some(pa.id.clone()); conns = c; }
             }
         }
     }
     let Some(owner) = owner else { return (None, None) };
-    let idx = if app.store.ai_rotate(&owner) { next_ai_index(&owner, conns.len()) } else { 0 };
+    let idx = if app.store.ai_rotate(&owner).await { next_ai_index(&owner, conns.len()) } else { 0 };
     let c = &conns[idx % conns.len()];
     let (agent_cli, agent_config_dir, agent_token, guard) = match &c.auth {
         hull_core::AiAuth::AgentCli { command, session, .. } if !session.is_empty() => {
@@ -4669,7 +4716,7 @@ async fn perform_auto_review(
     if reviewer.kind != hull_core::ActorKind::Agent {
         return Err((StatusCode::FORBIDDEN, "auto-review must be performed by an agent actor".into()));
     }
-    let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+    let Some(pr) = app.store.prs(&key).await.into_iter().find(|p| p.number == number) else {
         return Err((StatusCode::NOT_FOUND, "no such PR".into()));
     };
     if pr.author == reviewer.id {
@@ -4693,14 +4740,14 @@ async fn perform_auto_review(
     let Some(info) = app.repos.change_info(tenant, repo, &change) else {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, "cannot resolve change".into()));
     };
-    let session = app.store.session_record(&key, &change);
+    let session = app.store.session_record(&key, &change).await;
     let lesson = session.as_ref().map(|s| s.lesson.clone()).unwrap_or_default();
     let author_model = session.as_ref().map(|s| s.model.clone()).unwrap_or_default();
     // C1 — claim extraction from the issue's acceptance criteria: when this PR closes an issue, fold
     // that issue's title + body into the reviewed narrative, so the reconciliation verifies the change
     // against **what the issue asked for**, not just what the change's own message claims.
     let review_intent = {
-        let issues = app.store.issues(&key);
+        let issues = app.store.issues(&key).await;
         let acceptance: Vec<String> = closing_issue_numbers(&pr.title, &info.intent, &[])
             .into_iter()
             .filter_map(|n| issues.iter().find(|i| i.number == n))
@@ -4723,7 +4770,7 @@ async fn perform_auto_review(
     let semantic = app.repos.semantic_summary(tenant, repo, &change);
     let touched: Vec<String> = semantic.moves.iter().flat_map(|m| [m.from.clone(), m.to.clone()]).chain(semantic.added.iter().cloned()).chain(semantic.deleted.iter().cloned()).chain(semantic.modified.iter().cloned()).collect();
     let mechanical = semantic.pure_move && {
-        let acct = repo_account_id(app, tenant, repo);
+        let acct = repo_account_id(app, tenant, repo).await;
         !autonomy::touches_protected(&touched, &app.autonomy.effective(tenant, repo, acct.as_deref()).protected_paths)
     };
     let (verdict, findings, ledger, base_summary, from_cache) = if mechanical {
@@ -4768,7 +4815,7 @@ async fn perform_auto_review(
                 .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "reviewer panicked".to_string()))?;
             // Meter this run's token usage against the connection that served it.
             if let (Some(cid), Some(u)) = (&usage_conn, &pkg.usage) {
-                app.store.add_ai_usage(cid, u.input_tokens, u.output_tokens, u.cost_micros, now());
+                app.store.add_ai_usage(cid, u.input_tokens, u.output_tokens, u.cost_micros, now()).await;
             }
             let v = match pkg.verdict {
                 hull_plugin::ReviewVerdict::Approve => Verdict::Approve,
@@ -4808,7 +4855,7 @@ async fn perform_auto_review(
             }
         }
     }
-    let count = app.store.reviews(&key).len();
+    let count = app.store.reviews(&key).await.len();
     let rid = format!("rv_{}_{}", key.replace('/', "_"), count + 1);
     // D8 — content-addressed audit artifact: the full record of why this verdict was reached.
     let artifact = json!({
@@ -4841,7 +4888,7 @@ async fn perform_auto_review(
         artifact_id: Some(artifact_id),
         created_unix: now(),
     };
-    app.store.put_review(review.clone());
+    app.store.put_review(review.clone()).await;
     app.registry.notify(&NotifyEvent {
         kind: "review_posted".into(),
         to: vec![pr.author.clone()],
@@ -4854,7 +4901,7 @@ async fn perform_auto_review(
 
     // Auto-triage (T2+): a review that requests changes turns its blocker findings into a triaged
     // issue — automatic issue triage out of reviews. Gated by the repo's autonomy tier.
-    let acct = repo_account_id(app, tenant, repo);
+    let acct = repo_account_id(app, tenant, repo).await;
     let tier = app.autonomy.effective(tenant, repo, acct.as_deref()).tier;
     if tier >= hull_core::AutonomyTier::T2 && review.verdict == Verdict::RequestChanges {
         let blockers: Vec<&ReviewFinding> = review.findings.iter().filter(|f| f.severity == "blocker").collect();
@@ -4863,10 +4910,11 @@ async fn perform_auto_review(
             let already = app
                 .store
                 .issues(&key)
+                .await
                 .into_iter()
                 .any(|i| i.labels.iter().any(|l| l == "from-review") && i.linked_prs.contains(&pr.id) && matches!(i.status, IssueStatus::Open));
             if !already {
-                let inum = app.store.issues(&key).iter().map(|i| i.number).max().unwrap_or(0) + 1;
+                let inum = app.store.issues(&key).await.iter().map(|i| i.number).max().unwrap_or(0) + 1;
                 let body = blockers.iter().map(|f| format!("- {} ({})", f.note, f.path)).collect::<Vec<_>>().join("\n");
                 let issue = Issue {
                     id: format!("iss_{}_{inum}", key.replace('/', "_")),
@@ -4886,7 +4934,7 @@ async fn perform_auto_review(
                     created_unix: now(),
                     edited_unix: None,
                 };
-                app.store.put_issue(issue);
+                app.store.put_issue(issue).await;
                 app.registry.notify(&NotifyEvent {
                     kind: "issue_triaged".into(),
                     to: vec![pr.author.clone()],
@@ -4952,7 +5000,7 @@ async fn perform_auto_review(
 #[allow(clippy::too_many_arguments)]
 async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull_core::Actor, path: &str, note: &str, severity: &str) -> Option<hull_plugin::FixResult> {
     let key = format!("{tenant}/{repo}");
-    let pr = app.store.prs(&key).into_iter().find(|p| p.number == number)?;
+    let pr = app.store.prs(&key).await.into_iter().find(|p| p.number == number)?;
     let change = pr.changes.first().cloned()?;
     let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
     let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
@@ -4972,7 +5020,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
     // `_bundle` (decrypted per-user bundle, if any) stays alive across the fixer call, then wipes.
     let res = tokio::task::spawn_blocking(move || registry.fix(&req)).await.ok()??;
     if let (Some(cid), Some(u)) = (&usage_conn, &res.usage) {
-        app.store.add_ai_usage(cid, u.input_tokens, u.output_tokens, u.cost_micros, now());
+        app.store.add_ai_usage(cid, u.input_tokens, u.output_tokens, u.cost_micros, now()).await;
     }
     if res.ok && !res.edits.is_empty() {
         let intent = format!("fix: {}", res.explanation);
@@ -4981,13 +5029,13 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
         match app.repos.apply_fix(tenant, repo, &change, &edits, &intent, &agent.handle, now()) {
             Some(fix_change) => {
                 // Point the PR at the fixed change and run its checks.
-                if let Some(mut pr2) = app.store.prs(&key).into_iter().find(|p| p.number == number) {
+                if let Some(mut pr2) = app.store.prs(&key).await.into_iter().find(|p| p.number == number) {
                     pr2.changes = vec![fix_change.clone()];
-                    app.store.replace_pr(pr2);
+                    app.store.replace_pr(pr2).await;
                 }
                 let _ = resolve_check(app, tenant, repo, &fix_change, false).await;
                 let diff = res.edits.iter().map(|e| format!("--- {}\n- {}\n+ {}", e.path, e.search.lines().next().unwrap_or(""), e.replace.lines().next().unwrap_or(""))).collect::<Vec<_>>().join("\n");
-                let count = app.store.comments(&key).len();
+                let count = app.store.comments(&key).await.len();
                 app.store.put_comment(Comment {
                     id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
                     repo: key.clone(),
@@ -4998,7 +5046,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
                     path: None,
                     line: None,
                     edited_unix: None,
-                });
+                }).await;
                 app.registry.notify(&NotifyEvent {
                     kind: "fix_applied".into(),
                     to: vec![pr.author.clone()],
@@ -5011,7 +5059,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
             }
             None => {
                 // The fix didn't apply cleanly — record it as a proposal instead of a silent drop.
-                let count = app.store.comments(&key).len();
+                let count = app.store.comments(&key).await.len();
                 app.store.put_comment(Comment {
                     id: format!("cm_{}_{}", key.replace('/', "_"), count + 1),
                     repo: key.clone(),
@@ -5022,7 +5070,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
                     path: None,
                     line: None,
                     edited_unix: None,
-                });
+                }).await;
             }
         }
     }
@@ -5038,19 +5086,19 @@ async fn fix_finding(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match require_actor(&app, &headers, "") {
+    let actor = match require_actor(&app, &headers, "").await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Repo-op gate: requesting an AI fix spawns agent compute — members only, not open participation.
-    if !is_repo_member(&app, &tenant, &repo, &actor.id) {
+    if !is_repo_member(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo member can request an AI fix").into_response();
     }
     let key = format!("{tenant}/{repo}");
-    let Some(pr) = app.store.prs(&key).into_iter().find(|p| p.number == number) else {
+    let Some(pr) = app.store.prs(&key).await.into_iter().find(|p| p.number == number) else {
         return (StatusCode::NOT_FOUND, "no such PR").into_response();
     };
-    let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author) else {
+    let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author).await else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "no agent available to fix").into_response();
     };
     let path = body.get("path").and_then(Value::as_str).unwrap_or("").to_string();
@@ -5066,28 +5114,31 @@ async fn fix_finding(
 /// Pick an agent actor that may independently review a PR by `author` — the reviewer for the on-open
 /// agent flow. `None` if no **accountable** agent other than the author is registered: an agent whose
 /// delegation doesn't cryptographically verify (NEW-1166) must not author, so it's never selected.
-fn independent_agent_reviewer(app: &App, tenant: &str, repo: &str, author: &str) -> Option<hull_core::Actor> {
-    app.store
-        .actors()
-        .into_iter()
-        .find(|a| {
-            a.kind == hull_core::ActorKind::Agent
-                && a.id != author
-                && accountable(app, a).is_ok()
-                // Same-org only: an agent from another tenant must never be selected to review — and,
-                // at T3, auto-merge — a repo it isn't a member of (cross-tenant escalation).
-                && is_repo_member(app, tenant, repo, &a.id)
-        })
+async fn independent_agent_reviewer(app: &App, tenant: &str, repo: &str, author: &str) -> Option<hull_core::Actor> {
+    // Explicit loop rather than `.find(async closure)` — the predicate now `.await`s (accountable +
+    // is_repo_member), which an iterator adapter closure can't express. Same first-match semantics.
+    for a in app.store.actors().await {
+        if a.kind == hull_core::ActorKind::Agent
+            && a.id != author
+            && accountable(app, &a).await.is_ok()
+            // Same-org only: an agent from another tenant must never be selected to review — and,
+            // at T3, auto-merge — a repo it isn't a member of (cross-tenant escalation).
+            && is_repo_member(app, tenant, repo, &a.id).await
+        {
+            return Some(a);
+        }
+    }
+    None
 }
 
 /// List pull requests for a hosted repo (`GET /api/repos/:tenant/:repo/prs`). Each PR's verification
 /// is refreshed live from keel (the change's verify state), so an approving review + green keel
 /// verify shows on the badge.
 async fn prs(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
-    let mut list = app.store.prs(&format!("{tenant}/{repo}"));
+    let mut list = app.store.prs(&format!("{tenant}/{repo}")).await;
     for pr in &mut list {
         if let Some(c) = pr.changes.first() {
             if let Some(v) = app.repos.verification(&tenant, &repo, c) {
@@ -5111,7 +5162,7 @@ async fn verify_change(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+    let actor = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -5119,7 +5170,7 @@ async fn verify_change(
     // The legitimate CI path writes verification through the secret-authed `ci-result` callback (and
     // the local runner writes it directly), never this endpoint, so restrict manual overrides to a
     // repo owner/admin.
-    if !is_repo_admin(&app, &tenant, &repo, &actor.id) {
+    if !is_repo_admin(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo owner/admin may set verification directly (CI reports via the ci-result callback)").into_response();
     }
     let green = body.get("green").and_then(Value::as_bool).unwrap_or(true);
@@ -5140,13 +5191,13 @@ async fn create_pr(
     Json(body): Json<Value>,
 ) -> Response {
     let key = format!("{tenant}/{repo}");
-    let actor = match require_actor(&app, &headers, body.get("author").and_then(Value::as_str).unwrap_or("")) {
+    let actor = match require_actor(&app, &headers, body.get("author").and_then(Value::as_str).unwrap_or("")).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
     // lets people who can read it (its members) open a PR.
-    if !can_read_repo(&app, Some(&actor.id), &tenant, &repo) {
+    if !can_read_repo(&app, Some(&actor.id), &tenant, &repo).await {
         return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
     }
     let title = body.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -5164,7 +5215,7 @@ async fn create_pr(
     if changes.is_empty() {
         return (StatusCode::UNPROCESSABLE_ENTITY, "no changes to propose (unknown commit or empty repo?)").into_response();
     }
-    let number = app.store.prs(&key).iter().map(|p| p.number).max().unwrap_or(0) + 1;
+    let number = app.store.prs(&key).await.iter().map(|p| p.number).max().unwrap_or(0) + 1;
     // Code owners: resolve the owners of any file this change touches — they become requested
     // reviewers and get notified.
     let files: Vec<String> = changes
@@ -5172,7 +5223,7 @@ async fn create_pr(
         .and_then(|c| app.repos.change_info(&tenant, &repo, c))
         .map(|ci| ci.files.into_iter().map(|f| f.path).collect())
         .unwrap_or_default();
-    let owners = owners_for(&app, &key, &files);
+    let owners = owners_for(&app, &key, &files).await;
     // Code owners plus any repo-configured default reviewers are auto-requested on the new voyage.
     let mut reviewers = owners.clone();
     for r in app.repo_settings.get(&key).default_reviewers {
@@ -5204,16 +5255,16 @@ async fn create_pr(
             target_number: Some(number),
         });
     }
-    app.store.put_pr(pr.clone());
+    app.store.put_pr(pr.clone()).await;
     // Link the issues this PR closes (from `fixes #N` in the title, or an explicit `closes` list) so
     // they show the incoming PR now and auto-close when it merges.
     let explicit: Vec<u64> = body.get("closes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
     let intent_body: String = pr.changes.iter().filter_map(|c| app.repos.change_info(&tenant, &repo, c).map(|i| i.intent)).collect::<Vec<_>>().join("\n");
     for num in closing_issue_numbers(&pr.title, &intent_body, &explicit) {
-        if let Some(mut issue) = app.store.issues(&pr.repo).into_iter().find(|i| i.number == num) {
+        if let Some(mut issue) = app.store.issues(&pr.repo).await.into_iter().find(|i| i.number == num) {
             if !issue.linked_prs.contains(&pr.id) {
                 issue.linked_prs.push(pr.id.clone());
-                app.store.replace_issue(issue);
+                app.store.replace_issue(issue).await;
             }
         }
     }
@@ -5223,10 +5274,10 @@ async fn create_pr(
     );
     // Agent flow (M6): when a PR opens, an independent agent reviewer auto-reviews it — but only if
     // the repo's autonomy tier permits autonomous action (T1+). At T0 (observe-only), nothing fires.
-    let acct = repo_account_id(&app, &tenant, &repo);
+    let acct = repo_account_id(&app, &tenant, &repo).await;
     let tier = app.autonomy.effective(&tenant, &repo, acct.as_deref()).tier;
     if tier >= hull_core::AutonomyTier::T1 {
-        if let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author) {
+        if let Some(agent) = independent_agent_reviewer(&app, &tenant, &repo, &pr.author).await {
             let (app2, t2, r2, n2) = (app.clone(), tenant.clone(), repo.clone(), number);
             tokio::spawn(async move {
                 let _ = perform_auto_review(&app2, &t2, &r2, n2, &agent, 0).await;
@@ -5242,10 +5293,10 @@ async fn create_pr(
 
 /// List issues for a hosted repo (`GET /api/repos/:tenant/:repo/issues`).
 async fn issues(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
-    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo) {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
     }
-    Json(json!({ "issues": app.store.issues(&format!("{tenant}/{repo}")) })).into_response()
+    Json(json!({ "issues": app.store.issues(&format!("{tenant}/{repo}")).await })).into_response()
 }
 
 /// Open an issue (`POST /api/repos/:tenant/:repo/issues`). An optional `code_ref` `{path, line_start,
@@ -5261,13 +5312,13 @@ async fn create_issue(
     let key = format!("{tenant}/{repo}");
     // Accountability gate: the author is the signed-in actor (or the body actor for scripts).
     let author_id = body.get("author").and_then(Value::as_str).unwrap_or("");
-    let actor = match require_actor(&app, &headers, author_id) {
+    let actor = match require_actor(&app, &headers, author_id).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
     // lets people who can read it (its members) open an issue.
-    if !can_read_repo(&app, Some(&actor.id), &tenant, &repo) {
+    if !can_read_repo(&app, Some(&actor.id), &tenant, &repo).await {
         return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
     }
     let title = body.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -5290,21 +5341,19 @@ async fn create_issue(
             });
         }
     }
-    // Assignees must themselves be registered accountable actors (unknown ids are dropped).
-    let mut assignees: Vec<String> = body
-        .get("assignees")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .filter(|id| app.store.actor(id).map(|a| a.is_accountable()).unwrap_or(false))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    // Assignees must themselves be registered accountable actors (unknown ids are dropped). Explicit
+    // loop rather than `.filter(async)` — the accountability lookup now `.await`s.
+    let mut assignees: Vec<String> = Vec::new();
+    if let Some(arr) = body.get("assignees").and_then(Value::as_array) {
+        for id in arr.iter().filter_map(Value::as_str) {
+            if app.store.actor(id).await.map(|a| a.is_accountable()).unwrap_or(false) {
+                assignees.push(id.to_string());
+            }
+        }
+    }
     // @mentions in the title or body also assign the mentioned actor.
     let mention_text = format!("{} {}", title, body.get("body").and_then(Value::as_str).unwrap_or(""));
-    let actors = app.store.actors();
+    let actors = app.store.actors().await;
     for h in parse_mentions(&mention_text) {
         if let Some(a) = actors.iter().find(|a| a.handle == h && a.is_accountable()) {
             if !assignees.contains(&a.id) {
@@ -5312,7 +5361,7 @@ async fn create_issue(
             }
         }
     }
-    let number = app.store.issues(&key).iter().map(|i| i.number).max().unwrap_or(0) + 1;
+    let number = app.store.issues(&key).await.iter().map(|i| i.number).max().unwrap_or(0) + 1;
     let author = actor.id.clone();
     let issue = Issue {
         id: format!("iss_{}_{number}", key.replace('/', "_")),
@@ -5332,7 +5381,7 @@ async fn create_issue(
         created_unix: now(),
         edited_unix: None,
     };
-    app.store.put_issue(issue.clone());
+    app.store.put_issue(issue.clone()).await;
     if !issue.assignees.is_empty() {
         app.registry.notify(&NotifyEvent {
             kind: "issue_assigned".into(),
@@ -5364,17 +5413,17 @@ async fn update_issue(
 ) -> Response {
     let key = format!("{tenant}/{repo}");
     // A transition is an authoring action — the acting actor must chain to a human.
-    let acting = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")) {
+    let acting = match require_actor(&app, &headers, body.get("actor").and_then(Value::as_str).unwrap_or("")).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
     // Participation gate: a public/unlisted repo stays open to any authed actor; a private repo only
     // lets people who can read it (its members) transition an issue. The per-action author/admin
     // checks below (edit = author-only, etc.) are still enforced ON TOP of this.
-    if !can_read_repo(&app, Some(&acting.id), &tenant, &repo) {
+    if !can_read_repo(&app, Some(&acting.id), &tenant, &repo).await {
         return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
     }
-    let Some(mut issue) = app.store.issues(&key).into_iter().find(|i| i.number == number) else {
+    let Some(mut issue) = app.store.issues(&key).await.into_iter().find(|i| i.number == number) else {
         return (StatusCode::NOT_FOUND, "no such issue").into_response();
     };
     let action = body.get("action").and_then(Value::as_str).unwrap_or("");
@@ -5391,7 +5440,7 @@ async fn update_issue(
         "reopen" => issue.status = IssueStatus::Open,
         "assign" | "unassign" => {
             let who = body.get("assignee").and_then(Value::as_str).unwrap_or("").to_string();
-            if who.is_empty() || app.store.actor(&who).is_none() {
+            if who.is_empty() || app.store.actor(&who).await.is_none() {
                 return (StatusCode::UNPROCESSABLE_ENTITY, "assignee must be a registered actor").into_response();
             }
             issue.assignees.retain(|a| a != &who);
@@ -5426,8 +5475,8 @@ async fn update_issue(
             if new_title.is_none() && new_body.is_none() {
                 return (StatusCode::BAD_REQUEST, "edit requires a title and/or body").into_response();
             }
-            app.store.update_issue_content(&key, number, new_title.as_deref(), new_body.as_deref(), now());
-            let updated = app.store.issues(&key).into_iter().find(|i| i.number == number);
+            app.store.update_issue_content(&key, number, new_title.as_deref(), new_body.as_deref(), now()).await;
+            let updated = app.store.issues(&key).await.into_iter().find(|i| i.number == number);
             app.hub.publish(
                 &tenant,
                 ActivityEvent::Issue { repo, number, action: "edited".into(), actor: acting.handle, ts: now() },
@@ -5436,7 +5485,7 @@ async fn update_issue(
         }
         _ => return (StatusCode::BAD_REQUEST, "action must be close | reopen | assign | unassign | label | unlabel | edit").into_response(),
     }
-    app.store.replace_issue(issue.clone());
+    app.store.replace_issue(issue.clone()).await;
     app.hub.publish(
         &tenant,
         ActivityEvent::Issue { repo, number, action: action.into(), actor: acting.handle, ts: now() },
@@ -5481,21 +5530,21 @@ async fn feed(
 
 /// Seed a little sample data so the scaffold is explorable — including real accountable actors: a
 /// human, and an agent delegated by that human (so there's an accountable author to open issues).
-fn seed(store: &dyn Store) {
+async fn seed(store: &dyn Store) {
     for name in ["keel", "hull"] {
         store.put_repo(Repo {
             id: format!("repo_{name}"),
             owner: "acct_tankrap".into(),
             name: name.into(),
             default_branch: "main".into(),
-        });
+        }).await;
     }
     // A human root + an agent it delegated — both real Ed25519 identities, both org members. The
     // human signs the agent's delegation hop (it holds the key at mint), so the chain is
     // cryptographically verifiable, not merely asserted.
     let human_minted = identity::mint_human("justin");
     let human = human_minted.actor.clone();
-    store.put_actor(human.clone());
+    store.put_actor(human.clone()).await;
     let mut members = vec![Membership { actor: human.id.clone(), role: Role::Owner }];
     if let Some(agent) =
         identity::mint_agent("agent:reviewer", &human, &human_minted.secret_key, "*", Lifetime::Static)
@@ -5505,15 +5554,15 @@ fn seed(store: &dyn Store) {
         store.set_owners(
             "tankrap/hull",
             vec![OwnerRule { glob: "crates/hull-server/**".into(), owners: vec![agent.actor.id.clone()] }],
-        );
-        store.put_actor(agent.actor);
+        ).await;
+        store.put_actor(agent.actor).await;
     }
     store.put_account(Account {
         id: "acct_tankrap".into(),
         kind: AccountKind::Organization,
         handle: "tankrap".into(),
         members,
-    });
+    }).await;
     store.put_issue(Issue {
         id: "iss_1".into(),
         repo: "repo_keel".into(),
@@ -5531,7 +5580,7 @@ fn seed(store: &dyn Store) {
         resolved_by: Some("blake3:eb17068".into()),
         created_unix: 0,
         edited_unix: None,
-    });
+    }).await;
 }
 
 /// Synthesize fleet-coordination events on a timer (stand-in for the keeld QUIC stream).
@@ -5656,8 +5705,8 @@ mod tests {
     // Serialize the env-var writes that isolate each `App`'s file-backed side stores under a fresh HOME.
     static MERGE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    #[test]
-    fn demo_owner_backdoor_is_gated_off_by_default() {
+    #[tokio::test]
+    async fn demo_owner_backdoor_is_gated_off_by_default() {
         // Serialize the HULL_DEMO_MODE env mutation against the other env-touching tests.
         let _g = MERGE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let demo_id = identity::human_from_secret("demo", DEMO_OWNER_SECRET).expect("demo id").actor.id;
@@ -5667,10 +5716,10 @@ mod tests {
         std::env::remove_var("HULL_DEMO_MODE");
         assert!(!demo_mode_enabled(), "demo mode is OFF by default");
         let store = InMemory::new();
-        seed_if_empty(&store);
-        assert!(store.actor(&demo_id).is_none(), "demo actor is not minted when demo mode is off");
+        seed_if_empty(&store).await;
+        assert!(store.actor(&demo_id).await.is_none(), "demo actor is not minted when demo mode is off");
         assert!(
-            store.accounts().iter().all(|a| !a.members.iter().any(|m| m.actor == demo_id)),
+            store.accounts().await.iter().all(|a| !a.members.iter().any(|m| m.actor == demo_id)),
             "demo owner must NOT be a member of any account when demo mode is off",
         );
 
@@ -5679,9 +5728,9 @@ mod tests {
         std::env::set_var("HULL_DEMO_MODE", "on");
         assert!(demo_mode_enabled(), "truthy HULL_DEMO_MODE turns demo mode on");
         let store2 = InMemory::new();
-        seed_if_empty(&store2);
+        seed_if_empty(&store2).await;
         assert!(
-            store2.accounts().iter().all(|a| a.members.iter().any(|m| m.actor == demo_id && matches!(m.role, Role::Owner))),
+            store2.accounts().await.iter().all(|a| a.members.iter().any(|m| m.actor == demo_id && matches!(m.role, Role::Owner))),
             "demo owner is Owner on every account when demo mode is on",
         );
         std::env::remove_var("HULL_DEMO_MODE");
@@ -5726,7 +5775,7 @@ mod tests {
         Actor { id: id.into(), kind, lifetime: Lifetime::Static, handle: id.into(), delegation: None, nostr_pubkey: None, revoked: false }
     }
 
-    fn put_pr(app: &App, key: &str, number: u64, author: &str, change: &str) {
+    async fn put_pr(app: &App, key: &str, number: u64, author: &str, change: &str) {
         app.store.put_pr(PullRequest {
             id: format!("pr-{number}"),
             repo: key.into(),
@@ -5739,10 +5788,10 @@ mod tests {
             state: PrState::Open,
             merged_by: None,
             created_unix: 0,
-        });
+        }).await;
     }
 
-    fn put_approval(app: &App, key: &str, number: u64, reviewer: &str) {
+    async fn put_approval(app: &App, key: &str, number: u64, reviewer: &str) {
         app.store.put_review(Review {
             id: format!("rev-{reviewer}-{number}"),
             repo: key.into(),
@@ -5754,11 +5803,11 @@ mod tests {
             ledger: None,
             artifact_id: None,
             created_unix: 0,
-        });
+        }).await;
     }
 
     async fn is_merged(app: &App, key: &str, number: u64) -> bool {
-        app.store.prs(key).into_iter().find(|p| p.number == number).map(|p| p.state == PrState::Merged).unwrap_or(false)
+        app.store.prs(key).await.into_iter().find(|p| p.number == number).map(|p| p.state == PrState::Merged).unwrap_or(false)
     }
 
     #[tokio::test]
@@ -5766,9 +5815,9 @@ mod tests {
         let (app, tmp) = build_test_app("notgreen");
         let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
         // verification left unset (unverified). A human reviewer approves — but green is required.
-        app.store.put_actor(actor("human", ActorKind::Human));
-        put_pr(&app, "t/r", 1, "author", &change);
-        put_approval(&app, "t/r", 1, "human");
+        app.store.put_actor(actor("human", ActorKind::Human)).await;
+        put_pr(&app, "t/r", 1, "author", &change).await;
+        put_approval(&app, "t/r", 1, "human").await;
         let acting = actor("author", ActorKind::Human);
         let res = perform_merge(&app, "t", "r", 1, &acting, false).await;
         let (code, msg) = res.expect_err("un-green change must be blocked");
@@ -5782,9 +5831,9 @@ mod tests {
         let (app, tmp) = build_test_app("selfapprove");
         let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
         app.repos.set_verification("t", "r", &change, true);
-        app.store.put_actor(actor("author", ActorKind::Human));
-        put_pr(&app, "t/r", 1, "author", &change);
-        put_approval(&app, "t/r", 1, "author"); // the author approves their OWN pr
+        app.store.put_actor(actor("author", ActorKind::Human)).await;
+        put_pr(&app, "t/r", 1, "author", &change).await;
+        put_approval(&app, "t/r", 1, "author").await; // the author approves their OWN pr
         let acting = actor("author", ActorKind::Human);
 
         // Default: self-approval doesn't count ⇒ no independent approval ⇒ blocked.
@@ -5804,10 +5853,10 @@ mod tests {
         let (app, tmp) = build_test_app("humanok");
         let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
         app.repos.set_verification("t", "r", &change, true);
-        app.store.put_actor(actor("author", ActorKind::Human));
-        app.store.put_actor(actor("reviewer", ActorKind::Human));
-        put_pr(&app, "t/r", 1, "author", &change);
-        put_approval(&app, "t/r", 1, "reviewer");
+        app.store.put_actor(actor("author", ActorKind::Human)).await;
+        app.store.put_actor(actor("reviewer", ActorKind::Human)).await;
+        put_pr(&app, "t/r", 1, "author", &change).await;
+        put_approval(&app, "t/r", 1, "reviewer").await;
         let acting = actor("author", ActorKind::Human);
         perform_merge(&app, "t", "r", 1, &acting, false).await.expect("green + independent human approval merges");
         assert!(is_merged(&app, "t/r", 1).await);
@@ -5820,10 +5869,10 @@ mod tests {
         // A clean, non-protected change with a claimed narrative (no phantom ops from notes.txt).
         let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
         app.repos.set_verification("t", "r", &change, true);
-        app.store.put_actor(actor("author", ActorKind::Human));
-        app.store.put_actor(actor("agent", ActorKind::Agent));
-        put_pr(&app, "t/r", 1, "author", &change);
-        put_approval(&app, "t/r", 1, "agent");
+        app.store.put_actor(actor("author", ActorKind::Human)).await;
+        app.store.put_actor(actor("agent", ActorKind::Agent)).await;
+        put_pr(&app, "t/r", 1, "author", &change).await;
+        put_approval(&app, "t/r", 1, "agent").await;
         let acting = actor("author", ActorKind::Human);
 
         // T1: an agent's approve is advisory ⇒ still needs a human.
@@ -5845,10 +5894,10 @@ mod tests {
         // Touches a protected path (auth/…) → D11: always needs a human, even at the top tier.
         let change = app.repos.test_commit("t", "r", "", None, &[("auth/token.rs", "x\n")]);
         app.repos.set_verification("t", "r", &change, true);
-        app.store.put_actor(actor("author", ActorKind::Human));
-        app.store.put_actor(actor("agent", ActorKind::Agent));
-        put_pr(&app, "t/r", 1, "author", &change);
-        put_approval(&app, "t/r", 1, "agent");
+        app.store.put_actor(actor("author", ActorKind::Human)).await;
+        app.store.put_actor(actor("agent", ActorKind::Agent)).await;
+        put_pr(&app, "t/r", 1, "author", &change).await;
+        put_approval(&app, "t/r", 1, "agent").await;
         app.autonomy.set_repo("t", "r", AutonomyPolicy { tier: AutonomyTier::T3, protected_paths: vec![] });
         let acting = actor("author", ActorKind::Human);
         let (code, msg) = perform_merge(&app, "t", "r", 1, &acting, false).await.expect_err("protected path blocks agent auto-merge at T3");
@@ -5866,10 +5915,10 @@ mod tests {
         let (app, tmp) = build_test_app("t2phantom");
         let phantom = app.repos.test_commit("t", "r", "", None, &[("helper.rs", "fn secret_backdoor() {}\n")]);
         app.repos.set_verification("t", "r", &phantom, true);
-        app.store.put_actor(actor("author", ActorKind::Human));
-        app.store.put_actor(actor("agent", ActorKind::Agent));
-        put_pr(&app, "t/r", 1, "author", &phantom);
-        put_approval(&app, "t/r", 1, "agent");
+        app.store.put_actor(actor("author", ActorKind::Human)).await;
+        app.store.put_actor(actor("agent", ActorKind::Agent)).await;
+        put_pr(&app, "t/r", 1, "author", &phantom).await;
+        put_approval(&app, "t/r", 1, "agent").await;
         app.autonomy.set_repo("t", "r", AutonomyPolicy { tier: AutonomyTier::T2, protected_paths: vec![] });
         let acting = actor("author", ActorKind::Human);
         let (code, _msg) = perform_merge(&app, "t", "r", 1, &acting, false).await.expect_err("phantom work is not low-risk ⇒ blocked at T2");
@@ -5878,8 +5927,8 @@ mod tests {
         // A clean low-risk change (no phantom ops) DOES auto-merge at T2.
         let clean = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "just prose\n")]);
         app.repos.set_verification("t", "r", &clean, true);
-        put_pr(&app, "t/r", 2, "author", &clean);
-        put_approval(&app, "t/r", 2, "agent");
+        put_pr(&app, "t/r", 2, "author", &clean).await;
+        put_approval(&app, "t/r", 2, "agent").await;
         perform_merge(&app, "t", "r", 2, &acting, false).await.expect("clean low-risk change auto-merges at T2");
         assert!(is_merged(&app, "t/r", 2).await);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -5894,12 +5943,12 @@ mod tests {
             kind: AccountKind::Organization,
             handle: "t".into(),
             members: vec![Membership { actor: "boss".into(), role: Role::Owner }],
-        });
-        app.store.put_actor(actor("boss", ActorKind::Human));
-        app.store.put_actor(actor("rando", ActorKind::Human));
+        }).await;
+        app.store.put_actor(actor("boss", ActorKind::Human)).await;
+        app.store.put_actor(actor("rando", ActorKind::Human)).await;
         // Un-green, no approvals — the gate would normally block.
         let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
-        put_pr(&app, "t/r", 1, "author", &change);
+        put_pr(&app, "t/r", 1, "author", &change).await;
 
         // A non-admin can't override even with force.
         let rando = actor("rando", ActorKind::Human);
@@ -5929,8 +5978,8 @@ mod tests {
     #[tokio::test]
     async fn edit_comment_is_author_only() {
         let (app, tmp) = build_test_app("edit-comment");
-        app.store.put_actor(actor("author", ActorKind::Human));
-        app.store.put_actor(actor("intruder", ActorKind::Human));
+        app.store.put_actor(actor("author", ActorKind::Human)).await;
+        app.store.put_actor(actor("intruder", ActorKind::Human)).await;
         mint_token(&app, "tok-author", "author");
         mint_token(&app, "tok-intruder", "intruder");
         app.store.put_comment(Comment {
@@ -5943,7 +5992,7 @@ mod tests {
             path: None,
             line: None,
             edited_unix: None,
-        });
+        }).await;
 
         // A non-author is rejected server-side (not just hidden in the UI) and the body is untouched.
         let resp = edit_comment(
@@ -5954,7 +6003,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a non-author must not be allowed to edit");
-        assert_eq!(app.store.comments("acme/web")[0].body, "original", "a rejected edit leaves the body unchanged");
+        assert_eq!(app.store.comments("acme/web").await[0].body, "original", "a rejected edit leaves the body unchanged");
 
         // The author can edit: the body updates and `edited_unix` is stamped.
         let resp = edit_comment(
@@ -5965,7 +6014,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK, "the author may edit their own comment");
-        let c = app.store.comments("acme/web").into_iter().find(|c| c.id == "cm_1").unwrap();
+        let c = app.store.comments("acme/web").await.into_iter().find(|c| c.id == "cm_1").unwrap();
         assert_eq!(c.body, "revised");
         assert!(c.edited_unix.is_some(), "an accepted edit stamps edited_unix");
 
@@ -5974,7 +6023,7 @@ mod tests {
 
     // ── edit-issue authorization (`update_issue` action:"edit") ───────────────────────────────────
 
-    fn put_issue_fixture(app: &App, key: &str, number: u64, author: &str) {
+    async fn put_issue_fixture(app: &App, key: &str, number: u64, author: &str) {
         app.store.put_issue(Issue {
             id: format!("iss_{number}"),
             repo: key.into(),
@@ -5992,7 +6041,7 @@ mod tests {
             resolved_by: None,
             created_unix: 0,
             edited_unix: None,
-        });
+        }).await;
     }
 
     #[tokio::test]
@@ -6005,12 +6054,12 @@ mod tests {
             kind: AccountKind::Organization,
             handle: "acme".into(),
             members: vec![Membership { actor: "intruder".into(), role: Role::Owner }],
-        });
-        app.store.put_actor(actor("author", ActorKind::Human));
-        app.store.put_actor(actor("intruder", ActorKind::Human));
+        }).await;
+        app.store.put_actor(actor("author", ActorKind::Human)).await;
+        app.store.put_actor(actor("intruder", ActorKind::Human)).await;
         mint_token(&app, "tok-author", "author");
         mint_token(&app, "tok-intruder", "intruder");
-        put_issue_fixture(&app, "acme/web", 1, "author");
+        put_issue_fixture(&app, "acme/web", 1, "author").await;
 
         // A non-author (even a repo admin) is rejected server-side, and the title/body are untouched.
         let resp = update_issue(
@@ -6021,7 +6070,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a non-author (even an admin) must not edit an issue's words");
-        let i = app.store.issues("acme/web").into_iter().find(|i| i.number == 1).unwrap();
+        let i = app.store.issues("acme/web").await.into_iter().find(|i| i.number == 1).unwrap();
         assert_eq!(i.title, "original title", "a rejected edit leaves the title unchanged");
         assert_eq!(i.body, "original body", "a rejected edit leaves the body unchanged");
 
@@ -6034,7 +6083,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "an empty title must be rejected");
-        assert_eq!(app.store.issues("acme/web")[0].title, "original title", "a rejected edit leaves the title unchanged");
+        assert_eq!(app.store.issues("acme/web").await[0].title, "original title", "a rejected edit leaves the title unchanged");
 
         // The author can edit: title + body update and `edited_unix` is stamped.
         let resp = update_issue(
@@ -6045,7 +6094,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK, "the author may edit their own issue");
-        let i = app.store.issues("acme/web").into_iter().find(|i| i.number == 1).unwrap();
+        let i = app.store.issues("acme/web").await.into_iter().find(|i| i.number == 1).unwrap();
         assert_eq!(i.title, "revised title");
         assert_eq!(i.body, "revised body");
         assert!(i.edited_unix.is_some(), "an accepted edit stamps edited_unix");
@@ -6057,9 +6106,9 @@ mod tests {
 
     /// Seed a tenant account (`handle`, id `acct_<handle>`) with `boss` as Owner, and a repo record
     /// `<handle>/<name>`. `boss` and `rando` are accountable humans with session tokens minted.
-    fn seed_repo_admin_fixture(app: &App, handle: &str, name: &str) {
-        app.store.put_actor(actor("boss", ActorKind::Human));
-        app.store.put_actor(actor("rando", ActorKind::Human));
+    async fn seed_repo_admin_fixture(app: &App, handle: &str, name: &str) {
+        app.store.put_actor(actor("boss", ActorKind::Human)).await;
+        app.store.put_actor(actor("rando", ActorKind::Human)).await;
         mint_token(app, "tok-boss", "boss");
         mint_token(app, "tok-rando", "rando");
         app.store.put_account(Account {
@@ -6067,21 +6116,21 @@ mod tests {
             kind: AccountKind::Organization,
             handle: handle.into(),
             members: vec![Membership { actor: "boss".into(), role: Role::Owner }],
-        });
+        }).await;
         app.store.put_repo(Repo {
             id: format!("repo_{handle}_{name}"),
             owner: format!("acct_{handle}"),
             name: name.into(),
             default_branch: "main".into(),
-        });
+        }).await;
     }
 
     #[tokio::test]
     async fn repo_delete_is_admin_only() {
         let (app, tmp) = build_test_app("repo-delete");
-        seed_repo_admin_fixture(&app, "acme", "web");
+        seed_repo_admin_fixture(&app, "acme", "web").await;
         let key = "acme/web";
-        put_pr(&app, key, 1, "boss", "deadbeef");
+        put_pr(&app, key, 1, "boss", "deadbeef").await;
         // A durable human judgment on a claim under this repo — it must be purged on delete so it
         // can't resurface if the name is recreated.
         app.claims.set(key, "chg1", "claimA", claims::ClaimResolution { by: "boss".into(), judgment: "verified".into(), note: "checked".into(), ts: 1 });
@@ -6089,15 +6138,15 @@ mod tests {
         // A non-admin actor is rejected server-side — and nothing is removed.
         let resp = delete_repo_handler(State(app.clone()), Path(("acme".into(), "web".into())), bearer("tok-rando")).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a non-admin must not delete a repo");
-        assert!(find_repo(&app, "acme", "web").is_some(), "a rejected delete leaves the repo intact");
-        assert_eq!(app.store.prs(key).len(), 1, "a rejected delete leaves PRs intact");
+        assert!(find_repo(&app, "acme", "web").await.is_some(), "a rejected delete leaves the repo intact");
+        assert_eq!(app.store.prs(key).await.len(), 1, "a rejected delete leaves PRs intact");
         assert!(app.claims.for_change(key, "chg1").contains_key("claimA"), "a rejected delete leaves claim resolutions intact");
 
         // The owner may delete: the repo record and its domain state are gone.
         let resp = delete_repo_handler(State(app.clone()), Path(("acme".into(), "web".into())), bearer("tok-boss")).await;
         assert_eq!(resp.status(), StatusCode::OK, "an owner may delete the repo");
-        assert!(find_repo(&app, "acme", "web").is_none(), "the repo record is removed");
-        assert!(app.store.prs(key).is_empty(), "the repo's PRs are purged");
+        assert!(find_repo(&app, "acme", "web").await.is_none(), "the repo record is removed");
+        assert!(app.store.prs(key).await.is_empty(), "the repo's PRs are purged");
         assert!(app.claims.for_change(key, "chg1").is_empty(), "the repo's claim resolutions are purged");
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -6106,8 +6155,8 @@ mod tests {
     #[tokio::test]
     async fn repo_rename_is_admin_only_and_rekeys_state() {
         let (app, tmp) = build_test_app("repo-rename");
-        seed_repo_admin_fixture(&app, "acme", "web");
-        put_pr(&app, "acme/web", 1, "boss", "deadbeef");
+        seed_repo_admin_fixture(&app, "acme", "web").await;
+        put_pr(&app, "acme/web", 1, "boss", "deadbeef").await;
         // A durable human judgment on a claim under the old name — it must follow the rename.
         app.claims.set("acme/web", "chg1", "claimA", claims::ClaimResolution { by: "boss".into(), judgment: "verified".into(), note: "checked".into(), ts: 1 });
 
@@ -6120,7 +6169,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "a non-admin must not rename a repo");
-        assert!(find_repo(&app, "acme", "web").is_some(), "a rejected rename leaves the old name");
+        assert!(find_repo(&app, "acme", "web").await.is_some(), "a rejected rename leaves the old name");
 
         // The owner may rename: the repo record and its PRs re-key to the new name.
         let resp = rename_repo_handler(
@@ -6131,10 +6180,10 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK, "an owner may rename the repo");
-        assert!(find_repo(&app, "acme", "web").is_none(), "the old name no longer resolves");
-        assert!(find_repo(&app, "acme", "site").is_some(), "the new name resolves");
-        assert!(app.store.prs("acme/web").is_empty(), "PRs no longer sit under the old key");
-        assert_eq!(app.store.prs("acme/site").len(), 1, "PRs re-key to the new name");
+        assert!(find_repo(&app, "acme", "web").await.is_none(), "the old name no longer resolves");
+        assert!(find_repo(&app, "acme", "site").await.is_some(), "the new name resolves");
+        assert!(app.store.prs("acme/web").await.is_empty(), "PRs no longer sit under the old key");
+        assert_eq!(app.store.prs("acme/site").await.len(), 1, "PRs re-key to the new name");
         // The human claim judgment follows the rename: gone under the old repo, visible under the new.
         assert!(app.claims.for_change("acme/web", "chg1").is_empty(), "claim resolutions no longer sit under the old key");
         let resolved = app.claims.for_change("acme/site", "chg1");
@@ -6151,15 +6200,15 @@ mod tests {
 
     /// Seed an org whose handle == `tenant`, owning `repo`, with the given members and visibility — the
     /// exact shape `find_repo` / `repo_account_id` / `can_read_repo` read.
-    fn setup_org_repo(app: &App, tenant: &str, repo: &str, private: bool, members: &[(&str, Role)]) {
+    async fn setup_org_repo(app: &App, tenant: &str, repo: &str, private: bool, members: &[(&str, Role)]) {
         let acct_id = format!("acct-{tenant}");
         app.store.put_account(Account {
             id: acct_id.clone(),
             kind: AccountKind::Organization,
             handle: tenant.into(),
             members: members.iter().map(|(a, r)| Membership { actor: (*a).into(), role: *r }).collect(),
-        });
-        app.store.put_repo(Repo { id: format!("repo-{tenant}-{repo}"), owner: acct_id, name: repo.into(), default_branch: "main".into() });
+        }).await;
+        app.store.put_repo(Repo { id: format!("repo-{tenant}-{repo}"), owner: acct_id, name: repo.into(), default_branch: "main".into() }).await;
         app.repo_settings.set(&format!("{tenant}/{repo}"), crate::reposettings::RepoSettings { private, ..Default::default() });
     }
 
@@ -6167,38 +6216,38 @@ mod tests {
         app.repo_settings.set(key, crate::reposettings::RepoSettings { private, ..Default::default() });
     }
 
-    #[test]
-    fn can_read_repo_truth_table() {
+    #[tokio::test]
+    async fn can_read_repo_truth_table() {
         let (app, tmp) = build_test_app("can-read");
-        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]).await;
         // PRIVATE: only members read; anonymous and outsiders are refused.
-        assert!(!can_read_repo(&app, None, "acme", "web"), "anonymous cannot read a private repo");
-        assert!(!can_read_repo(&app, Some("outsider"), "acme", "web"), "a non-member cannot read a private repo");
-        assert!(can_read_repo(&app, Some("member"), "acme", "web"), "a member can read a private repo");
+        assert!(!can_read_repo(&app, None, "acme", "web").await, "anonymous cannot read a private repo");
+        assert!(!can_read_repo(&app, Some("outsider"), "acme", "web").await, "a non-member cannot read a private repo");
+        assert!(can_read_repo(&app, Some("member"), "acme", "web").await, "a member can read a private repo");
         // PUBLIC (and unlisted, which is `!private`): readable by anyone, including anonymous.
         set_private(&app, "acme/web", false);
-        assert!(can_read_repo(&app, None, "acme", "web"), "anonymous CAN read a public repo");
-        assert!(can_read_repo(&app, Some("outsider"), "acme", "web"), "a non-member can read a public repo");
+        assert!(can_read_repo(&app, None, "acme", "web").await, "anonymous CAN read a public repo");
+        assert!(can_read_repo(&app, Some("outsider"), "acme", "web").await, "a non-member can read a public repo");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
-    fn is_repo_member_and_admin_truth_table() {
+    #[tokio::test]
+    async fn is_repo_member_and_admin_truth_table() {
         let (app, tmp) = build_test_app("is-member");
-        setup_org_repo(&app, "acme", "web", true, &[("owner", Role::Owner), ("dev", Role::Write), ("reader", Role::Read)]);
+        setup_org_repo(&app, "acme", "web", true, &[("owner", Role::Owner), ("dev", Role::Write), ("reader", Role::Read)]).await;
         // is_repo_member: ANY role of the owning account.
-        assert!(is_repo_member(&app, "acme", "web", "owner"));
-        assert!(is_repo_member(&app, "acme", "web", "dev"));
-        assert!(is_repo_member(&app, "acme", "web", "reader"), "even a Read role is a member");
-        assert!(!is_repo_member(&app, "acme", "web", "outsider"));
+        assert!(is_repo_member(&app, "acme", "web", "owner").await);
+        assert!(is_repo_member(&app, "acme", "web", "dev").await);
+        assert!(is_repo_member(&app, "acme", "web", "reader").await, "even a Read role is a member");
+        assert!(!is_repo_member(&app, "acme", "web", "outsider").await);
         // Visibility is irrelevant to membership: a public repo is still only *mutated* by members.
         set_private(&app, "acme/web", false);
-        assert!(!is_repo_member(&app, "acme", "web", "outsider"), "a public repo does not make an outsider a member");
+        assert!(!is_repo_member(&app, "acme", "web", "outsider").await, "a public repo does not make an outsider a member");
         // is_repo_admin: Owner/Admin only, a strict subset of members.
-        assert!(is_repo_admin(&app, "acme", "web", "owner"));
-        assert!(!is_repo_admin(&app, "acme", "web", "dev"), "Write is a member but not an admin");
-        assert!(!is_repo_admin(&app, "acme", "web", "reader"), "Read is a member but not an admin");
-        assert!(!is_repo_admin(&app, "acme", "web", "outsider"));
+        assert!(is_repo_admin(&app, "acme", "web", "owner").await);
+        assert!(!is_repo_admin(&app, "acme", "web", "dev").await, "Write is a member but not an admin");
+        assert!(!is_repo_admin(&app, "acme", "web", "reader").await, "Read is a member but not an admin");
+        assert!(!is_repo_admin(&app, "acme", "web", "outsider").await);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6225,65 +6274,65 @@ mod tests {
         assert_eq!(git_token_from_headers(&h), None, "empty password is not a token");
     }
 
-    #[test]
-    fn git_auth_decision_matrix() {
+    #[tokio::test]
+    async fn git_auth_decision_matrix() {
         // Area D: the pure decision over public/private × fetch/push × member/non-member/anon, with the
         // config-off case proven a total no-op (always Allow) regardless of visibility/creds.
         let (app, tmp) = build_test_app("git-auth");
-        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
-        app.store.put_actor(actor("member", ActorKind::Human));
-        app.store.put_actor(actor("outsider", ActorKind::Human));
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]).await;
+        app.store.put_actor(actor("member", ActorKind::Human)).await;
+        app.store.put_actor(actor("outsider", ActorKind::Human)).await;
         mint_token(&app, "tok-member", "member");
         mint_token(&app, "tok-outsider", "outsider");
         let fetch = "git-upload-pack";
         let push = "git-receive-pack";
-        let d = |enforce, service, token| git_auth_decision(&app, enforce, "acme", "web", service, token);
+        macro_rules! d { ($e:expr, $s:expr, $t:expr) => { git_auth_decision(&app, $e, "acme", "web", $s, $t).await }; }
 
         // ── enforce OFF: ALWAYS Allow, whatever the repo/service/creds. The no-op guarantee. ──
         for service in [fetch, push] {
             for token in [None, Some("tok-member"), Some("tok-outsider"), Some("bad")] {
-                assert_eq!(d(false, service, token), GitAuthDecision::Allow, "config off is always Allow ({service}, {token:?})");
+                assert_eq!(d!(false, service, token), GitAuthDecision::Allow, "config off is always Allow ({service}, {token:?})");
             }
         }
 
         // ── enforce ON, PRIVATE repo ──
         // Fetch: anon/non-member/invalid → 401 (so git prompts); a read-authorized member → Allow.
-        assert_eq!(d(true, fetch, None), GitAuthDecision::Unauthorized, "anon fetch of a private repo → 401");
-        assert_eq!(d(true, fetch, Some("bad")), GitAuthDecision::Unauthorized, "invalid token fetch of private → 401");
-        assert_eq!(d(true, fetch, Some("tok-outsider")), GitAuthDecision::Unauthorized, "non-member fetch of private → 401");
-        assert_eq!(d(true, fetch, Some("tok-member")), GitAuthDecision::Allow, "member fetch of a private repo → Allow");
+        assert_eq!(d!(true, fetch, None), GitAuthDecision::Unauthorized, "anon fetch of a private repo → 401");
+        assert_eq!(d!(true, fetch, Some("bad")), GitAuthDecision::Unauthorized, "invalid token fetch of private → 401");
+        assert_eq!(d!(true, fetch, Some("tok-outsider")), GitAuthDecision::Unauthorized, "non-member fetch of private → 401");
+        assert_eq!(d!(true, fetch, Some("tok-member")), GitAuthDecision::Allow, "member fetch of a private repo → Allow");
         // Push: anon/invalid → 401; a valid non-member → 403; a member → Allow.
-        assert_eq!(d(true, push, None), GitAuthDecision::Unauthorized, "anon push → 401");
-        assert_eq!(d(true, push, Some("bad")), GitAuthDecision::Unauthorized, "invalid token push → 401");
-        assert_eq!(d(true, push, Some("tok-outsider")), GitAuthDecision::Forbidden, "non-member push → 403");
-        assert_eq!(d(true, push, Some("tok-member")), GitAuthDecision::Allow, "member push → Allow");
+        assert_eq!(d!(true, push, None), GitAuthDecision::Unauthorized, "anon push → 401");
+        assert_eq!(d!(true, push, Some("bad")), GitAuthDecision::Unauthorized, "invalid token push → 401");
+        assert_eq!(d!(true, push, Some("tok-outsider")), GitAuthDecision::Forbidden, "non-member push → 403");
+        assert_eq!(d!(true, push, Some("tok-member")), GitAuthDecision::Allow, "member push → Allow");
 
         // ── enforce ON, PUBLIC repo ── anonymous clone MUST still work; push still needs a member.
         set_private(&app, "acme/web", false);
-        assert_eq!(d(true, fetch, None), GitAuthDecision::Allow, "anon fetch of a PUBLIC repo → Allow even when enforcing");
-        assert_eq!(d(true, fetch, Some("tok-outsider")), GitAuthDecision::Allow, "non-member fetch of a public repo → Allow");
-        assert_eq!(d(true, push, None), GitAuthDecision::Unauthorized, "anon push to a public repo still → 401");
-        assert_eq!(d(true, push, Some("tok-outsider")), GitAuthDecision::Forbidden, "non-member push to a public repo → 403");
-        assert_eq!(d(true, push, Some("tok-member")), GitAuthDecision::Allow, "member push to a public repo → Allow");
+        assert_eq!(d!(true, fetch, None), GitAuthDecision::Allow, "anon fetch of a PUBLIC repo → Allow even when enforcing");
+        assert_eq!(d!(true, fetch, Some("tok-outsider")), GitAuthDecision::Allow, "non-member fetch of a public repo → Allow");
+        assert_eq!(d!(true, push, None), GitAuthDecision::Unauthorized, "anon push to a public repo still → 401");
+        assert_eq!(d!(true, push, Some("tok-outsider")), GitAuthDecision::Forbidden, "non-member push to a public repo → 403");
+        assert_eq!(d!(true, push, Some("tok-member")), GitAuthDecision::Allow, "member push to a public repo → Allow");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
-    fn git_auth_create_on_push_requires_account_member() {
+    #[tokio::test]
+    async fn git_auth_create_on_push_requires_account_member() {
         // Area D: auto-create-on-push must not let an anon/outsider provision a repo. For a not-yet-
         // existent repo under account handle `acme`, the push decision is Allow only for an `acme`
         // member (via `is_repo_member`'s tenant→account resolution), else 401 (anon) / 403 (outsider).
         let (app, tmp) = build_test_app("git-create");
         // Account exists (handle == tenant) but the repo record/dir does not yet.
-        setup_org_repo(&app, "acme", "placeholder", false, &[("member", Role::Write)]);
-        app.store.put_actor(actor("member", ActorKind::Human));
-        app.store.put_actor(actor("outsider", ActorKind::Human));
+        setup_org_repo(&app, "acme", "placeholder", false, &[("member", Role::Write)]).await;
+        app.store.put_actor(actor("member", ActorKind::Human)).await;
+        app.store.put_actor(actor("outsider", ActorKind::Human)).await;
         mint_token(&app, "tok-member", "member");
         mint_token(&app, "tok-outsider", "outsider");
         let push = "git-receive-pack";
-        assert_eq!(git_auth_decision(&app, true, "acme", "brand-new", push, None), GitAuthDecision::Unauthorized, "anon cannot provision a new repo by push");
-        assert_eq!(git_auth_decision(&app, true, "acme", "brand-new", push, Some("tok-outsider")), GitAuthDecision::Forbidden, "an outsider cannot provision a new repo under acme");
-        assert_eq!(git_auth_decision(&app, true, "acme", "brand-new", push, Some("tok-member")), GitAuthDecision::Allow, "an acme member may provision a new repo by push");
+        assert_eq!(git_auth_decision(&app, true, "acme", "brand-new", push, None).await, GitAuthDecision::Unauthorized, "anon cannot provision a new repo by push");
+        assert_eq!(git_auth_decision(&app, true, "acme", "brand-new", push, Some("tok-outsider")).await, GitAuthDecision::Forbidden, "an outsider cannot provision a new repo under acme");
+        assert_eq!(git_auth_decision(&app, true, "acme", "brand-new", push, Some("tok-member")).await, GitAuthDecision::Allow, "an acme member may provision a new repo by push");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6292,9 +6341,9 @@ mod tests {
         // Area B: drive a real gated handler (`change_diff`) — a private repo is hidden (404) from
         // anonymous and non-members, visible to a member, and flips fully open once public.
         let (app, tmp) = build_test_app("read-gate");
-        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
-        app.store.put_actor(actor("member", ActorKind::Human));
-        app.store.put_actor(actor("outsider", ActorKind::Human));
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]).await;
+        app.store.put_actor(actor("member", ActorKind::Human)).await;
+        app.store.put_actor(actor("outsider", ActorKind::Human)).await;
         mint_token(&app, "tok-member", "member");
         mint_token(&app, "tok-outsider", "outsider");
         let t = ("acme".to_string(), "web".to_string(), "deadbeef".to_string());
@@ -6317,10 +6366,10 @@ mod tests {
         // Area C: setting verification green/red directly is the merge gate — a plain member (Write) is
         // refused; only an Owner/Admin may override. (CI reports via the secret-authed ci-result path.)
         let (app, tmp) = build_test_app("verify-gate");
-        setup_org_repo(&app, "acme", "web", false, &[("boss", Role::Owner), ("dev", Role::Write)]);
+        setup_org_repo(&app, "acme", "web", false, &[("boss", Role::Owner), ("dev", Role::Write)]).await;
         let change = app.repos.test_commit("acme", "web", "", None, &[("notes.txt", "hi\n")]);
-        app.store.put_actor(actor("boss", ActorKind::Human));
-        app.store.put_actor(actor("dev", ActorKind::Human));
+        app.store.put_actor(actor("boss", ActorKind::Human)).await;
+        app.store.put_actor(actor("dev", ActorKind::Human)).await;
         mint_token(&app, "tok-boss", "boss");
         mint_token(&app, "tok-dev", "dev");
         let t = ("acme".to_string(), "web".to_string(), change.clone());
@@ -6340,9 +6389,9 @@ mod tests {
     async fn set_owners_is_repo_admin_only() {
         // Area C: code owners drive routing + the merge gate — admin-only.
         let (app, tmp) = build_test_app("owners-gate");
-        setup_org_repo(&app, "acme", "web", false, &[("boss", Role::Admin), ("dev", Role::Write)]);
-        app.store.put_actor(actor("boss", ActorKind::Human));
-        app.store.put_actor(actor("dev", ActorKind::Human));
+        setup_org_repo(&app, "acme", "web", false, &[("boss", Role::Admin), ("dev", Role::Write)]).await;
+        app.store.put_actor(actor("boss", ActorKind::Human)).await;
+        app.store.put_actor(actor("dev", ActorKind::Human)).await;
         mint_token(&app, "tok-boss", "boss");
         mint_token(&app, "tok-dev", "dev");
         let t = ("acme".to_string(), "web".to_string());
@@ -6350,10 +6399,10 @@ mod tests {
 
         let r = set_owners(State(app.clone()), Path(t.clone()), bearer("tok-dev"), Json(rules.clone())).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-admin member cannot rewrite code owners");
-        assert!(app.store.owners("acme/web").is_empty(), "no owners were written by a refused call");
+        assert!(app.store.owners("acme/web").await.is_empty(), "no owners were written by a refused call");
         let r = set_owners(State(app.clone()), Path(t.clone()), bearer("tok-boss"), Json(rules)).await;
         assert_eq!(r.status(), StatusCode::CREATED, "an owner/admin may set code owners");
-        assert_eq!(app.store.owners("acme/web").len(), 1);
+        assert_eq!(app.store.owners("acme/web").await.len(), 1);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6362,26 +6411,26 @@ mod tests {
         // Area C: a review is an accountable act on the repo — a non-member (even a valid, accountable
         // actor) is refused; a member may review.
         let (app, tmp) = build_test_app("review-gate");
-        setup_org_repo(&app, "acme", "web", false, &[("member", Role::Write)]);
-        app.store.put_actor(actor("member", ActorKind::Human));
-        app.store.put_actor(actor("outsider", ActorKind::Human));
+        setup_org_repo(&app, "acme", "web", false, &[("member", Role::Write)]).await;
+        app.store.put_actor(actor("member", ActorKind::Human)).await;
+        app.store.put_actor(actor("outsider", ActorKind::Human)).await;
         mint_token(&app, "tok-member", "member");
         mint_token(&app, "tok-outsider", "outsider");
-        put_pr(&app, "acme/web", 1, "author", "chg");
+        put_pr(&app, "acme/web", 1, "author", "chg").await;
         let t = ("acme".to_string(), "web".to_string());
         let body = json!({ "target": "pr:1", "verdict": "comment", "summary": "looks fine" });
 
         let r = create_review(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(body.clone())).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-member cannot review");
-        assert!(app.store.reviews("acme/web").is_empty(), "no review persisted for a refused call");
+        assert!(app.store.reviews("acme/web").await.is_empty(), "no review persisted for a refused call");
         let r = create_review(State(app.clone()), Path(t.clone()), bearer("tok-member"), Json(body)).await;
         assert_eq!(r.status(), StatusCode::CREATED, "a repo member may review");
-        assert_eq!(app.store.reviews("acme/web").len(), 1);
+        assert_eq!(app.store.reviews("acme/web").await.len(), 1);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
-    fn independent_agent_reviewer_is_scoped_to_repo_members() {
+    #[tokio::test]
+    async fn independent_agent_reviewer_is_scoped_to_repo_members() {
         // Area C: the auto-reviewer must be a MEMBER of the repo's owning account — never an agent from
         // another tenant (which, at T3, could otherwise auto-merge cross-tenant). Uses real accountable
         // agents (minted delegations), since an unaccountable agent is filtered out regardless.
@@ -6389,14 +6438,14 @@ mod tests {
         let human = hull_core::identity::mint_human("boss");
         let in_agent = hull_core::identity::mint_agent("agent:in", &human.actor, &human.secret_key, "*", Lifetime::Static).expect("mint in-org agent");
         let out_agent = hull_core::identity::mint_agent("agent:out", &human.actor, &human.secret_key, "*", Lifetime::Static).expect("mint outsider agent");
-        app.store.put_actor(human.actor.clone());
-        app.store.put_actor(in_agent.actor.clone());
-        app.store.put_actor(out_agent.actor.clone());
+        app.store.put_actor(human.actor.clone()).await;
+        app.store.put_actor(in_agent.actor.clone()).await;
+        app.store.put_actor(out_agent.actor.clone()).await;
         // acme owns web; the human author + the in-org agent are members. `out_agent` is accountable but
         // not a member of acme.
-        setup_org_repo(&app, "acme", "web", false, &[(human.actor.id.as_str(), Role::Owner), (in_agent.actor.id.as_str(), Role::Write)]);
+        setup_org_repo(&app, "acme", "web", false, &[(human.actor.id.as_str(), Role::Owner), (in_agent.actor.id.as_str(), Role::Write)]).await;
 
-        let picked = independent_agent_reviewer(&app, "acme", "web", &human.actor.id);
+        let picked = independent_agent_reviewer(&app, "acme", "web", &human.actor.id).await;
         assert_eq!(picked.map(|a| a.id), Some(in_agent.actor.id.clone()), "only the in-org accountable agent is eligible");
 
         // Drop the in-org agent's membership ⇒ no eligible reviewer (the accountable outsider is never chosen).
@@ -6405,8 +6454,8 @@ mod tests {
             kind: AccountKind::Organization,
             handle: "acme".into(),
             members: vec![Membership { actor: human.actor.id.clone(), role: Role::Owner }],
-        });
-        assert!(independent_agent_reviewer(&app, "acme", "web", &human.actor.id).is_none(), "an out-of-org agent is never selected as reviewer");
+        }).await;
+        assert!(independent_agent_reviewer(&app, "acme", "web", &human.actor.id).await.is_none(), "an out-of-org agent is never selected as reviewer");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6416,8 +6465,8 @@ mod tests {
         // PRIVATE repo a non-reader (valid, accountable, but not a member) is refused; the SAME actor is
         // ALLOWED once the repo is public — a public repo stays open to any authed actor (no regression).
         let (app, tmp) = build_test_app("participation-gate");
-        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
-        app.store.put_actor(actor("outsider", ActorKind::Human));
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]).await;
+        app.store.put_actor(actor("outsider", ActorKind::Human)).await;
         mint_token(&app, "tok-outsider", "outsider");
         let t = ("acme".to_string(), "web".to_string());
         let comment = json!({ "target": "pr:1", "body": "hello" });
@@ -6426,19 +6475,19 @@ mod tests {
         // PRIVATE: the non-reader is denied both.
         let r = create_comment(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(comment.clone())).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-reader cannot comment on a PRIVATE repo");
-        assert!(app.store.comments("acme/web").is_empty(), "no comment persisted for a refused call");
+        assert!(app.store.comments("acme/web").await.is_empty(), "no comment persisted for a refused call");
         let r = create_issue(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(issue.clone())).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN, "a non-reader cannot open an issue on a PRIVATE repo");
-        assert!(app.store.issues("acme/web").is_empty(), "no issue persisted for a refused call");
+        assert!(app.store.issues("acme/web").await.is_empty(), "no issue persisted for a refused call");
 
         // PUBLIC: the very same non-member actor may now participate freely.
         set_private(&app, "acme/web", false);
         let r = create_comment(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(comment)).await;
         assert_eq!(r.status(), StatusCode::CREATED, "any authed actor may comment on a PUBLIC repo");
-        assert_eq!(app.store.comments("acme/web").len(), 1, "the public comment persisted");
+        assert_eq!(app.store.comments("acme/web").await.len(), 1, "the public comment persisted");
         let r = create_issue(State(app.clone()), Path(t.clone()), bearer("tok-outsider"), Json(issue)).await;
         assert_eq!(r.status(), StatusCode::CREATED, "any authed actor may open an issue on a PUBLIC repo");
-        assert_eq!(app.store.issues("acme/web").len(), 1, "the public issue persisted");
+        assert_eq!(app.store.issues("acme/web").await.len(), 1, "the public issue persisted");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6449,13 +6498,13 @@ mod tests {
         // past the gate (request_reviewer succeeds; auto_review reaches the "no agent" stage, i.e. it is
         // NOT refused for membership).
         let (app, tmp) = build_test_app("repo-op-gate");
-        setup_org_repo(&app, "acme", "web", false, &[("member", Role::Write)]);
-        app.store.put_actor(actor("member", ActorKind::Human));
-        app.store.put_actor(actor("outsider", ActorKind::Human));
-        app.store.put_actor(actor("rev", ActorKind::Human));
+        setup_org_repo(&app, "acme", "web", false, &[("member", Role::Write)]).await;
+        app.store.put_actor(actor("member", ActorKind::Human)).await;
+        app.store.put_actor(actor("outsider", ActorKind::Human)).await;
+        app.store.put_actor(actor("rev", ActorKind::Human)).await;
         mint_token(&app, "tok-member", "member");
         mint_token(&app, "tok-outsider", "outsider");
-        put_pr(&app, "acme/web", 1, "author", "chg");
+        put_pr(&app, "acme/web", 1, "author", "chg").await;
         let t = ("acme".to_string(), "web".to_string(), 1u64);
 
         // request_reviewer: non-member refused, member allowed.
@@ -6479,9 +6528,9 @@ mod tests {
         // Area B (missed reads): `mirror_status` + `get_repo_autonomy` join the read sweep — a private
         // repo is hidden (404) from anonymous/non-members and visible to a member; a public repo is open.
         let (app, tmp) = build_test_app("missed-reads");
-        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]);
-        app.store.put_actor(actor("member", ActorKind::Human));
-        app.store.put_actor(actor("outsider", ActorKind::Human));
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]).await;
+        app.store.put_actor(actor("member", ActorKind::Human)).await;
+        app.store.put_actor(actor("outsider", ActorKind::Human)).await;
         mint_token(&app, "tok-member", "member");
         mint_token(&app, "tok-outsider", "outsider");
         let t = ("acme".to_string(), "web".to_string());
