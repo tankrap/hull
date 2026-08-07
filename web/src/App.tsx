@@ -1143,11 +1143,11 @@ export function App() {
     setAuthBusy(true);
     try {
       const start = await fetch("/api/auth/register/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(authForm) });
-      if (!start.ok) { setAuthError(await start.text()); return; }
+      if (!start.ok) { setAuthError((await start.text()) || `request failed (${start.status}) — is the server running?`); return; }
       const { flow_id, options } = await start.json();
       const credential = await createPasskey(options);
       const fin = await fetch("/api/auth/register/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ flow_id, credential }) });
-      if (!fin.ok) { setAuthError(await fin.text()); return; }
+      if (!fin.ok) { setAuthError((await fin.text()) || `request failed (${fin.status}) — is the server running?`); return; }
       const { token: t } = await fin.json();
       finishSession(t);
       setAuthForm({ username: "", email: "" });
@@ -1164,11 +1164,11 @@ export function App() {
     setAuthBusy(true);
     try {
       const start = await fetch("/api/auth/passkey/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ username }) });
-      if (!start.ok) { setAuthError(await start.text()); return; }
+      if (!start.ok) { setAuthError((await start.text()) || `request failed (${start.status}) — is the server running?`); return; }
       const { flow_id, options } = await start.json();
       const credential = await getPasskey(options);
       const fin = await fetch("/api/auth/passkey/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ flow_id, credential }) });
-      if (!fin.ok) { setAuthError(await fin.text()); return; }
+      if (!fin.ok) { setAuthError((await fin.text()) || `request failed (${fin.status}) — is the server running?`); return; }
       const { token: t } = await fin.json();
       finishSession(t);
       navigate("/");

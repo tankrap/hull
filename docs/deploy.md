@@ -196,7 +196,7 @@ metrics** below for the `/ready` and `/metrics` endpoints.
 | Var                   | Purpose                                    | Default |
 |-----------------------|--------------------------------------------|---------|
 | `HULL_WEBAUTHN_RP_ID` | WebAuthn relying-party ID (your host).     | `localhost` |
-| `HULL_WEBAUTHN_ORIGIN`| WebAuthn origin (scheme + host + port).    | `http://localhost:5931` |
+| `HULL_WEBAUTHN_ORIGIN`| WebAuthn origin (scheme + host + port); must match the browser's URL exactly. | `http://localhost:5930` |
 
 ### On-disk state paths (all default under `$HOME/.hull`)
 
