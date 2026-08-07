@@ -429,21 +429,62 @@ impl FileStore {
         FileStore { path, inner: RwLock::new(inner) }
     }
 
-    /// Persist the current snapshot atomically. A write failure is logged, not fatal — the in-memory
-    /// state stays correct for this process.
+    /// Persist the current snapshot **durably and atomically**: write a temp file, `sync_all` its
+    /// contents to disk, `rename` it over the target (an atomic replace), then best-effort fsync the
+    /// parent directory so the rename itself survives a crash.
+    ///
+    /// A persist failure is NOT fatal here (the [`Store`] trait is infallible — it returns `()`), but
+    /// it is no longer swallowed with a quiet `eprintln!`: the in-memory state has now silently
+    /// diverged from disk, so we log at a loud ERROR level AND flip the process-global
+    /// [`crate::PERSISTENCE_DEGRADED`] flag, which the server's `/health` handler surfaces as 503.
+    /// Fully propagating the error to the caller requires a fallible `Store` trait (follow-up).
     fn save(&self, snap: &Snapshot) {
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let tmp = self.path.with_extension("json.tmp");
-        match serde_json::to_vec_pretty(snap) {
-            Ok(bytes) => {
-                if std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &self.path)).is_err() {
-                    eprintln!("hull: failed to persist store to {}", self.path.display());
-                }
+        let bytes = match serde_json::to_vec_pretty(snap) {
+            Ok(b) => b,
+            Err(e) => {
+                crate::mark_persistence_degraded();
+                eprintln!(
+                    "hull: ERROR failed to serialize store snapshot: {e} — persistence is DEGRADED \
+                     (in-memory state has diverged from disk)."
+                );
+                return;
             }
-            Err(e) => eprintln!("hull: failed to serialize store: {e}"),
+        };
+        let tmp = self.path.with_extension("json.tmp");
+        let write_durably = || -> std::io::Result<()> {
+            use std::io::Write;
+            let f = std::fs::File::create(&tmp)?;
+            {
+                let mut w = std::io::BufWriter::new(&f);
+                w.write_all(&bytes)?;
+                w.flush()?;
+            }
+            f.sync_all()?; // temp file contents are on disk before the rename makes them live
+            std::fs::rename(&tmp, &self.path)?;
+            Ok(())
+        };
+        if let Err(e) = write_durably() {
+            crate::mark_persistence_degraded();
+            eprintln!(
+                "hull: ERROR failed to persist store to {}: {e} — persistence is DEGRADED (in-memory \
+                 state has diverged from disk; a restart would lose un-persisted writes).",
+                self.path.display()
+            );
+            return;
         }
+        // Best-effort: fsync the directory so the rename is durable across a crash. Opening a dir as a
+        // File and syncing it is a no-op / unsupported on some platforms (e.g. Windows) — a failure
+        // here alone is not treated as data loss.
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+        }
+        // The snapshot is now fully on disk: whatever transient failure may have set the degraded flag
+        // is resolved (a full snapshot rewrite re-syncs disk to memory), so clear it and let `/health`
+        // recover to 200.
+        crate::clear_persistence_degraded();
     }
 
     fn mutate(&self, f: impl FnOnce(&mut Snapshot)) {

@@ -22,6 +22,35 @@ pub type ActorId = String;
 /// A keel object address (BLAKE3, hex) — a change, tree, or blob.
 pub type KeelId = String;
 
+/// Process-global "persistence degraded" flag. Set when a durable write (the [`store::FileStore`]
+/// snapshot, or a JSON side-store persist) fails — at which point the in-memory state has silently
+/// **diverged from disk** and a restart would lose the un-persisted writes. The server's `/health`
+/// handler reads this and returns 503 while it is set, so an orchestrator can pull the instance.
+///
+/// This is a stopgap: the [`store::Store`] trait methods are infallible (return `()`), so a persist
+/// failure cannot be propagated to the caller. Fully surfacing the error needs a fallible `Store`
+/// trait — tracked as a follow-up. Until then, "log loudly + flip this flag" is the safety net.
+pub static PERSISTENCE_DEGRADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Flip the process into the "persistence degraded" state (see [`PERSISTENCE_DEGRADED`]). Set on any
+/// failed durable write; cleared by [`clear_persistence_degraded`] on the next fully-successful one.
+pub fn mark_persistence_degraded() {
+    PERSISTENCE_DEGRADED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Clear the "persistence degraded" state after a SUCCESSFUL durable write. Because every persist
+/// rewrites the entire snapshot, one clean write fully re-syncs disk to memory — so a transient blip
+/// (a full disk that's since freed, a brief I/O error) recovers and `/health` returns to 200 rather
+/// than staying 503 for the process lifetime. Called only on the success path of a persist.
+pub fn clear_persistence_degraded() {
+    PERSISTENCE_DEGRADED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether persistence has degraded this process (see [`PERSISTENCE_DEGRADED`]).
+pub fn persistence_degraded() -> bool {
+    PERSISTENCE_DEGRADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A human or an agent. Identity is a keypair, so authorship is signed, not asserted.
 ///
 /// **Hard invariant — no unaccountable agents.** Every agent's authority is a cryptographically
