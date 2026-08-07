@@ -144,24 +144,13 @@ impl NostrNotifier {
 impl NostrNotifier {
     /// Build the signed nostr note for a [`NotifyEvent`], or `None` if no recipient opted into nostr.
     /// Pure but for the store lookup — the testable heart of [`Notifier::notify`].
-    fn event_for(&self, event: &NotifyEvent, created_at: u64) -> Option<Event> {
-        // TODO(async-store): the `Store` trait is now async, but `Notifier::notify` (which calls this)
-        // is a synchronous external trait method, so we can't `.await` here. Bridge to the current
-        // tokio runtime with `block_in_place` + `block_on`. `notify` is always dispatched from an async
-        // request handler on the multi-threaded server runtime, where `block_in_place` is valid. If a
-        // future caller invokes `notify` off-runtime this will panic — making `Notifier` async is the
-        // real fix.
-        let recipients: Vec<String> = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut out = Vec::new();
-                for id in &event.to {
-                    if let Some(pk) = self.store.actor(id).await.and_then(|a| a.nostr_pubkey) {
-                        out.push(pk);
-                    }
-                }
-                out
-            })
-        });
+    async fn event_for(&self, event: &NotifyEvent, created_at: u64) -> Option<Event> {
+        let mut recipients: Vec<String> = Vec::new();
+        for id in &event.to {
+            if let Some(pk) = self.store.actor(id).await.and_then(|a| a.nostr_pubkey) {
+                recipients.push(pk);
+            }
+        }
         if recipients.is_empty() {
             return None;
         }
@@ -178,10 +167,11 @@ impl NostrNotifier {
     }
 }
 
+#[async_trait::async_trait]
 impl Notifier for NostrNotifier {
-    fn notify(&self, event: &NotifyEvent) {
+    async fn notify(&self, event: &NotifyEvent) {
         let created_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let Some(ev) = self.event_for(event, created_at) else { return };
+        let Some(ev) = self.event_for(event, created_at).await else { return };
         // Fire-and-forget: relay round-trips must never block or fail the request path.
         let relays = self.relays.clone();
         std::thread::spawn(move || {
@@ -222,9 +212,7 @@ mod tests {
         assert!(!ev.verify());
     }
 
-    // `event_for` bridges its now-async store lookup with `block_in_place`, which requires a
-    // multi-threaded runtime — hence `flavor = "multi_thread"`.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn notifier_builds_a_signed_note_only_for_opted_in_recipients() {
         use hull_core::store::{InMemory, Store};
         use hull_core::{Actor, ActorKind, Lifetime};
@@ -238,7 +226,7 @@ mod tests {
         let n = NostrNotifier { secret_hex: SK.into(), relays: vec!["ws://127.0.0.1:1".into()], store: Arc::new(store) };
         // targets both owners, but only owner1 opted in → the note p-tags exactly owner1's key + change tag.
         let ev = NotifyEvent { kind: "code_owner_referenced".into(), to: vec!["owner1".into(), "owner2".into()], summary: "crates/x touched".into(), change: Some("blake3:abc".into()), repo: None, target_kind: None, target_number: None };
-        let note = n.event_for(&ev, 1_700_000_000).expect("an opted-in recipient yields a note");
+        let note = n.event_for(&ev, 1_700_000_000).await.expect("an opted-in recipient yields a note");
         assert!(note.verify());
         assert!(note.tags.contains(&vec!["p".to_string(), pubkey_of(SK).unwrap()]));
         assert!(note.tags.iter().filter(|t| t[0] == "p").count() == 1); // owner2 (no key) is not tagged
@@ -246,7 +234,7 @@ mod tests {
 
         // nobody opted in → no note at all.
         let none = NotifyEvent { kind: "x".into(), to: vec!["owner2".into()], summary: "y".into(), change: None, repo: None, target_kind: None, target_number: None };
-        assert!(n.event_for(&none, 1_700_000_000).is_none());
+        assert!(n.event_for(&none, 1_700_000_000).await.is_none());
     }
 
     #[test]
