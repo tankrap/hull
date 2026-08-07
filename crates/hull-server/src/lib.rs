@@ -3971,7 +3971,7 @@ async fn perform_merge(
                     done = true; // head already on the branch — nothing to advance
                     break;
                 }
-                Ok(repos::MergeOutcome::Tree(tree)) => {
+                Ok(repos::MergeOutcome::Tree { tree, fast_forward }) => {
                     // Speculative verify of the MERGED tree — catches semantic conflicts two
                     // independently-green changes create. An admin override may bypass the green gate
                     // (a wedged/misconfigured check) but STILL lands through this merge path — there is
@@ -3986,7 +3986,7 @@ async fn perform_merge(
                             return Err((StatusCode::CONFLICT, "CONFLICT: merged result fails checks".into()));
                         }
                     }
-                    match app.repos.land_merge(tenant, repo, &default_branch, base.as_deref(), &head, &tree, &intent, &actor.id, now()) {
+                    match app.repos.land_merge(tenant, repo, &default_branch, base.as_deref(), &head, &tree, fast_forward, &intent, &actor.id, now()) {
                         Ok(Some(new_change)) => {
                             landed_change = Some(new_change);
                             done = true;
