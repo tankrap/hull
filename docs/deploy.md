@@ -225,7 +225,52 @@ these at once; override individually only if you want them elsewhere.
 | `HULL_CI_URL`     | External CI endpoint to POST job payloads to. Unset → built-in local runner. | (unset) |
 | `HULL_CI_SECRET`  | Shared secret for signing/verifying CI callbacks.           | (empty) |
 | `HULL_CI_CMD`     | Override test command for the built-in runner (via `sh -c`).| auto-detect (Cargo/npm) |
-| `HULL_CI_TIMEOUT` | Built-in runner timeout, seconds.                           | `600` |
+| `HULL_CI_TIMEOUT` | Built-in runner timeout (wall-clock), seconds.              | `600` |
+
+### CI sandbox (built-in runner)
+
+The built-in local runner is the one place Hull executes **attacker-controlled repo code** — a
+repo's `build.rs`/proc-macro or `.cargo/config.toml` runner (the cargo path), its `package.json`
+`test` script (the npm path), or an explicit `HULL_CI_CMD`, all run during an ordinary check. On unix
+that spawn is confined by default (a `SandboxedCiRunner`); it does **not** apply to the external CI
+dispatch path (`HULL_CI_URL`), which runs on your own CI system.
+
+**What's confined** (each holds regardless of what the repo's command does):
+
+- **Scrubbed environment** — the child gets `env_clear()` + a curated allow-list only (`PATH`, a
+  per-run scratch `HOME`/`CARGO_HOME`/`npm_config_cache`/`TMPDIR`, `RUSTUP_HOME` if present,
+  `LANG`/`LC_ALL`, `TERM=dumb`). No `HULL_*`, `GITHUB_*`, `*_API_KEY`, or `HULL_CI_SECRET` reaches
+  the repo command, so secrets and the `~/.hull/*` stores can't leak.
+- **Process group + group-kill** — the command runs in its own process group; on timeout (or on
+  cleanup) the **whole group** is `SIGKILL`ed, so backgrounded grandchildren can't survive the run.
+- **Resource limits** (`setrlimit`) — address space, CPU seconds, process count, and max file size
+  are capped (see the table). A memory/fork/disk bomb is killed by the cap, not left to the wall clock.
+- **Filesystem confinement (Linux, Landlock)** — the command may read+write only the checkout and the
+  per-run scratch dir, read+execute the toolchain + system dirs (`/usr`, `/lib`, `/bin`, `/etc`, …),
+  and read+write `/dev`. Everything else — the `~/.hull/*` stores, other tenants' checkouts, and the
+  rest of `/` — is **denied**, closing the planted-symlink escape.
+
+**Landlock kernel note.** Filesystem confinement needs Landlock (Linux **≥ 5.13** with the Landlock
+LSM enabled). It is applied **best-effort**: on an older kernel or a Landlock-less LSM config it
+degrades to a logged warning and a no-op — the env-scrub, process-group, and resource-limit
+protections still apply. On macOS the Landlock step is skipped (dev only; `RLIMIT_AS` is also not
+enforced there — CPU/file-size caps still are).
+
+**Network is intentionally left open** — cargo/npm need to fetch dependencies on first build. Network
+isolation (a network namespace or egress proxy) is a deferred follow-up increment.
+
+| Var                | Purpose                                                                  | Default |
+|--------------------|--------------------------------------------------------------------------|---------|
+| `HULL_CI_SANDBOX`  | `off` disables the sandbox (raw, unconfined runner) — for debugging.     | on (unix) |
+| `HULL_CI_MEM_MB`   | `RLIMIT_AS` address-space cap, MiB. Raise for memory-hungry builds.      | `4096` |
+| `HULL_CI_CPU_SECS` | `RLIMIT_CPU` cap, seconds.                                               | `HULL_CI_TIMEOUT` (`600`) |
+| `HULL_CI_NPROC`    | `RLIMIT_NPROC` cap (max processes for the runtime uid — caps fork bombs).| `512` |
+| `HULL_CI_FSIZE_MB` | `RLIMIT_FSIZE` cap, MiB (max size of a single written file).             | `2048` |
+
+> If a legitimate build breaks under the sandbox, first raise the relevant `HULL_CI_*` cap; the
+> `HULL_CI_SANDBOX=off` escape hatch exists as a last resort. `HULL_CI_NPROC` counts **all** of the
+> runtime user's processes host-wide, so a host packing many server processes under one uid may need
+> it raised.
 
 ### Mirroring to a forge
 
