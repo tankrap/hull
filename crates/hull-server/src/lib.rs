@@ -4134,6 +4134,19 @@ async fn mirror_github_webhook(
     }
     app.mirror.set_origin(&after, "github");
 
+    // Branch protection: the protected default branch may only advance through the reviewed, merge-
+    // verified merge queue (`perform_merge`). Mirror-inbound is secret-gated (not attacker-arbitrary),
+    // but importing a forge push here would move the protected branch OUTSIDE review — so on a protected
+    // repo we refuse to advance the protected branch and log it. (Non-default branches were already
+    // ignored above; this path only ever reaches `refs/heads/main`.)
+    if app.repo_settings.get(&format!("{tenant}/{repo}")).protects_default_branch() {
+        let default_branch = find_repo(&app, &tenant, &repo).await.map(|r| r.default_branch).unwrap_or_else(|| "main".into());
+        if git_ref == format!("refs/heads/{default_branch}") {
+            eprintln!("hull: ⚠ mirror-inbound push to {tenant}/{repo} targets protected '{default_branch}'; skipped (advance only via a reviewed PR)");
+            return Json(json!({ "skipped_protected": default_branch, "change": after })).into_response();
+        }
+    }
+
     // Import: fetch the forge's git and bridge into keel (off the async runtime — it shells git).
     let key = format!("{tenant}/{repo}");
     let result = tokio::task::spawn_blocking({
