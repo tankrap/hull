@@ -44,6 +44,12 @@ pub struct RepoHost {
     root: PathBuf,
     open: Arc<Mutex<HashMap<String, Store>>>,
     secrets: Arc<Mutex<Vec<SecretHit>>>,
+    /// Per-`tenant/repo/branch` land+export serialization. The git-mirror export runs *after* the
+    /// keel CAS commits, so two concurrent lands to the same protected branch would otherwise race
+    /// `mirror::refs`-read → `set_ref` and the last writer would drop the other landed change from
+    /// git `main`. `perform_merge` holds the branch's async mutex across the whole land+export
+    /// critical section to fully order them (see [`RepoHost::land_lock`]).
+    land_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl RepoHost {
@@ -52,7 +58,23 @@ impl RepoHost {
             root: root.into(),
             open: Arc::new(Mutex::new(HashMap::new())),
             secrets: Arc::new(Mutex::new(Vec::new())),
+            land_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The per-branch land+export lock for `tenant/repo/branch`, created on first use. The caller
+    /// (`perform_merge`) holds the returned mutex's guard across `plan_merge` → verify → `land_merge`
+    /// (which runs the git-mirror export) so concurrent same-branch lands are serialized as a unit.
+    /// No deadlock: this lock is acquired only in that one place and is the outermost lock held —
+    /// nothing else is awaited while a task waits to acquire it, and no store lock is held across it.
+    pub(crate) fn land_lock(&self, tenant: &str, repo: &str, branch: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{tenant}/{repo}/{branch}");
+        self.land_locks
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Scan the changed blobs of a repo's HEAD change for secrets (the server-side backstop; the

@@ -3953,6 +3953,15 @@ async fn perform_merge(
         };
         let intent = format!("Merge PR !{number}: {}", pr.title);
         let mut done = false;
+        // Serialize land+export per (repo, branch). The git-mirror export runs INSIDE `land_merge`
+        // AFTER the keel CAS commits, so two concurrent lands to the same protected branch would
+        // otherwise race `mirror::refs`-read → `set_ref`, the last writer dropping the other's landed
+        // change from git `main`. Holding this per-branch async lock across the whole plan → verify →
+        // land → export critical section fully orders them (the keel CAS still guards correctness; this
+        // also orders the git side). No deadlock: it is the outermost lock, acquired only here and
+        // released at end of scope, and no store lock is held while awaiting it.
+        let land_lock = app.repos.land_lock(tenant, repo, &default_branch);
+        let _land_guard = land_lock.lock().await;
         // CAS-advance with bounded retry: a concurrent land moves the branch, so we re-read the base
         // and re-plan (and re-verify the fresh merged tree) rather than clobber the other land.
         for _ in 0..8 {
