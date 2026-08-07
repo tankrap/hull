@@ -25,11 +25,24 @@ struct MemoEntry {
     summary: String,
 }
 
-/// The content-addressed CI memo: tree id → verdict, persisted to JSON so it survives restarts.
-/// Errored runs are never memoized (they are not a verdict about the tree).
+/// The content-addressed CI memo: `(tenant, tree id)` → verdict, persisted to JSON so it survives
+/// restarts. Errored runs are never memoized (they are not a verdict about the tree).
+///
+/// **The tenant is part of the key.** Content-addressing holds WITHIN a tenant — an identical tree
+/// re-run by the same tenant is an instant hit — but a byte-identical tree in a *different* tenant
+/// does NOT inherit the first tenant's verdict. Keying by tree alone was cross-tenant poisoning:
+/// tenant B would serve tenant A's cached green/red, and A could pre-seed a green for a tree B will
+/// build. Namespacing by tenant closes that.
 pub struct CiMemo {
     path: PathBuf,
     map: Mutex<HashMap<String, MemoEntry>>,
+}
+
+/// The persisted map key: the tenant namespace joined to the content-addressed tree id by an ASCII
+/// unit separator (which never appears in an org handle or a hex tree id), so two tenants can never
+/// collide on the same tree.
+fn memo_key(tenant: &str, tree: &str) -> String {
+    format!("{tenant}\u{1f}{tree}")
 }
 
 impl CiMemo {
@@ -43,21 +56,21 @@ impl CiMemo {
         CiMemo { path, map: Mutex::new(map) }
     }
 
-    fn get(&self, tree: &str) -> Option<MemoEntry> {
-        self.map.lock().unwrap().get(tree).cloned()
+    fn get(&self, tenant: &str, tree: &str) -> Option<MemoEntry> {
+        self.map.lock().unwrap().get(&memo_key(tenant, tree)).cloned()
     }
 
-    /// The memoized verdict for a tree, as a [`CiOutcome`] (with `memoized: true`), if any.
-    pub fn get_memoized(&self, tree: &str) -> Option<CiOutcome> {
-        self.get(tree).map(|hit| {
+    /// The memoized verdict for a tenant's tree, as a [`CiOutcome`] (with `memoized: true`), if any.
+    pub fn get_memoized(&self, tenant: &str, tree: &str) -> Option<CiOutcome> {
+        self.get(tenant, tree).map(|hit| {
             let status = status_from_str(&hit.status);
             CiOutcome { status, summary: hit.summary, memoized: true }
         })
     }
 
-    fn put(&self, tree: &str, entry: MemoEntry) {
+    fn put(&self, tenant: &str, tree: &str, entry: MemoEntry) {
         let mut m = self.map.lock().unwrap();
-        m.insert(tree.to_string(), entry);
+        m.insert(memo_key(tenant, tree), entry);
         crate::jsonstore::persist_json_atomic(&self.path, &*m);
     }
 }
@@ -100,9 +113,9 @@ pub fn run_check(
         return CiOutcome { status: CiStatus::Errored, summary: "unknown change".into(), memoized: false };
     };
 
-    // Content-addressed memo hit: an identical tree has already been judged.
+    // Content-addressed memo hit: an identical tree THIS tenant already judged.
     if !force {
-        if let Some(hit) = memo.get(&tree) {
+        if let Some(hit) = memo.get(tenant, &tree) {
             let status = status_from_str(&hit.status);
             apply_verification(repos, tenant, repo, change, status);
             return CiOutcome { status, summary: hit.summary, memoized: true };
@@ -125,7 +138,7 @@ pub fn run_check(
 
     // Memoize only real verdicts (green/red), and reflect them in keel verification.
     if matches!(outcome.status, CiStatus::Green | CiStatus::Red) {
-        memo.put(&tree, MemoEntry { status: status_str(outcome.status).into(), summary: outcome.summary.clone() });
+        memo.put(tenant, &tree, MemoEntry { status: status_str(outcome.status).into(), summary: outcome.summary.clone() });
         apply_verification(repos, tenant, repo, change, outcome.status);
     }
     outcome
@@ -135,7 +148,7 @@ pub fn run_check(
 /// write. This is how the independence check runs its composed tree (new code + pre-existing tests).
 /// Memoized by tree id like any other run, so an identical composed tree is judged once.
 pub fn run_check_tree(repos: &RepoHost, registry: &Registry, memo: &CiMemo, tenant: &str, repo: &str, tree: &str) -> CiOutcome {
-    if let Some(hit) = memo.get(tree) {
+    if let Some(hit) = memo.get(tenant, tree) {
         let status = status_from_str(&hit.status);
         return CiOutcome { status, summary: hit.summary, memoized: true };
     }
@@ -149,7 +162,7 @@ pub fn run_check_tree(repos: &RepoHost, registry: &Registry, memo: &CiMemo, tena
     let outcome = registry.run_ci(&req);
     let _ = std::fs::remove_dir_all(&dir);
     if matches!(outcome.status, CiStatus::Green | CiStatus::Red) {
-        memo.put(tree, MemoEntry { status: status_str(outcome.status).into(), summary: outcome.summary.clone() });
+        memo.put(tenant, tree, MemoEntry { status: status_str(outcome.status).into(), summary: outcome.summary.clone() });
     }
     outcome
 }
@@ -283,7 +296,7 @@ pub fn finalize(repos: &RepoHost, memo: &CiMemo, config: &CiConfig, tenant: &str
     let st = status_from_str(status);
     if let Some(tree) = repos.change_tree(tenant, repo, change) {
         if matches!(st, CiStatus::Green | CiStatus::Red) {
-            memo.put(&tree, MemoEntry { status: status_str(st).into(), summary: summary.to_string() });
+            memo.put(tenant, &tree, MemoEntry { status: status_str(st).into(), summary: summary.to_string() });
             apply_verification(repos, tenant, repo, change, st);
         }
         config.clear_inflight(&tree);
@@ -311,19 +324,38 @@ mod tests {
     fn memo_round_trips_green_and_red_by_tree() {
         let memo = memo_at("rt");
         // Unknown tree ⇒ nothing memoized ⇒ must re-run.
-        assert!(memo.get_memoized("tree-x").is_none());
+        assert!(memo.get_memoized("acme", "tree-x").is_none());
 
-        memo.put("tree-green", MemoEntry { status: "green".into(), summary: "ok".into() });
-        memo.put("tree-red", MemoEntry { status: "red".into(), summary: "boom".into() });
+        memo.put("acme", "tree-green", MemoEntry { status: "green".into(), summary: "ok".into() });
+        memo.put("acme", "tree-red", MemoEntry { status: "red".into(), summary: "boom".into() });
 
-        let g = memo.get_memoized("tree-green").expect("green memoized");
+        let g = memo.get_memoized("acme", "tree-green").expect("green memoized");
         assert!(matches!(g.status, CiStatus::Green));
         assert_eq!(g.summary, "ok");
         assert!(g.memoized, "a served verdict is flagged memoized");
 
-        let r = memo.get_memoized("tree-red").expect("red memoized");
+        let r = memo.get_memoized("acme", "tree-red").expect("red memoized");
         assert!(matches!(r.status, CiStatus::Red));
         assert!(r.memoized);
+    }
+
+    #[test]
+    fn memo_is_namespaced_by_tenant_no_cross_tenant_bleed() {
+        let memo = memo_at("tenant-ns");
+        // Tenant A memoizes a green for a specific tree id.
+        memo.put("tenant-a", "tree-shared", MemoEntry { status: "green".into(), summary: "A's run".into() });
+
+        // A byte-identical tree id under a DIFFERENT tenant must NOT inherit A's verdict — otherwise A
+        // could pre-seed a green for a tree B will build (or leak B's red). B sees a miss and re-runs.
+        assert!(memo.get_memoized("tenant-b", "tree-shared").is_none(), "tenant B must not inherit tenant A's verdict");
+
+        // Content-addressing still holds WITHIN a tenant: A hits its own memo.
+        assert!(matches!(memo.get_memoized("tenant-a", "tree-shared").map(|o| o.status), Some(CiStatus::Green)));
+
+        // B can hold its OWN independent verdict for the same tree id without disturbing A's.
+        memo.put("tenant-b", "tree-shared", MemoEntry { status: "red".into(), summary: "B's run".into() });
+        assert!(matches!(memo.get_memoized("tenant-b", "tree-shared").map(|o| o.status), Some(CiStatus::Red)));
+        assert!(matches!(memo.get_memoized("tenant-a", "tree-shared").map(|o| o.status), Some(CiStatus::Green)), "A's verdict is unchanged");
     }
 
     #[test]
@@ -342,13 +374,13 @@ mod tests {
         // re-runs next time; verification is left untouched.
         let st = finalize(&repos, &memo, &config, "t", "r", &change, "errored", "flaky infra");
         assert!(matches!(st, CiStatus::Errored));
-        assert!(memo.get_memoized(&tree).is_none(), "errored must not be memoized");
+        assert!(memo.get_memoized("t", &tree).is_none(), "errored must not be memoized");
         assert_eq!(repos.verification("t", "r", &change).as_deref(), Some("unverified"), "errored writes no verification");
 
         // A green verdict, by contrast, IS memoized and reflected in keel verification.
         let st2 = finalize(&repos, &memo, &config, "t", "r", &change, "green", "all pass");
         assert!(matches!(st2, CiStatus::Green));
-        assert!(matches!(memo.get_memoized(&tree).map(|o| o.status), Some(CiStatus::Green)), "green is memoized by tree");
+        assert!(matches!(memo.get_memoized("t", &tree).map(|o| o.status), Some(CiStatus::Green)), "green is memoized by tree");
         assert_eq!(repos.verification("t", "r", &change).as_deref(), Some("green"));
 
         let _ = std::fs::remove_dir_all(&tmp);
