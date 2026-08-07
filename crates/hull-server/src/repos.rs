@@ -1812,6 +1812,35 @@ impl RepoHost {
         let _ = std::fs::remove_dir_all(&dir);
         id.to_hex()
     }
+
+    /// Test-only: like [`Self::test_commit`] but does NOT move `main` — commits a change parented on
+    /// `parent` and leaves the branch where it is. Used by the protected-branch merge tests to build a
+    /// PR head that sits OFF the default branch (so a real land has something to fast-forward/advance).
+    pub(crate) fn test_change(&self, tenant: &str, repo: &str, parent: Option<&str>, files: &[(&str, &str)]) -> String {
+        let store = self.store(tenant, repo, true).unwrap().unwrap();
+        let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("hull-testchange-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (p, c) in files {
+            let fp = dir.join(p);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, c).unwrap();
+        }
+        let tree = keel_store::snapshot::snapshot_uncached(&store, &dir).unwrap();
+        let parents: Vec<ObjectId> = parent.and_then(ObjectId::from_hex).into_iter().collect();
+        let change = keel_store::Change {
+            parents,
+            tree,
+            session: None,
+            intent: "child".into(),
+            author: "tester".into(),
+            timestamp: 0,
+            verification: keel_store::Verification::Unverified,
+        };
+        let id = store.put(&Object::Change(change)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        id.to_hex()
+    }
 }
 
 #[cfg(test)]
@@ -1924,6 +1953,240 @@ mod tests {
         assert_eq!(b.behavioral, vec!["a.rs".to_string()]);
         assert!(b.whitespace_only.is_empty());
         assert!(!b.mechanical, "a real content edit is behavioral");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── branch-protection: receive-pack command parser ──────────────────────────────────────────
+
+    // Frame a git pkt-line (4-hex length prefix covering the 4 bytes + payload).
+    fn pkt(line: &str) -> Vec<u8> {
+        let mut v = format!("{:04x}", line.len() + 4).into_bytes();
+        v.extend_from_slice(line.as_bytes());
+        v
+    }
+    const ZERO: &str = "0000000000000000000000000000000000000000";
+
+    #[test]
+    fn parse_receive_commands_reads_the_command_section() {
+        let new = "1111111111111111111111111111111111111111";
+        let old = "2222222222222222222222222222222222222222";
+        // First command carries `\0capabilities`; a flush ends the list, then the PACK follows.
+        let mut body = Vec::new();
+        body.extend(pkt(&format!("{old} {new} refs/heads/main\0report-status side-band-64k\n")));
+        body.extend(pkt(&format!("{ZERO} {new} refs/heads/feature\n")));
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(b"PACK\x00\x00garbagepackdata"); // never decoded
+        let cmds = parse_receive_commands(&body);
+        assert_eq!(cmds.len(), 2, "both commands parsed, PACK ignored");
+        assert_eq!(cmds[0], PushCommand { old: old.into(), new: new.into(), refname: "refs/heads/main".into() });
+        assert_eq!(cmds[1], PushCommand { old: ZERO.into(), new: new.into(), refname: "refs/heads/feature".into() });
+    }
+
+    #[test]
+    fn updates_protected_detects_update_but_exempts_creation_and_other_refs() {
+        let new = "1111111111111111111111111111111111111111";
+        let old = "2222222222222222222222222222222222222222";
+        let up_main = PushCommand { old: old.into(), new: new.into(), refname: "refs/heads/main".into() };
+        let create_main = PushCommand { old: ZERO.into(), new: new.into(), refname: "refs/heads/main".into() };
+        let delete_main = PushCommand { old: old.into(), new: ZERO.into(), refname: "refs/heads/main".into() };
+        let other = PushCommand { old: old.into(), new: new.into(), refname: "refs/heads/feature".into() };
+        // Update (fast-forward or force) to the protected branch is caught.
+        assert!(updates_protected(std::slice::from_ref(&up_main), "main"));
+        // Deleting the protected branch is an update (non-zero old) → caught.
+        assert!(updates_protected(std::slice::from_ref(&delete_main), "main"));
+        // Ref CREATION (old = zeros) is exempt so a fresh repo can initialize `main`.
+        assert!(!updates_protected(std::slice::from_ref(&create_main), "main"));
+        // A push touching only other branches is fine.
+        assert!(!updates_protected(std::slice::from_ref(&other), "main"));
+        // A multi-command push that includes an update to main is caught.
+        assert!(updates_protected(&[other.clone(), up_main.clone()], "main"));
+        // No commands at all → nothing protected.
+        assert!(!updates_protected(&[], "main"));
+    }
+
+    // ── branch-protection: 3-way merge synthesis ─────────────────────────────────────────────────
+
+    // Flatten a merged tree id to a `path -> contents` map for assertions.
+    fn tree_contents(store: &Store, tree_hex: &str) -> std::collections::BTreeMap<String, String> {
+        let tid = ObjectId::from_hex(tree_hex).unwrap();
+        let mut flat = HashMap::new();
+        flatten_tree(store, tid, "", &mut flat, 0);
+        flat.into_iter()
+            .map(|(p, id)| {
+                let content = match store.get(&id) {
+                    Ok(Some(Object::Blob(b))) => String::from_utf8_lossy(&b).into_owned(),
+                    _ => String::new(),
+                };
+                (p, content)
+            })
+            .collect()
+    }
+
+    // A repo host with a base→head fast-forward chain and a divergent (3-way) pair off a shared base.
+    fn merge_host(tag: &str) -> (std::path::PathBuf, RepoHost) {
+        let tmp = std::env::temp_dir().join(format!("hull-merge-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("t/r/.keel/store")).unwrap();
+        let host = RepoHost::new(&tmp);
+        (tmp, host)
+    }
+
+    #[test]
+    fn plan_merge_fast_forwards_when_base_is_ancestor_of_head() {
+        let (tmp, host) = merge_host("ff");
+        let (base_hex, head_hex, head_tree_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let base = commit(&store, vec![], tree_from(&store, &tmp, "b", &[("a.txt", "1\n")]));
+            let head = commit(&store, vec![base], tree_from(&store, &tmp, "h", &[("a.txt", "1\n"), ("b.txt", "2\n")]));
+            let head_tree = match store.get(&head).unwrap().unwrap() {
+                Object::Change(c) => c.tree.to_hex(),
+                _ => unreachable!(),
+            };
+            (base.to_hex(), head.to_hex(), head_tree)
+        };
+        match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Ok(MergeOutcome::Tree(t)) => assert_eq!(t, head_tree_hex, "a fast-forward's merged tree IS the head's tree"),
+            _ => panic!("expected a fast-forward Tree outcome"),
+        }
+        // Symmetric: head already contained in base ⇒ nothing to land.
+        match host.plan_merge("t", "r", "main", Some(&head_hex), &base_hex) {
+            Ok(MergeOutcome::AlreadyMerged) => {}
+            _ => panic!("expected AlreadyMerged when head is an ancestor of base"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn three_way_merges_disjoint_edits() {
+        let (tmp, host) = merge_host("disjoint");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            // ancestor: a=1, b=1. base edits a; head edits b (disjoint).
+            let mb = commit(&store, vec![], tree_from(&store, &tmp, "mb", &[("a.txt", "1\n"), ("b.txt", "1\n")]));
+            let base = commit(&store, vec![mb], tree_from(&store, &tmp, "base", &[("a.txt", "2\n"), ("b.txt", "1\n")]));
+            let head = commit(&store, vec![mb], tree_from(&store, &tmp, "head", &[("a.txt", "1\n"), ("b.txt", "2\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        let tree_hex = match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Ok(MergeOutcome::Tree(t)) => t,
+            other => panic!("expected a synthesized 3-way Tree, got {}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
+        };
+        let store = host.store("t", "r", false).unwrap().unwrap();
+        let c = tree_contents(&store, &tree_hex);
+        assert_eq!(c.get("a.txt").map(String::as_str), Some("2\n"), "base's edit to a survives");
+        assert_eq!(c.get("b.txt").map(String::as_str), Some("2\n"), "head's edit to b survives");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn three_way_conflicts_on_same_file_different_edits() {
+        let (tmp, host) = merge_host("conflict");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let mb = commit(&store, vec![], tree_from(&store, &tmp, "mb", &[("a.txt", "1\n")]));
+            let base = commit(&store, vec![mb], tree_from(&store, &tmp, "base", &[("a.txt", "2\n")]));
+            let head = commit(&store, vec![mb], tree_from(&store, &tmp, "head", &[("a.txt", "3\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Err(MergeError::Conflict(m)) => assert!(m.contains("a.txt") && m.contains("CONFLICT"), "message names the path: {m}"),
+            _ => panic!("expected a conflict on divergent edits to the same file"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn three_way_conflicts_on_add_add() {
+        let (tmp, host) = merge_host("addadd");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let mb = commit(&store, vec![], tree_from(&store, &tmp, "mb", &[("keep.txt", "x\n")]));
+            let base = commit(&store, vec![mb], tree_from(&store, &tmp, "base", &[("keep.txt", "x\n"), ("new.txt", "A\n")]));
+            let head = commit(&store, vec![mb], tree_from(&store, &tmp, "head", &[("keep.txt", "x\n"), ("new.txt", "B\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Err(MergeError::Conflict(m)) => assert!(m.contains("new.txt"), "add/add differing is a conflict: {m}"),
+            _ => panic!("expected an add/add conflict"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn three_way_conflicts_on_delete_vs_modify() {
+        let (tmp, host) = merge_host("delmod");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let mb = commit(&store, vec![], tree_from(&store, &tmp, "mb", &[("a.txt", "1\n"), ("k.txt", "0\n")]));
+            // base deletes a.txt; head modifies it.
+            let base = commit(&store, vec![mb], tree_from(&store, &tmp, "base", &[("k.txt", "0\n")]));
+            let head = commit(&store, vec![mb], tree_from(&store, &tmp, "head", &[("a.txt", "2\n"), ("k.txt", "0\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Err(MergeError::Conflict(m)) => assert!(m.contains("a.txt"), "delete-vs-modify is a conflict: {m}"),
+            _ => panic!("expected a delete/modify conflict"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn three_way_takes_one_sided_edits_and_deletes_cleanly() {
+        // ancestor: a,b,c. base edits a and deletes b; head adds d (all disjoint from base) → clean.
+        let (tmp, host) = merge_host("onesided");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let mb = commit(&store, vec![], tree_from(&store, &tmp, "mb", &[("a.txt", "1\n"), ("b.txt", "1\n"), ("c.txt", "1\n")]));
+            let base = commit(&store, vec![mb], tree_from(&store, &tmp, "base", &[("a.txt", "2\n"), ("c.txt", "1\n")]));
+            let head = commit(&store, vec![mb], tree_from(&store, &tmp, "head", &[("a.txt", "1\n"), ("b.txt", "1\n"), ("c.txt", "1\n"), ("d.txt", "9\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        let tree_hex = match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Ok(MergeOutcome::Tree(t)) => t,
+            _ => panic!("expected a clean 3-way merge"),
+        };
+        let store = host.store("t", "r", false).unwrap().unwrap();
+        let c = tree_contents(&store, &tree_hex);
+        assert_eq!(c.get("a.txt").map(String::as_str), Some("2\n"), "base's edit to a wins (head unchanged there)");
+        assert!(!c.contains_key("b.txt"), "base's delete of b is honored (head unchanged there)");
+        assert_eq!(c.get("d.txt").map(String::as_str), Some("9\n"), "head's added d is taken");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn land_merge_advances_branch_by_cas_and_conflicts_on_stale_base() {
+        let (tmp, host) = merge_host("land");
+        let (base_hex, head_hex, merged_tree_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let base = commit(&store, vec![], tree_from(&store, &tmp, "base", &[("a.txt", "1\n")]));
+            store.set_ref("main", &base).unwrap();
+            let head = commit(&store, vec![base], tree_from(&store, &tmp, "head", &[("a.txt", "1\n"), ("b.txt", "2\n")]));
+            let head_tree = match store.get(&head).unwrap().unwrap() {
+                Object::Change(c) => c.tree.to_hex(),
+                _ => unreachable!(),
+            };
+            (base.to_hex(), head.to_hex(), head_tree)
+        };
+        // Landing from the correct base advances main to a two-parent merge change.
+        let landed = host
+            .land_merge("t", "r", "main", Some(&base_hex), &head_hex, &merged_tree_hex, "Merge PR !1", "alice", 0)
+            .expect("land ok");
+        let landed = landed.expect("committed");
+        let store = host.store("t", "r", false).unwrap().unwrap();
+        assert_eq!(store.get_ref("main").unwrap().unwrap().to_hex(), landed, "main advanced to the merge change");
+        match store.get(&ObjectId::from_hex(&landed).unwrap()).unwrap().unwrap() {
+            Object::Change(c) => {
+                assert_eq!(c.parents.len(), 2, "a merge change has two parents");
+                assert_eq!(c.parents[0].to_hex(), base_hex);
+                assert_eq!(c.parents[1].to_hex(), head_hex);
+            }
+            _ => panic!("landed object is not a change"),
+        }
+        // A second land from the now-STALE base is a CAS miss → None (caller re-plans + retries).
+        let stale = host
+            .land_merge("t", "r", "main", Some(&base_hex), &head_hex, &merged_tree_hex, "Merge PR !1 again", "alice", 0)
+            .expect("land ok");
+        assert!(stale.is_none(), "a stale-base land is rejected by CAS, not clobbered");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
