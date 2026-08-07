@@ -264,7 +264,7 @@ isolation (a network namespace or egress proxy) is a deferred follow-up incremen
 | `HULL_CI_SANDBOX`  | `off` disables the sandbox (raw, unconfined runner) — for debugging.     | on (unix) |
 | `HULL_CI_MEM_MB`   | `RLIMIT_AS` address-space cap, MiB. Raise for memory-hungry builds.      | `4096` |
 | `HULL_CI_CPU_SECS` | `RLIMIT_CPU` cap, seconds.                                               | `HULL_CI_TIMEOUT` (`600`) |
-| `HULL_CI_NPROC`    | `RLIMIT_NPROC` cap (max processes for the runtime uid — caps fork bombs).| `512` |
+| `HULL_CI_NPROC`    | `RLIMIT_NPROC` cap (max tasks for the runtime uid — caps fork bombs).    | `2048` |
 | `HULL_CI_FSIZE_MB` | `RLIMIT_FSIZE` cap, MiB (max size of a single written file).             | `2048` |
 
 > If a legitimate build breaks under the sandbox, first raise the relevant `HULL_CI_*` cap; the

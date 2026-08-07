@@ -106,7 +106,11 @@ mod unix {
     /// Default caps (MiB / seconds). Builds are hungry, so memory is generous; CPU is aligned to the
     /// wall-clock timeout. All overridable via `HULL_CI_*`.
     const DEFAULT_MEM_MB: u64 = 4096;
-    const DEFAULT_NPROC: u64 = 512;
+    // RLIMIT_NPROC counts ALL of the runtime uid's tasks host-wide (the server's own threads +
+    // sibling processes + the build's parallel `rustc`/`cc`), checked at each fork. A tight cap
+    // breaks a legitimate parallel build (fork → EAGAIN), so the default is generous while still
+    // bounding a fork bomb. Tune down on a dedicated single-tenant uid.
+    const DEFAULT_NPROC: u64 = 2048;
     const DEFAULT_FSIZE_MB: u64 = 2048;
     const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
