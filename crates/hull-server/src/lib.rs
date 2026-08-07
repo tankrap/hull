@@ -3594,8 +3594,8 @@ async fn receive_pack_handler(
     let key = format!("{tenant}/{repo}");
     if app.repo_settings.get(&key).protects_default_branch() {
         let default_branch = find_repo(&app, &tenant, &repo).await.map(|r| r.default_branch).unwrap_or_else(|| "main".into());
-        let commands = repos::parse_receive_commands(&repos::maybe_gunzip(&headers, body.to_vec()));
-        if repos::updates_protected(&commands, &default_branch) {
+        let commands = repos::parse_receive_refs(&repos::maybe_gunzip(&headers, body.to_vec()));
+        if repos::touches_protected(&commands, &default_branch) {
             return protected_push_rejection(&default_branch);
         }
     }

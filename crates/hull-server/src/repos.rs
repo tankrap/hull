@@ -1726,59 +1726,49 @@ pub(crate) fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>) -> Vec<u8> {
     }
 }
 
-/// One ref-update command from a git receive-pack request: advance `refname` from `old` to `new`
-/// (both 40-hex SHA-1). `old` = 40 zeros ⇒ ref **creation**; `new` = 40 zeros ⇒ ref **deletion**.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PushCommand {
-    pub old: String,
-    pub new: String,
-    pub refname: String,
-}
-
-/// Parse the **command section** of a (gunzipped) git-receive-pack request body — the leading
-/// pkt-lines `<old-oid> SP <new-oid> SP <refname>`, the first of which carries `\0<capabilities>`,
-/// terminated by the `0000` flush-pkt that precedes the PACK data. Only the commands are parsed; the
-/// packfile is never decoded. A pkt-line = a 4-hex length prefix (covering the 4 bytes) + payload.
-pub(crate) fn parse_receive_commands(body: &[u8]) -> Vec<PushCommand> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i + 4 <= body.len() {
-        let Ok(len_hex) = std::str::from_utf8(&body[i..i + 4]) else { break };
-        let Ok(len) = usize::from_str_radix(len_hex, 16) else { break };
-        if len == 0 {
-            break; // flush-pkt: end of the command list, the PACK follows
-        }
-        if len < 4 || i + len > body.len() {
-            break; // malformed length — stop rather than misread the packfile
-        }
-        let data = &body[i + 4..i + len];
-        i += len;
-        // Strip a trailing LF, then drop the `\0<capabilities>` tail present on the first command.
-        let data = data.strip_suffix(b"\n").unwrap_or(data);
-        let line = match data.iter().position(|&b| b == 0) {
-            Some(p) => &data[..p],
-            None => data,
-        };
-        let Ok(s) = std::str::from_utf8(line) else { continue };
-        let mut parts = s.splitn(3, ' ');
-        if let (Some(old), Some(new), Some(refname)) = (parts.next(), parts.next(), parts.next()) {
-            // Real oids are 40 hex chars; guard so a stray pkt-line can't masquerade as a command.
-            if old.len() == 40 && new.len() == 40 && !refname.is_empty() {
-                out.push(PushCommand { old: old.to_string(), new: new.to_string(), refname: refname.to_string() });
+/// Parse the **command section** of a (gunzipped) git-receive-pack request body into the
+/// `(new-oid, refname)` pairs it will apply — using the **exact same reader and tokenization** that
+/// keel-git's `smart_http::receive_pack` uses to actually move refs (`pktline::read_at` +
+/// `split_whitespace`, capabilities dropped after the first `\0`). Sharing the one parser is the
+/// point: hull's recognized command set is then *provably identical* to what keel-git applies, so a
+/// double-space, a tab, a trailing token, or a `0001` delimiter can't make hull's view of "which refs
+/// this push touches" diverge from what really gets written. Mirrors `smart_http.rs:118-132`.
+///
+/// The `new-oid` is retained only for parity with keel-git's `commands` shape; the protection
+/// predicate ([`touches_protected`]) judges by refname alone (see its doc).
+pub(crate) fn parse_receive_refs(body: &[u8]) -> Vec<(String, String)> {
+    use keel_git::pktline::{read_at, Pkt};
+    let mut out = Vec::new(); // (new-oid, refname)
+    let mut pos = 0;
+    while let Some(pkt) = read_at(body, &mut pos) {
+        match pkt {
+            Pkt::Flush => break,
+            Pkt::Line(line) => {
+                let line = line.split(|&b| b == 0).next().unwrap_or(line); // drop caps after NUL
+                let s = String::from_utf8_lossy(line);
+                let mut it = s.split_whitespace();
+                if let (Some(_old), Some(new), Some(r)) = (it.next(), it.next(), it.next()) {
+                    out.push((new.to_string(), r.to_string()));
+                }
             }
+            Pkt::Delim => {}
         }
     }
     out
 }
 
-/// Does any command **update** the protected default branch (`refs/heads/<default_branch>`)? An update
-/// is any command whose old-oid is non-zero — so ref **creation** (old = 40 zeros, e.g. initializing a
-/// fresh repo) is EXEMPT, while a fast-forward, force-update, or deletion of the protected branch is
-/// caught.
-pub(crate) fn updates_protected(commands: &[PushCommand], default_branch: &str) -> bool {
+/// Does any command **touch** the protected default branch (`refs/heads/<default_branch>`)? On a
+/// protected repo we reject the push if any recorded command's refname equals the protected ref,
+/// **regardless of old/new** — an overwrite (even one the client dresses up with a zeroed `old`), a
+/// deletion (`new` = zeros), and a normal update are all caught. We deliberately do NOT exempt
+/// "creation" based on the client-supplied `old`: on a protected repo the branch already exists
+/// (protection is opt-in, enabled after the repo is created), and the only sanctioned way to advance
+/// it is the server-side merge queue (`perform_merge` → `set_ref`), which never goes through
+/// receive-pack. keel-git applies refs with no old-value check, so trusting the client's `old` was
+/// exactly the zeroed-old bypass — judging by refname closes it.
+pub(crate) fn touches_protected(commands: &[(String, String)], default_branch: &str) -> bool {
     let target = format!("refs/heads/{default_branch}");
-    let zero = "0".repeat(40);
-    commands.iter().any(|c| c.refname == target && c.old != zero)
+    commands.iter().any(|(_new, refname)| *refname == target)
 }
 
 #[cfg(test)]
@@ -1966,42 +1956,101 @@ mod tests {
     }
     const ZERO: &str = "0000000000000000000000000000000000000000";
 
-    #[test]
-    fn parse_receive_commands_reads_the_command_section() {
-        let new = "1111111111111111111111111111111111111111";
-        let old = "2222222222222222222222222222222222222222";
-        // First command carries `\0capabilities`; a flush ends the list, then the PACK follows.
+    const NEW: &str = "1111111111111111111111111111111111111111";
+    const OLD: &str = "2222222222222222222222222222222222222222";
+
+    // Is this raw receive-pack body rejected against a `main`-protected repo? (Mirrors the lib.rs gate:
+    // parse the refs with the shared parser, then apply the protection predicate.)
+    fn rejected(body: &[u8]) -> bool {
+        touches_protected(&parse_receive_refs(body), "main")
+    }
+
+    // The command section of a well-formed receive-pack request: `cmd` pkt-lines (first carrying
+    // `\0caps`), a flush, then a never-decoded PACK. `raw_prefix` lets a test splice bytes (e.g. a
+    // `0001` delim) ahead of the commands.
+    fn recv_body(cmds: &[&str]) -> Vec<u8> {
         let mut body = Vec::new();
-        body.extend(pkt(&format!("{old} {new} refs/heads/main\0report-status side-band-64k\n")));
-        body.extend(pkt(&format!("{ZERO} {new} refs/heads/feature\n")));
+        for (i, c) in cmds.iter().enumerate() {
+            let line = if i == 0 { format!("{c}\0report-status side-band-64k\n") } else { format!("{c}\n") };
+            body.extend(pkt(&line));
+        }
         body.extend_from_slice(b"0000");
-        body.extend_from_slice(b"PACK\x00\x00garbagepackdata"); // never decoded
-        let cmds = parse_receive_commands(&body);
-        assert_eq!(cmds.len(), 2, "both commands parsed, PACK ignored");
-        assert_eq!(cmds[0], PushCommand { old: old.into(), new: new.into(), refname: "refs/heads/main".into() });
-        assert_eq!(cmds[1], PushCommand { old: ZERO.into(), new: new.into(), refname: "refs/heads/feature".into() });
+        body.extend_from_slice(b"PACK\x00\x00garbagepackdata");
+        body
     }
 
     #[test]
-    fn updates_protected_detects_update_but_exempts_creation_and_other_refs() {
-        let new = "1111111111111111111111111111111111111111";
-        let old = "2222222222222222222222222222222222222222";
-        let up_main = PushCommand { old: old.into(), new: new.into(), refname: "refs/heads/main".into() };
-        let create_main = PushCommand { old: ZERO.into(), new: new.into(), refname: "refs/heads/main".into() };
-        let delete_main = PushCommand { old: old.into(), new: ZERO.into(), refname: "refs/heads/main".into() };
-        let other = PushCommand { old: old.into(), new: new.into(), refname: "refs/heads/feature".into() };
-        // Update (fast-forward or force) to the protected branch is caught.
-        assert!(updates_protected(std::slice::from_ref(&up_main), "main"));
-        // Deleting the protected branch is an update (non-zero old) → caught.
-        assert!(updates_protected(std::slice::from_ref(&delete_main), "main"));
-        // Ref CREATION (old = zeros) is exempt so a fresh repo can initialize `main`.
-        assert!(!updates_protected(std::slice::from_ref(&create_main), "main"));
-        // A push touching only other branches is fine.
-        assert!(!updates_protected(std::slice::from_ref(&other), "main"));
-        // A multi-command push that includes an update to main is caught.
-        assert!(updates_protected(&[other.clone(), up_main.clone()], "main"));
+    fn parse_receive_refs_reads_the_command_section() {
+        let body = recv_body(&[&format!("{OLD} {NEW} refs/heads/main"), &format!("{ZERO} {NEW} refs/heads/feature")]);
+        let cmds = parse_receive_refs(&body);
+        assert_eq!(cmds.len(), 2, "both commands parsed, PACK ignored");
+        assert_eq!(cmds[0], (NEW.to_string(), "refs/heads/main".to_string()));
+        assert_eq!(cmds[1], (NEW.to_string(), "refs/heads/feature".to_string()));
+    }
+
+    // Parity: the recognizer mirrors keel-git's — it uses the SAME `pktline::read_at` reader and the
+    // SAME `split_whitespace` tokenization, keeping caps after the first NUL. So the (new, ref) pairs
+    // hull records are exactly the pairs keel-git's `receive_pack` would apply. This test documents
+    // that by reproducing keel-git's loop inline and asserting byte-for-byte agreement.
+    #[test]
+    fn parse_receive_refs_mirrors_keel_git_tokenization() {
+        let body = recv_body(&[
+            &format!("{OLD}  {NEW} refs/heads/main"), // double space
+            &format!("{OLD}\t{NEW} refs/heads/feature"), // tab
+            &format!("{ZERO} {NEW} refs/heads/x y"), // trailing token
+        ]);
+        // keel-git's exact loop (smart_http.rs:118-132).
+        let mut expected: Vec<(String, String)> = Vec::new();
+        let mut pos = 0;
+        while let Some(pkt) = keel_git::pktline::read_at(&body, &mut pos) {
+            match pkt {
+                keel_git::pktline::Pkt::Flush => break,
+                keel_git::pktline::Pkt::Line(line) => {
+                    let line = line.split(|&b| b == 0).next().unwrap_or(line);
+                    let s = String::from_utf8_lossy(line);
+                    let mut it = s.split_whitespace();
+                    if let (Some(_o), Some(n), Some(r)) = (it.next(), it.next(), it.next()) {
+                        expected.push((n.to_string(), r.to_string()));
+                    }
+                }
+                keel_git::pktline::Pkt::Delim => {}
+            }
+        }
+        assert_eq!(parse_receive_refs(&body), expected, "hull's recognizer must match keel-git's exactly");
+    }
+
+    // Every documented bypass of the old bespoke parser must now be REJECTED on a protected `main`.
+    #[test]
+    fn protected_push_bypasses_are_all_rejected() {
+        // (a) zeroed-old overwrite: client lies that this is a "creation" — keel-git overwrites anyway.
+        assert!(rejected(&recv_body(&[&format!("{ZERO} {NEW} refs/heads/main")])), "zeroed-old overwrite");
+        // (b) delete (new = zeros).
+        assert!(rejected(&recv_body(&[&format!("{OLD} {ZERO} refs/heads/main")])), "delete");
+        // (c) double space between tokens — old splitn(3,' ') dropped it; split_whitespace doesn't.
+        assert!(rejected(&recv_body(&[&format!("{OLD}  {NEW} refs/heads/main")])), "double space");
+        // (d) tab between the oids.
+        assert!(rejected(&recv_body(&[&format!("{OLD}\t{NEW} refs/heads/main")])), "tab");
+        // (e) trailing token after the refname — old `!=` match missed it; 3rd whitespace token catches.
+        assert!(rejected(&recv_body(&[&format!("{OLD} {NEW} refs/heads/main x")])), "trailing token");
+        // (e') trailing space after the refname.
+        assert!(rejected(&recv_body(&[&format!("{OLD} {NEW} refs/heads/main ")])), "trailing space");
+        // (f) a `0001` delim pkt before the real command — old parser `break`d on len<4 and dropped it.
+        let mut delim_body = Vec::new();
+        delim_body.extend_from_slice(b"0001");
+        delim_body.extend(pkt(&format!("{OLD} {NEW} refs/heads/main\0report-status\n")));
+        delim_body.extend_from_slice(b"0000");
+        assert!(rejected(&delim_body), "0001 delim before the command");
+        // (g) a normal well-formed update.
+        assert!(rejected(&recv_body(&[&format!("{OLD} {NEW} refs/heads/main")])), "normal update");
+        // (h) a push touching ONLY a feature branch is NOT rejected.
+        assert!(!rejected(&recv_body(&[&format!("{OLD} {NEW} refs/heads/feature")])), "feature-only push allowed");
+        // And a multi-command push where main hides behind a feature command is still caught.
+        assert!(
+            rejected(&recv_body(&[&format!("{OLD} {NEW} refs/heads/feature"), &format!("{OLD} {NEW} refs/heads/main")])),
+            "main touched alongside a feature branch"
+        );
         // No commands at all → nothing protected.
-        assert!(!updates_protected(&[], "main"));
+        assert!(!rejected(&recv_body(&[])), "empty command section");
     }
 
     // ── branch-protection: 3-way merge synthesis ─────────────────────────────────────────────────
