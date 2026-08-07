@@ -839,6 +839,58 @@ fn flatten_tree(store: &Store, tree: ObjectId, prefix: &str, out: &mut HashMap<S
     }
 }
 
+/// Like [`flatten_tree`] but carries each path's **mode** (`MODE_FILE`/`MODE_EXEC`/`MODE_SYMLINK`)
+/// alongside the blob id. The 3-way merge uses this so a merged executable keeps its `+x` bit and a
+/// merged symlink is re-created as a symlink — a plain blob-id flatten drops the mode and silently
+/// materializes both as ordinary files ("green but wrong").
+fn flatten_tree_modes(store: &Store, tree: ObjectId, prefix: &str, out: &mut HashMap<String, (ObjectId, u32)>, depth: u32) {
+    if depth > 64 {
+        return;
+    }
+    let entries = match store.get(&tree).ok().flatten() {
+        Some(Object::Tree(t)) => t.entries,
+        _ => return,
+    };
+    for e in entries {
+        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        if e.mode == MODE_DIR {
+            flatten_tree_modes(store, e.id, &path, out, depth + 1);
+        } else {
+            out.insert(path, (e.id, e.mode));
+        }
+    }
+}
+
+/// Write a merged tree entry to disk honoring its git mode: a `MODE_SYMLINK` blob is materialized as
+/// a real symlink whose target IS the blob content (git's symlink encoding); a `MODE_EXEC` blob is
+/// written and `chmod +x`'d; everything else is a plain file. Matches how `keel_store::snapshot`
+/// checks out and re-reads modes, so the subsequent `snapshot_uncached` captures the mode exactly.
+fn write_entry(fp: &std::path::Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use keel_store::snapshot::{MODE_EXEC, MODE_SYMLINK};
+    if mode == MODE_SYMLINK {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(bytes), fp);
+        }
+        #[cfg(not(unix))]
+        {
+            return std::fs::write(fp, bytes); // no cheap symlinks — fall back to the target as content
+        }
+    }
+    std::fs::write(fp, bytes)?;
+    if mode == MODE_EXEC {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(fp)?.permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(fp, perm)?;
+        }
+    }
+    Ok(())
+}
+
 impl RepoHost {
     /// Expand the keel change `hex` in a hosted repo: its intent/author and the files it changed vs
     /// its first parent (keel-native — "what does this change touch"). `None` if not found.
@@ -1393,11 +1445,31 @@ impl RepoHost {
             // base ∈ ancestors(head) ⇒ fast-forward: the merged tree IS the head's tree, no synthesis.
             return Ok(Self::pin_merge_tree(&store, head_tree));
         }
-        // 3-way: near common ancestor = first of head's ancestors (BFS/nearest-first) also under base.
-        let mergebase = head_anc
-            .into_iter()
-            .find(|a| base_anc.contains(a))
-            .ok_or_else(|| MergeError::Internal("no common ancestor for 3-way merge".into()))?;
+        // 3-way merge. Pick the merge-base as a true LCA, not just the nearest common ancestor: in a
+        // criss-cross / multi-base history there can be several *incomparable* common ancestors (none an
+        // ancestor of another). Silently picking one produces a clean-but-wrong merge, so we detect that
+        // and REJECT — a single unambiguous base (the common diamond) still auto-merges.
+        let common: Vec<ObjectId> = head_anc.iter().copied().filter(|a| base_anc.contains(a)).collect();
+        if common.is_empty() {
+            return Err(MergeError::Internal("no common ancestor for 3-way merge".into()));
+        }
+        // Reduce to the *maximal* common ancestors (the merge bases): drop any common ancestor that is a
+        // proper ancestor of another common ancestor. What's left are pairwise-incomparable LCAs.
+        let common_set: std::collections::HashSet<ObjectId> = common.iter().copied().collect();
+        let mut non_maximal: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        for &c in &common {
+            for a in Self::ancestors_bfs(&store, c) {
+                if a != c && common_set.contains(&a) {
+                    non_maximal.insert(a);
+                }
+            }
+        }
+        // `common` is BFS-nearest-first, so the surviving bases keep that order (nearest first).
+        let merge_bases: Vec<ObjectId> = common.into_iter().filter(|c| !non_maximal.contains(c)).collect();
+        if merge_bases.len() > 1 {
+            return Err(MergeError::Conflict("CONFLICT: complex history (multiple merge bases); merge manually".into()));
+        }
+        let mergebase = merge_bases[0];
         let base_tree = Self::change_tree_id(&store, base).ok_or_else(|| MergeError::Internal("base change not found".into()))?;
         let mb_tree = Self::change_tree_id(&store, mergebase).ok_or_else(|| MergeError::Internal("merge-base change not found".into()))?;
         let merged = self.synthesize_three_way(&store, branch, mb_tree, base_tree, head_tree)?;
@@ -1410,23 +1482,25 @@ impl RepoHost {
     /// changed the same path to different content (incl. add/add-differing and delete/modify) ⇒
     /// CONFLICT. The merge is applied on top of a base checkout so unchanged files keep their mode.
     fn synthesize_three_way(&self, store: &Store, branch: &str, mb_tree: ObjectId, base_tree: ObjectId, head_tree: ObjectId) -> Result<ObjectId, MergeError> {
+        // Mode-aware: each side maps path → (blob, mode). Comparing the tuple means a change that ONLY
+        // flips the exec bit (or file↔symlink) is a real change and is resolved/materialized as such.
         let mut mb = HashMap::new();
-        flatten_tree(store, mb_tree, "", &mut mb, 0);
+        flatten_tree_modes(store, mb_tree, "", &mut mb, 0);
         let mut ours = HashMap::new();
-        flatten_tree(store, base_tree, "", &mut ours, 0);
+        flatten_tree_modes(store, base_tree, "", &mut ours, 0);
         let mut theirs = HashMap::new();
-        flatten_tree(store, head_tree, "", &mut theirs, 0);
+        flatten_tree_modes(store, head_tree, "", &mut theirs, 0);
         let mut paths: Vec<&String> = ours.keys().chain(theirs.keys()).chain(mb.keys()).collect();
         paths.sort();
         paths.dedup();
-        // Only paths whose resolved blob DIFFERS from `ours` become edits applied on top of the base
-        // checkout — so unchanged files (the vast majority) retain their mode from the checkout.
-        let mut edits: Vec<(String, Option<ObjectId>)> = Vec::new();
+        // Only paths whose resolved (blob, mode) DIFFERS from `ours` become edits applied on top of the
+        // base checkout — so unchanged files (the vast majority) retain their mode from the checkout.
+        let mut edits: Vec<(String, Option<(ObjectId, u32)>)> = Vec::new();
         for p in paths {
             let b = mb.get(p).copied();
             let o = ours.get(p).copied();
             let t = theirs.get(p).copied();
-            let resolved: Option<ObjectId> = if o == t {
+            let resolved: Option<(ObjectId, u32)> = if o == t {
                 o // both sides agree (incl. both-absent)
             } else if o == b {
                 t // ours unchanged from the ancestor ⇒ take theirs (add / modify / delete)
@@ -1442,9 +1516,12 @@ impl RepoHost {
         self.materialize_merge(store, base_tree, &edits)
     }
 
-    /// Materialize a merged tree: check out `base_tree`, apply the resolved edits (write a blob, or
-    /// delete a path), then snapshot. Mirrors [`RepoHost::compose_independence_tree`]'s checkout+patch.
-    fn materialize_merge(&self, store: &Store, base_tree: ObjectId, edits: &[(String, Option<ObjectId>)]) -> Result<ObjectId, MergeError> {
+    /// Materialize a merged tree: check out `base_tree`, apply the resolved edits (write a blob at its
+    /// mode — plain / executable / symlink — or delete a path), then snapshot. Mode-aware so a merged
+    /// `+x` script stays executable and a merged symlink stays a symlink (see [`flatten_tree_modes`]);
+    /// a plain `fs::write` for every edit is exactly what dropped the exec bit and turned symlinks into
+    /// regular files. Mirrors [`RepoHost::compose_independence_tree`]'s checkout+patch.
+    fn materialize_merge(&self, store: &Store, base_tree: ObjectId, edits: &[(String, Option<(ObjectId, u32)>)]) -> Result<ObjectId, MergeError> {
         let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("hull-merge-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1452,10 +1529,10 @@ impl RepoHost {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(MergeError::Internal("checkout of base tree failed".into()));
         }
-        for (path, blob) in edits {
+        for (path, resolved) in edits {
             let fp = dir.join(path);
-            match blob {
-                Some(id) => {
+            match resolved {
+                Some((id, mode)) => {
                     let bytes = match store.get(id) {
                         Ok(Some(Object::Blob(b))) => b,
                         _ => {
@@ -1466,9 +1543,11 @@ impl RepoHost {
                     if let Some(parent) = fp.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if std::fs::write(&fp, &bytes).is_err() {
+                    // Replace any existing entry first so file↔symlink transitions apply cleanly.
+                    let _ = std::fs::remove_file(&fp);
+                    if let Err(e) = write_entry(&fp, &bytes, *mode) {
                         let _ = std::fs::remove_dir_all(&dir);
-                        return Err(MergeError::Internal(format!("write failed for {path}")));
+                        return Err(MergeError::Internal(format!("write failed for {path}: {e}")));
                     }
                 }
                 None => {
@@ -2199,6 +2278,91 @@ mod tests {
         assert_eq!(c.get("a.txt").map(String::as_str), Some("2\n"), "base's edit to a wins (head unchanged there)");
         assert!(!c.contains_key("b.txt"), "base's delete of b is honored (head unchanged there)");
         assert_eq!(c.get("d.txt").map(String::as_str), Some("9\n"), "head's added d is taken");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Flatten a merged tree id to `path -> git mode`.
+    fn tree_modes(store: &Store, tree_hex: &str) -> std::collections::BTreeMap<String, u32> {
+        let tid = ObjectId::from_hex(tree_hex).unwrap();
+        let mut flat = HashMap::new();
+        flatten_tree_modes(store, tid, "", &mut flat, 0);
+        flat.into_iter().map(|(p, (_, m))| (p, m)).collect()
+    }
+
+    // MED 1: a merge that flips the exec bit or introduces a symlink must carry the MODE through — a
+    // plain-`fs::write` materialize dropped +x and turned symlinks into regular files ("green but
+    // wrong"). Unix-only: modes are a no-op on platforms without them.
+    #[cfg(unix)]
+    #[test]
+    fn three_way_preserves_exec_bit_and_symlink_through_merge() {
+        use keel_store::snapshot::{snapshot_uncached, MODE_EXEC, MODE_FILE, MODE_SYMLINK};
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, host) = merge_host("modes");
+        // Write `bytes` to `dir/name` at `mode` (MODE_FILE or MODE_EXEC).
+        let write_mode = |dir: &std::path::Path, name: &str, bytes: &[u8], mode: u32| {
+            let fp = dir.join(name);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, bytes).unwrap();
+            if mode == MODE_EXEC {
+                let mut perm = std::fs::metadata(&fp).unwrap().permissions();
+                perm.set_mode(0o755);
+                std::fs::set_permissions(&fp, perm).unwrap();
+            }
+        };
+        let script = b"#!/bin/sh\necho hi\n";
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            // ancestor: a plain (non-exec) script + a text file.
+            let mb_dir = tmp.join("mb");
+            write_mode(&mb_dir, "script.sh", script, MODE_FILE);
+            write_mode(&mb_dir, "other.txt", b"1\n", MODE_FILE);
+            let mb = commit(&store, vec![], snapshot_uncached(&store, &mb_dir).unwrap());
+            // base (ours): edits other.txt; leaves script.sh plain.
+            let base_dir = tmp.join("base");
+            write_mode(&base_dir, "script.sh", script, MODE_FILE);
+            write_mode(&base_dir, "other.txt", b"2\n", MODE_FILE);
+            let base = commit(&store, vec![mb], snapshot_uncached(&store, &base_dir).unwrap());
+            // head (theirs): same script content but now EXECUTABLE, plus a NEW symlink `link -> other.txt`.
+            let head_dir = tmp.join("head");
+            write_mode(&head_dir, "script.sh", script, MODE_EXEC);
+            write_mode(&head_dir, "other.txt", b"1\n", MODE_FILE);
+            std::os::unix::fs::symlink("other.txt", head_dir.join("link")).unwrap();
+            let head = commit(&store, vec![mb], snapshot_uncached(&store, &head_dir).unwrap());
+            (base.to_hex(), head.to_hex())
+        };
+        let tree_hex = match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Ok(MergeOutcome::Tree(t)) => t,
+            other => panic!("expected a synthesized 3-way tree, got AlreadyMerged={}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
+        };
+        let store = host.store("t", "r", false).unwrap().unwrap();
+        let modes = tree_modes(&store, &tree_hex);
+        assert_eq!(modes.get("script.sh"), Some(&MODE_EXEC), "the merged script keeps its +x bit");
+        assert_eq!(modes.get("link"), Some(&MODE_SYMLINK), "the merged symlink stays a symlink, not a regular file");
+        let c = tree_contents(&store, &tree_hex);
+        assert_eq!(c.get("other.txt").map(String::as_str), Some("2\n"), "base's edit to other.txt survives");
+        assert_eq!(c.get("link").map(String::as_str), Some("other.txt"), "the symlink's content is its target path");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // MED 2: a criss-cross history with two INCOMPARABLE merge bases must be rejected, not silently
+    // merged against one arbitrarily-chosen base.
+    #[test]
+    fn plan_merge_rejects_multiple_incomparable_merge_bases() {
+        let (tmp, host) = merge_host("crisscross");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            // o1, o2 are two independent roots (neither an ancestor of the other). base and head each
+            // descend from BOTH → their common ancestors are {o1, o2}, two incomparable merge bases.
+            let o1 = commit(&store, vec![], tree_from(&store, &tmp, "o1", &[("a.txt", "1\n")]));
+            let o2 = commit(&store, vec![], tree_from(&store, &tmp, "o2", &[("b.txt", "1\n")]));
+            let base = commit(&store, vec![o1, o2], tree_from(&store, &tmp, "base", &[("a.txt", "1\n"), ("b.txt", "1\n"), ("c.txt", "base\n")]));
+            let head = commit(&store, vec![o1, o2], tree_from(&store, &tmp, "head", &[("a.txt", "1\n"), ("b.txt", "1\n"), ("d.txt", "head\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Err(MergeError::Conflict(m)) => assert!(m.contains("multiple merge bases"), "message flags complex history: {m}"),
+            other => panic!("expected a complex-history conflict; got ok={}", matches!(other, Ok(_))),
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
