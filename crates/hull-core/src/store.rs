@@ -83,6 +83,12 @@ pub trait Store: Send + Sync {
     async fn team(&self, id: &str) -> Option<Team>;
     async fn teams(&self, account: &str) -> Vec<Team>;
     async fn delete_team(&self, id: &str);
+    /// Readiness probe (distinct from liveness): can this backend actually serve traffic right now?
+    /// Backends without a remote dependency return `true`; the Postgres backend runs a trivial query
+    /// to confirm the pool can hand out a live connection. Infallible by convention (returns `bool`,
+    /// never `Result`) like the rest of the trait — a failure surfaces as `false`, which the server's
+    /// `/ready` route maps to a 503 so an orchestrator holds traffic off an unready instance.
+    async fn ready(&self) -> bool;
 }
 
 /// Match a code-owner / protected-path glob against a repo-relative path. Supports:
@@ -354,6 +360,10 @@ impl Store for InMemory {
     }
     async fn delete_team(&self, id: &str) {
         self.teams.write().unwrap().remove(id);
+    }
+    async fn ready(&self) -> bool {
+        // Purely in-memory: no external dependency to check, always ready.
+        true
     }
 }
 
@@ -735,6 +745,17 @@ impl Store for FileStore {
         self.mutate(|s| {
             s.teams.remove(id);
         });
+    }
+    async fn ready(&self) -> bool {
+        // Ready as long as the data directory is reachable (a cheap check that the durable path is
+        // still writable-ish). A missing parent dir means writes would fail, so report not-ready.
+        // The snapshot file itself may legitimately not exist yet on a fresh install, so we check the
+        // parent directory rather than the file.
+        match self.path.parent() {
+            Some(dir) => dir.is_dir(),
+            // No parent (e.g. a bare relative filename) → cwd, which exists.
+            None => true,
+        }
     }
 }
 
@@ -1156,6 +1177,15 @@ impl Store for PostgresStore {
     async fn delete_team(&self, id: &str) {
         self.conn().await.execute("DELETE FROM teams WHERE id = $1", &[&id]).await.expect("delete_team");
     }
+    async fn ready(&self) -> bool {
+        // Unlike the other methods, readiness must NOT panic on a dead pool/server — that is exactly
+        // the condition it exists to report. Check out a connection (bounded) and run a trivial query;
+        // any failure at either step ⇒ not ready.
+        match tokio::time::timeout(std::time::Duration::from_secs(2), self.pool.get()).await {
+            Ok(Ok(client)) => client.simple_query("SELECT 1").await.is_ok(),
+            _ => false,
+        }
+    }
 }
 
 /// How many rows a [`import_store_json`] run wrote, per entity. Purely informational (for the CLI).
@@ -1445,6 +1475,23 @@ mod tests {
         FileStore::open(&path).put_issue(it).await;
         let reopened = FileStore::open(&path).issues("r").await;
         assert!(matches!(reopened[0].status, IssueStatus::Closed { reason: CloseReason::Completed }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ready_true_for_local_backends() {
+        // InMemory has no external dependency — always ready.
+        assert!(InMemory::new().ready().await);
+        // FileStore is ready when its data directory is reachable (fresh install: the snapshot file
+        // itself need not exist yet, only its parent dir).
+        let dir = std::env::temp_dir().join(format!("hull-ready-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = FileStore::open(dir.join("store.json"));
+        assert!(s.ready().await);
+        // A backend rooted at a non-existent directory reports not-ready (writes would fail).
+        let missing = FileStore::open(dir.join("nope").join("store.json"));
+        assert!(!missing.ready().await);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
