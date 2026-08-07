@@ -4,8 +4,22 @@
 //! this crate as a library, and calls `hull_server::run(opts, |reg| hull_hosted::register(reg))`.
 //! See PLUGINS.md.
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // `hull-server ci-sandbox …` — the CI sandbox helper re-exec (Phase 3). This MUST run before the
+    // tokio runtime (and its worker threads) exist: the helper drops resource limits + a Landlock
+    // filesystem jail single-threaded, then `execvp`s the repo's test command, never returning. If
+    // this process was not invoked as the helper, it returns immediately and the server boots as usual.
+    hull_server::ci_sandbox::dispatch_if_invoked();
+
+    // Everything else runs on the async runtime.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("hull-server: build tokio runtime");
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     // `hull-server import-postgres` — one-shot migration of the on-disk store.json into the Postgres
     // named by HULL_DATABASE_URL, then exit. Everything else falls through to running the server.
     if std::env::args().nth(1).as_deref() == Some("import-postgres") {

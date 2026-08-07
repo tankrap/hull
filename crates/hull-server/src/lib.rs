@@ -13,6 +13,7 @@ pub mod agentsession;
 pub mod artifacts;
 pub mod autonomy;
 pub mod ci;
+pub mod ci_sandbox;
 pub mod connections;
 pub mod claims;
 pub mod reviewcache;
@@ -27,6 +28,10 @@ pub mod reposettings;
 pub mod plugins;
 pub mod quic;
 pub mod repos;
+
+/// Convenience re-export: the CI sandbox helper dispatch, called as the first line of `main` (and by
+/// a hosted binary's `main`) so a `ci-sandbox` re-exec is intercepted before the runtime boots.
+pub use ci_sandbox::dispatch_if_invoked;
 
 use activity::{ActivityEvent, ActivityHub};
 use axum::{

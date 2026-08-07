@@ -11,8 +11,32 @@ use std::sync::Arc;
 pub fn build_registry(register_extra: impl FnOnce(&mut Registry)) -> Registry {
     let mut reg = Registry::new();
     reg.install(&CorePlugin);
+    // Install the sandboxed CI runner as the DEFAULT (Phase 3). It is set BEFORE `register_extra`, so
+    // a hosted plugin that installs its own (e.g. autoscaled remote) runner still wins — `set_ci_runner`
+    // is last-write-wins. Gated on `HULL_CI_SANDBOX` (default on, unix only); `off` leaves the raw
+    // `default_local_ci` fallback in place for debugging.
+    install_default_ci_runner(&mut reg);
     register_extra(&mut reg);
     reg
+}
+
+/// Install [`crate::ci_sandbox::SandboxedCiRunner`] as the default CI runner on unix (unless
+/// `HULL_CI_SANDBOX=off`). On non-unix the sandbox primitives (setrlimit/pgroup/Landlock) are absent,
+/// so nothing is installed and the registry falls back to the raw `default_local_ci` — with a warning.
+fn install_default_ci_runner(reg: &mut Registry) {
+    #[cfg(unix)]
+    {
+        if std::env::var("HULL_CI_SANDBOX").as_deref() == Ok("off") {
+            eprintln!("hull-server: CI sandbox DISABLED (HULL_CI_SANDBOX=off) — CI runs unconfined");
+        } else {
+            reg.set_ci_runner(Arc::new(crate::ci_sandbox::SandboxedCiRunner::new()));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = reg;
+        eprintln!("hull-server: CI sandbox unavailable on this platform — CI runs unconfined");
+    }
 }
 
 /// The always-on core capabilities. The built-in secret engine is already merged by the registry;
