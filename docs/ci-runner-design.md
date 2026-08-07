@@ -467,6 +467,49 @@ quietly widening the surface.
 > hermeticity/termination properties are unaffected. The prototype has been deleted; this is what it
 > proved.
 
+> **Correction — the memory bound was not a bound, and "no spawn in the plan step" was too strong.**
+> The heap ceiling above is `starlark-rust`'s own, and its documentation is explicit that the check
+> is "not enforced on allocation, but instead checked once every so often during evaluation… Use
+> OS-level APIs in a subprocess if you want that." Measured: every ~1 000 bytecode instructions. A
+> string-doubling loop is ~150 instructions, so at the 64 MiB setting **this file — 58 bytes —
+> allocated 4 420 MB and evaluated successfully**:
+>
+> ```python
+> s = "A"
+> for i in range(31):
+>     s = s + s
+> step("x", run = s)
+> ```
+>
+> And "the right error came back" was never evidence of a bound: `x = "A" * 500000000` (41 bytes)
+> *did* return the memory error — after 1 008 MB; `[0] * 100000000` after 1 608 MB; one statement of
+> 400 concatenations after 4 901 MB. Repeat any of them and the control plane dies, taking every
+> tenant's in-flight work with it.
+>
+> **It cannot be fixed in-process, and the reason is structural.** The only thing that sees a byte
+> before it is committed is the global allocator, and a `GlobalAlloc` may not unwind — so its only
+> available refusals are "return null" (which aborts) and "terminate". Nor can a thread be killed
+> from outside in Rust, so a watchdog has nothing to act on; and any *cooperative* check is after the
+> fact, because a single operation spends a gigabyte between two of them. Evaluation therefore runs
+> in a **bounded child process**, where terminating is the correct answer — which also contains the
+> `len overflow` panic, a mispredicted stack overflow, and any future way starlark ends a process.
+>
+> **The cost, measured — and why it does not contradict the SDK paragraph above.** That paragraph
+> rejected a **sandbox** spawn, a container or a microVM at hundreds of milliseconds, and it was
+> right to. `posix_spawn` of a helper binary is not that. Release build, 300 iterations: the example
+> above went from **123 µs in-process to 3.55 ms**, and a 37-step generated matrix from 103 µs to
+> 3.60 ms. The cost is **fixed** — `exec`, dynamic linking, and building the Starlark globals once in
+> a cold address space — not proportional: a one-step pipeline costs the same 3.40 ms. For scale,
+> §6.1 measures one `**/*.rs` glob on this same plan path at **23.9 ms**. So the bound costs ~15% of
+> one glob and ~0.35% of the sub-second verdict, and peak resident memory for every file above fell
+> from 1–4.9 GB to **under 32 MB, in a process that is not the control plane**.
+>
+> **The lesson, and it is the same shape as the parser one above.** A limit that is *reported* is not
+> a limit that is *enforced*, and the difference is invisible to a test that asserts on the error —
+> which is why the old tests passed while the process took 4 GB. The test has to assert on the
+> resource. These read `getrusage`, for this process and for its children, because resident memory is
+> what a control plane dies of and an error type is not.
+
 No `.hull/ci.star`? Fall back to autodetect matching Hull's built-in runner (`Cargo.toml → cargo test`,
 `package.json → npm test`, `go.mod → go test`, `Makefile` with a `test` target → `make test`) so
 pointing a repo at Drydock doesn't change behavior. Nothing detectable → `errored` with
