@@ -32,10 +32,18 @@ pub type KeelId = String;
 /// trait — tracked as a follow-up. Until then, "log loudly + flip this flag" is the safety net.
 pub static PERSISTENCE_DEGRADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Flip the process into the "persistence degraded" state (see [`PERSISTENCE_DEGRADED`]). Sticky:
-/// once set it stays set for the life of the process (a single lost write is unrecoverable in-memory).
+/// Flip the process into the "persistence degraded" state (see [`PERSISTENCE_DEGRADED`]). Set on any
+/// failed durable write; cleared by [`clear_persistence_degraded`] on the next fully-successful one.
 pub fn mark_persistence_degraded() {
     PERSISTENCE_DEGRADED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Clear the "persistence degraded" state after a SUCCESSFUL durable write. Because every persist
+/// rewrites the entire snapshot, one clean write fully re-syncs disk to memory — so a transient blip
+/// (a full disk that's since freed, a brief I/O error) recovers and `/health` returns to 200 rather
+/// than staying 503 for the process lifetime. Called only on the success path of a persist.
+pub fn clear_persistence_degraded() {
+    PERSISTENCE_DEGRADED.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether persistence has degraded this process (see [`PERSISTENCE_DEGRADED`]).

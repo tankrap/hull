@@ -469,6 +469,10 @@ impl FileStore {
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
         }
+        // The snapshot is now fully on disk: whatever transient failure may have set the degraded flag
+        // is resolved (a full snapshot rewrite re-syncs disk to memory), so clear it and let `/health`
+        // recover to 200.
+        crate::clear_persistence_degraded();
     }
 
     fn mutate(&self, f: impl FnOnce(&mut Snapshot)) {

@@ -58,6 +58,13 @@ use tower_http::timeout::TimeoutLayer;
 /// Max time any single non-streaming API request may run before it's aborted (408). The SSE feed,
 /// git smart-HTTP, and the tar download are exempt (they legitimately run long / stream).
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Timeout for the handful of long **synchronous** handlers that `.await` a real agent-CLI or
+/// local-CI subprocess inline and return the result in the HTTP response (auto-review, fix-finding,
+/// run-check, and the LLM "ask agent" path of create-comment). These legitimately run for minutes, so
+/// the 30s cap would 408 them mid-run. 600s sits comfortably above both wall-clocks: `HULL_CI_TIMEOUT`
+/// (default 600s) and the agent-CLI timeout (~180s). They aren't streams — just slow — so they keep
+/// the body-cap and concurrency layers.
+const SLOW_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// Request-body cap for the normal JSON API surface. git push (packfiles) and the tar endpoint are
 /// exempt — they carry legitimately large bodies. A few MiB is ample for every JSON handler.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -485,16 +492,13 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/prs", get(prs).post(create_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/merge", post(merge_pr))
         .route("/api/repos/:tenant/:repo/prs/:number/close", post(close_pr))
-        .route("/api/repos/:tenant/:repo/prs/:number/auto-review", post(auto_review))
         .route("/api/repos/:tenant/:repo/prs/:number/reviewers", post(request_reviewer))
-        .route("/api/repos/:tenant/:repo/prs/:number/fix", post(fix_finding))
         .route("/api/repos/:tenant/:repo/mirror", get(mirror_status))
         .route("/api/repos/:tenant/:repo/mirror/push", post(mirror_push_now))
         .route("/api/repos/:tenant/:repo/mirror/inbound", post(mirror_inbound))
         .route("/api/repos/:tenant/:repo/mirror/github", post(mirror_github_webhook))
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/artifacts/:id", get(get_artifact))
-        .route("/api/repos/:tenant/:repo/comments", get(comments_list).post(create_comment))
         .route("/api/repos/:tenant/:repo/comments/:id", axum::routing::patch(edit_comment).delete(delete_comment))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
@@ -502,7 +506,6 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/change/:id/semantic", get(change_semantic))
         .route("/api/repos/:tenant/:repo/change/:id/ledger", get(change_ledger))
         .route("/api/repos/:tenant/:repo/change/:id/claims/:claim/resolve", post(resolve_claim))
-        .route("/api/repos/:tenant/:repo/change/:id/check", post(run_check_handler))
         .route("/api/repos/:tenant/:repo/change/:id/ci-result", post(ci_result))
         .route("/api/repos/:tenant/:repo/ci-config", get(get_ci_config).put(set_ci_config))
         .route("/api/repos/:tenant/:repo/autonomy", get(get_repo_autonomy).put(set_repo_autonomy))
@@ -521,7 +524,21 @@ fn make_router(app: App) -> Router {
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(REQUEST_TIMEOUT_SECS)))
         .layer(GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS));
 
-    api.merge(streaming)
+    // Long **synchronous** handlers that `.await` an agent-CLI / local-CI subprocess inline and return
+    // the result in the response — they legitimately run for minutes, so the fast 30s timeout would
+    // 408 them mid-run and break the core review/CI loop. They aren't streams (unlike `streaming`),
+    // just slow, so they keep the body-cap and concurrency layers but get a generous 600s timeout.
+    let slow = Router::new()
+        .route("/api/repos/:tenant/:repo/prs/:number/auto-review", post(auto_review))
+        .route("/api/repos/:tenant/:repo/prs/:number/fix", post(fix_finding))
+        .route("/api/repos/:tenant/:repo/change/:id/check", post(run_check_handler))
+        .route("/api/repos/:tenant/:repo/comments", get(comments_list).post(create_comment))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(SLOW_REQUEST_TIMEOUT_SECS)))
+        .layer(GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS));
+
+    api.merge(slow)
+        .merge(streaming)
         // The panic guard wraps EVERY route (streaming included): a handler panic becomes a logged,
         // counted 500 instead of a reset connection.
         .layer(CatchPanicLayer::custom(handle_panic))
@@ -598,8 +615,16 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     eprintln!("hull-server listening on http://{}", opts.addr);
     // Graceful shutdown on SIGTERM/SIGINT: stop accepting, let in-flight requests drain, then flush
     // the activity ranking one last time so a redeploy doesn't drop the last (≤5s) window of events.
-    axum::serve(listener, router).with_graceful_shutdown(shutdown_signal()).await.expect("serve");
-    eprintln!("hull-server: draining complete — flushing activity hub before exit");
+    // The drain is BOUNDED: long-lived SSE (`/api/feed`) connections never close on their own, so an
+    // unbounded `with_graceful_shutdown` would block until the orchestrator SIGKILLs us and the final
+    // flush would never run. Cap the drain at 20s, then flush unconditionally whether it completed or
+    // hit the cap.
+    let server = axum::serve(listener, router).with_graceful_shutdown(shutdown_signal());
+    if tokio::time::timeout(Duration::from_secs(20), server).await.is_err() {
+        eprintln!("hull-server: drain cap (20s) hit — some connections still open; flushing anyway");
+    } else {
+        eprintln!("hull-server: draining complete — flushing activity hub before exit");
+    }
     hub_shutdown.flush();
 }
 

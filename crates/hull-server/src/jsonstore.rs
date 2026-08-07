@@ -70,6 +70,9 @@ pub fn persist_json_atomic<T: Serialize>(path: &Path, value: &T) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
     }
+    // Persisted cleanly — clear any lingering degraded flag so a transient blip recovers (see
+    // FileStore::save).
+    hull_core::clear_persistence_degraded();
 }
 
 #[cfg(test)]
