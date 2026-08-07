@@ -1967,7 +1967,7 @@ async fn import_repo_handler(State(app): State<App>, Path(id): Path<String>, hea
         .map(str::to_string)
         .unwrap_or_else(|| source.rsplit('/').next().unwrap_or(&source).to_string());
     let tenant = acct.handle.clone();
-    if app.store.repos().iter().any(|r| r.owner == acct.id && r.name == name) {
+    if app.store.repos().iter().any(|r| r.owner == acct.id && r.name.eq_ignore_ascii_case(&name)) {
         return (StatusCode::CONFLICT, "a repo with that name already exists").into_response();
     }
     let dest = format!("{tenant}/{name}");
