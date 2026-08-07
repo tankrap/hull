@@ -1126,6 +1126,48 @@ path traversal / symlink escape / tar bombs (§4.2), and bounded Starlark evalua
 process attacker-controlled bytes *outside* a sandbox, which makes them the highest-value hardening in
 the system.
 
+### 9.1 What a four-lens security audit changed
+
+Four independent adversarial reviews — cryptography, untrusted-input parsing, isolation, and
+multi-tenancy — were run against the implementation. The table above survived; **the claims underneath
+it mostly did not.** The pattern is worth more than any individual finding:
+
+**Every false claim was a control that was correct, documented, and tested — through the wrong
+channel.**
+
+- The proxy returned identical *status codes* for "no such upstream" and "not in your grant", with a
+  comment explaining why and a test asserting it — and then said which in the response **body**. One
+  request per guess enumerated the deployment's private-registry topology.
+- The container backend reported `non_root` from the *presence* of the `--user` flag rather than its
+  value, so `--user 0:0` ran jobs as root while reporting non-root enforced. It reported CPU, memory
+  and PID limits from what the *daemon* can do rather than the values passed, so `--cpus 0.00
+  --memory 0` produced an unbounded container with all three reported `true`.
+- The network-posture probe scored a missing tool (`rc=127`) as the *strongest possible* posture:
+  egress denied, DNS unresolvable, metadata unreachable — on a wide-open network.
+- `max_heap_bytes` did not bound memory, because starlark samples by allocation count; and the wider
+  form is that **returning the right error is not the same as not spending the memory** — a call that
+  errors correctly can still cost 1.6 GB first.
+- WFQ keyed its cost estimate on a step *name* the tenant writes, so one trivial step called `test`
+  set that tenant's price forever: measured, an attacker at *equal weight* took 40 of 40 turns.
+
+Two corrections to §1's threat table specifically:
+
+1. **The timing/existence row is overstated.** It claims "every cache/memo/affinity key is
+   tenant-scoped, so a cross-tenant hit is structurally impossible — there is nothing to time." The
+   *keys* are scoped; the memo's **capacity** was not, and capacity is countable. An attacker filled
+   the store with its own keys and watched its own count drop by exactly the number of steps a
+   neighbour completed. Eviction is now max-min fair per tenant, which weakens the channel to an
+   aggregate signal — but "structurally impossible" needs a per-tenant partition to be literally true,
+   and until then the row should say so.
+2. **The noisy-neighbour row was defeated by the scheduler itself**, not by the cgroups it names. Fair
+   *ordering* is only fair if the price is not set by the priced party.
+
+And one framing caveat that belongs next to the whole table: the runner has **a single shared ingest
+secret carrying no tenant claim**, so the entire tenant boundary rests on trusting Hull's `repo`
+field. That matches this design's assumption and holds under the stated attacker — but several
+findings graded "latent" become critical the moment that secret leaks or Hull can be induced to emit
+an attacker-shaped `repo`.
+
 **Beyond §14 — the multi-tenant conformance map.** §14 is written for a single hostile job against the
 platform; it says nothing about job-vs-job across tenants, because that is Drydock's design surface,
 not Hull's contract. The **cross-tenant threat table in §1** is the second half of this audit

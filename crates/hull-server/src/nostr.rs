@@ -145,7 +145,23 @@ impl NostrNotifier {
     /// Build the signed nostr note for a [`NotifyEvent`], or `None` if no recipient opted into nostr.
     /// Pure but for the store lookup — the testable heart of [`Notifier::notify`].
     fn event_for(&self, event: &NotifyEvent, created_at: u64) -> Option<Event> {
-        let recipients: Vec<String> = event.to.iter().filter_map(|id| self.store.actor(id).and_then(|a| a.nostr_pubkey)).collect();
+        // TODO(async-store): the `Store` trait is now async, but `Notifier::notify` (which calls this)
+        // is a synchronous external trait method, so we can't `.await` here. Bridge to the current
+        // tokio runtime with `block_in_place` + `block_on`. `notify` is always dispatched from an async
+        // request handler on the multi-threaded server runtime, where `block_in_place` is valid. If a
+        // future caller invokes `notify` off-runtime this will panic — making `Notifier` async is the
+        // real fix.
+        let recipients: Vec<String> = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut out = Vec::new();
+                for id in &event.to {
+                    if let Some(pk) = self.store.actor(id).await.and_then(|a| a.nostr_pubkey) {
+                        out.push(pk);
+                    }
+                }
+                out
+            })
+        });
         if recipients.is_empty() {
             return None;
         }
@@ -206,16 +222,18 @@ mod tests {
         assert!(!ev.verify());
     }
 
-    #[test]
-    fn notifier_builds_a_signed_note_only_for_opted_in_recipients() {
+    // `event_for` bridges its now-async store lookup with `block_in_place`, which requires a
+    // multi-threaded runtime — hence `flavor = "multi_thread"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notifier_builds_a_signed_note_only_for_opted_in_recipients() {
         use hull_core::store::{InMemory, Store};
         use hull_core::{Actor, ActorKind, Lifetime};
         let store = InMemory::new();
         // An owner who opted into nostr, and one who didn't.
         let mut opted = Actor { id: "owner1".into(), kind: ActorKind::Human, lifetime: Lifetime::Static, handle: "mo".into(), delegation: None, nostr_pubkey: None, revoked: false };
         opted.nostr_pubkey = Some(pubkey_of(SK).unwrap());
-        store.put_actor(opted);
-        store.put_actor(Actor { id: "owner2".into(), kind: ActorKind::Human, lifetime: Lifetime::Static, handle: "no".into(), delegation: None, nostr_pubkey: None, revoked: false });
+        store.put_actor(opted).await;
+        store.put_actor(Actor { id: "owner2".into(), kind: ActorKind::Human, lifetime: Lifetime::Static, handle: "no".into(), delegation: None, nostr_pubkey: None, revoked: false }).await;
 
         let n = NostrNotifier { secret_hex: SK.into(), relays: vec!["ws://127.0.0.1:1".into()], store: Arc::new(store) };
         // targets both owners, but only owner1 opted in → the note p-tags exactly owner1's key + change tag.

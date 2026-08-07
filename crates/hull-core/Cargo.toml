@@ -12,3 +12,17 @@ serde_json = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 hex = "0.4"
+# Postgres domain store (M1). ASYNC driver (`tokio-postgres`) behind a `deadpool-postgres` connection
+# pool, so the `Store` trait is `async` and runs natively inside the server's tokio runtime (a blocking
+# client nests its own runtime and panics under `#[tokio::main]`). Each method checks out a pooled
+# connection and `.await`s the SQL. `with-serde_json-1` maps JSONB ⇆ serde_json::Value so domain
+# objects round-trip through a `data` column. Deps are always compiled (the backend is chosen at
+# runtime by `HULL_DATABASE_URL`), not feature-gated. `NoTls` for now.
+async-trait = "0.1"
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+deadpool-postgres = "0.14"
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+# Async store trait tests run on a tokio runtime (`#[tokio::test]`).
+tokio = { version = "1", features = ["rt", "macros"] }
