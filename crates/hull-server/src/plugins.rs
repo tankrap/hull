@@ -41,8 +41,9 @@ impl Plugin for CorePlugin {
 
 /// Logs notifications to stderr. Hosted plugins deliver over real channels.
 struct LogNotifier;
+#[async_trait::async_trait]
 impl Notifier for LogNotifier {
-    fn notify(&self, event: &NotifyEvent) {
+    async fn notify(&self, event: &NotifyEvent) {
         eprintln!("notify[{}] to={:?}: {}", event.kind, event.to, event.summary);
     }
 }

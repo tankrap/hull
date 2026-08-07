@@ -35,9 +35,12 @@ pub trait SecretRuleset: Send + Sync {
 }
 
 /// Deliver a notification (code-owner pings, review requests, CI results). Core default logs;
-/// hosted plugins deliver over email/Slack/nostr/managed fan-out.
+/// hosted plugins deliver over email/Slack/nostr/managed fan-out. `async` (via [`async_trait`]) so a
+/// notifier can `.await` the store / a channel client; `Arc<dyn Notifier>` needs `#[async_trait]`
+/// (native async-fn-in-trait isn't dyn-safe here).
+#[async_trait::async_trait]
 pub trait Notifier: Send + Sync {
-    fn notify(&self, event: &NotifyEvent);
+    async fn notify(&self, event: &NotifyEvent);
 }
 
 /// Authenticate a request into an actor id. Core default verifies a keypair signature; hosted
@@ -610,9 +613,9 @@ impl Registry {
     }
 
     /// Fan a notification out to every registered notifier.
-    pub fn notify(&self, event: &NotifyEvent) {
+    pub async fn notify(&self, event: &NotifyEvent) {
         for n in &self.notifiers {
-            n.notify(event);
+            n.notify(event).await;
         }
     }
 

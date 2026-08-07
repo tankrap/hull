@@ -8,5 +8,6 @@ description = "Hull's plugin SDK — the stable extension-point traits + registr
 [dependencies]
 hull-core = { path = "../hull-core" }
 hull-scan = { path = "../hull-scan" }
+async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }

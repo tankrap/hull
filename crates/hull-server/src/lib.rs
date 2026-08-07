@@ -141,8 +141,9 @@ struct Notification {
 /// A core [`Notifier`] capability that records recent notifications in memory so the UI can show
 /// them — demonstrating the plugin seam end-to-end (the registry fans out to every notifier).
 struct RecordingNotifier(Arc<Mutex<Vec<Notification>>>);
+#[async_trait::async_trait]
 impl Notifier for RecordingNotifier {
-    fn notify(&self, e: &NotifyEvent) {
+    async fn notify(&self, e: &NotifyEvent) {
         let mut buf = self.0.lock().unwrap();
         buf.push(Notification {
             kind: e.kind.clone(),
@@ -3088,7 +3089,7 @@ async fn run_check_handler(
         CiResolution::Done(o) => {
             let status = ci_status_str(o.status);
             if matches!(o.status, hull_plugin::CiStatus::Green | hull_plugin::CiStatus::Red) {
-                notify_ci(&app, &tenant, &repo, &id, status, &o.summary);
+                notify_ci(&app, &tenant, &repo, &id, status, &o.summary).await;
             }
             // Auto-triage a failed check: an independent agent reviews the failing change and posts
             // findings, so a red result isn't a dead end. Runs in the background; the memoized red
@@ -3261,7 +3262,7 @@ fn ci_status_str(s: hull_plugin::CiStatus) -> &'static str {
     }
 }
 
-fn notify_ci(app: &App, tenant: &str, repo: &str, change: &str, status: &str, summary: &str) {
+async fn notify_ci(app: &App, tenant: &str, repo: &str, change: &str, status: &str, summary: &str) {
     app.registry.notify(&hull_plugin::NotifyEvent {
         kind: if status == "green" { "ci_passed".into() } else { "ci_failed".into() },
         to: vec![],
@@ -3270,7 +3271,8 @@ fn notify_ci(app: &App, tenant: &str, repo: &str, change: &str, status: &str, su
         repo: Some(format!("{tenant}/{repo}")),
         target_kind: None,
         target_number: None,
-    });
+    })
+    .await;
 }
 
 /// The CI system's verdict callback (`POST …/change/:id/ci-result`) — the other half of the standard
@@ -3300,7 +3302,7 @@ async fn ci_result(
     let summary = body.get("summary").and_then(Value::as_str).unwrap_or("").to_string();
     let st = ci::finalize(&app.repos, &app.ci, &app.ci_config, &tenant, &repo, &id, &status, &summary);
     if matches!(st, hull_plugin::CiStatus::Green | hull_plugin::CiStatus::Red) {
-        notify_ci(&app, &tenant, &repo, &id, ci_status_str(st), &summary);
+        notify_ci(&app, &tenant, &repo, &id, ci_status_str(st), &summary).await;
     }
     Json(json!({ "recorded": status })).into_response()
 }
@@ -3765,7 +3767,7 @@ async fn request_reviewer(
         repo: Some(key.clone()),
         target_kind: Some("pr".into()),
         target_number: Some(number),
-    });
+    }).await;
     Json(json!({ "pr": pr })).into_response()
 }
 
@@ -3910,7 +3912,7 @@ async fn perform_merge(
     );
     // Outbound mirror on change-land — guarded by loop prevention + idempotency.
     if let Some(change) = pr.changes.first() {
-        mirror_out(app, tenant, repo, change);
+        mirror_out(app, tenant, repo, change).await;
     }
     // Auto-close the issues this PR fixes, stamping the resolving keel change as provenance.
     let resolving = pr.changes.first().cloned();
@@ -3946,7 +3948,7 @@ async fn perform_merge(
                     repo: Some(key.clone()),
                     target_kind: Some("issue".into()),
                     target_number: Some(num),
-                });
+                }).await;
             }
         }
     }
@@ -4100,7 +4102,7 @@ async fn mirror_push_now(State(app): State<App>, headers: axum::http::HeaderMap,
     (if result.ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY }, Json(json!({ "ok": result.ok, "change": change, "detail": result.detail }))).into_response()
 }
 
-fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
+async fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
     let key = format!("{tenant}/{repo}");
     let Some(target) = app.registry.mirror_target(&key) else { return false };
     if !app.mirror.should_push_out(change) {
@@ -4138,7 +4140,7 @@ fn mirror_out(app: &App, tenant: &str, repo: &str, change: &str) -> bool {
             repo: Some(format!("{tenant}/{repo}")),
             target_kind: None,
             target_number: None,
-        });
+        }).await;
     }
     result.ok
 }
@@ -4328,7 +4330,7 @@ async fn create_comment(
     to.dedup();
     if !to.is_empty() {
         let (target_kind, target_number) = notify_target(&target);
-        app.registry.notify(&NotifyEvent { kind: "comment_posted".into(), to, summary, change, repo: Some(key.clone()), target_kind, target_number });
+        app.registry.notify(&NotifyEvent { kind: "comment_posted".into(), to, summary, change, repo: Some(key.clone()), target_kind, target_number }).await;
     }
     // @mentions in a comment add the mentioned actor as a reviewer (on a PR) or assignee (on an issue).
     let mentioned = parse_mentions(&comment.body);
@@ -4346,7 +4348,7 @@ async fn create_comment(
                 }
                 if !added.is_empty() {
                     app.store.replace_pr(pr.clone()).await;
-                    app.registry.notify(&NotifyEvent { kind: "review_requested".into(), to: added, summary: format!("{} mentioned you as a reviewer on PR !{num}", author.handle), change: pr.changes.first().cloned(), repo: Some(key.clone()), target_kind: Some("pr".into()), target_number: Some(num) });
+                    app.registry.notify(&NotifyEvent { kind: "review_requested".into(), to: added, summary: format!("{} mentioned you as a reviewer on PR !{num}", author.handle), change: pr.changes.first().cloned(), repo: Some(key.clone()), target_kind: Some("pr".into()), target_number: Some(num) }).await;
                 }
             }
         } else if let Some(num) = target.strip_prefix("issue:").and_then(|s| s.parse::<u64>().ok()) {
@@ -4360,7 +4362,7 @@ async fn create_comment(
                 }
                 if !added.is_empty() {
                     app.store.replace_issue(issue.clone()).await;
-                    app.registry.notify(&NotifyEvent { kind: "issue_assigned".into(), to: added, summary: format!("{} mentioned you on issue #{num}", author.handle), change: None, repo: Some(key.clone()), target_kind: Some("issue".into()), target_number: Some(num) });
+                    app.registry.notify(&NotifyEvent { kind: "issue_assigned".into(), to: added, summary: format!("{} mentioned you on issue #{num}", author.handle), change: None, repo: Some(key.clone()), target_kind: Some("issue".into()), target_number: Some(num) }).await;
                 }
             }
         }
@@ -4584,7 +4586,7 @@ async fn create_review(
                 repo: Some(review.repo.clone()),
                 target_kind: Some("pr".into()),
                 target_number: Some(num),
-            });
+            }).await;
         }
     }
     (StatusCode::CREATED, Json(json!({ "review": review }))).into_response()
@@ -4897,7 +4899,7 @@ async fn perform_auto_review(
         repo: Some(key.clone()),
         target_kind: Some("pr".into()),
         target_number: Some(number),
-    });
+    }).await;
 
     // Auto-triage (T2+): a review that requests changes turns its blocker findings into a triaged
     // issue — automatic issue triage out of reviews. Gated by the repo's autonomy tier.
@@ -4943,7 +4945,7 @@ async fn perform_auto_review(
                     repo: Some(key.clone()),
                     target_kind: Some("issue".into()),
                     target_number: Some(inum),
-                });
+                }).await;
                 app.hub.publish(
                     tenant,
                     ActivityEvent::Issue { repo: repo.to_string(), number: inum, action: "opened".into(), actor: reviewer.handle.clone(), ts: now() },
@@ -4986,7 +4988,7 @@ async fn perform_auto_review(
                     repo: Some(key.clone()),
                     target_kind: Some("pr".into()),
                     target_number: Some(number),
-                });
+                }).await;
             }
             Err((_, why)) => eprintln!("hull: T3 auto-merge of PR !{number} declined: {why}"),
         }
@@ -5055,7 +5057,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
                     repo: Some(key.clone()),
                     target_kind: Some("pr".into()),
                     target_number: Some(number),
-                });
+                }).await;
             }
             None => {
                 // The fix didn't apply cleanly — record it as a proposal instead of a silent drop.
@@ -5253,7 +5255,7 @@ async fn create_pr(
             repo: Some(key.clone()),
             target_kind: Some("pr".into()),
             target_number: Some(number),
-        });
+        }).await;
     }
     app.store.put_pr(pr.clone()).await;
     // Link the issues this PR closes (from `fixes #N` in the title, or an explicit `closes` list) so
@@ -5391,7 +5393,7 @@ async fn create_issue(
             repo: Some(key.clone()),
             target_kind: Some("issue".into()),
             target_number: Some(number),
-        });
+        }).await;
     }
     app.hub.publish(
         &tenant,
