@@ -44,6 +44,12 @@ pub struct RepoHost {
     root: PathBuf,
     open: Arc<Mutex<HashMap<String, Store>>>,
     secrets: Arc<Mutex<Vec<SecretHit>>>,
+    /// Per-`tenant/repo/branch` land+export serialization. The git-mirror export runs *after* the
+    /// keel CAS commits, so two concurrent lands to the same protected branch would otherwise race
+    /// `mirror::refs`-read → `set_ref` and the last writer would drop the other landed change from
+    /// git `main`. `perform_merge` holds the branch's async mutex across the whole land+export
+    /// critical section to fully order them (see [`RepoHost::land_lock`]).
+    land_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl RepoHost {
@@ -52,7 +58,23 @@ impl RepoHost {
             root: root.into(),
             open: Arc::new(Mutex::new(HashMap::new())),
             secrets: Arc::new(Mutex::new(Vec::new())),
+            land_locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The per-branch land+export lock for `tenant/repo/branch`, created on first use. The caller
+    /// (`perform_merge`) holds the returned mutex's guard across `plan_merge` → verify → `land_merge`
+    /// (which runs the git-mirror export) so concurrent same-branch lands are serialized as a unit.
+    /// No deadlock: this lock is acquired only in that one place and is the outermost lock held —
+    /// nothing else is awaited while a task waits to acquire it, and no store lock is held across it.
+    pub(crate) fn land_lock(&self, tenant: &str, repo: &str, branch: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{tenant}/{repo}/{branch}");
+        self.land_locks
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Scan the changed blobs of a repo's HEAD change for secrets (the server-side backstop; the
@@ -891,6 +913,39 @@ fn write_entry(fp: &std::path::Path, bytes: &[u8], mode: u32) -> io::Result<()> 
     Ok(())
 }
 
+/// Committer stamped on a synthesized git merge commit — the land was performed by Hull's merge
+/// queue, not authored by a person. Stable so a re-export is deterministic.
+const HULL_COMMITTER: &str = "Hull Merge Queue <merge@hull.local>";
+
+/// Invert keel's mode → the git tree-entry mode bytes. Note keel folds a git symlink into file
+/// content on ingest ([`keel_git::bridge`]), so a symlink that arrived via `git push` is `MODE_FILE`
+/// here and re-exports as `100644` (a v1 fidelity caveat); a NATIVE keel symlink is `MODE_SYMLINK`
+/// and re-exports faithfully as `120000`. `MODE_DIR` is handled by the recursive caller, not here.
+fn git_mode_bytes(mode: u32) -> Vec<u8> {
+    use keel_store::snapshot::{MODE_EXEC, MODE_SYMLINK};
+    if mode == MODE_EXEC {
+        b"100755".to_vec()
+    } else if mode == MODE_SYMLINK {
+        b"120000".to_vec()
+    } else {
+        b"100644".to_vec()
+    }
+}
+
+/// Build a git identity (`Name <email>`) for a commit header from a keel change author. If the author
+/// already looks like a git identity (`Name <email>`), use it verbatim; otherwise synthesize a stable
+/// placeholder address so the header is well-formed.
+fn git_identity(author: &str) -> String {
+    let a = author.trim();
+    if a.contains('<') && a.contains('>') {
+        a.to_string()
+    } else if a.is_empty() {
+        "Hull <noreply@hull.local>".to_string()
+    } else {
+        format!("{a} <{}@hull.local>", a.replace(char::is_whitespace, "-"))
+    }
+}
+
 impl RepoHost {
     /// Expand the keel change `hex` in a hosted repo: its intent/author and the files it changed vs
     /// its first parent (keel-native — "what does this change touch"). `None` if not found.
@@ -1345,7 +1400,12 @@ pub(crate) enum MergeOutcome {
     /// A merged tree id, ready to speculatively verify and land. A fast-forward yields the head's own
     /// tree; a divergent land yields a synthesized 3-way tree. Pinned reachable (`hull/merge/<tree>`)
     /// so GC can't sweep it during the verify + advance window.
-    Tree(String),
+    ///
+    /// `fast_forward` records the genuine ANCESTRY outcome (`base ∈ ancestors(head)`), not a
+    /// tree-equality guess: a no-op/empty base (revert-of-revert) can make the synthesized 3-way tree
+    /// equal the head's tree while the land is still divergent. The git-mirror export must take the
+    /// FF shortcut only when this is `true`, or it would do a non-fast-forward ref move (CRITICAL-1).
+    Tree { tree: String, fast_forward: bool },
 }
 
 /// Why a protected-branch land could not proceed.
@@ -1410,9 +1470,10 @@ impl RepoHost {
     }
 
     /// Pin a tree reachable (so a concurrent GC can't sweep it between synthesis and land) and wrap it.
-    fn pin_merge_tree(store: &Store, tree: ObjectId) -> MergeOutcome {
+    /// `fast_forward` is the genuine ancestry outcome, threaded to the exporter (see [`MergeOutcome`]).
+    fn pin_merge_tree(store: &Store, tree: ObjectId, fast_forward: bool) -> MergeOutcome {
         let _ = store.set_ref(&format!("hull/merge/{}", tree.to_hex()), &tree);
-        MergeOutcome::Tree(tree.to_hex())
+        MergeOutcome::Tree { tree: tree.to_hex(), fast_forward }
     }
 
     /// Plan the land of `head_hex` onto the protected branch `branch` whose current tip is `base_hex`
@@ -1430,7 +1491,7 @@ impl RepoHost {
         let head_tree = Self::change_tree_id(&store, head).ok_or_else(|| MergeError::Internal("head change not found".into()))?;
         // Unborn branch: the first land is a trivial fast-forward to the head's tree.
         let Some(base_hex) = base_hex else {
-            return Ok(Self::pin_merge_tree(&store, head_tree));
+            return Ok(Self::pin_merge_tree(&store, head_tree, true));
         };
         let base = ObjectId::from_hex(base_hex).ok_or_else(|| MergeError::Internal("bad base change id".into()))?;
         if base == head {
@@ -1443,7 +1504,7 @@ impl RepoHost {
         let head_anc = Self::ancestors_bfs(&store, head);
         if head_anc.contains(&base) {
             // base ∈ ancestors(head) ⇒ fast-forward: the merged tree IS the head's tree, no synthesis.
-            return Ok(Self::pin_merge_tree(&store, head_tree));
+            return Ok(Self::pin_merge_tree(&store, head_tree, true));
         }
         // 3-way merge. Pick the merge-base as a true LCA, not just the nearest common ancestor: in a
         // criss-cross / multi-base history there can be several *incomparable* common ancestors (none an
@@ -1473,7 +1534,9 @@ impl RepoHost {
         let base_tree = Self::change_tree_id(&store, base).ok_or_else(|| MergeError::Internal("base change not found".into()))?;
         let mb_tree = Self::change_tree_id(&store, mergebase).ok_or_else(|| MergeError::Internal("merge-base change not found".into()))?;
         let merged = self.synthesize_three_way(&store, branch, mb_tree, base_tree, head_tree)?;
-        Ok(Self::pin_merge_tree(&store, merged))
+        // A synthesized 3-way is NEVER a fast-forward, even if `merged == head_tree` coincidentally
+        // (no-op/empty base): the exporter must preserve base_git as a parent, not FF to head.
+        Ok(Self::pin_merge_tree(&store, merged, false))
     }
 
     /// Per-path 3-way merge of `base_tree` (ours) and `head_tree` (theirs) against common ancestor
@@ -1573,6 +1636,7 @@ impl RepoHost {
         base_hex: Option<&str>,
         head_hex: &str,
         merged_tree_hex: &str,
+        fast_forward: bool,
         intent: &str,
         author: &str,
         timestamp: u64,
@@ -1603,10 +1667,271 @@ impl RepoHost {
         let obj = Object::Change(change);
         let id = obj.id();
         match store.apply_cas(std::slice::from_ref(&obj), branch, expected, id) {
-            Ok(keel_store::store::Applied::Committed) => Ok(Some(id.to_hex())),
+            Ok(keel_store::store::Applied::Committed) => {
+                // The keel-native `branch` ref advanced; the git mirror's `refs/heads/<branch>` did
+                // NOT — so `git clone`/`ls-remote` would never see this gated merge. Advance it too.
+                // Best-effort: the keel merge already committed and must not roll back on a mirror
+                // hiccup, so an export failure is logged and swallowed.
+                if let Err(e) = self.export_change_to_git_mirror(tenant, repo, &id.to_hex(), branch, fast_forward) {
+                    eprintln!("hull: git-mirror export failed for {tenant}/{repo} change {}: {e}", id.to_hex());
+                }
+                Ok(Some(id.to_hex()))
+            }
             Ok(keel_store::store::Applied::Conflict(_)) => Ok(None),
             Err(e) => Err(MergeError::Internal(e.to_string())),
         }
+    }
+
+    /// Advance the git mirror's `refs/heads/<branch>` to reflect a just-landed merge-queue change, so
+    /// `git clone` / `git ls-remote` observe gated merges (the keel-native `<branch>` ref already
+    /// advanced in [`land_merge`]; the git ref namespace, read by git clients via [`keel_git::mirror`],
+    /// did not). Best-effort consistency — the caller has already committed the keel merge.
+    ///
+    /// **History must not diverge.** Git clients already hold commits for everything that arrived via
+    /// push. Re-serializing a keel change into a *new* git commit with a different oid would rewrite
+    /// history, so the parents of the exported merge always REUSE existing git commit oids:
+    /// - parent[0] is the current git `refs/heads/<branch>` tip that clients already have (falling back
+    ///   to the base change's existing git commit via a reverse `gchange` scan);
+    /// - parent[1] is the head change's existing git commit (it arrived via a feature-branch push, so
+    ///   it is present in `gchange`), found by reverse-scanning that map.
+    ///
+    /// If a required parent can't be resolved to an existing git commit, the export is SKIPPED (the git
+    /// ref is left stale — exactly today's behavior — rather than diverging history) and `Ok(())` is
+    /// returned after a warning. A **fast-forward** advances the ref straight to the head's existing git
+    /// commit, synthesizing nothing. A **divergent** land synthesizes exactly ONE new git merge commit
+    /// over those two existing parents.
+    ///
+    /// `fast_forward` is the genuine ancestry outcome threaded from [`RepoHost::plan_merge`]
+    /// (`base ∈ ancestors(head)`) — NOT inferred from tree equality, which a no-op/empty base
+    /// (revert-of-revert) would fool into a non-fast-forward ref move (CRITICAL-1). Even when the plan
+    /// says fast-forward, the ref only advances if `head_git` genuinely descends from the current git
+    /// tip in the GIT commit graph (belt-and-suspenders); otherwise it falls back to non-FF synthesis.
+    ///
+    /// On the non-FF path the export is **skipped** (git left stale, `Ok(())`) if either parent's real
+    /// git tree uses a feature keel's bridge cannot round-trip — `160000` gitlinks/submodules, `120000`
+    /// symlinks, or non-UTF-8 entry names — because a tree re-derived from keel would silently drop the
+    /// submodule, fold the symlink to a plain file, or mangle the name (MED-HIGH-3). This guarantees the
+    /// export only ever ADDS a faithful advance for ordinary-file repos; it never regresses content.
+    pub(crate) fn export_change_to_git_mirror(&self, tenant: &str, repo: &str, change_hex: &str, branch: &str, fast_forward: bool) -> io::Result<()> {
+        let store = self
+            .store(tenant, repo, false)
+            .map_err(|e| io::Error::other(e.to_string()))?
+            .ok_or_else(|| io::Error::other("no such repo"))?;
+        let change_id = ObjectId::from_hex(change_hex).ok_or_else(|| io::Error::other("bad change id"))?;
+        let change = match store.get(&change_id).map_err(|e| io::Error::other(e.to_string()))? {
+            Some(Object::Change(c)) => c,
+            _ => return Err(io::Error::other("landed change not found")),
+        };
+        // The head change is the LAST parent (`[base, head]` on a real merge, `[head]` on an unborn
+        // branch's first land); the base (parent[0]) exists only when there are two parents.
+        let Some(&head_keel) = change.parents.last() else {
+            return Err(io::Error::other("merge change has no parents"));
+        };
+        let base_keel: Option<ObjectId> = if change.parents.len() >= 2 { Some(change.parents[0]) } else { None };
+
+        // Reverse the `gchange` map (git-commit-oid(20) → keel-change-id(32)) so parents resolve to the
+        // EXISTING git commits clients already hold — the guarantee against history divergence.
+        let mut rev: HashMap<[u8; 32], [u8; 20]> = HashMap::new();
+        for (k, v) in store.aux_iter("gchange").map_err(|e| io::Error::other(e.to_string()))? {
+            if k.len() == 20 && v.len() == 32 {
+                let (mut goid, mut cid) = ([0u8; 20], [0u8; 32]);
+                goid.copy_from_slice(&k);
+                cid.copy_from_slice(&v);
+                rev.entry(cid).or_insert(goid); // first wins — deterministic enough for v1
+            }
+        }
+        let git_for = |cid: &ObjectId| -> Option<String> { rev.get(&cid.0).map(|o| keel_git::Oid::from_bytes(*o).to_hex()) };
+
+        let refname = format!("refs/heads/{branch}");
+        let current_git_tip: Option<String> = keel_git::mirror::refs(&store)?
+            .into_iter()
+            .find(|(n, _)| *n == refname)
+            .map(|(_, v)| v)
+            .filter(|v| v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // parent[1]: the head's existing git commit. If the head never reached git (a purely keel-native
+        // head), there is nothing to fast-forward to and nothing whose oid we may reuse — skip.
+        let Some(head_git) = git_for(&head_keel) else {
+            eprintln!(
+                "hull: git-mirror export skipped for {tenant}/{repo} change {change_hex}: head change {} has no git commit in gchange (leaving {refname} stale, not diverging history)",
+                head_keel.to_hex()
+            );
+            return Ok(());
+        };
+
+        // parse the head's existing git commit once — needed for the FF descendant proof and (on the
+        // non-FF path) the fidelity guard and merge parent.
+        let head_git_oid = keel_git::Oid::from_hex_str(&head_git).map_err(|e| io::Error::other(format!("{e:?}")))?;
+
+        // Fast-forward? The decision is the plan's genuine ancestry outcome (`base ∈ ancestors(head)`),
+        // NOT tree equality — a no-op/empty base can make a divergent land's merged tree equal the head's
+        // while head_git is only a SIBLING of the git tip, so FF-ing there would be a non-fast-forward
+        // ref move that drops base history. Belt-and-suspenders: even on a FF plan, only advance if the
+        // GIT graph confirms head_git descends from the current tip; otherwise fall through to non-FF
+        // synthesis (which reuses the tip as parent[0]). An unborn git branch (no tip) FF's trivially.
+        if fast_forward {
+            let ff_sound = match &current_git_tip {
+                None => true,
+                Some(tip) => match keel_git::Oid::from_hex_str(tip) {
+                    Ok(tip_oid) => Self::git_commit_reaches(&store, &head_git_oid, &tip_oid)?,
+                    Err(_) => false,
+                },
+            };
+            if ff_sound {
+                keel_git::mirror::set_ref(&store, &refname, &head_git)?;
+                Self::ensure_head_symref(&store, &refname)?;
+                return Ok(());
+            }
+            // plan said FF but the git graph disagrees (stale/ambiguous tip) — fall through to non-FF.
+        }
+
+        // Non-fast-forward: synthesize exactly ONE new git merge commit over the existing parents.
+        // parent[0] prefers the git tip clients already have; else the base change's existing commit.
+        let Some(parent0) = current_git_tip.or_else(|| base_keel.as_ref().and_then(git_for)) else {
+            eprintln!(
+                "hull: git-mirror export skipped for {tenant}/{repo} change {change_hex}: base parent has no existing git commit (leaving {refname} stale, not diverging history)"
+            );
+            return Ok(());
+        };
+
+        // Fidelity guard (never regress). keel's git bridge drops `160000` gitlinks/submodules, folds
+        // `120000` symlinks to plain files, and lossily converts non-UTF-8 entry names at ingest — so a
+        // synthesized non-FF merge tree (re-derived from keel) would silently remove a submodule, turn a
+        // symlink into a regular file, or mangle a name that either parent carries. Rather than write an
+        // unfaithful tree, inspect BOTH parents' REAL git trees (recursively); if either uses any of
+        // those features, SKIP the export — leaving the git ref stale, identical to pre-feature behavior.
+        let parent0_oid = keel_git::Oid::from_hex_str(&parent0).map_err(|e| io::Error::other(format!("{e:?}")))?;
+        if Self::git_tree_has_unfaithful_entry(&store, &parent0_oid)? || Self::git_tree_has_unfaithful_entry(&store, &head_git_oid)? {
+            eprintln!(
+                "hull: git-mirror export skipped for {tenant}/{repo} change {change_hex}: repo uses submodules/symlinks/non-UTF-8 names not faithfully representable; {refname} left stale"
+            );
+            return Ok(());
+        }
+
+        let git_tree = Self::export_keel_tree_to_git(&store, change.tree)?;
+        let ident = git_identity(&change.author);
+        let mut headers = Vec::new();
+        headers.extend_from_slice(format!("tree {}\n", git_tree.to_hex()).as_bytes());
+        headers.extend_from_slice(format!("parent {parent0}\n").as_bytes());
+        headers.extend_from_slice(format!("parent {head_git}\n").as_bytes());
+        headers.extend_from_slice(format!("author {ident} {} +0000\n", change.timestamp).as_bytes());
+        // A stable committer identity: the merge was landed by Hull's merge queue, not authored by hand.
+        headers.extend_from_slice(format!("committer {HULL_COMMITTER} {} +0000\n", change.timestamp).as_bytes());
+        let message = if change.intent.is_empty() {
+            format!("Merge into {branch}\n").into_bytes()
+        } else if change.intent.ends_with('\n') {
+            change.intent.clone().into_bytes()
+        } else {
+            format!("{}\n", change.intent).into_bytes()
+        };
+        let payload = keel_git::serialize_headed(&keel_git::Headed { headers, message });
+        let merge_oid = keel_git::hash(keel_git::Kind::Commit, &payload);
+        keel_git::mirror::ingest_objects(&store, &[(keel_git::Kind::Commit, payload)])?;
+        // Keep the FORWARD map consistent (git-commit → keel-change) so a later push/bridge over this
+        // commit doesn't re-synthesize a divergent keel change.
+        store.aux_put("gchange", merge_oid.as_bytes(), &change_id.0).map_err(|e| io::Error::other(e.to_string()))?;
+        keel_git::mirror::set_ref(&store, &refname, &merge_oid.to_hex())?;
+        Self::ensure_head_symref(&store, &refname)?;
+        Ok(())
+    }
+
+    /// Recursively serialize a keel tree into git tree/blob objects in the mirror, returning the git
+    /// tree oid. Each blob is ingested (a dedup no-op — the content already exists from the pushes that
+    /// built it, so git oids match); each subdirectory recurses. Modes are inverted keel → git.
+    fn export_keel_tree_to_git(store: &Store, tree_id: ObjectId) -> io::Result<keel_git::Oid> {
+        let entries = match store.get(&tree_id).map_err(|e| io::Error::other(e.to_string()))? {
+            Some(Object::Tree(t)) => t.entries,
+            _ => return Err(io::Error::other("expected a keel tree")),
+        };
+        let mut git_entries = Vec::with_capacity(entries.len());
+        for e in entries {
+            let (mode, oid) = if e.mode == MODE_DIR {
+                (b"40000".to_vec(), Self::export_keel_tree_to_git(store, e.id)?)
+            } else {
+                let bytes = match store.get(&e.id).map_err(|er| io::Error::other(er.to_string()))? {
+                    Some(Object::Blob(b)) => b,
+                    _ => return Err(io::Error::other("expected a keel blob")),
+                };
+                let oid = keel_git::hash(keel_git::Kind::Blob, &bytes);
+                keel_git::mirror::ingest_objects(store, &[(keel_git::Kind::Blob, bytes)])?;
+                (git_mode_bytes(e.mode), oid)
+            };
+            git_entries.push(keel_git::TreeEntry { mode, name: e.name.into_bytes(), oid });
+        }
+        keel_git::sort_tree(&mut git_entries);
+        let payload = keel_git::serialize_tree(&git_entries);
+        let oid = keel_git::hash(keel_git::Kind::Tree, &payload);
+        keel_git::mirror::ingest_objects(store, &[(keel_git::Kind::Tree, payload)])?;
+        Ok(oid)
+    }
+
+    /// Walk the GIT commit graph from `start` over parent edges: is `target` reachable — i.e. is
+    /// `start` a descendant of `target`? Cycle-safe and bounded by the objects present; a missing or
+    /// non-commit object just ends that branch. Used to PROVE a planned fast-forward is a genuine
+    /// ancestry advance in git before moving the ref, so the export can never do a non-FF ref move.
+    fn git_commit_reaches(store: &Store, start: &keel_git::Oid, target: &keel_git::Oid) -> io::Result<bool> {
+        if start == target {
+            return Ok(true);
+        }
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(*start);
+        let mut stack = vec![*start];
+        while let Some(oid) = stack.pop() {
+            let Some((kind, payload)) = keel_git::mirror::get_object(store, &oid)? else { continue };
+            if kind != keel_git::Kind::Commit {
+                continue;
+            }
+            for p in keel_git::Headed::parse(&payload).parents().unwrap_or_default() {
+                if p == *target {
+                    return Ok(true);
+                }
+                if seen.insert(p) {
+                    stack.push(p);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Does `commit`'s real git tree (recursively) contain any entry keel's git bridge cannot faithfully
+    /// round-trip — a `160000` gitlink/submodule, a `120000` symlink, or a non-UTF-8 entry name? Such an
+    /// entry means a keel-re-derived merge tree would silently regress content, so the exporter skips
+    /// rather than synthesize. A missing/non-commit object answers `false` (nothing to protect).
+    fn git_tree_has_unfaithful_entry(store: &Store, commit: &keel_git::Oid) -> io::Result<bool> {
+        let Some((kind, payload)) = keel_git::mirror::get_object(store, commit)? else { return Ok(false) };
+        if kind != keel_git::Kind::Commit {
+            return Ok(false);
+        }
+        let Ok(tree) = keel_git::Headed::parse(&payload).tree() else { return Ok(false) };
+        Self::git_tree_entry_unfaithful_rec(store, &tree)
+    }
+
+    /// Recursive worker for [`RepoHost::git_tree_has_unfaithful_entry`], walking a git tree oid.
+    fn git_tree_entry_unfaithful_rec(store: &Store, tree: &keel_git::Oid) -> io::Result<bool> {
+        let Some((kind, payload)) = keel_git::mirror::get_object(store, tree)? else { return Ok(false) };
+        if kind != keel_git::Kind::Tree {
+            return Ok(false);
+        }
+        for e in keel_git::parse_tree(&payload).map_err(|err| io::Error::other(format!("{err:?}")))? {
+            // A gitlink (submodule) or symlink is dropped/folded by the bridge; a non-UTF-8 name is
+            // lossily converted. Any of these anywhere in the tree disqualifies faithful synthesis.
+            if e.mode == b"160000" || e.mode == b"120000" || std::str::from_utf8(&e.name).is_err() {
+                return Ok(true);
+            }
+            if e.mode == b"40000" && Self::git_tree_entry_unfaithful_rec(store, &e.oid)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Ensure the mirror has a symbolic `HEAD` (a fresh clone needs it to check out), mirroring what
+    /// [`keel_git::smart_http`]'s receive-pack does after the first push.
+    fn ensure_head_symref(store: &Store, refname: &str) -> io::Result<()> {
+        if !keel_git::mirror::refs(store)?.iter().any(|(n, _)| n == "HEAD") {
+            keel_git::mirror::set_ref(store, "HEAD", &format!("ref: {refname}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -2173,7 +2498,10 @@ mod tests {
             (base.to_hex(), head.to_hex(), head_tree)
         };
         match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
-            Ok(MergeOutcome::Tree(t)) => assert_eq!(t, head_tree_hex, "a fast-forward's merged tree IS the head's tree"),
+            Ok(MergeOutcome::Tree { tree, fast_forward }) => {
+                assert_eq!(tree, head_tree_hex, "a fast-forward's merged tree IS the head's tree");
+                assert!(fast_forward, "base ∈ ancestors(head) is a genuine fast-forward");
+            }
             _ => panic!("expected a fast-forward Tree outcome"),
         }
         // Symmetric: head already contained in base ⇒ nothing to land.
@@ -2196,7 +2524,10 @@ mod tests {
             (base.to_hex(), head.to_hex())
         };
         let tree_hex = match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
-            Ok(MergeOutcome::Tree(t)) => t,
+            Ok(MergeOutcome::Tree { tree, fast_forward }) => {
+                assert!(!fast_forward, "a synthesized 3-way is never a fast-forward");
+                tree
+            }
             other => panic!("expected a synthesized 3-way Tree, got {}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
         };
         let store = host.store("t", "r", false).unwrap().unwrap();
@@ -2270,7 +2601,7 @@ mod tests {
             (base.to_hex(), head.to_hex())
         };
         let tree_hex = match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
-            Ok(MergeOutcome::Tree(t)) => t,
+            Ok(MergeOutcome::Tree { tree, .. }) => tree,
             _ => panic!("expected a clean 3-way merge"),
         };
         let store = host.store("t", "r", false).unwrap().unwrap();
@@ -2331,7 +2662,7 @@ mod tests {
             (base.to_hex(), head.to_hex())
         };
         let tree_hex = match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
-            Ok(MergeOutcome::Tree(t)) => t,
+            Ok(MergeOutcome::Tree { tree, .. }) => tree,
             other => panic!("expected a synthesized 3-way tree, got AlreadyMerged={}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
         };
         let store = host.store("t", "r", false).unwrap().unwrap();
@@ -2382,7 +2713,7 @@ mod tests {
         };
         // Landing from the correct base advances main to a two-parent merge change.
         let landed = host
-            .land_merge("t", "r", "main", Some(&base_hex), &head_hex, &merged_tree_hex, "Merge PR !1", "alice", 0)
+            .land_merge("t", "r", "main", Some(&base_hex), &head_hex, &merged_tree_hex, true, "Merge PR !1", "alice", 0)
             .expect("land ok");
         let landed = landed.expect("committed");
         let store = host.store("t", "r", false).unwrap().unwrap();
@@ -2397,9 +2728,459 @@ mod tests {
         }
         // A second land from the now-STALE base is a CAS miss → None (caller re-plans + retries).
         let stale = host
-            .land_merge("t", "r", "main", Some(&base_hex), &head_hex, &merged_tree_hex, "Merge PR !1 again", "alice", 0)
+            .land_merge("t", "r", "main", Some(&base_hex), &head_hex, &merged_tree_hex, true, "Merge PR !1 again", "alice", 0)
             .expect("land ok");
         assert!(stale.is_none(), "a stale-base land is rejected by CAS, not clobbered");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── git-mirror export of gated merges ────────────────────────────────────────────────────────
+    // Build a git blob in the mirror, returning its git oid.
+    fn gblob(store: &Store, content: &[u8]) -> keel_git::Oid {
+        let oid = keel_git::hash(keel_git::Kind::Blob, content);
+        keel_git::mirror::ingest_objects(store, &[(keel_git::Kind::Blob, content.to_vec())]).unwrap();
+        oid
+    }
+    // Compute a git tree oid from `(mode, name, child-oid)` entries WITHOUT touching a store — the
+    // canonical git-side answer to compare the exporter against.
+    fn gtree_oid(entries: &[(&str, &str, keel_git::Oid)]) -> keel_git::Oid {
+        let mut te: Vec<keel_git::TreeEntry> = entries
+            .iter()
+            .map(|(m, n, o)| keel_git::TreeEntry { mode: m.as_bytes().to_vec(), name: n.as_bytes().to_vec(), oid: *o })
+            .collect();
+        keel_git::sort_tree(&mut te);
+        keel_git::hash(keel_git::Kind::Tree, &keel_git::serialize_tree(&te))
+    }
+    // Build (and ingest) a git tree in the mirror from `(mode, name, child-oid)` entries.
+    fn gtree(store: &Store, entries: &[(&str, &str, keel_git::Oid)]) -> keel_git::Oid {
+        let mut te: Vec<keel_git::TreeEntry> = entries
+            .iter()
+            .map(|(m, n, o)| keel_git::TreeEntry { mode: m.as_bytes().to_vec(), name: n.as_bytes().to_vec(), oid: *o })
+            .collect();
+        keel_git::sort_tree(&mut te);
+        let payload = keel_git::serialize_tree(&te);
+        let oid = keel_git::hash(keel_git::Kind::Tree, &payload);
+        keel_git::mirror::ingest_objects(store, &[(keel_git::Kind::Tree, payload)]).unwrap();
+        oid
+    }
+    // Build (and ingest) a git commit in the mirror.
+    fn gcommit(store: &Store, tree: keel_git::Oid, parents: &[keel_git::Oid], msg: &str) -> keel_git::Oid {
+        let mut headers = Vec::new();
+        headers.extend_from_slice(format!("tree {}\n", tree.to_hex()).as_bytes());
+        for p in parents {
+            headers.extend_from_slice(format!("parent {}\n", p.to_hex()).as_bytes());
+        }
+        headers.extend_from_slice(b"author A <a@e> 1700000000 +0000\n");
+        headers.extend_from_slice(b"committer A <a@e> 1700000000 +0000\n");
+        let payload = keel_git::serialize_headed(&keel_git::Headed { headers, message: format!("{msg}\n").into_bytes() });
+        let oid = keel_git::hash(keel_git::Kind::Commit, &payload);
+        keel_git::mirror::ingest_objects(store, &[(keel_git::Kind::Commit, payload)]).unwrap();
+        oid
+    }
+    // The value of a git ref in the mirror.
+    fn mirror_ref(store: &Store, name: &str) -> Option<String> {
+        keel_git::mirror::refs(store).unwrap().into_iter().find(|(n, _)| n == name).map(|(_, v)| v)
+    }
+    // Recursively resolve a git tree in the mirror to `path -> blob-content`.
+    fn git_tree_contents(store: &Store, tree: &keel_git::Oid, prefix: &str, out: &mut std::collections::BTreeMap<String, String>) {
+        let (kind, payload) = keel_git::mirror::get_object(store, tree).unwrap().unwrap();
+        assert_eq!(kind, keel_git::Kind::Tree);
+        for e in keel_git::parse_tree(&payload).unwrap() {
+            let name = String::from_utf8_lossy(&e.name).into_owned();
+            let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            if e.mode == b"40000" {
+                git_tree_contents(store, &e.oid, &path, out);
+            } else {
+                let (_, bytes) = keel_git::mirror::get_object(store, &e.oid).unwrap().unwrap();
+                out.insert(path, String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+    }
+    // Reverse a git-commit-oid to its keel change id via the forward `gchange` map.
+    fn keel_for_git(store: &Store, goid: &keel_git::Oid) -> ObjectId {
+        let v = store.aux_get("gchange", goid.as_bytes()).unwrap().unwrap();
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&v);
+        ObjectId(a)
+    }
+
+    // UNIT: the keel-tree → git-tree exporter must produce the CANONICAL git tree oid — the exact oid a
+    // real git client computes for the same content/modes. Covers nested dirs and the exec-bit inversion.
+    #[test]
+    fn export_keel_tree_reproduces_canonical_git_tree_oid() {
+        let (tmp, host) = merge_host("exporttree");
+        let store = host.store("t", "r", true).unwrap().unwrap();
+        // A keel tree with a plain file, a nested dir, and (unix) an executable — built the normal way.
+        #[cfg(unix)]
+        let keel_tree = {
+            use keel_store::snapshot::snapshot_uncached;
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tmp.join("work");
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::write(dir.join("a.txt"), "1\n").unwrap();
+            std::fs::write(dir.join("sub/b.txt"), "2\n").unwrap();
+            std::fs::write(dir.join("run.sh"), "#!/bin/sh\n").unwrap();
+            let mut perm = std::fs::metadata(dir.join("run.sh")).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(dir.join("run.sh"), perm).unwrap();
+            snapshot_uncached(&store, &dir).unwrap()
+        };
+        #[cfg(not(unix))]
+        let keel_tree = tree_from(&store, &tmp, "work", &[("a.txt", "1\n"), ("sub/b.txt", "2\n")]);
+
+        let got = RepoHost::export_keel_tree_to_git(&store, keel_tree).unwrap();
+
+        // Independently compute the git oid the same content/modes must hash to.
+        let ba = keel_git::hash(keel_git::Kind::Blob, b"1\n");
+        let bb = keel_git::hash(keel_git::Kind::Blob, b"2\n");
+        let sub = gtree_oid(&[("100644", "b.txt", bb)]);
+        #[cfg(unix)]
+        let expected = {
+            let brun = keel_git::hash(keel_git::Kind::Blob, b"#!/bin/sh\n");
+            gtree_oid(&[("100644", "a.txt", ba), ("100755", "run.sh", brun), ("40000", "sub", sub)])
+        };
+        #[cfg(not(unix))]
+        let expected = gtree_oid(&[("100644", "a.txt", ba), ("40000", "sub", sub)]);
+        assert_eq!(got, expected, "exporter must yield the canonical git tree oid (a real client's answer)");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // INTEGRATION (fast-forward): a gated land whose merge carries the head's tree verbatim must point
+    // git `refs/heads/main` at the head's PRE-EXISTING git commit — no new object, no rewritten history.
+    #[test]
+    fn gated_merge_fast_forward_points_git_main_at_existing_head_commit() {
+        let (tmp, host) = merge_host("ffexport");
+        let store = host.store("t", "r", true).unwrap().unwrap();
+        // A git base commit and a git head commit that fast-forwards it (adds b.txt). Both are already
+        // in the mirror + bridged to keel — exactly the post-push state.
+        let base_git = gcommit(&store, gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n"))]), &[], "base");
+        let head_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n")), ("100644", "b.txt", gblob(&store, b"2\n"))]),
+            &[base_git],
+            "head",
+        );
+        keel_git::mirror::set_ref(&store, "refs/heads/main", &base_git.to_hex()).unwrap();
+        keel_git::bridge::bridge(&store).unwrap();
+        let base_keel = keel_for_git(&store, &base_git);
+        let head_keel = keel_for_git(&store, &head_git);
+        store.set_ref("main", &base_keel).unwrap();
+
+        // Drive the real merge-queue path: plan then land (land triggers the export).
+        let (tree, ff) = match host.plan_merge("t", "r", "main", Some(&base_keel.to_hex()), &head_keel.to_hex()) {
+            Ok(MergeOutcome::Tree { tree, fast_forward }) => (tree, fast_forward),
+            other => panic!("expected a FF Tree outcome: {}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
+        };
+        assert!(ff, "base ∈ ancestors(head) plans a fast-forward");
+        host.land_merge("t", "r", "main", Some(&base_keel.to_hex()), &head_keel.to_hex(), &tree, ff, "Merge PR !1", "alice", 0)
+            .unwrap()
+            .expect("committed");
+
+        assert_eq!(
+            mirror_ref(&store, "refs/heads/main").as_deref(),
+            Some(head_git.to_hex().as_str()),
+            "FF advances git main straight to the head's EXISTING commit (no synthesis)"
+        );
+        assert_eq!(mirror_ref(&store, "HEAD").as_deref(), Some("ref: refs/heads/main"), "HEAD symref present for clone");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // INTEGRATION (non-fast-forward): a gated land of two divergent branches must synthesize ONE new git
+    // merge commit whose PARENTS are the pre-existing git commits (base git tip + head's pushed commit)
+    // and whose TREE matches the merged content. This is the history-divergence guard, proven.
+    #[test]
+    fn gated_merge_non_ff_synthesizes_two_parent_commit_reusing_existing_parents() {
+        let (tmp, host) = merge_host("nffexport");
+        let store = host.store("t", "r", true).unwrap().unwrap();
+        // mergebase a=1,b=1; base edits a→2 (on main); head edits b→2 (feature). Divergent, clean merge.
+        let mb_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n")), ("100644", "b.txt", gblob(&store, b"1\n"))]),
+            &[],
+            "mb",
+        );
+        let base_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"2\n")), ("100644", "b.txt", gblob(&store, b"1\n"))]),
+            &[mb_git],
+            "base",
+        );
+        let head_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n")), ("100644", "b.txt", gblob(&store, b"2\n"))]),
+            &[mb_git],
+            "head",
+        );
+        keel_git::mirror::set_ref(&store, "refs/heads/main", &base_git.to_hex()).unwrap();
+        keel_git::mirror::set_ref(&store, "HEAD", "ref: refs/heads/main").unwrap();
+        keel_git::bridge::bridge(&store).unwrap();
+        let base_keel = keel_for_git(&store, &base_git);
+        let head_keel = keel_for_git(&store, &head_git);
+        store.set_ref("main", &base_keel).unwrap();
+
+        let (tree, ff) = match host.plan_merge("t", "r", "main", Some(&base_keel.to_hex()), &head_keel.to_hex()) {
+            Ok(MergeOutcome::Tree { tree, fast_forward }) => (tree, fast_forward),
+            other => panic!("expected a synthesized 3-way Tree: {}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
+        };
+        assert!(!ff, "divergent branches plan a non-fast-forward");
+        let landed = host
+            .land_merge("t", "r", "main", Some(&base_keel.to_hex()), &head_keel.to_hex(), &tree, ff, "Merge PR !7: land", "alice", 0)
+            .unwrap()
+            .expect("committed");
+
+        // git main now points at a NEW merge commit (neither pre-existing parent).
+        let main_hex = mirror_ref(&store, "refs/heads/main").expect("git main set");
+        assert_ne!(main_hex, base_git.to_hex(), "a divergent land is not a FF to base");
+        assert_ne!(main_hex, head_git.to_hex(), "a divergent land is not a FF to head");
+        let merge_oid = keel_git::Oid::from_hex_str(&main_hex).unwrap();
+        let (kind, payload) = keel_git::mirror::get_object(&store, &merge_oid).unwrap().unwrap();
+        assert_eq!(kind, keel_git::Kind::Commit, "the new git main is a commit");
+        let headed = keel_git::Headed::parse(&payload);
+
+        // THE KEY INVARIANT: parents REUSE the pre-existing git commits — history is not rewritten.
+        assert_eq!(
+            headed.parents().unwrap(),
+            vec![base_git, head_git],
+            "merge parents must be the pre-existing git commits (base tip, pushed head), never re-synthesized"
+        );
+
+        // The synthesized tree matches the merged content (base's a=2 AND head's b=2).
+        let mut contents = std::collections::BTreeMap::new();
+        git_tree_contents(&store, &headed.tree().unwrap(), "", &mut contents);
+        assert_eq!(contents.get("a.txt").map(String::as_str), Some("2\n"), "base's edit survives in the git merge tree");
+        assert_eq!(contents.get("b.txt").map(String::as_str), Some("2\n"), "head's edit survives in the git merge tree");
+
+        // Forward gchange stays consistent: the new git commit maps to the landed keel change.
+        assert_eq!(keel_for_git(&store, &merge_oid).to_hex(), landed, "gchange maps the synthesized commit → landed keel change");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // CRITICAL-1 (FF only on TRUE ancestry): a NO-OP base (its tree equals the merge-base's) makes the
+    // synthesized 3-way tree equal the HEAD's tree, yet the land is divergent — head_git is a SIBLING of
+    // the git tip, not a descendant. The old tree-equality FF inference would point git `main` at head_git
+    // (a non-fast-forward move that drops base history). The plan-threaded ancestry flag must instead take
+    // the non-FF 2-parent path, preserving base_git as a parent.
+    #[test]
+    fn ff_shortcut_not_taken_for_noop_base_even_when_merged_tree_equals_head() {
+        let (tmp, host) = merge_host("noopbaseff");
+        let store = host.store("t", "r", true).unwrap().unwrap();
+        // mb: a=1. base: a NO-OP commit off mb (same tree). head: a=1,b=2 off mb (adds b). base & head are
+        // siblings; the 3-way merge of (base unchanged from mb) with (head adds b) yields exactly head's tree.
+        let mb_tree = gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n"))]);
+        let mb_git = gcommit(&store, mb_tree, &[], "mb");
+        let base_git = gcommit(&store, mb_tree, &[mb_git], "noop base"); // tree IDENTICAL to mb
+        let head_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n")), ("100644", "b.txt", gblob(&store, b"2\n"))]),
+            &[mb_git],
+            "head",
+        );
+        keel_git::mirror::set_ref(&store, "refs/heads/main", &base_git.to_hex()).unwrap();
+        keel_git::mirror::set_ref(&store, "HEAD", "ref: refs/heads/main").unwrap();
+        keel_git::bridge::bridge(&store).unwrap();
+        let base_keel = keel_for_git(&store, &base_git);
+        let head_keel = keel_for_git(&store, &head_git);
+        store.set_ref("main", &base_keel).unwrap();
+
+        // The plan MUST report a non-fast-forward even though the merged tree equals the head's tree.
+        let (tree, ff) = match host.plan_merge("t", "r", "main", Some(&base_keel.to_hex()), &head_keel.to_hex()) {
+            Ok(MergeOutcome::Tree { tree, fast_forward }) => (tree, fast_forward),
+            other => panic!("expected a divergent Tree, got AlreadyMerged={}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
+        };
+        assert!(!ff, "a no-op-base land is NOT a fast-forward, even though its merged tree equals the head's");
+        let head_tree_keel = match store.get(&head_keel).unwrap().unwrap() {
+            Object::Change(c) => c.tree.to_hex(),
+            _ => unreachable!(),
+        };
+        assert_eq!(tree, head_tree_keel, "the merged tree coincidentally equals the head's tree (the trap)");
+
+        let landed = host
+            .land_merge("t", "r", "main", Some(&base_keel.to_hex()), &head_keel.to_hex(), &tree, ff, "Merge PR !1", "alice", 0)
+            .unwrap()
+            .expect("committed");
+
+        // git main must be a NEW 2-parent merge over [base_git, head_git] — NOT a non-FF jump to head_git.
+        let main_hex = mirror_ref(&store, "refs/heads/main").expect("git main set");
+        assert_ne!(main_hex, head_git.to_hex(), "must NOT non-fast-forward git main to head's sibling commit (the CRITICAL-1 bug)");
+        assert_ne!(main_hex, base_git.to_hex(), "the ref advanced (a merge was synthesized)");
+        let merge_oid = keel_git::Oid::from_hex_str(&main_hex).unwrap();
+        let (_, payload) = keel_git::mirror::get_object(&store, &merge_oid).unwrap().unwrap();
+        assert_eq!(
+            keel_git::Headed::parse(&payload).parents().unwrap(),
+            vec![base_git, head_git],
+            "base_git is preserved as parent[0] — base history is not dropped"
+        );
+        assert_eq!(keel_for_git(&store, &merge_oid).to_hex(), landed, "gchange maps the synthesized commit → landed change");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // CRITICAL-1 belt-and-suspenders: even if a caller forces `fast_forward = true`, the export must
+    // verify in the GIT graph that head_git descends from the current tip before moving the ref. Here
+    // head_git is a sibling of the tip, so the descendant check fails and the export falls back to a
+    // non-FF 2-parent synthesis rather than a non-fast-forward ref move.
+    #[test]
+    fn export_ff_falls_back_when_git_graph_denies_descent() {
+        let (tmp, host) = merge_host("ffdescent");
+        let store = host.store("t", "r", true).unwrap().unwrap();
+        let mb_tree = gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n"))]);
+        let mb_git = gcommit(&store, mb_tree, &[], "mb");
+        let base_git = gcommit(&store, mb_tree, &[mb_git], "base"); // git tip
+        let head_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n")), ("100644", "b.txt", gblob(&store, b"2\n"))]),
+            &[mb_git],
+            "head",
+        ); // SIBLING of base_git, not a descendant
+        keel_git::mirror::set_ref(&store, "refs/heads/main", &base_git.to_hex()).unwrap();
+        keel_git::mirror::set_ref(&store, "HEAD", "ref: refs/heads/main").unwrap();
+        keel_git::bridge::bridge(&store).unwrap();
+        let base_keel = keel_for_git(&store, &base_git);
+        let head_keel = keel_for_git(&store, &head_git);
+        store.set_ref("main", &base_keel).unwrap();
+        let head_tree_keel = match store.get(&head_keel).unwrap().unwrap() {
+            Object::Change(c) => c.tree.to_hex(),
+            _ => unreachable!(),
+        };
+
+        // Force fast_forward = true — the adversarial input the belt-and-suspenders defends against.
+        host.land_merge("t", "r", "main", Some(&base_keel.to_hex()), &head_keel.to_hex(), &head_tree_keel, true, "Merge PR !1", "alice", 0)
+            .unwrap()
+            .expect("committed");
+
+        let main_hex = mirror_ref(&store, "refs/heads/main").expect("git main set");
+        assert_ne!(main_hex, head_git.to_hex(), "the git-graph descendant check blocks the non-FF ref move");
+        let merge_oid = keel_git::Oid::from_hex_str(&main_hex).unwrap();
+        let (_, payload) = keel_git::mirror::get_object(&store, &merge_oid).unwrap().unwrap();
+        assert_eq!(
+            keel_git::Headed::parse(&payload).parents().unwrap(),
+            vec![base_git, head_git],
+            "fell back to non-FF synthesis over [tip, head], preserving the tip as a parent"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // CRITICAL-2 (land+export serialized with keel commit order): two SEQUENTIAL lands to the same
+    // protected branch must leave git `main` at the SECOND merge, containing BOTH landed changes — never
+    // regressing to the first. This exercises the export chaining that the per-branch land lock protects
+    // under concurrency (the lock orders concurrent lands into exactly this sequential shape).
+    #[test]
+    fn sequential_lands_leave_git_main_at_second_merge_with_both_changes() {
+        let (tmp, host) = merge_host("seqlands");
+        let store = host.store("t", "r", true).unwrap().unwrap();
+        // b0 is the branch base. h1 (adds f1) fast-forwards it; h2 (adds f2) diverges off b0.
+        let b0_git = gcommit(&store, gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n"))]), &[], "b0");
+        let h1_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n")), ("100644", "f1.txt", gblob(&store, b"1\n"))]),
+            &[b0_git],
+            "h1",
+        );
+        let h2_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n")), ("100644", "f2.txt", gblob(&store, b"1\n"))]),
+            &[b0_git],
+            "h2",
+        );
+        keel_git::mirror::set_ref(&store, "refs/heads/main", &b0_git.to_hex()).unwrap();
+        keel_git::mirror::set_ref(&store, "HEAD", "ref: refs/heads/main").unwrap();
+        keel_git::bridge::bridge(&store).unwrap();
+        let b0_keel = keel_for_git(&store, &b0_git);
+        let h1_keel = keel_for_git(&store, &h1_git);
+        let h2_keel = keel_for_git(&store, &h2_git);
+        store.set_ref("main", &b0_keel).unwrap();
+
+        // Land 1 (h1): a fast-forward. git main → h1's existing commit.
+        let (t1, ff1) = match host.plan_merge("t", "r", "main", Some(&b0_keel.to_hex()), &h1_keel.to_hex()) {
+            Ok(MergeOutcome::Tree { tree, fast_forward }) => (tree, fast_forward),
+            other => panic!("land1 expected Tree, AlreadyMerged={}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
+        };
+        let mc1 = host
+            .land_merge("t", "r", "main", Some(&b0_keel.to_hex()), &h1_keel.to_hex(), &t1, ff1, "Merge PR !1", "alice", 0)
+            .unwrap()
+            .expect("land1 committed");
+        assert_eq!(mirror_ref(&store, "refs/heads/main").as_deref(), Some(h1_git.to_hex().as_str()), "land1 FF's git main to h1");
+
+        // Land 2 (h2): diverges from the new keel tip (mc1). Non-FF synthesis chaining off h1's commit.
+        let (t2, ff2) = match host.plan_merge("t", "r", "main", Some(&mc1), &h2_keel.to_hex()) {
+            Ok(MergeOutcome::Tree { tree, fast_forward }) => (tree, fast_forward),
+            other => panic!("land2 expected Tree, AlreadyMerged={}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
+        };
+        assert!(!ff2, "land2 is a divergent 3-way");
+        let mc2 = host
+            .land_merge("t", "r", "main", Some(&mc1), &h2_keel.to_hex(), &t2, ff2, "Merge PR !2", "alice", 0)
+            .unwrap()
+            .expect("land2 committed");
+
+        // git main ends at the SECOND merge — NOT regressed to h1 — and its tree carries BOTH f1 and f2.
+        let main_hex = mirror_ref(&store, "refs/heads/main").expect("git main set");
+        assert_ne!(main_hex, h1_git.to_hex(), "git main must NOT regress to the first land");
+        assert_ne!(main_hex, h2_git.to_hex(), "the second land is a synthesized merge, not a FF to h2");
+        let merge_oid = keel_git::Oid::from_hex_str(&main_hex).unwrap();
+        let (_, payload) = keel_git::mirror::get_object(&store, &merge_oid).unwrap().unwrap();
+        let headed = keel_git::Headed::parse(&payload);
+        assert_eq!(headed.parents().unwrap(), vec![h1_git, h2_git], "the second merge chains off the first land's tip (h1) and h2");
+        let mut contents = std::collections::BTreeMap::new();
+        git_tree_contents(&store, &headed.tree().unwrap(), "", &mut contents);
+        assert_eq!(contents.get("f1.txt").map(String::as_str), Some("1\n"), "the FIRST landed change survives in git main");
+        assert_eq!(contents.get("f2.txt").map(String::as_str), Some("1\n"), "the SECOND landed change is present in git main");
+        assert_eq!(keel_for_git(&store, &merge_oid).to_hex(), mc2, "gchange maps the second merge → its keel change");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // MED-HIGH-3 (never regress content): keel's bridge cannot faithfully round-trip a `120000` symlink
+    // (it folds to a plain file). When a non-FF land's parent tree carries one, the exporter must SKIP —
+    // leaving git `main` stale (pre-feature behavior) rather than writing an unfaithful merge tree that
+    // silently turns the symlink into a regular file. The keel land itself still succeeds.
+    #[test]
+    fn non_ff_export_skipped_when_parent_tree_has_symlink() {
+        let (tmp, host) = merge_host("symlinkskip");
+        let store = host.store("t", "r", true).unwrap().unwrap();
+        let target = gblob(&store, b"a.txt"); // a symlink's blob is its target path
+        // mb: a=1 + symlink `link`. base edits a→2 (main). head adds b=2 (feature). Divergent, clean.
+        let mb_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n")), ("120000", "link", target)]),
+            &[],
+            "mb",
+        );
+        let base_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"2\n")), ("120000", "link", target)]),
+            &[mb_git],
+            "base",
+        );
+        let head_git = gcommit(
+            &store,
+            gtree(&store, &[("100644", "a.txt", gblob(&store, b"1\n")), ("100644", "b.txt", gblob(&store, b"2\n")), ("120000", "link", target)]),
+            &[mb_git],
+            "head",
+        );
+        keel_git::mirror::set_ref(&store, "refs/heads/main", &base_git.to_hex()).unwrap();
+        keel_git::mirror::set_ref(&store, "HEAD", "ref: refs/heads/main").unwrap();
+        keel_git::bridge::bridge(&store).unwrap();
+        let base_keel = keel_for_git(&store, &base_git);
+        let head_keel = keel_for_git(&store, &head_git);
+        store.set_ref("main", &base_keel).unwrap();
+
+        let (tree, ff) = match host.plan_merge("t", "r", "main", Some(&base_keel.to_hex()), &head_keel.to_hex()) {
+            Ok(MergeOutcome::Tree { tree, fast_forward }) => (tree, fast_forward),
+            other => panic!("expected a divergent Tree, AlreadyMerged={}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
+        };
+        assert!(!ff, "divergent land");
+        let landed = host
+            .land_merge("t", "r", "main", Some(&base_keel.to_hex()), &head_keel.to_hex(), &tree, ff, "Merge PR !1", "alice", 0)
+            .unwrap()
+            .expect("keel land still succeeds");
+
+        // The export was SKIPPED: git main is unchanged (still base_git), never an unfaithful merge tree.
+        assert_eq!(
+            mirror_ref(&store, "refs/heads/main").as_deref(),
+            Some(base_git.to_hex().as_str()),
+            "git main left stale (export skipped) — the symlink is not regressed to a regular file"
+        );
+        // But the keel land committed and advanced native `main`.
+        assert_eq!(store.get_ref("main").unwrap().unwrap().to_hex(), landed, "keel main advanced to the landed merge change");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
