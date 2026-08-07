@@ -796,7 +796,15 @@ impl PostgresStore {
             if version > current {
                 let mut tx = c.transaction()?;
                 tx.batch_execute(sql)?;
-                tx.execute("INSERT INTO _hull_schema_version (version, applied_unix) VALUES ($1, $2)", &[&version, &now])?;
+                // Idempotent bookkeeping insert: on a fresh DB two instances can both read current=0
+                // and race to apply v1. The migration DDL is re-runnable (IF NOT EXISTS) and this
+                // ON CONFLICT DO NOTHING keeps the loser from failing on the version PK — whichever
+                // commits first wins, the other's transaction is a harmless no-op. Still run-once per
+                // migration in the steady state (the `version > current` guard skips applied ones).
+                tx.execute(
+                    "INSERT INTO _hull_schema_version (version, applied_unix) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
+                    &[&version, &now],
+                )?;
                 tx.commit()?;
             }
         }
@@ -1165,75 +1173,130 @@ pub fn import_store_json(pg: &PostgresStore, path: &Path) -> Result<ImportStats,
     let snap = load_snapshot(path);
     let mut c = pg.conn();
 
-    // Replace, don't append: truncate all domain tables in one transaction so re-running is safe.
-    let mut tx = c.transaction().map_err(|e| format!("import truncate tx: {e}"))?;
+    // The ENTIRE import — the TRUNCATE of every domain table AND every row insert — runs inside ONE
+    // transaction on a SINGLE connection, committed only at the very end. Any failure (a bad row, a
+    // unique violation from a snapshot that still holds case-variant-duplicate repos, a dropped
+    // connection) rolls the whole thing back, leaving the pre-import data intact — never a truncated,
+    // half-loaded DB. Inserts go straight to the transaction client with fallible SQL (no `.expect`)
+    // rather than through the infallible `Store::put_*` methods, which each grab their own pooled
+    // connection and panic on error. Re-running on a clean snapshot is idempotent (truncate-then-load).
+    let mut tx = c.transaction().map_err(|e| format!("import: begin tx: {e}"))?;
     tx.batch_execute(
         "TRUNCATE actors, accounts, repos, issues, prs, reviews, comments, session_records, \
          projects, users, teams, ai_connections, ai_rotate, ai_usage, owners",
     )
     .map_err(|e| format!("import truncate: {e}"))?;
-    tx.commit().map_err(|e| format!("import truncate commit: {e}"))?;
 
     let mut stats = ImportStats::default();
     for actor in snap.actors.into_values() {
-        pg.put_actor(actor);
+        let key = actor.id.clone();
+        tx.execute("INSERT INTO actors (id, data) VALUES ($1, $2)", &[&actor.id, &to_json(&actor)])
+            .map_err(|e| format!("import actor {key}: {e}"))?;
         stats.actors += 1;
     }
     for account in snap.accounts.into_values() {
-        pg.put_account(account);
+        let key = account.id.clone();
+        tx.execute("INSERT INTO accounts (id, data) VALUES ($1, $2)", &[&account.id, &to_json(&account)])
+            .map_err(|e| format!("import account {key}: {e}"))?;
         stats.accounts += 1;
     }
     for repo in snap.repos.into_values() {
-        pg.put_repo(repo);
+        // A unique violation here means the snapshot still holds case-variant-duplicate repos under
+        // one owner (the old loose create guard let those through); the (owner, name) in the error
+        // tells the operator which pair to dedupe before re-importing.
+        tx.execute(
+            "INSERT INTO repos (id, owner, name, data) VALUES ($1, $2, $3, $4)",
+            &[&repo.id, &repo.owner, &repo.name, &to_json(&repo)],
+        )
+        .map_err(|e| format!("import repo {}/{} (id {}): {e}", repo.owner, repo.name, repo.id))?;
         stats.repos += 1;
     }
     for issue in snap.issues {
-        pg.put_issue(issue);
+        tx.execute(
+            "INSERT INTO issues (repo, number, data) VALUES ($1, $2, $3)",
+            &[&issue.repo, &(issue.number as i64), &to_json(&issue)],
+        )
+        .map_err(|e| format!("import issue {}#{}: {e}", issue.repo, issue.number))?;
         stats.issues += 1;
     }
     for pr in snap.prs {
-        pg.put_pr(pr);
+        tx.execute(
+            "INSERT INTO prs (repo, number, data) VALUES ($1, $2, $3)",
+            &[&pr.repo, &(pr.number as i64), &to_json(&pr)],
+        )
+        .map_err(|e| format!("import pr {}#{}: {e}", pr.repo, pr.number))?;
         stats.prs += 1;
     }
     for review in snap.reviews {
-        pg.put_review(review);
+        tx.execute(
+            "INSERT INTO reviews (id, repo, data) VALUES ($1, $2, $3)",
+            &[&review.id, &review.repo, &to_json(&review)],
+        )
+        .map_err(|e| format!("import review {} ({}): {e}", review.id, review.repo))?;
         stats.reviews += 1;
     }
     for comment in snap.comments {
-        pg.put_comment(comment);
+        tx.execute(
+            "INSERT INTO comments (id, repo, data) VALUES ($1, $2, $3)",
+            &[&comment.id, &comment.repo, &to_json(&comment)],
+        )
+        .map_err(|e| format!("import comment {} ({}): {e}", comment.id, comment.repo))?;
         stats.comments += 1;
     }
     for session in snap.sessions {
-        pg.put_session_record(session);
+        tx.execute(
+            "INSERT INTO session_records (repo, change, data) VALUES ($1, $2, $3)",
+            &[&session.repo, &session.change, &to_json(&session)],
+        )
+        .map_err(|e| format!("import session {}@{}: {e}", session.repo, session.change))?;
         stats.sessions += 1;
     }
     for project in snap.projects {
-        pg.put_project(project);
+        tx.execute(
+            "INSERT INTO projects (id, owner, data) VALUES ($1, $2, $3)",
+            &[&project.id, &project.owner, &to_json(&project)],
+        )
+        .map_err(|e| format!("import project {} ({}): {e}", project.id, project.owner))?;
         stats.projects += 1;
     }
     for user in snap.users.into_values() {
-        pg.put_user(user);
+        // Unique on lower(username): a collision names the duplicate login to dedupe.
+        tx.execute(
+            "INSERT INTO users (id, username, actor, data) VALUES ($1, $2, $3, $4)",
+            &[&user.id, &user.username, &user.actor, &to_json(&user)],
+        )
+        .map_err(|e| format!("import user {} (username {}): {e}", user.id, user.username))?;
         stats.users += 1;
     }
     for team in snap.teams.into_values() {
-        pg.put_team(team);
+        tx.execute(
+            "INSERT INTO teams (id, account, data) VALUES ($1, $2, $3)",
+            &[&team.id, &team.account, &to_json(&team)],
+        )
+        .map_err(|e| format!("import team {} ({}): {e}", team.id, team.account))?;
         stats.teams += 1;
     }
     for conn in snap.ai_conns {
-        pg.put_ai_connection(conn);
+        tx.execute(
+            "INSERT INTO ai_connections (id, owner, data) VALUES ($1, $2, $3)",
+            &[&conn.id, &conn.owner, &to_json(&conn)],
+        )
+        .map_err(|e| format!("import ai_connection {} ({}): {e}", conn.id, conn.owner))?;
         stats.ai_connections += 1;
     }
     for (owner, on) in snap.ai_rotate {
-        pg.set_ai_rotate(&owner, on);
+        tx.execute("INSERT INTO ai_rotate (owner, on_flag) VALUES ($1, $2)", &[&owner, &on])
+            .map_err(|e| format!("import ai_rotate {owner}: {e}"))?;
         stats.ai_rotate += 1;
     }
     for (repo, rules) in snap.owners {
-        pg.set_owners(&repo, rules);
+        tx.execute("INSERT INTO owners (repo, rules) VALUES ($1, $2)", &[&repo, &to_json(&rules)])
+            .map_err(|e| format!("import owners {repo}: {e}"))?;
         stats.owners += 1;
     }
     // Usage is an absolute tally, not an increment — set it directly rather than via add_ai_usage.
     for (conn_id, usage) in snap.ai_usage {
-        c.execute(
+        tx.execute(
             "INSERT INTO ai_usage (conn_id, input_tokens, output_tokens, cost_micros, runs, updated_unix) \
              VALUES ($1, $2, $3, $4, $5, $6)",
             &[
@@ -1245,9 +1308,13 @@ pub fn import_store_json(pg: &PostgresStore, path: &Path) -> Result<ImportStats,
                 &(usage.updated_unix as i64),
             ],
         )
-        .map_err(|e| format!("import ai_usage: {e}"))?;
+        .map_err(|e| format!("import ai_usage {conn_id}: {e}"))?;
         stats.ai_usage += 1;
     }
+
+    // Commit only after every row landed — a failure above returned Err with the transaction still
+    // open, and dropping it here rolls back automatically.
+    tx.commit().map_err(|e| format!("import commit: {e}"))?;
     Ok(stats)
 }
 

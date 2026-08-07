@@ -1371,7 +1371,10 @@ async fn create_repo_handler(State(app): State<App>, headers: axum::http::Header
         return (StatusCode::BAD_REQUEST, "name is required").into_response();
     }
     let tenant = acct.handle.clone();
-    if app.store.repos().iter().any(|r| r.owner == acct.id && r.name == name) {
+    // Case-INSENSITIVE, matching the `rename` guard and the PG `repos_owner_lower_name` unique
+    // index — so a case-variant duplicate (`web` next to `Web`) is rejected here with CONFLICT
+    // rather than passing the guard and panicking on the index violation under Postgres.
+    if app.store.repos().iter().any(|r| r.owner == acct.id && r.name.eq_ignore_ascii_case(&name)) {
         return (StatusCode::CONFLICT, "a repo with that name already exists").into_response();
     }
     if let Err(e) = app.repos.create_repo(&tenant, &name) {
