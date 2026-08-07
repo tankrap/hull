@@ -10,6 +10,7 @@
 //! (`<session>.enc`, ChaCha20-Poly1305 under the server key). It is only ever plaintext transiently:
 //!   - during **login**, in `dir_for(session)` while `setup-token` writes into it, then [`seal`]ed;
 //!   - during a **run**, [`open`]ed into a throwaway dir that is wiped when the [`BundleGuard`] drops.
+//!
 //! A run is **not** read-only against the bundle: the CLI rotates its own access/refresh tokens as it
 //! runs, and those rotations must survive to the next run or the credential goes stale. So on drop the
 //! guard **re-seals** the (possibly mutated) dir back to `<session>.enc`, then wipes the plaintext.
@@ -255,7 +256,7 @@ fn harden_file(path: &Path) {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(());
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ())).collect()

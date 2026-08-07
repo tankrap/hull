@@ -357,7 +357,7 @@ fn scrape_device_code(buf: &[u8]) -> Option<String> {
             i += 1;
         }
         let a_len = i - a0;
-        if a_len >= 3 && a_len <= 8 && i < bytes.len() && bytes[i] == b'-' {
+        if (3..=8).contains(&a_len) && i < bytes.len() && bytes[i] == b'-' {
             let dash = i;
             i += 1;
             let b0 = i;
@@ -365,7 +365,7 @@ fn scrape_device_code(buf: &[u8]) -> Option<String> {
                 i += 1;
             }
             let b_len = i - b0;
-            if b_len >= 3 && b_len <= 8 {
+            if (3..=8).contains(&b_len) {
                 let after_ok = i >= bytes.len() || !bytes[i].is_ascii_alphanumeric();
                 if after_ok {
                     return Some(hay[a0..i].to_string());
@@ -377,6 +377,35 @@ fn scrape_device_code(buf: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// Remove ANSI/OSC escape sequences so scraping sees plain text.
+fn strip_ansi(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == 0x1b {
+            i += 1;
+            if i < b.len() && b[i] == b'[' {
+                i += 1;
+                while i < b.len() && !(0x40..=0x7e).contains(&b[i]) {
+                    i += 1;
+                }
+                i += 1;
+            } else if i < b.len() && b[i] == b']' {
+                i += 1;
+                while i < b.len() && b[i] != 0x07 && b[i] != 0x1b {
+                    i += 1;
+                }
+                i += 1;
+            }
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -467,33 +496,4 @@ mod tests {
         // No escapes → identity.
         assert_eq!(strip_ansi("plain text"), "plain text");
     }
-}
-
-/// Remove ANSI/OSC escape sequences so scraping sees plain text.
-fn strip_ansi(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == 0x1b {
-            i += 1;
-            if i < b.len() && b[i] == b'[' {
-                i += 1;
-                while i < b.len() && !(0x40..=0x7e).contains(&b[i]) {
-                    i += 1;
-                }
-                i += 1;
-            } else if i < b.len() && b[i] == b']' {
-                i += 1;
-                while i < b.len() && b[i] != 0x07 && b[i] != 0x1b {
-                    i += 1;
-                }
-                i += 1;
-            }
-        } else {
-            out.push(b[i] as char);
-            i += 1;
-        }
-    }
-    out
 }

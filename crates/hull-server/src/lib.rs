@@ -4898,7 +4898,7 @@ async fn perform_auto_review(
         let n = semantic.moves.len();
         (Verdict::Approve, Vec::new(), Some(ledger), format!("pure move — {n} file{} relocated with byte-identical content (verified by content address); no behavioral review needed", if n == 1 { "" } else { "s" }), false)
     } else {
-    let (cred, _bundle) = resolve_ai_credential(&app, &key, Some(&pr.author)).await;
+    let (cred, _bundle) = resolve_ai_credential(app, &key, Some(&pr.author)).await;
     let usage_conn = cred.as_ref().and_then(|c| c.connection_id.clone());
     let review_req = hull_plugin::ReviewRequest {
         repo: key.clone(),
@@ -5124,7 +5124,7 @@ async fn post_fix(app: &App, tenant: &str, repo: &str, number: u64, agent: &hull
     let change = pr.changes.first().cloned()?;
     let tree = app.repos.change_tree(tenant, repo, &change).unwrap_or_default();
     let source_url = format!("{}/api/repos/{tenant}/{repo}/tree/{tree}/tar", app.public_url.trim_end_matches('/'));
-    let (cred, _bundle) = resolve_ai_credential(&app, &key, Some(&pr.author)).await;
+    let (cred, _bundle) = resolve_ai_credential(app, &key, Some(&pr.author)).await;
     let usage_conn = cred.as_ref().and_then(|c| c.connection_id.clone());
     let req = hull_plugin::FixRequest {
         repo: key.clone(),
@@ -5825,6 +5825,10 @@ mod tests {
     // Serialize the env-var writes that isolate each `App`'s file-backed side stores under a fresh HOME.
     static MERGE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    // The env-isolation guard is deliberately held across the awaited seed so the HULL_DEMO_MODE
+    // mutation stays in effect for the whole operation; the same sync-locked static also backs
+    // `build_test_app`, so an async mutex is not a clean swap.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn demo_owner_backdoor_is_gated_off_by_default() {
         // Serialize the HULL_DEMO_MODE env mutation against the other env-touching tests.
@@ -6146,6 +6150,9 @@ mod tests {
 
     /// On a protected branch, the SPECULATIVE verify of the merged tree gates the land: a red merged
     /// tree is rejected and `main` does not move. Drives the built-in local CI via `HULL_CI_CMD`.
+    // Holds the env-isolation guard across the awaited merge so HULL_CI_CMD stays set for the
+    // speculative verify; same reason as above the async mutex is not a clean swap.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn protected_land_blocked_when_merged_tree_fails_checks() {
         let (app, tmp) = build_test_app("protred");
@@ -6176,6 +6183,9 @@ mod tests {
     }
 
     /// On a protected branch, a green merged tree lands: `main` advances and the PR flips Merged.
+    // Holds the env-isolation guard across the awaited merge so HULL_CI_CMD stays set for the
+    // speculative verify; same reason as above the async mutex is not a clean swap.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn protected_land_succeeds_when_merged_tree_is_green() {
         let (app, tmp) = build_test_app("protgreen");
