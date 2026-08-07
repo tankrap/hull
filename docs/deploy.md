@@ -12,7 +12,9 @@ Hull has two storage tiers:
   These always live on the filesystem, under `$HOME/.hull/...` by default. Mount a volume for them.
 
 The server speaks **plain HTTP** — there is no built-in TLS. Terminate TLS at a reverse proxy
-(nginx/Caddy/Traefik/a cloud LB) in front of port 8930 and forward to it.
+(nginx/Caddy/Traefik/a cloud LB) in front of port 8930 and forward to it. See
+[TLS / reverse proxy](#tls--reverse-proxy) for concrete nginx and Caddy configs (and the one buffering
+gotcha that would otherwise break the SSE feed).
 
 ## Quickstart
 
@@ -35,6 +37,94 @@ The API is then on `http://localhost:8930`. Put your TLS-terminating proxy in fr
 Note: the binary defaults its bind addresses to `127.0.0.1`, which is unreachable across the
 container boundary. The compose file overrides `HULL_ADDR`/`HULL_INGRESS_ADDR` to `0.0.0.0` — keep
 that if you write your own manifests.
+
+## TLS / reverse proxy
+
+Run a TLS-terminating reverse proxy in front of `:8930` and forward plain HTTP to the server. The one
+**critical** detail: the SSE activity feed (`GET /api/feed`) is a long-lived streaming response, so the
+proxy must **not buffer** that location — a buffering proxy holds the whole response and the live feed
+never arrives. nginx buffers by default and needs `proxy_buffering off;` on the feed; Caddy's
+`reverse_proxy` streams by default (nothing extra needed). Git smart-HTTP (`/*/git-upload-pack`,
+`/*/git-receive-pack`) and the tar download also stream/carry large bodies — don't impose a small body
+cap or aggressive buffering on the proxy for those either.
+
+### nginx
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name hull.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/hull.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/hull.example.com/privkey.pem;
+
+    # git push can carry large packfiles; the tar endpoint can be large too. Don't cap the body.
+    client_max_body_size 0;
+
+    # Everything → the server. Buffering ON here is fine for the normal JSON API.
+    location / {
+        proxy_pass http://127.0.0.1:8930;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # SSE feed: MUST NOT be buffered, or the live activity stream never flushes to the client.
+    location = /api/feed {
+        proxy_pass http://127.0.0.1:8930;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";     # keep the upstream connection alive
+        proxy_buffering off;                # ← the important line for SSE
+        proxy_cache off;
+        proxy_read_timeout 1h;              # the feed is long-lived; don't time it out
+    }
+}
+
+# Redirect plain HTTP → HTTPS.
+server {
+    listen 80;
+    server_name hull.example.com;
+    return 301 https://$host$request_uri;
+}
+```
+
+### Caddy
+
+Caddy fetches/renews certs automatically and its `reverse_proxy` streams responses (SSE works with no
+extra config):
+
+```caddy
+hull.example.com {
+    reverse_proxy 127.0.0.1:8930 {
+        # flush_interval -1 forces immediate flushing (belt-and-suspenders for SSE; Caddy already
+        # streams, but this guarantees no response buffering on /api/feed).
+        flush_interval -1
+    }
+}
+```
+
+## Health, readiness & metrics
+
+The server exposes three **unauthenticated** operational endpoints (all cheap; poll them freely, and
+point your orchestrator's probes at them):
+
+| Endpoint   | Kind      | 200 when…                          | Non-200                        | Use it for |
+|------------|-----------|------------------------------------|--------------------------------|------------|
+| `/health`  | liveness  | the process is up and persistence is not degraded | 503 `degraded` when the FileStore can't persist (in-memory state has diverged from disk) | "is the process alive / should it be restarted" |
+| `/ready`   | readiness | `{"ready":true}` — the store backend can serve (Postgres: a live pooled connection + `SELECT 1`; local backends: always) | 503 `{"ready":false}` | "should traffic be routed here yet" (k8s readiness gate, LB pool membership) |
+| `/metrics` | scrape    | always 200, Prometheus text v0.0.4 | —                              | Prometheus scraping |
+
+`/metrics` exposes `hull_http_requests_total` (counter, labeled `class="2xx".."5xx"`),
+`hull_http_requests_in_flight` (gauge), and `hull_process_uptime_seconds` (gauge). The `/ready` and
+`/metrics` scrapes are themselves exempt from the request-log and metrics counters, so polling them
+doesn't inflate the numbers.
+
+Liveness vs readiness: a liveness failure means *restart me*; a readiness failure means *hold traffic
+off me but don't kill me* (e.g. Postgres briefly unreachable). Wire `/health` to the liveness probe and
+`/ready` to the readiness probe.
 
 ## The prod profile (fail-fast security gate)
 
@@ -78,6 +168,17 @@ Then `docker compose up` as normal.
 | `HULL_ADDR`         | HTTP API bind address.                                         | `127.0.0.1:8930` |
 | `HULL_INGRESS_ADDR` | QUIC ingress bind address; `off` disables the ingress.        | `127.0.0.1:8931` |
 | `HULL_PUBLIC_URL`   | Externally reachable base URL (used in generated links).      | `http://127.0.0.1:8930` |
+
+### Logging / observability
+
+| Var               | Purpose                                                          | Default |
+|-------------------|------------------------------------------------------------------|---------|
+| `RUST_LOG`        | Log level / filter (standard `env-filter` syntax, e.g. `info`, `hull_server=debug`). | `info` |
+| `HULL_LOG_FORMAT` | `json` emits machine-parseable structured logs; anything else → compact human logs. | (dev: compact) |
+
+Logs are JSON automatically under `HULL_PROFILE=prod` (override with `HULL_LOG_FORMAT`). One structured
+line is emitted per request (`method`, `path`, `status`, `latency_ms`). See **Health, readiness &
+metrics** below for the `/ready` and `/metrics` endpoints.
 
 ### Prod profile / security
 
