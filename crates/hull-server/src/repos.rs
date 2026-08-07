@@ -235,6 +235,14 @@ impl RepoHost {
         store.get_ref("main").ok()?.map(|id| id.to_hex())
     }
 
+    /// The change a named `branch` ref points at (hex), or `None` if the repo/branch is absent. Unlike
+    /// [`Self::head_change`] this isn't hard-wired to `main` — the protected-branch land reads the
+    /// repo's configured default branch through it.
+    pub fn branch_head(&self, tenant: &str, repo: &str, branch: &str) -> Option<String> {
+        let store = self.store(tenant, repo, false).ok()??;
+        store.get_ref(branch).ok()?.map(|id| id.to_hex())
+    }
+
     /// Resolve a pushed git commit (full 40-hex SHA-1) to the keel change it was bridged into — the
     /// glue that lets a voyage be opened from a pushed branch's HEAD, not just `main`.
     /// The `gchange` aux namespace (git-commit-oid(20) → keel change id(32)) is written by the bridge
@@ -831,6 +839,58 @@ fn flatten_tree(store: &Store, tree: ObjectId, prefix: &str, out: &mut HashMap<S
     }
 }
 
+/// Like [`flatten_tree`] but carries each path's **mode** (`MODE_FILE`/`MODE_EXEC`/`MODE_SYMLINK`)
+/// alongside the blob id. The 3-way merge uses this so a merged executable keeps its `+x` bit and a
+/// merged symlink is re-created as a symlink — a plain blob-id flatten drops the mode and silently
+/// materializes both as ordinary files ("green but wrong").
+fn flatten_tree_modes(store: &Store, tree: ObjectId, prefix: &str, out: &mut HashMap<String, (ObjectId, u32)>, depth: u32) {
+    if depth > 64 {
+        return;
+    }
+    let entries = match store.get(&tree).ok().flatten() {
+        Some(Object::Tree(t)) => t.entries,
+        _ => return,
+    };
+    for e in entries {
+        let path = if prefix.is_empty() { e.name.clone() } else { format!("{prefix}/{}", e.name) };
+        if e.mode == MODE_DIR {
+            flatten_tree_modes(store, e.id, &path, out, depth + 1);
+        } else {
+            out.insert(path, (e.id, e.mode));
+        }
+    }
+}
+
+/// Write a merged tree entry to disk honoring its git mode: a `MODE_SYMLINK` blob is materialized as
+/// a real symlink whose target IS the blob content (git's symlink encoding); a `MODE_EXEC` blob is
+/// written and `chmod +x`'d; everything else is a plain file. Matches how `keel_store::snapshot`
+/// checks out and re-reads modes, so the subsequent `snapshot_uncached` captures the mode exactly.
+fn write_entry(fp: &std::path::Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use keel_store::snapshot::{MODE_EXEC, MODE_SYMLINK};
+    if mode == MODE_SYMLINK {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(bytes), fp);
+        }
+        #[cfg(not(unix))]
+        {
+            return std::fs::write(fp, bytes); // no cheap symlinks — fall back to the target as content
+        }
+    }
+    std::fs::write(fp, bytes)?;
+    if mode == MODE_EXEC {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(fp)?.permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(fp, perm)?;
+        }
+    }
+    Ok(())
+}
+
 impl RepoHost {
     /// Expand the keel change `hex` in a hosted repo: its intent/author and the files it changed vs
     /// its first parent (keel-native — "what does this change touch"). `None` if not found.
@@ -1271,6 +1331,285 @@ impl RepoHost {
     }
 }
 
+// ── protected-branch merge queue ─────────────────────────────────────────────────────────────────
+//
+// When a repo's default branch is protected (`require_review_to_land`), a PR lands not by flipping
+// metadata but by *synthesizing* the merge server-side (fast-forward or a real 3-way), speculatively
+// re-verifying the merged tree, and advancing the branch by compare-and-swap. These helpers do the
+// tree math; the App layer (`perform_merge`) drives verify + retry around them.
+
+/// The plan for landing a PR onto a protected branch, produced by [`RepoHost::plan_merge`].
+pub(crate) enum MergeOutcome {
+    /// The PR's head is already contained in the branch — nothing to land (idempotent success).
+    AlreadyMerged,
+    /// A merged tree id, ready to speculatively verify and land. A fast-forward yields the head's own
+    /// tree; a divergent land yields a synthesized 3-way tree. Pinned reachable (`hull/merge/<tree>`)
+    /// so GC can't sweep it during the verify + advance window.
+    Tree(String),
+}
+
+/// Why a protected-branch land could not proceed.
+#[derive(Debug)]
+pub(crate) enum MergeError {
+    /// A real content conflict — both sides changed the same path incompatibly (incl. add/add and
+    /// delete/modify). v1 does no line-level auto-merge, so this **rejects** the land. User-facing.
+    Conflict(String),
+    /// A store/IO failure while synthesizing or committing the merge.
+    Internal(String),
+}
+
+impl RepoHost {
+    /// The tree id of a change, or `None` if it isn't a change / can't be read.
+    fn change_tree_id(store: &Store, change: ObjectId) -> Option<ObjectId> {
+        match store.get(&change).ok()?? {
+            Object::Change(c) => Some(c.tree),
+            _ => None,
+        }
+    }
+
+    /// All ancestors of `id` (including `id`) over every parent edge, nearest-first (BFS). Used for
+    /// fast-forward detection and picking a near merge-base.
+    fn ancestors_bfs(store: &Store, id: ObjectId) -> Vec<ObjectId> {
+        let mut seen = std::collections::HashSet::new();
+        let mut order = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        seen.insert(id);
+        queue.push_back(id);
+        while let Some(x) = queue.pop_front() {
+            order.push(x);
+            if let Some(Object::Change(c)) = store.get(&x).ok().flatten() {
+                for p in c.parents {
+                    if seen.insert(p) {
+                        queue.push_back(p);
+                    }
+                }
+            }
+        }
+        order
+    }
+
+    /// The **head** change of a PR — the tip among its proposed `changes` (the one whose ancestry
+    /// contains all the others). A single-change PR is trivially that change; diverging changes with no
+    /// single tip fall back to the last proposed change. This is the change landed onto the branch.
+    pub(crate) fn pr_head(&self, tenant: &str, repo: &str, changes: &[String]) -> Option<String> {
+        match changes {
+            [] => None,
+            [only] => Some(only.clone()),
+            _ => {
+                let store = self.store(tenant, repo, false).ok()??;
+                let ids: Vec<ObjectId> = changes.iter().filter_map(|h| ObjectId::from_hex(h)).collect();
+                for &cand in &ids {
+                    let anc: std::collections::HashSet<ObjectId> = Self::ancestors_bfs(&store, cand).into_iter().collect();
+                    if ids.iter().all(|o| anc.contains(o)) {
+                        return Some(cand.to_hex());
+                    }
+                }
+                changes.last().cloned()
+            }
+        }
+    }
+
+    /// Pin a tree reachable (so a concurrent GC can't sweep it between synthesis and land) and wrap it.
+    fn pin_merge_tree(store: &Store, tree: ObjectId) -> MergeOutcome {
+        let _ = store.set_ref(&format!("hull/merge/{}", tree.to_hex()), &tree);
+        MergeOutcome::Tree(tree.to_hex())
+    }
+
+    /// Plan the land of `head_hex` onto the protected branch `branch` whose current tip is `base_hex`
+    /// (`None` = an unborn branch — the first land is a trivial fast-forward). Fast-forward when the
+    /// base is an ancestor of the head; already-contained when the head is an ancestor of the base;
+    /// otherwise a per-path 3-way merge against a near common ancestor. Returns the merged tree id
+    /// (pinned reachable) to verify + land, or a conflict/internal error. NO line-level merge: any
+    /// path both sides changed incompatibly is a hard conflict.
+    pub(crate) fn plan_merge(&self, tenant: &str, repo: &str, branch: &str, base_hex: Option<&str>, head_hex: &str) -> Result<MergeOutcome, MergeError> {
+        let store = self
+            .store(tenant, repo, false)
+            .map_err(|e| MergeError::Internal(e.to_string()))?
+            .ok_or_else(|| MergeError::Internal("no such repo".into()))?;
+        let head = ObjectId::from_hex(head_hex).ok_or_else(|| MergeError::Internal("bad head change id".into()))?;
+        let head_tree = Self::change_tree_id(&store, head).ok_or_else(|| MergeError::Internal("head change not found".into()))?;
+        // Unborn branch: the first land is a trivial fast-forward to the head's tree.
+        let Some(base_hex) = base_hex else {
+            return Ok(Self::pin_merge_tree(&store, head_tree));
+        };
+        let base = ObjectId::from_hex(base_hex).ok_or_else(|| MergeError::Internal("bad base change id".into()))?;
+        if base == head {
+            return Ok(MergeOutcome::AlreadyMerged);
+        }
+        let base_anc: std::collections::HashSet<ObjectId> = Self::ancestors_bfs(&store, base).into_iter().collect();
+        if base_anc.contains(&head) {
+            return Ok(MergeOutcome::AlreadyMerged); // head already in the branch's history
+        }
+        let head_anc = Self::ancestors_bfs(&store, head);
+        if head_anc.contains(&base) {
+            // base ∈ ancestors(head) ⇒ fast-forward: the merged tree IS the head's tree, no synthesis.
+            return Ok(Self::pin_merge_tree(&store, head_tree));
+        }
+        // 3-way merge. Pick the merge-base as a true LCA, not just the nearest common ancestor: in a
+        // criss-cross / multi-base history there can be several *incomparable* common ancestors (none an
+        // ancestor of another). Silently picking one produces a clean-but-wrong merge, so we detect that
+        // and REJECT — a single unambiguous base (the common diamond) still auto-merges.
+        let common: Vec<ObjectId> = head_anc.iter().copied().filter(|a| base_anc.contains(a)).collect();
+        if common.is_empty() {
+            return Err(MergeError::Internal("no common ancestor for 3-way merge".into()));
+        }
+        // Reduce to the *maximal* common ancestors (the merge bases): drop any common ancestor that is a
+        // proper ancestor of another common ancestor. What's left are pairwise-incomparable LCAs.
+        let common_set: std::collections::HashSet<ObjectId> = common.iter().copied().collect();
+        let mut non_maximal: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        for &c in &common {
+            for a in Self::ancestors_bfs(&store, c) {
+                if a != c && common_set.contains(&a) {
+                    non_maximal.insert(a);
+                }
+            }
+        }
+        // `common` is BFS-nearest-first, so the surviving bases keep that order (nearest first).
+        let merge_bases: Vec<ObjectId> = common.into_iter().filter(|c| !non_maximal.contains(c)).collect();
+        if merge_bases.len() > 1 {
+            return Err(MergeError::Conflict("CONFLICT: complex history (multiple merge bases); merge manually".into()));
+        }
+        let mergebase = merge_bases[0];
+        let base_tree = Self::change_tree_id(&store, base).ok_or_else(|| MergeError::Internal("base change not found".into()))?;
+        let mb_tree = Self::change_tree_id(&store, mergebase).ok_or_else(|| MergeError::Internal("merge-base change not found".into()))?;
+        let merged = self.synthesize_three_way(&store, branch, mb_tree, base_tree, head_tree)?;
+        Ok(Self::pin_merge_tree(&store, merged))
+    }
+
+    /// Per-path 3-way merge of `base_tree` (ours) and `head_tree` (theirs) against common ancestor
+    /// `mb_tree`, producing a merged tree id. Per path: both sides equal ⇒ take it; a side unchanged
+    /// from the ancestor ⇒ take the other side (covers add / modify / delete on one side); both sides
+    /// changed the same path to different content (incl. add/add-differing and delete/modify) ⇒
+    /// CONFLICT. The merge is applied on top of a base checkout so unchanged files keep their mode.
+    fn synthesize_three_way(&self, store: &Store, branch: &str, mb_tree: ObjectId, base_tree: ObjectId, head_tree: ObjectId) -> Result<ObjectId, MergeError> {
+        // Mode-aware: each side maps path → (blob, mode). Comparing the tuple means a change that ONLY
+        // flips the exec bit (or file↔symlink) is a real change and is resolved/materialized as such.
+        let mut mb = HashMap::new();
+        flatten_tree_modes(store, mb_tree, "", &mut mb, 0);
+        let mut ours = HashMap::new();
+        flatten_tree_modes(store, base_tree, "", &mut ours, 0);
+        let mut theirs = HashMap::new();
+        flatten_tree_modes(store, head_tree, "", &mut theirs, 0);
+        let mut paths: Vec<&String> = ours.keys().chain(theirs.keys()).chain(mb.keys()).collect();
+        paths.sort();
+        paths.dedup();
+        // Only paths whose resolved (blob, mode) DIFFERS from `ours` become edits applied on top of the
+        // base checkout — so unchanged files (the vast majority) retain their mode from the checkout.
+        let mut edits: Vec<(String, Option<(ObjectId, u32)>)> = Vec::new();
+        for p in paths {
+            let b = mb.get(p).copied();
+            let o = ours.get(p).copied();
+            let t = theirs.get(p).copied();
+            let resolved: Option<(ObjectId, u32)> = if o == t {
+                o // both sides agree (incl. both-absent)
+            } else if o == b {
+                t // ours unchanged from the ancestor ⇒ take theirs (add / modify / delete)
+            } else if t == b {
+                o // theirs unchanged ⇒ take ours
+            } else {
+                return Err(MergeError::Conflict(format!("CONFLICT: merge conflict in {p}; update your change against {branch}")));
+            };
+            if resolved != o {
+                edits.push((p.clone(), resolved));
+            }
+        }
+        self.materialize_merge(store, base_tree, &edits)
+    }
+
+    /// Materialize a merged tree: check out `base_tree`, apply the resolved edits (write a blob at its
+    /// mode — plain / executable / symlink — or delete a path), then snapshot. Mode-aware so a merged
+    /// `+x` script stays executable and a merged symlink stays a symlink (see [`flatten_tree_modes`]);
+    /// a plain `fs::write` for every edit is exactly what dropped the exec bit and turned symlinks into
+    /// regular files. Mirrors [`RepoHost::compose_independence_tree`]'s checkout+patch.
+    fn materialize_merge(&self, store: &Store, base_tree: ObjectId, edits: &[(String, Option<(ObjectId, u32)>)]) -> Result<ObjectId, MergeError> {
+        let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("hull-merge-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        if keel_store::snapshot::checkout(store, base_tree, &dir).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(MergeError::Internal("checkout of base tree failed".into()));
+        }
+        for (path, resolved) in edits {
+            let fp = dir.join(path);
+            match resolved {
+                Some((id, mode)) => {
+                    let bytes = match store.get(id) {
+                        Ok(Some(Object::Blob(b))) => b,
+                        _ => {
+                            let _ = std::fs::remove_dir_all(&dir);
+                            return Err(MergeError::Internal(format!("missing merged blob for {path}")));
+                        }
+                    };
+                    if let Some(parent) = fp.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    // Replace any existing entry first so file↔symlink transitions apply cleanly.
+                    let _ = std::fs::remove_file(&fp);
+                    if let Err(e) = write_entry(&fp, &bytes, *mode) {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        return Err(MergeError::Internal(format!("write failed for {path}: {e}")));
+                    }
+                }
+                None => {
+                    let _ = std::fs::remove_file(&fp);
+                }
+            }
+        }
+        let tree = keel_store::snapshot::snapshot_uncached(store, &dir).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        tree.ok_or_else(|| MergeError::Internal("snapshot of merged tree failed".into()))
+    }
+
+    /// Commit the two-parent merge change (`parents = [base, head]`, or `[head]` on an unborn branch)
+    /// carrying `merged_tree`, and advance `branch` to it by **compare-and-swap** from `base`. Returns
+    /// `Some(change_hex)` on success, `None` if the branch moved under us (caller re-plans + retries),
+    /// or an internal error.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn land_merge(
+        &self,
+        tenant: &str,
+        repo: &str,
+        branch: &str,
+        base_hex: Option<&str>,
+        head_hex: &str,
+        merged_tree_hex: &str,
+        intent: &str,
+        author: &str,
+        timestamp: u64,
+    ) -> Result<Option<String>, MergeError> {
+        let store = self
+            .store(tenant, repo, false)
+            .map_err(|e| MergeError::Internal(e.to_string()))?
+            .ok_or_else(|| MergeError::Internal("no such repo".into()))?;
+        let merged_tree = ObjectId::from_hex(merged_tree_hex).ok_or_else(|| MergeError::Internal("bad merged tree id".into()))?;
+        let head = ObjectId::from_hex(head_hex).ok_or_else(|| MergeError::Internal("bad head change id".into()))?;
+        let expected = match base_hex {
+            Some(h) => Some(ObjectId::from_hex(h).ok_or_else(|| MergeError::Internal("bad base change id".into()))?),
+            None => None,
+        };
+        let parents: Vec<ObjectId> = match expected {
+            Some(b) => vec![b, head],
+            None => vec![head],
+        };
+        let change = keel_store::Change {
+            parents,
+            tree: merged_tree,
+            session: None,
+            intent: intent.to_string(),
+            author: author.to_string(),
+            timestamp,
+            verification: keel_store::Verification::Unverified,
+        };
+        let obj = Object::Change(change);
+        let id = obj.id();
+        match store.apply_cas(std::slice::from_ref(&obj), branch, expected, id) {
+            Ok(keel_store::store::Applied::Committed) => Ok(Some(id.to_hex())),
+            Ok(keel_store::store::Applied::Conflict(_)) => Ok(None),
+            Err(e) => Err(MergeError::Internal(e.to_string())),
+        }
+    }
+}
+
 impl RepoHost {
     /// First-parent history where `path`'s content changed vs its parent — i.e. the changes (and
     /// authors/agents) that actually touched it. This is `keel why` over a hosted repo, the spine
@@ -1449,7 +1788,7 @@ fn server_error(e: io::Error) -> Response {
 
 /// Decompress the body if the request declares `Content-Encoding: gzip` (git's default for the
 /// upload-pack POST). On any decode failure fall back to the raw bytes.
-fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>) -> Vec<u8> {
     let is_gzip = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -1464,6 +1803,51 @@ fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>) -> Vec<u8> {
         Ok(_) => out,
         Err(_) => body,
     }
+}
+
+/// Parse the **command section** of a (gunzipped) git-receive-pack request body into the
+/// `(new-oid, refname)` pairs it will apply — using the **exact same reader and tokenization** that
+/// keel-git's `smart_http::receive_pack` uses to actually move refs (`pktline::read_at` +
+/// `split_whitespace`, capabilities dropped after the first `\0`). Sharing the one parser is the
+/// point: hull's recognized command set is then *provably identical* to what keel-git applies, so a
+/// double-space, a tab, a trailing token, or a `0001` delimiter can't make hull's view of "which refs
+/// this push touches" diverge from what really gets written. Mirrors `smart_http.rs:118-132`.
+///
+/// The `new-oid` is retained only for parity with keel-git's `commands` shape; the protection
+/// predicate ([`touches_protected`]) judges by refname alone (see its doc).
+pub(crate) fn parse_receive_refs(body: &[u8]) -> Vec<(String, String)> {
+    use keel_git::pktline::{read_at, Pkt};
+    let mut out = Vec::new(); // (new-oid, refname)
+    let mut pos = 0;
+    while let Some(pkt) = read_at(body, &mut pos) {
+        match pkt {
+            Pkt::Flush => break,
+            Pkt::Line(line) => {
+                let line = line.split(|&b| b == 0).next().unwrap_or(line); // drop caps after NUL
+                let s = String::from_utf8_lossy(line);
+                let mut it = s.split_whitespace();
+                if let (Some(_old), Some(new), Some(r)) = (it.next(), it.next(), it.next()) {
+                    out.push((new.to_string(), r.to_string()));
+                }
+            }
+            Pkt::Delim => {}
+        }
+    }
+    out
+}
+
+/// Does any command **touch** the protected default branch (`refs/heads/<default_branch>`)? On a
+/// protected repo we reject the push if any recorded command's refname equals the protected ref,
+/// **regardless of old/new** — an overwrite (even one the client dresses up with a zeroed `old`), a
+/// deletion (`new` = zeros), and a normal update are all caught. We deliberately do NOT exempt
+/// "creation" based on the client-supplied `old`: on a protected repo the branch already exists
+/// (protection is opt-in, enabled after the repo is created), and the only sanctioned way to advance
+/// it is the server-side merge queue (`perform_merge` → `set_ref`), which never goes through
+/// receive-pack. keel-git applies refs with no old-value check, so trusting the client's `old` was
+/// exactly the zeroed-old bypass — judging by refname closes it.
+pub(crate) fn touches_protected(commands: &[(String, String)], default_branch: &str) -> bool {
+    let target = format!("refs/heads/{default_branch}");
+    commands.iter().any(|(_new, refname)| *refname == target)
 }
 
 #[cfg(test)]
@@ -1494,6 +1878,35 @@ impl RepoHost {
         };
         let id = store.put(&Object::Change(change)).unwrap();
         let _ = store.set_ref("main", &id);
+        let _ = std::fs::remove_dir_all(&dir);
+        id.to_hex()
+    }
+
+    /// Test-only: like [`Self::test_commit`] but does NOT move `main` — commits a change parented on
+    /// `parent` and leaves the branch where it is. Used by the protected-branch merge tests to build a
+    /// PR head that sits OFF the default branch (so a real land has something to fast-forward/advance).
+    pub(crate) fn test_change(&self, tenant: &str, repo: &str, parent: Option<&str>, files: &[(&str, &str)]) -> String {
+        let store = self.store(tenant, repo, true).unwrap().unwrap();
+        let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("hull-testchange-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (p, c) in files {
+            let fp = dir.join(p);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, c).unwrap();
+        }
+        let tree = keel_store::snapshot::snapshot_uncached(&store, &dir).unwrap();
+        let parents: Vec<ObjectId> = parent.and_then(ObjectId::from_hex).into_iter().collect();
+        let change = keel_store::Change {
+            parents,
+            tree,
+            session: None,
+            intent: "child".into(),
+            author: "tester".into(),
+            timestamp: 0,
+            verification: keel_store::Verification::Unverified,
+        };
+        let id = store.put(&Object::Change(change)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         id.to_hex()
     }
@@ -1609,6 +2022,384 @@ mod tests {
         assert_eq!(b.behavioral, vec!["a.rs".to_string()]);
         assert!(b.whitespace_only.is_empty());
         assert!(!b.mechanical, "a real content edit is behavioral");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── branch-protection: receive-pack command parser ──────────────────────────────────────────
+
+    // Frame a git pkt-line (4-hex length prefix covering the 4 bytes + payload).
+    fn pkt(line: &str) -> Vec<u8> {
+        let mut v = format!("{:04x}", line.len() + 4).into_bytes();
+        v.extend_from_slice(line.as_bytes());
+        v
+    }
+    const ZERO: &str = "0000000000000000000000000000000000000000";
+
+    const NEW: &str = "1111111111111111111111111111111111111111";
+    const OLD: &str = "2222222222222222222222222222222222222222";
+
+    // Is this raw receive-pack body rejected against a `main`-protected repo? (Mirrors the lib.rs gate:
+    // parse the refs with the shared parser, then apply the protection predicate.)
+    fn rejected(body: &[u8]) -> bool {
+        touches_protected(&parse_receive_refs(body), "main")
+    }
+
+    // The command section of a well-formed receive-pack request: `cmd` pkt-lines (first carrying
+    // `\0caps`), a flush, then a never-decoded PACK. `raw_prefix` lets a test splice bytes (e.g. a
+    // `0001` delim) ahead of the commands.
+    fn recv_body(cmds: &[&str]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (i, c) in cmds.iter().enumerate() {
+            let line = if i == 0 { format!("{c}\0report-status side-band-64k\n") } else { format!("{c}\n") };
+            body.extend(pkt(&line));
+        }
+        body.extend_from_slice(b"0000");
+        body.extend_from_slice(b"PACK\x00\x00garbagepackdata");
+        body
+    }
+
+    #[test]
+    fn parse_receive_refs_reads_the_command_section() {
+        let body = recv_body(&[&format!("{OLD} {NEW} refs/heads/main"), &format!("{ZERO} {NEW} refs/heads/feature")]);
+        let cmds = parse_receive_refs(&body);
+        assert_eq!(cmds.len(), 2, "both commands parsed, PACK ignored");
+        assert_eq!(cmds[0], (NEW.to_string(), "refs/heads/main".to_string()));
+        assert_eq!(cmds[1], (NEW.to_string(), "refs/heads/feature".to_string()));
+    }
+
+    // Parity: the recognizer mirrors keel-git's — it uses the SAME `pktline::read_at` reader and the
+    // SAME `split_whitespace` tokenization, keeping caps after the first NUL. So the (new, ref) pairs
+    // hull records are exactly the pairs keel-git's `receive_pack` would apply. This test documents
+    // that by reproducing keel-git's loop inline and asserting byte-for-byte agreement.
+    #[test]
+    fn parse_receive_refs_mirrors_keel_git_tokenization() {
+        let body = recv_body(&[
+            &format!("{OLD}  {NEW} refs/heads/main"), // double space
+            &format!("{OLD}\t{NEW} refs/heads/feature"), // tab
+            &format!("{ZERO} {NEW} refs/heads/x y"), // trailing token
+        ]);
+        // keel-git's exact loop (smart_http.rs:118-132).
+        let mut expected: Vec<(String, String)> = Vec::new();
+        let mut pos = 0;
+        while let Some(pkt) = keel_git::pktline::read_at(&body, &mut pos) {
+            match pkt {
+                keel_git::pktline::Pkt::Flush => break,
+                keel_git::pktline::Pkt::Line(line) => {
+                    let line = line.split(|&b| b == 0).next().unwrap_or(line);
+                    let s = String::from_utf8_lossy(line);
+                    let mut it = s.split_whitespace();
+                    if let (Some(_o), Some(n), Some(r)) = (it.next(), it.next(), it.next()) {
+                        expected.push((n.to_string(), r.to_string()));
+                    }
+                }
+                keel_git::pktline::Pkt::Delim => {}
+            }
+        }
+        assert_eq!(parse_receive_refs(&body), expected, "hull's recognizer must match keel-git's exactly");
+    }
+
+    // Every documented bypass of the old bespoke parser must now be REJECTED on a protected `main`.
+    #[test]
+    fn protected_push_bypasses_are_all_rejected() {
+        // (a) zeroed-old overwrite: client lies that this is a "creation" — keel-git overwrites anyway.
+        assert!(rejected(&recv_body(&[&format!("{ZERO} {NEW} refs/heads/main")])), "zeroed-old overwrite");
+        // (b) delete (new = zeros).
+        assert!(rejected(&recv_body(&[&format!("{OLD} {ZERO} refs/heads/main")])), "delete");
+        // (c) double space between tokens — old splitn(3,' ') dropped it; split_whitespace doesn't.
+        assert!(rejected(&recv_body(&[&format!("{OLD}  {NEW} refs/heads/main")])), "double space");
+        // (d) tab between the oids.
+        assert!(rejected(&recv_body(&[&format!("{OLD}\t{NEW} refs/heads/main")])), "tab");
+        // (e) trailing token after the refname — old `!=` match missed it; 3rd whitespace token catches.
+        assert!(rejected(&recv_body(&[&format!("{OLD} {NEW} refs/heads/main x")])), "trailing token");
+        // (e') trailing space after the refname.
+        assert!(rejected(&recv_body(&[&format!("{OLD} {NEW} refs/heads/main ")])), "trailing space");
+        // (f) a `0001` delim pkt before the real command — old parser `break`d on len<4 and dropped it.
+        let mut delim_body = Vec::new();
+        delim_body.extend_from_slice(b"0001");
+        delim_body.extend(pkt(&format!("{OLD} {NEW} refs/heads/main\0report-status\n")));
+        delim_body.extend_from_slice(b"0000");
+        assert!(rejected(&delim_body), "0001 delim before the command");
+        // (g) a normal well-formed update.
+        assert!(rejected(&recv_body(&[&format!("{OLD} {NEW} refs/heads/main")])), "normal update");
+        // (h) a push touching ONLY a feature branch is NOT rejected.
+        assert!(!rejected(&recv_body(&[&format!("{OLD} {NEW} refs/heads/feature")])), "feature-only push allowed");
+        // And a multi-command push where main hides behind a feature command is still caught.
+        assert!(
+            rejected(&recv_body(&[&format!("{OLD} {NEW} refs/heads/feature"), &format!("{OLD} {NEW} refs/heads/main")])),
+            "main touched alongside a feature branch"
+        );
+        // No commands at all → nothing protected.
+        assert!(!rejected(&recv_body(&[])), "empty command section");
+    }
+
+    // ── branch-protection: 3-way merge synthesis ─────────────────────────────────────────────────
+
+    // Flatten a merged tree id to a `path -> contents` map for assertions.
+    fn tree_contents(store: &Store, tree_hex: &str) -> std::collections::BTreeMap<String, String> {
+        let tid = ObjectId::from_hex(tree_hex).unwrap();
+        let mut flat = HashMap::new();
+        flatten_tree(store, tid, "", &mut flat, 0);
+        flat.into_iter()
+            .map(|(p, id)| {
+                let content = match store.get(&id) {
+                    Ok(Some(Object::Blob(b))) => String::from_utf8_lossy(&b).into_owned(),
+                    _ => String::new(),
+                };
+                (p, content)
+            })
+            .collect()
+    }
+
+    // A repo host with a base→head fast-forward chain and a divergent (3-way) pair off a shared base.
+    fn merge_host(tag: &str) -> (std::path::PathBuf, RepoHost) {
+        let tmp = std::env::temp_dir().join(format!("hull-merge-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("t/r/.keel/store")).unwrap();
+        let host = RepoHost::new(&tmp);
+        (tmp, host)
+    }
+
+    #[test]
+    fn plan_merge_fast_forwards_when_base_is_ancestor_of_head() {
+        let (tmp, host) = merge_host("ff");
+        let (base_hex, head_hex, head_tree_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let base = commit(&store, vec![], tree_from(&store, &tmp, "b", &[("a.txt", "1\n")]));
+            let head = commit(&store, vec![base], tree_from(&store, &tmp, "h", &[("a.txt", "1\n"), ("b.txt", "2\n")]));
+            let head_tree = match store.get(&head).unwrap().unwrap() {
+                Object::Change(c) => c.tree.to_hex(),
+                _ => unreachable!(),
+            };
+            (base.to_hex(), head.to_hex(), head_tree)
+        };
+        match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Ok(MergeOutcome::Tree(t)) => assert_eq!(t, head_tree_hex, "a fast-forward's merged tree IS the head's tree"),
+            _ => panic!("expected a fast-forward Tree outcome"),
+        }
+        // Symmetric: head already contained in base ⇒ nothing to land.
+        match host.plan_merge("t", "r", "main", Some(&head_hex), &base_hex) {
+            Ok(MergeOutcome::AlreadyMerged) => {}
+            _ => panic!("expected AlreadyMerged when head is an ancestor of base"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn three_way_merges_disjoint_edits() {
+        let (tmp, host) = merge_host("disjoint");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            // ancestor: a=1, b=1. base edits a; head edits b (disjoint).
+            let mb = commit(&store, vec![], tree_from(&store, &tmp, "mb", &[("a.txt", "1\n"), ("b.txt", "1\n")]));
+            let base = commit(&store, vec![mb], tree_from(&store, &tmp, "base", &[("a.txt", "2\n"), ("b.txt", "1\n")]));
+            let head = commit(&store, vec![mb], tree_from(&store, &tmp, "head", &[("a.txt", "1\n"), ("b.txt", "2\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        let tree_hex = match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Ok(MergeOutcome::Tree(t)) => t,
+            other => panic!("expected a synthesized 3-way Tree, got {}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
+        };
+        let store = host.store("t", "r", false).unwrap().unwrap();
+        let c = tree_contents(&store, &tree_hex);
+        assert_eq!(c.get("a.txt").map(String::as_str), Some("2\n"), "base's edit to a survives");
+        assert_eq!(c.get("b.txt").map(String::as_str), Some("2\n"), "head's edit to b survives");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn three_way_conflicts_on_same_file_different_edits() {
+        let (tmp, host) = merge_host("conflict");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let mb = commit(&store, vec![], tree_from(&store, &tmp, "mb", &[("a.txt", "1\n")]));
+            let base = commit(&store, vec![mb], tree_from(&store, &tmp, "base", &[("a.txt", "2\n")]));
+            let head = commit(&store, vec![mb], tree_from(&store, &tmp, "head", &[("a.txt", "3\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Err(MergeError::Conflict(m)) => assert!(m.contains("a.txt") && m.contains("CONFLICT"), "message names the path: {m}"),
+            _ => panic!("expected a conflict on divergent edits to the same file"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn three_way_conflicts_on_add_add() {
+        let (tmp, host) = merge_host("addadd");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let mb = commit(&store, vec![], tree_from(&store, &tmp, "mb", &[("keep.txt", "x\n")]));
+            let base = commit(&store, vec![mb], tree_from(&store, &tmp, "base", &[("keep.txt", "x\n"), ("new.txt", "A\n")]));
+            let head = commit(&store, vec![mb], tree_from(&store, &tmp, "head", &[("keep.txt", "x\n"), ("new.txt", "B\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Err(MergeError::Conflict(m)) => assert!(m.contains("new.txt"), "add/add differing is a conflict: {m}"),
+            _ => panic!("expected an add/add conflict"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn three_way_conflicts_on_delete_vs_modify() {
+        let (tmp, host) = merge_host("delmod");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let mb = commit(&store, vec![], tree_from(&store, &tmp, "mb", &[("a.txt", "1\n"), ("k.txt", "0\n")]));
+            // base deletes a.txt; head modifies it.
+            let base = commit(&store, vec![mb], tree_from(&store, &tmp, "base", &[("k.txt", "0\n")]));
+            let head = commit(&store, vec![mb], tree_from(&store, &tmp, "head", &[("a.txt", "2\n"), ("k.txt", "0\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Err(MergeError::Conflict(m)) => assert!(m.contains("a.txt"), "delete-vs-modify is a conflict: {m}"),
+            _ => panic!("expected a delete/modify conflict"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn three_way_takes_one_sided_edits_and_deletes_cleanly() {
+        // ancestor: a,b,c. base edits a and deletes b; head adds d (all disjoint from base) → clean.
+        let (tmp, host) = merge_host("onesided");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let mb = commit(&store, vec![], tree_from(&store, &tmp, "mb", &[("a.txt", "1\n"), ("b.txt", "1\n"), ("c.txt", "1\n")]));
+            let base = commit(&store, vec![mb], tree_from(&store, &tmp, "base", &[("a.txt", "2\n"), ("c.txt", "1\n")]));
+            let head = commit(&store, vec![mb], tree_from(&store, &tmp, "head", &[("a.txt", "1\n"), ("b.txt", "1\n"), ("c.txt", "1\n"), ("d.txt", "9\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        let tree_hex = match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Ok(MergeOutcome::Tree(t)) => t,
+            _ => panic!("expected a clean 3-way merge"),
+        };
+        let store = host.store("t", "r", false).unwrap().unwrap();
+        let c = tree_contents(&store, &tree_hex);
+        assert_eq!(c.get("a.txt").map(String::as_str), Some("2\n"), "base's edit to a wins (head unchanged there)");
+        assert!(!c.contains_key("b.txt"), "base's delete of b is honored (head unchanged there)");
+        assert_eq!(c.get("d.txt").map(String::as_str), Some("9\n"), "head's added d is taken");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // Flatten a merged tree id to `path -> git mode`.
+    fn tree_modes(store: &Store, tree_hex: &str) -> std::collections::BTreeMap<String, u32> {
+        let tid = ObjectId::from_hex(tree_hex).unwrap();
+        let mut flat = HashMap::new();
+        flatten_tree_modes(store, tid, "", &mut flat, 0);
+        flat.into_iter().map(|(p, (_, m))| (p, m)).collect()
+    }
+
+    // MED 1: a merge that flips the exec bit or introduces a symlink must carry the MODE through — a
+    // plain-`fs::write` materialize dropped +x and turned symlinks into regular files ("green but
+    // wrong"). Unix-only: modes are a no-op on platforms without them.
+    #[cfg(unix)]
+    #[test]
+    fn three_way_preserves_exec_bit_and_symlink_through_merge() {
+        use keel_store::snapshot::{snapshot_uncached, MODE_EXEC, MODE_FILE, MODE_SYMLINK};
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, host) = merge_host("modes");
+        // Write `bytes` to `dir/name` at `mode` (MODE_FILE or MODE_EXEC).
+        let write_mode = |dir: &std::path::Path, name: &str, bytes: &[u8], mode: u32| {
+            let fp = dir.join(name);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, bytes).unwrap();
+            if mode == MODE_EXEC {
+                let mut perm = std::fs::metadata(&fp).unwrap().permissions();
+                perm.set_mode(0o755);
+                std::fs::set_permissions(&fp, perm).unwrap();
+            }
+        };
+        let script = b"#!/bin/sh\necho hi\n";
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            // ancestor: a plain (non-exec) script + a text file.
+            let mb_dir = tmp.join("mb");
+            write_mode(&mb_dir, "script.sh", script, MODE_FILE);
+            write_mode(&mb_dir, "other.txt", b"1\n", MODE_FILE);
+            let mb = commit(&store, vec![], snapshot_uncached(&store, &mb_dir).unwrap());
+            // base (ours): edits other.txt; leaves script.sh plain.
+            let base_dir = tmp.join("base");
+            write_mode(&base_dir, "script.sh", script, MODE_FILE);
+            write_mode(&base_dir, "other.txt", b"2\n", MODE_FILE);
+            let base = commit(&store, vec![mb], snapshot_uncached(&store, &base_dir).unwrap());
+            // head (theirs): same script content but now EXECUTABLE, plus a NEW symlink `link -> other.txt`.
+            let head_dir = tmp.join("head");
+            write_mode(&head_dir, "script.sh", script, MODE_EXEC);
+            write_mode(&head_dir, "other.txt", b"1\n", MODE_FILE);
+            std::os::unix::fs::symlink("other.txt", head_dir.join("link")).unwrap();
+            let head = commit(&store, vec![mb], snapshot_uncached(&store, &head_dir).unwrap());
+            (base.to_hex(), head.to_hex())
+        };
+        let tree_hex = match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Ok(MergeOutcome::Tree(t)) => t,
+            other => panic!("expected a synthesized 3-way tree, got AlreadyMerged={}", matches!(other, Ok(MergeOutcome::AlreadyMerged))),
+        };
+        let store = host.store("t", "r", false).unwrap().unwrap();
+        let modes = tree_modes(&store, &tree_hex);
+        assert_eq!(modes.get("script.sh"), Some(&MODE_EXEC), "the merged script keeps its +x bit");
+        assert_eq!(modes.get("link"), Some(&MODE_SYMLINK), "the merged symlink stays a symlink, not a regular file");
+        let c = tree_contents(&store, &tree_hex);
+        assert_eq!(c.get("other.txt").map(String::as_str), Some("2\n"), "base's edit to other.txt survives");
+        assert_eq!(c.get("link").map(String::as_str), Some("other.txt"), "the symlink's content is its target path");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // MED 2: a criss-cross history with two INCOMPARABLE merge bases must be rejected, not silently
+    // merged against one arbitrarily-chosen base.
+    #[test]
+    fn plan_merge_rejects_multiple_incomparable_merge_bases() {
+        let (tmp, host) = merge_host("crisscross");
+        let (base_hex, head_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            // o1, o2 are two independent roots (neither an ancestor of the other). base and head each
+            // descend from BOTH → their common ancestors are {o1, o2}, two incomparable merge bases.
+            let o1 = commit(&store, vec![], tree_from(&store, &tmp, "o1", &[("a.txt", "1\n")]));
+            let o2 = commit(&store, vec![], tree_from(&store, &tmp, "o2", &[("b.txt", "1\n")]));
+            let base = commit(&store, vec![o1, o2], tree_from(&store, &tmp, "base", &[("a.txt", "1\n"), ("b.txt", "1\n"), ("c.txt", "base\n")]));
+            let head = commit(&store, vec![o1, o2], tree_from(&store, &tmp, "head", &[("a.txt", "1\n"), ("b.txt", "1\n"), ("d.txt", "head\n")]));
+            (base.to_hex(), head.to_hex())
+        };
+        match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
+            Err(MergeError::Conflict(m)) => assert!(m.contains("multiple merge bases"), "message flags complex history: {m}"),
+            other => panic!("expected a complex-history conflict; got ok={}", matches!(other, Ok(_))),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn land_merge_advances_branch_by_cas_and_conflicts_on_stale_base() {
+        let (tmp, host) = merge_host("land");
+        let (base_hex, head_hex, merged_tree_hex) = {
+            let store = host.store("t", "r", true).unwrap().unwrap();
+            let base = commit(&store, vec![], tree_from(&store, &tmp, "base", &[("a.txt", "1\n")]));
+            store.set_ref("main", &base).unwrap();
+            let head = commit(&store, vec![base], tree_from(&store, &tmp, "head", &[("a.txt", "1\n"), ("b.txt", "2\n")]));
+            let head_tree = match store.get(&head).unwrap().unwrap() {
+                Object::Change(c) => c.tree.to_hex(),
+                _ => unreachable!(),
+            };
+            (base.to_hex(), head.to_hex(), head_tree)
+        };
+        // Landing from the correct base advances main to a two-parent merge change.
+        let landed = host
+            .land_merge("t", "r", "main", Some(&base_hex), &head_hex, &merged_tree_hex, "Merge PR !1", "alice", 0)
+            .expect("land ok");
+        let landed = landed.expect("committed");
+        let store = host.store("t", "r", false).unwrap().unwrap();
+        assert_eq!(store.get_ref("main").unwrap().unwrap().to_hex(), landed, "main advanced to the merge change");
+        match store.get(&ObjectId::from_hex(&landed).unwrap()).unwrap().unwrap() {
+            Object::Change(c) => {
+                assert_eq!(c.parents.len(), 2, "a merge change has two parents");
+                assert_eq!(c.parents[0].to_hex(), base_hex);
+                assert_eq!(c.parents[1].to_hex(), head_hex);
+            }
+            _ => panic!("landed object is not a change"),
+        }
+        // A second land from the now-STALE base is a CAS miss → None (caller re-plans + retries).
+        let stale = host
+            .land_merge("t", "r", "main", Some(&base_hex), &head_hex, &merged_tree_hex, "Merge PR !1 again", "alice", 0)
+            .expect("land ok");
+        assert!(stale.is_none(), "a stale-base land is rejected by CAS, not clobbered");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

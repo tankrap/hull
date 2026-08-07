@@ -3551,6 +3551,33 @@ async fn upload_pack_handler(
 /// (memoized by tree, so an unchanged tree is a no-op); dispatched to the configured CI or the local
 /// runner. Also carries the push auth gate (receive-pack), enforced BEFORE the handler provisions or
 /// mutates the repo.
+/// The git receive-pack **report-status** stream that rejects a push to a protected branch, so
+/// `git push` prints a clean `! [remote rejected] main -> main (protected: …)`. keel-git advertises
+/// no side-band, so the report goes in the response body directly (no sideband framing). We report
+/// `unpack ok` (the pack is simply never ingested — nothing is written) followed by an `ng` for the
+/// protected ref; git treats the `ng` as a rejection and fails the push, leaving the branch untouched.
+fn protected_push_rejection(default_branch: &str) -> Response {
+    fn pkt(line: &str) -> Vec<u8> {
+        // A git pkt-line: a 4-hex length prefix (covering the 4 bytes) followed by the payload.
+        let mut v = format!("{:04x}", line.len() + 4).into_bytes();
+        v.extend_from_slice(line.as_bytes());
+        v
+    }
+    let mut body = Vec::new();
+    body.extend(pkt("unpack ok\n"));
+    body.extend(pkt(&format!("ng refs/heads/{default_branch} protected: land changes via a reviewed PR\n")));
+    body.extend_from_slice(b"0000"); // flush-pkt
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-git-receive-pack-result"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 async fn receive_pack_handler(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
@@ -3559,6 +3586,18 @@ async fn receive_pack_handler(
 ) -> Response {
     if let Some(resp) = git_gate(&app, &tenant, &repo, "git-receive-pack", &headers).await {
         return resp;
+    }
+    // Branch protection: on a repo that requires review-to-land, a direct push that UPDATES the
+    // protected default branch is rejected — the branch may only advance through a reviewed, merge-
+    // verified land (`perform_merge`). Ref *creation* (a fresh repo) and every other branch push are
+    // unaffected. When protection is off this whole block is skipped — the config-off no-op.
+    let key = format!("{tenant}/{repo}");
+    if app.repo_settings.get(&key).protects_default_branch() {
+        let default_branch = find_repo(&app, &tenant, &repo).await.map(|r| r.default_branch).unwrap_or_else(|| "main".into());
+        let commands = repos::parse_receive_refs(&repos::maybe_gunzip(&headers, body.to_vec()));
+        if repos::touches_protected(&commands, &default_branch) {
+            return protected_push_rejection(&default_branch);
+        }
     }
     let resp = repos::receive_pack(State(app.clone()), Path((tenant.clone(), repo.clone())), headers, body).await;
     if resp.status().is_success() {
@@ -3903,15 +3942,72 @@ async fn perform_merge(
         };
         return Err((StatusCode::CONFLICT, format!("cannot merge: {why}")));
     }
+    // Landing. On a PROTECTED default branch this advances the branch through a synthesized,
+    // speculatively re-verified merge (the merge queue). When protection is off it stays exactly
+    // today's metadata-only flip — the config-off no-op that keeps every un-opted repo unchanged.
+    let default_branch = find_repo(app, tenant, repo).await.map(|r| r.default_branch).unwrap_or_else(|| "main".into());
+    let mut landed_change: Option<String> = None;
+    if app.repo_settings.get(&key).protects_default_branch() {
+        let Some(head) = app.repos.pr_head(tenant, repo, &pr.changes) else {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "PR has no landable change".into()));
+        };
+        let intent = format!("Merge PR !{number}: {}", pr.title);
+        let mut done = false;
+        // CAS-advance with bounded retry: a concurrent land moves the branch, so we re-read the base
+        // and re-plan (and re-verify the fresh merged tree) rather than clobber the other land.
+        for _ in 0..8 {
+            let base = app.repos.branch_head(tenant, repo, &default_branch);
+            match app.repos.plan_merge(tenant, repo, &default_branch, base.as_deref(), &head) {
+                Ok(repos::MergeOutcome::AlreadyMerged) => {
+                    done = true; // head already on the branch — nothing to advance
+                    break;
+                }
+                Ok(repos::MergeOutcome::Tree(tree)) => {
+                    // Speculative verify of the MERGED tree — catches semantic conflicts two
+                    // independently-green changes create. An admin override may bypass the green gate
+                    // (a wedged/misconfigured check) but STILL lands through this merge path — there is
+                    // no git-push escape hatch. A real content conflict already errored out of `plan_merge`.
+                    if !override_ok {
+                        let (rh, registry, ci) = (app.repos.clone(), app.registry.clone(), app.ci.clone());
+                        let (t, r, tr) = (tenant.to_string(), repo.to_string(), tree.clone());
+                        let outcome = tokio::task::spawn_blocking(move || ci::run_check_tree(&rh, &registry, &ci, &t, &r, &tr))
+                            .await
+                            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "merge verification panicked".to_string()))?;
+                        if !matches!(outcome.status, hull_plugin::CiStatus::Green) {
+                            return Err((StatusCode::CONFLICT, "CONFLICT: merged result fails checks".into()));
+                        }
+                    }
+                    match app.repos.land_merge(tenant, repo, &default_branch, base.as_deref(), &head, &tree, &intent, &actor.id, now()) {
+                        Ok(Some(new_change)) => {
+                            landed_change = Some(new_change);
+                            done = true;
+                            break;
+                        }
+                        Ok(None) => continue, // CAS miss: branch moved — re-read + re-plan
+                        Err(repos::MergeError::Conflict(m)) => return Err((StatusCode::CONFLICT, m)),
+                        Err(repos::MergeError::Internal(m)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, m)),
+                    }
+                }
+                Err(repos::MergeError::Conflict(m)) => return Err((StatusCode::CONFLICT, m)),
+                Err(repos::MergeError::Internal(m)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, m)),
+            }
+        }
+        if !done {
+            return Err((StatusCode::CONFLICT, "branch moved during merge; retry".into()));
+        }
+    }
     pr.state = PrState::Merged;
     pr.merged_by = Some(actor.id.clone());
     app.store.replace_pr(pr.clone()).await;
+    // Announce the change that now sits at the branch tip — the synthesized merge change on a
+    // protected land, else the PR's head change (today's behavior).
+    let announced = landed_change.clone().or_else(|| pr.changes.first().cloned()).unwrap_or_default();
     app.hub.publish(
         tenant,
-        ActivityEvent::Push { actor: actor.handle.clone(), repo: repo.to_string(), change: pr.changes.first().cloned().unwrap_or_default(), ts: now() },
+        ActivityEvent::Push { actor: actor.handle.clone(), repo: repo.to_string(), change: announced.clone(), ts: now() },
     );
     // Outbound mirror on change-land — guarded by loop prevention + idempotency.
-    if let Some(change) = pr.changes.first() {
+    if let Some(change) = landed_change.as_ref().or_else(|| pr.changes.first()) {
         mirror_out(app, tenant, repo, change).await;
     }
     // Auto-close the issues this PR fixes, stamping the resolving keel change as provenance.
@@ -4037,6 +4133,19 @@ async fn mirror_github_webhook(
         return Json(json!({ "loop_skipped": after })).into_response();
     }
     app.mirror.set_origin(&after, "github");
+
+    // Branch protection: the protected default branch may only advance through the reviewed, merge-
+    // verified merge queue (`perform_merge`). Mirror-inbound is secret-gated (not attacker-arbitrary),
+    // but importing a forge push here would move the protected branch OUTSIDE review — so on a protected
+    // repo we refuse to advance the protected branch and log it. (Non-default branches were already
+    // ignored above; this path only ever reaches `refs/heads/main`.)
+    if app.repo_settings.get(&format!("{tenant}/{repo}")).protects_default_branch() {
+        let default_branch = find_repo(&app, &tenant, &repo).await.map(|r| r.default_branch).unwrap_or_else(|| "main".into());
+        if git_ref == format!("refs/heads/{default_branch}") {
+            eprintln!("hull: ⚠ mirror-inbound push to {tenant}/{repo} targets protected '{default_branch}'; skipped (advance only via a reviewed PR)");
+            return Json(json!({ "skipped_protected": default_branch, "change": after })).into_response();
+        }
+    }
 
     // Import: fetch the forge's git and bridge into keel (off the async runtime — it shells git).
     let key = format!("{tenant}/{repo}");
@@ -5961,6 +6070,126 @@ mod tests {
         let boss = actor("boss", ActorKind::Human);
         perform_merge(&app, "t", "r", 1, &boss, true).await.expect("admin force override merges despite the gate");
         assert!(is_merged(&app, "t/r", 1).await);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── branch protection: default-off regression + merge-queue land ──────────────────────────────
+
+    #[test]
+    fn default_settings_do_not_protect_the_branch() {
+        // The config-off switch: a repo that hasn't opted in is unprotected, so the receive-pack gate
+        // is skipped entirely and `perform_merge` stays metadata-only.
+        assert!(!crate::reposettings::RepoSettings::default().protects_default_branch());
+    }
+
+    /// REGRESSION: with `require_review_to_land` OFF (the default), an approved+green merge behaves
+    /// exactly as today — the PR flips `Merged` and `main` does NOT move (metadata-only). This is the
+    /// hard guarantee that the whole feature is a no-op until a repo opts in.
+    #[tokio::test]
+    async fn protection_off_land_is_metadata_only_and_does_not_move_main() {
+        let (app, tmp) = build_test_app("protoff");
+        let change = app.repos.test_commit("t", "r", "", None, &[("notes.txt", "hi\n")]);
+        app.repos.set_verification("t", "r", &change, true);
+        app.store.put_actor(actor("author", ActorKind::Human)).await;
+        app.store.put_actor(actor("reviewer", ActorKind::Human)).await;
+        put_pr(&app, "t/r", 1, "author", &change).await;
+        put_approval(&app, "t/r", 1, "reviewer").await;
+        let main_before = app.repos.head_change("t", "r");
+        let acting = actor("author", ActorKind::Human);
+        perform_merge(&app, "t", "r", 1, &acting, false).await.expect("merges with default (unprotected) settings");
+        assert!(is_merged(&app, "t/r", 1).await, "PR flips Merged");
+        let main_after = app.repos.head_change("t", "r");
+        assert_eq!(main_before, main_after, "protection OFF ⇒ perform_merge must NOT advance main");
+        assert_eq!(main_after.as_deref(), Some(change.as_str()), "main still at the original change (no merge commit synthesized)");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// On a PROTECTED branch a land ADVANCES `main` through a synthesized two-parent merge change (not
+    /// a metadata flip). Uses the admin force-override so the ref-advance is exercised without a live CI
+    /// runner — the override bypasses the green gate but STILL lands through the merge queue (§4).
+    #[tokio::test]
+    async fn protected_land_advances_main_to_a_two_parent_merge_change() {
+        let (app, tmp) = build_test_app("protadvance");
+        app.store.put_account(Account {
+            id: "acct-t".into(),
+            kind: AccountKind::Organization,
+            handle: "t".into(),
+            members: vec![Membership { actor: "boss".into(), role: Role::Owner }],
+        }).await;
+        app.store.put_actor(actor("boss", ActorKind::Human)).await;
+        app.repo_settings.set("t/r", crate::reposettings::RepoSettings { require_review_to_land: true, ..Default::default() });
+        // main = base; the PR's head is a child of base sitting OFF main (a real fast-forward to land).
+        let base = app.repos.test_commit("t", "r", "base", None, &[("a.txt", "1\n")]);
+        let head = app.repos.test_change("t", "r", Some(&base), &[("a.txt", "1\n"), ("b.txt", "2\n")]);
+        put_pr(&app, "t/r", 1, "author", &head).await;
+
+        let boss = actor("boss", ActorKind::Human);
+        perform_merge(&app, "t", "r", 1, &boss, true).await.expect("admin force lands through the merge queue");
+        assert!(is_merged(&app, "t/r", 1).await);
+        let tip = app.repos.head_change("t", "r").expect("main has a tip");
+        assert_ne!(tip, base, "main advanced off the base");
+        assert_ne!(tip, head, "main is a synthesized merge change, not the PR head itself");
+        // The new tip is a two-parent merge of [base, head].
+        let info = app.repos.change_info("t", "r", &tip).expect("tip resolves");
+        assert!(info.files.iter().any(|f| f.path == "b.txt"), "the merged tree carries head's new file");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// On a protected branch, the SPECULATIVE verify of the merged tree gates the land: a red merged
+    /// tree is rejected and `main` does not move. Drives the built-in local CI via `HULL_CI_CMD`.
+    #[tokio::test]
+    async fn protected_land_blocked_when_merged_tree_fails_checks() {
+        let (app, tmp) = build_test_app("protred");
+        app.store.put_actor(actor("author", ActorKind::Human)).await;
+        app.store.put_actor(actor("reviewer", ActorKind::Human)).await;
+        app.repo_settings.set("t/r", crate::reposettings::RepoSettings { require_review_to_land: true, ..Default::default() });
+        let base = app.repos.test_commit("t", "r", "base", None, &[("a.txt", "1\n")]);
+        let head = app.repos.test_change("t", "r", Some(&base), &[("a.txt", "1\n"), ("b.txt", "2\n")]);
+        // The per-change green gate is satisfied directly; the MERGED-tree verify is what we exercise.
+        app.repos.set_verification("t", "r", &head, true);
+        put_pr(&app, "t/r", 1, "author", &head).await;
+        put_approval(&app, "t/r", 1, "reviewer").await;
+
+        let acting = actor("author", ActorKind::Human);
+        let (code, msg) = {
+            // Serialize the env mutation; make the local CI runner fail on the merged tree.
+            let _g = MERGE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("HULL_CI_CMD", "exit 1");
+            let r = perform_merge(&app, "t", "r", 1, &acting, false).await;
+            std::env::remove_var("HULL_CI_CMD");
+            r.expect_err("a red merged tree blocks the land")
+        };
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(msg.contains("merged result fails checks"), "msg: {msg}");
+        assert!(!is_merged(&app, "t/r", 1).await, "PR stays open");
+        assert_eq!(app.repos.head_change("t", "r").as_deref(), Some(base.as_str()), "main did not advance");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// On a protected branch, a green merged tree lands: `main` advances and the PR flips Merged.
+    #[tokio::test]
+    async fn protected_land_succeeds_when_merged_tree_is_green() {
+        let (app, tmp) = build_test_app("protgreen");
+        app.store.put_actor(actor("author", ActorKind::Human)).await;
+        app.store.put_actor(actor("reviewer", ActorKind::Human)).await;
+        app.repo_settings.set("t/r", crate::reposettings::RepoSettings { require_review_to_land: true, ..Default::default() });
+        let base = app.repos.test_commit("t", "r", "base", None, &[("a.txt", "1\n")]);
+        let head = app.repos.test_change("t", "r", Some(&base), &[("a.txt", "1\n"), ("b.txt", "2\n")]);
+        app.repos.set_verification("t", "r", &head, true);
+        put_pr(&app, "t/r", 1, "author", &head).await;
+        put_approval(&app, "t/r", 1, "reviewer").await;
+
+        let acting = actor("author", ActorKind::Human);
+        {
+            let _g = MERGE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("HULL_CI_CMD", "exit 0"); // merged tree passes speculative verify
+            let r = perform_merge(&app, "t", "r", 1, &acting, false).await;
+            std::env::remove_var("HULL_CI_CMD");
+            r.expect("green merged tree lands");
+        }
+        assert!(is_merged(&app, "t/r", 1).await);
+        let tip = app.repos.head_change("t", "r").expect("main has a tip");
+        assert_ne!(tip, base, "main advanced to the merge change");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

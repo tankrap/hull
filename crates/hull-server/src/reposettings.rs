@@ -43,6 +43,15 @@ pub struct RepoSettings {
     pub labels: Vec<Label>,
 }
 
+impl RepoSettings {
+    /// Is the repo's **default branch** protected — advanceable only through a reviewed, merge-verified
+    /// land, never a direct push? v1: exactly when `require_review_to_land` is on. Off (or missing
+    /// settings) ⇒ unprotected, the config-off no-op. Other branches are never protected in v1.
+    pub fn protects_default_branch(&self) -> bool {
+        self.require_review_to_land
+    }
+}
+
 /// A configurable issue label: a name, a color (hex, e.g. `#d73a4a`), and an optional emoji icon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Label {
