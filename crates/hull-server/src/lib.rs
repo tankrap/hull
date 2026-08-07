@@ -3551,6 +3551,33 @@ async fn upload_pack_handler(
 /// (memoized by tree, so an unchanged tree is a no-op); dispatched to the configured CI or the local
 /// runner. Also carries the push auth gate (receive-pack), enforced BEFORE the handler provisions or
 /// mutates the repo.
+/// The git receive-pack **report-status** stream that rejects a push to a protected branch, so
+/// `git push` prints a clean `! [remote rejected] main -> main (protected: …)`. keel-git advertises
+/// no side-band, so the report goes in the response body directly (no sideband framing). We report
+/// `unpack ok` (the pack is simply never ingested — nothing is written) followed by an `ng` for the
+/// protected ref; git treats the `ng` as a rejection and fails the push, leaving the branch untouched.
+fn protected_push_rejection(default_branch: &str) -> Response {
+    fn pkt(line: &str) -> Vec<u8> {
+        // A git pkt-line: a 4-hex length prefix (covering the 4 bytes) followed by the payload.
+        let mut v = format!("{:04x}", line.len() + 4).into_bytes();
+        v.extend_from_slice(line.as_bytes());
+        v
+    }
+    let mut body = Vec::new();
+    body.extend(pkt("unpack ok\n"));
+    body.extend(pkt(&format!("ng refs/heads/{default_branch} protected: land changes via a reviewed PR\n")));
+    body.extend_from_slice(b"0000"); // flush-pkt
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-git-receive-pack-result"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 async fn receive_pack_handler(
     State(app): State<App>,
     Path((tenant, repo)): Path<(String, String)>,
@@ -3559,6 +3586,18 @@ async fn receive_pack_handler(
 ) -> Response {
     if let Some(resp) = git_gate(&app, &tenant, &repo, "git-receive-pack", &headers).await {
         return resp;
+    }
+    // Branch protection: on a repo that requires review-to-land, a direct push that UPDATES the
+    // protected default branch is rejected — the branch may only advance through a reviewed, merge-
+    // verified land (`perform_merge`). Ref *creation* (a fresh repo) and every other branch push are
+    // unaffected. When protection is off this whole block is skipped — the config-off no-op.
+    let key = format!("{tenant}/{repo}");
+    if app.repo_settings.get(&key).protects_default_branch() {
+        let default_branch = find_repo(&app, &tenant, &repo).await.map(|r| r.default_branch).unwrap_or_else(|| "main".into());
+        let commands = repos::parse_receive_commands(&repos::maybe_gunzip(&headers, body.to_vec()));
+        if repos::updates_protected(&commands, &default_branch) {
+            return protected_push_rejection(&default_branch);
+        }
     }
     let resp = repos::receive_pack(State(app.clone()), Path((tenant.clone(), repo.clone())), headers, body).await;
     if resp.status().is_success() {

@@ -1449,7 +1449,7 @@ fn server_error(e: io::Error) -> Response {
 
 /// Decompress the body if the request declares `Content-Encoding: gzip` (git's default for the
 /// upload-pack POST). On any decode failure fall back to the raw bytes.
-fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>) -> Vec<u8> {
     let is_gzip = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -1464,6 +1464,61 @@ fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>) -> Vec<u8> {
         Ok(_) => out,
         Err(_) => body,
     }
+}
+
+/// One ref-update command from a git receive-pack request: advance `refname` from `old` to `new`
+/// (both 40-hex SHA-1). `old` = 40 zeros ⇒ ref **creation**; `new` = 40 zeros ⇒ ref **deletion**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushCommand {
+    pub old: String,
+    pub new: String,
+    pub refname: String,
+}
+
+/// Parse the **command section** of a (gunzipped) git-receive-pack request body — the leading
+/// pkt-lines `<old-oid> SP <new-oid> SP <refname>`, the first of which carries `\0<capabilities>`,
+/// terminated by the `0000` flush-pkt that precedes the PACK data. Only the commands are parsed; the
+/// packfile is never decoded. A pkt-line = a 4-hex length prefix (covering the 4 bytes) + payload.
+pub(crate) fn parse_receive_commands(body: &[u8]) -> Vec<PushCommand> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 4 <= body.len() {
+        let Ok(len_hex) = std::str::from_utf8(&body[i..i + 4]) else { break };
+        let Ok(len) = usize::from_str_radix(len_hex, 16) else { break };
+        if len == 0 {
+            break; // flush-pkt: end of the command list, the PACK follows
+        }
+        if len < 4 || i + len > body.len() {
+            break; // malformed length — stop rather than misread the packfile
+        }
+        let data = &body[i + 4..i + len];
+        i += len;
+        // Strip a trailing LF, then drop the `\0<capabilities>` tail present on the first command.
+        let data = data.strip_suffix(b"\n").unwrap_or(data);
+        let line = match data.iter().position(|&b| b == 0) {
+            Some(p) => &data[..p],
+            None => data,
+        };
+        let Ok(s) = std::str::from_utf8(line) else { continue };
+        let mut parts = s.splitn(3, ' ');
+        if let (Some(old), Some(new), Some(refname)) = (parts.next(), parts.next(), parts.next()) {
+            // Real oids are 40 hex chars; guard so a stray pkt-line can't masquerade as a command.
+            if old.len() == 40 && new.len() == 40 && !refname.is_empty() {
+                out.push(PushCommand { old: old.to_string(), new: new.to_string(), refname: refname.to_string() });
+            }
+        }
+    }
+    out
+}
+
+/// Does any command **update** the protected default branch (`refs/heads/<default_branch>`)? An update
+/// is any command whose old-oid is non-zero — so ref **creation** (old = 40 zeros, e.g. initializing a
+/// fresh repo) is EXEMPT, while a fast-forward, force-update, or deletion of the protected branch is
+/// caught.
+pub(crate) fn updates_protected(commands: &[PushCommand], default_branch: &str) -> bool {
+    let target = format!("refs/heads/{default_branch}");
+    let zero = "0".repeat(40);
+    commands.iter().any(|c| c.refname == target && c.old != zero)
 }
 
 #[cfg(test)]
