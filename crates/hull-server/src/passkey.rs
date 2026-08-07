@@ -12,7 +12,7 @@ use webauthn_rs::prelude::*;
 /// (no scheme/port); `origin` must match the browser's origin exactly, including port.
 pub fn build() -> Webauthn {
     let rp_id = std::env::var("HULL_WEBAUTHN_RP_ID").unwrap_or_else(|_| "localhost".into());
-    let origin = std::env::var("HULL_WEBAUTHN_ORIGIN").unwrap_or_else(|_| "http://localhost:5931".into());
+    let origin = std::env::var("HULL_WEBAUTHN_ORIGIN").unwrap_or_else(|_| "http://localhost:5930".into());
     let rp_origin = Url::parse(&origin).expect("HULL_WEBAUTHN_ORIGIN must be a URL");
     WebauthnBuilder::new(&rp_id, &rp_origin)
         .expect("invalid WebAuthn relying-party config")
