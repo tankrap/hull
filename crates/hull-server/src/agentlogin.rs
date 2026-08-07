@@ -101,6 +101,18 @@ pub fn begin(command: &str, session: &str, dir: &Path) -> Result<Begun, String> 
             cmd.arg("--device-auth");
         }
     }
+    // portable_pty's CommandBuilder inherits the FULL server environment by default, and the PTY child
+    // is `execve`-dumpable (unlike the non-dumpable server), so its `/proc/<pid>/environ` would expose
+    // any inherited secret to a same-uid CI job running concurrently during the (interactive, ≤15 min)
+    // login window. Strip the secret-shaped vars — the login CLI drives its own OAuth and needs none of
+    // them. (portable_pty's CommandBuilder exposes no `pre_exec`, so `PR_SET_DUMPABLE(0)` can't be set
+    // on it cleanly; this env-strip is the clean equivalent.)
+    for (k, _) in std::env::vars() {
+        let up = k.to_ascii_uppercase();
+        if up.starts_with("HULL_") || up.starts_with("GITHUB_") || up.ends_with("_API_KEY") {
+            cmd.env_remove(&k);
+        }
+    }
     // Codex keys credentials off its bundle dir; Claude's setup-token doesn't use it (it prints a
     // token), but we still isolate its scratch state there.
     cmd.env(config_env(command), dir.to_string_lossy().to_string());
