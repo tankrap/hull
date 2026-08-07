@@ -628,6 +628,10 @@ fn ingress_addr() -> Option<std::net::SocketAddr> {
 pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     // Install the tracing subscriber ONCE, before anything logs. Idempotent (guards double-init).
     observability::init_tracing();
+    // Harden the server process before it serves any request: on Linux, make it non-dumpable (so a
+    // same-uid CI child can't read the server's own /proc/<pid>/environ secrets) and a child-subreaper
+    // (so a CI descendant that escapes its process group reparents here to be reaped). No-op elsewhere.
+    ci_sandbox::harden_server_process();
     // Fail fast in the prod profile: refuse to boot with an unsafe/missing security config rather than
     // silently running open. A no-op unless `HULL_PROFILE=prod` / `HULL_PROD=1` is set (the default).
     enforce_prod_profile();

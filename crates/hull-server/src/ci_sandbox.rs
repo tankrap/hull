@@ -32,9 +32,17 @@
 //!   applies the Landlock ruleset (Linux only, best-effort so old kernels degrade to a warning), then
 //!   `execvp`s the real command (which inherits the rlimits + Landlock domain + pgid + curated env).
 //!
-//! Gated on `HULL_CI_SANDBOX` (default **on** on unix; `off` falls back to the raw `default_local_ci`
-//! for debugging). Network is intentionally left open (cargo/npm need to fetch deps) — a documented
-//! deferred increment. See `docs/deploy.md`.
+//! Gated on `HULL_CI_SANDBOX`: default **on** (best-effort) on unix; `off` falls back to the raw
+//! `default_local_ci` for debugging; `enforce` is fail-closed — the helper **refuses to exec** the
+//! command if Landlock filesystem confinement can't be enforced. Network is intentionally left open
+//! (cargo/npm need to fetch deps) — a documented deferred increment.
+//!
+//! **The child runs as the SAME uid as the server and its parent IS the server** (the helper `execvp`s
+//! in place). So `env_clear` on the child does not stop it reading the server's OWN environment via
+//! `/proc/<server-pid>/environ`. That escape is closed at server startup by
+//! [`harden_server_process`] (`PR_SET_DUMPABLE(0)` → the server's `/proc` files become root-owned),
+//! NOT here in the helper. The complete isolation (a dedicated CI uid / PID namespace) is a deferred
+//! increment; see `docs/deploy.md`.
 
 use hull_plugin::{CiOutcome, CiRequest, CiRunner, CiStatus};
 
@@ -149,6 +157,10 @@ mod unix {
         let cpu_secs = env_u64("HULL_CI_CPU_SECS", timeout_secs);
         let nproc = env_u64("HULL_CI_NPROC", DEFAULT_NPROC);
         let fsize_mb = env_u64("HULL_CI_FSIZE_MB", DEFAULT_FSIZE_MB);
+        // Fail-closed opt-in: `HULL_CI_SANDBOX=enforce` makes the helper REFUSE to exec the command if
+        // Landlock cannot be enforced (rather than degrading to a logged no-op). Passed as a flag
+        // because the helper's env is scrubbed (`env_clear`), so it can't read `HULL_CI_SANDBOX` itself.
+        let enforce = std::env::var("HULL_CI_SANDBOX").as_deref() == Ok("enforce");
 
         let mut cmd = Command::new(&helper);
         cmd.arg("ci-sandbox")
@@ -166,6 +178,9 @@ mod unix {
             .arg(&scratch);
         for ro in &allow_ro {
             cmd.arg("--allow-ro").arg(ro);
+        }
+        if enforce {
+            cmd.arg("--enforce");
         }
         cmd.arg("--").arg(&program);
         for a in &args {
@@ -223,8 +238,9 @@ mod unix {
                 Ok(None) => {
                     if start.elapsed().as_secs() >= timeout_secs {
                         // Kill the whole group, not just the leader — reaps backgrounded grandchildren
-                        // the old `child.kill()` left orphaned.
-                        kill_group(pgid);
+                        // the old `child.kill()` left orphaned — then sweep any descendant that left
+                        // the group via setpgid/setsid (done before `wait()`, while the tree is intact).
+                        reap_tree(pgid);
                         let _ = child.wait();
                         break errored(format!("timed out after {timeout_secs}s"));
                     }
@@ -235,7 +251,7 @@ mod unix {
         };
 
         // Reap any stragglers the command backgrounded even on a clean exit, then drop the scratch.
-        kill_group(pgid);
+        reap_tree(pgid);
         let _ = std::fs::remove_dir_all(&scratch);
         outcome
     }
@@ -258,6 +274,68 @@ mod unix {
                 libc::kill(-pgid, libc::SIGKILL);
             }
         }
+    }
+
+    /// Kill the whole job tree: the process group (`kill_group`) plus, on Linux, any descendant that
+    /// escaped the group via `setpgid`/`setsid` but whose parent chain still leads back to the helper
+    /// (`kill_descendants`). Scoped strictly to descendants of `pgid` (the helper pid), so it never
+    /// touches the server's other children — notably a long-lived agent-login PTY session. A fully
+    /// detached double-fork that has already reparented to the server (subreaper) is the documented
+    /// residual — see `docs/deploy.md`.
+    fn reap_tree(pgid: i32) {
+        kill_group(pgid);
+        #[cfg(target_os = "linux")]
+        kill_descendants(pgid);
+    }
+
+    /// SIGKILL every still-living transitive descendant of `root` by walking `/proc` (Linux only).
+    #[cfg(target_os = "linux")]
+    fn kill_descendants(root: i32) {
+        if root <= 1 {
+            return;
+        }
+        // Snapshot pid -> ppid for every visible process.
+        let mut ppid_of: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+        let Ok(rd) = std::fs::read_dir("/proc") else { return };
+        for ent in rd.flatten() {
+            if let Some(pid) = ent.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) {
+                if let Some(ppid) = read_ppid(pid) {
+                    ppid_of.insert(pid, ppid);
+                }
+            }
+        }
+        // Transitive closure of root's descendants (process counts are tiny, so repeated sweeps are fine).
+        let mut descendants: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        loop {
+            let mut added = false;
+            for (&pid, &ppid) in &ppid_of {
+                if pid != root
+                    && !descendants.contains(&pid)
+                    && (ppid == root || descendants.contains(&ppid))
+                {
+                    descendants.insert(pid);
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        for pid in descendants {
+            if pid > 1 {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// Read `PPid` from `/proc/<pid>/status` (robust to a `comm`/argv containing spaces or parens,
+    /// unlike parsing `/proc/<pid>/stat`).
+    #[cfg(target_os = "linux")]
+    fn read_ppid(pid: i32) -> Option<i32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status.lines().find_map(|l| l.strip_prefix("PPid:").and_then(|r| r.trim().parse().ok()))
     }
 
     fn scratch_dir(req: &CiRequest) -> PathBuf {
@@ -365,6 +443,46 @@ pub fn dispatch_if_invoked() {
     }
 }
 
+/// Harden the **server** process itself. Call this ONCE at server startup (from `hull_server::run`),
+/// **never** in the CI helper. On Linux it applies two process-wide `prctl` flags:
+///
+/// - **`PR_SET_DUMPABLE(0)` — closes the `/proc/<server-pid>/environ` exfiltration escape.** The CI
+///   child runs as the same uid as the server and its parent *is* the server (the helper `execvp`s in
+///   place), so `env_clear` on the child does not stop it reading the PARENT's environment via
+///   `cat /proc/$PPID/environ` — which holds `HULL_CI_SECRET`, `HULL_SESSION_KEY`, `GITHUB_APP_*`, any
+///   `*_API_KEY`, etc. Making the server non-dumpable causes its `/proc/[pid]/{environ,maps,mem,…}` to
+///   become **root-owned with restricted perms** (proc(5)), so a same-uid non-root child can no longer
+///   read them. The server can still read its OWN `/proc/self/*` (a process accessing itself always
+///   passes the ptrace check), and `/proc/self/exe` stays available to toolchains — so this does not
+///   affect the server's own operation. Landlock V1 cannot scope `/proc/self` vs `/proc/<other>`, and
+///   toolchains need `/proc/self/exe`, so denying `/proc` wholesale is not an option; this is the fix.
+/// - **`PR_SET_CHILD_SUBREAPER(1)` — bounds the `setpgid`/`setsid` group-kill escape.** A CI descendant
+///   that leaves the job's process group survives `kill(-pgid)`; with the server as subreaper such an
+///   orphan reparents to the server (not to init), so it can be swept/reaped rather than leaking.
+///
+/// Both are best-effort: a failure is logged, not fatal. No-op on non-Linux.
+pub fn harden_server_process() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `prctl` with these options reads only its scalar args and mutates only this
+        // process's own flags; no memory is dereferenced.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "hull-server: PR_SET_DUMPABLE(0) failed — the server's /proc/<pid>/environ may be \
+                 readable by a same-uid CI child (secret-exfiltration risk); prefer a dedicated CI uid"
+            );
+        }
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "hull-server: PR_SET_CHILD_SUBREAPER(1) failed — a CI descendant that escapes its \
+                 process group may reparent to init instead of the server and leak"
+            );
+        }
+    }
+}
+
 /// Read this process's argv robustly. `dispatch_if_invoked` runs at the very start of `main` — but the
 /// sandbox tests also drive it from a pre-`main` constructor (to intercept the `ci-sandbox` re-exec of
 /// the *test* binary before libtest's harness swallows the argv). `std::env::args()` is unreliable that
@@ -404,6 +522,8 @@ mod helper {
         fsize_mb: u64,
         allow_rw: Vec<PathBuf>,
         allow_ro: Vec<PathBuf>,
+        /// `HULL_CI_SANDBOX=enforce`: refuse to exec if Landlock can't be enforced (fail-closed).
+        enforce: bool,
         program: String,
         prog_args: Vec<String>,
     }
@@ -419,6 +539,7 @@ mod helper {
                 "--fsize-mb" => p.fsize_mb = next_u64(&mut it, "--fsize-mb")?,
                 "--allow-rw" => p.allow_rw.push(next_val(&mut it, "--allow-rw")?.into()),
                 "--allow-ro" => p.allow_ro.push(next_val(&mut it, "--allow-ro")?.into()),
+                "--enforce" => p.enforce = true,
                 "--" => {
                     p.program = it.next().ok_or("missing program after --")?;
                     p.prog_args = it.collect();
@@ -450,8 +571,29 @@ mod helper {
 
         set_rlimits(&parsed);
 
+        // Filesystem confinement + the fail-closed `enforce` gate.
         #[cfg(target_os = "linux")]
-        apply_landlock(&parsed.allow_rw, &parsed.allow_ro);
+        {
+            let enforced = apply_landlock(&parsed.allow_rw, &parsed.allow_ro);
+            if parsed.enforce && !enforced {
+                eprintln!(
+                    "ci-sandbox: HULL_CI_SANDBOX=enforce is set but Landlock filesystem confinement \
+                     could NOT be enforced (kernel <5.13 or Landlock LSM disabled) — refusing to run \
+                     the CI command"
+                );
+                return 3;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if parsed.enforce {
+                eprintln!(
+                    "ci-sandbox: HULL_CI_SANDBOX=enforce is only supported on Linux (Landlock); this \
+                     platform provides no filesystem confinement — refusing to run the CI command"
+                );
+                return 3;
+            }
+        }
 
         // Replace the process image. `exec()` runs execvp (PATH search) with the curated env, cwd,
         // process group, rlimits, and Landlock domain this process already holds — all inherited
@@ -491,11 +633,26 @@ mod helper {
     /// `/dev` (for `/dev/null` etc.), and denies **everything else** — the `~/.hull/*` stores, other
     /// tenants' checkouts, and the rest of `/`.
     ///
-    /// Best-effort compatibility: on kernels <5.13 or with the Landlock LSM disabled, the ruleset is a
-    /// logged no-op (`NotEnforced`) rather than a hard error — the env-scrub, pgroup, and rlimits still
-    /// apply. Only existing paths are added (a missing dir would otherwise fail the rule).
+    /// The allow-list is deliberately tight on secret-bearing roots:
+    /// - `/opt` is NOT granted (rarely needed by a build, a common place for deployment secret material).
+    /// - `/etc` is NOT granted wholesale — only the specific entries a build needs for TLS + name
+    ///   resolution (`/etc/ssl`, `/etc/ca-certificates{,.conf}`, `/etc/resolv.conf`, `/etc/hosts`,
+    ///   `/etc/nsswitch.conf`, `/etc/passwd`, `/etc/group`). This denies `/etc/hull/*` and any other
+    ///   deployment secret file under `/etc`.
+    /// - `/proc` and `/sys` ARE granted (toolchains need them). With the server made **non-dumpable**
+    ///   at startup ([`super::harden_server_process`]), `/proc/<server-pid>/environ` no longer leaks the
+    ///   server's own secrets to the same-uid child — that is what makes granting `/proc` safe here.
+    ///
+    /// Deployment note: `HULL_SECRET_FILE_*` secret files MUST live under a **denied** path (e.g.
+    /// `/var/lib/hull` or `/run/secrets`), NOT under any granted root (`/usr`, `/etc/ssl`, …).
+    ///
+    /// Returns `true` if confinement is active (`FullyEnforced`/`PartiallyEnforced`), `false` if it
+    /// could not be enforced (`NotEnforced` or a setup error) — the caller uses this for the fail-closed
+    /// `enforce` gate. Best-effort compatibility: on kernels <5.13 or with the Landlock LSM disabled,
+    /// the ruleset is a logged no-op rather than a hard error (unless `enforce` is set) — the env-scrub,
+    /// pgroup, and rlimits still apply. Only existing paths are added (a missing path would fail the rule).
     #[cfg(target_os = "linux")]
-    fn apply_landlock(allow_rw: &[PathBuf], allow_ro: &[PathBuf]) {
+    fn apply_landlock(allow_rw: &[PathBuf], allow_ro: &[PathBuf]) -> bool {
         use landlock::{
             path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
             RulesetCreatedAttr, RulesetStatus, ABI,
@@ -506,10 +663,23 @@ mod helper {
         // the checkout. Higher ABIs (Refer/Truncate/IoctlDev) are not needed here.
         let abi = ABI::V1;
 
-        // Fixed system roots the toolchain reads/executes: libraries, interpreters, TLS certs
-        // (`/etc/ssl`), DNS config (`/etc/resolv.conf`), and the cpu-topology pseudo-fs. `/dev` is
-        // read+write for `/dev/null` `/dev/urandom` `/dev/zero` `/dev/tty`.
-        let sys_ro = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt", "/proc", "/sys"];
+        // Fixed system roots the toolchain reads/executes: libraries, interpreters, and the
+        // cpu-topology / process pseudo-fs. `/etc` is intentionally absent — only the specific entries
+        // in `etc_ro` below are granted. `/dev` is read+write for `/dev/null` `/dev/urandom`
+        // `/dev/zero` `/dev/tty`.
+        let sys_ro = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/proc", "/sys"];
+        // The ONLY `/etc` entries a build needs (TLS trust store + name resolution). Granting these
+        // specific paths instead of all of `/etc` keeps deployment secrets (`/etc/hull/*`, …) denied.
+        let etc_ro = [
+            "/etc/ssl",
+            "/etc/ca-certificates",
+            "/etc/ca-certificates.conf",
+            "/etc/resolv.conf",
+            "/etc/hosts",
+            "/etc/nsswitch.conf",
+            "/etc/passwd",
+            "/etc/group",
+        ];
         let sys_rw = ["/dev"];
 
         let rw: Vec<PathBuf> = allow_rw
@@ -522,6 +692,7 @@ mod helper {
             .iter()
             .cloned()
             .chain(sys_ro.iter().map(PathBuf::from))
+            .chain(etc_ro.iter().map(PathBuf::from))
             .filter(|p| p.exists())
             .collect();
 
@@ -537,21 +708,24 @@ mod helper {
 
         match build() {
             Ok(status) => match status.ruleset {
-                RulesetStatus::FullyEnforced => {}
+                RulesetStatus::FullyEnforced => true,
                 RulesetStatus::PartiallyEnforced => {
                     eprintln!("ci-sandbox: Landlock partially enforced (kernel supports only an older ABI)");
+                    true
                 }
                 RulesetStatus::NotEnforced => {
                     eprintln!(
                         "ci-sandbox: WARNING Landlock NOT enforced (kernel <5.13 or Landlock LSM disabled) — \
                          filesystem confinement is OFF; env-scrub + process-group + rlimits still apply"
                     );
+                    false
                 }
             },
             Err(e) => {
                 eprintln!(
                     "ci-sandbox: WARNING Landlock setup failed ({e}) — continuing without filesystem confinement"
                 );
+                false
             }
         }
     }
@@ -618,6 +792,16 @@ mod tests {
     fn pid_alive(pid: i32) -> bool {
         // kill(pid, 0): 0 ⇒ signalable (alive); -1/ESRCH ⇒ gone.
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Whether the running kernel actually has the Landlock LSM (so the ruleset would be enforced).
+    /// GitHub's ubuntu runners do; some CI kernels don't.
+    #[cfg(target_os = "linux")]
+    fn kernel_has_landlock() -> bool {
+        std::fs::read_to_string("/sys/kernel/security/lsm")
+            .unwrap_or_default()
+            .split(',')
+            .any(|m| m == "landlock")
     }
 
     /// A normal command still runs green through the default-on sandbox (env/pgroup/rlimit path — and,
@@ -726,9 +910,8 @@ mod tests {
     #[test]
     fn landlock_denies_outside_the_checkout() {
         // Skip gracefully where Landlock can't be enforced.
-        let lsm = std::fs::read_to_string("/sys/kernel/security/lsm").unwrap_or_default();
-        if !lsm.split(',').any(|m| m == "landlock") {
-            eprintln!("skipping landlock test: kernel LSM list = {lsm:?} (no landlock)");
+        if !kernel_has_landlock() {
+            eprintln!("skipping landlock test: kernel has no landlock LSM");
             return;
         }
 
@@ -757,6 +940,79 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&secret_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The CRITICAL fix: once the server is non-dumpable, a same-uid child can NO LONGER read the
+    /// server's `/proc/<pid>/environ` (where `HULL_CI_SECRET` & friends live) — the escape that
+    /// `env_clear` on the child can't close, because the child could read its PARENT. Meanwhile the
+    /// server's own self-read and `/proc/self/exe` (needed by toolchains) keep working. This test
+    /// process stands in for the server.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn server_nondumpable_denies_child_environ_read() {
+        // Root reads any /proc environ regardless of the dumpable flag, so the mechanism can't be
+        // demonstrated as root — skip rather than false-fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root (the dumpable flag doesn't gate root's /proc access)");
+            return;
+        }
+        let _g = ENV_LOCK.lock().unwrap();
+        let pid = std::process::id();
+        // A same-uid child that reads OUR /proc/<pid>/environ, printing what it can (empty on deny).
+        let child_reads = || -> Vec<u8> {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("cat /proc/{pid}/environ 2>/dev/null || true"))
+                .output()
+                .expect("spawn child reader")
+                .stdout
+        };
+
+        // Sanity: while dumpable (the default), the child CAN read our environ (non-empty — PATH etc.).
+        assert!(!child_reads().is_empty(), "sanity: a same-uid child should read our environ while dumpable");
+
+        // Apply the fix (normally done at server startup by `harden_server_process`).
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0, "PR_SET_DUMPABLE(0) should succeed");
+
+        // The server still reads its OWN /proc/self (operation unaffected) and /proc/self/exe resolves.
+        assert!(std::fs::read(format!("/proc/{pid}/environ")).is_ok(), "self-read of own environ must still work");
+        assert!(std::fs::read_link("/proc/self/exe").is_ok(), "/proc/self/exe must still resolve (toolchains)");
+
+        // The fix in action: the same-uid child can no longer read our environ.
+        let denied = child_reads();
+
+        // Restore dumpable so the rest of this test process behaves normally.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+
+        assert!(
+            denied.is_empty(),
+            "non-dumpable server must DENY a same-uid child reading its /proc/<pid>/environ — got {} bytes",
+            denied.len()
+        );
+    }
+
+    /// Fail-closed `HULL_CI_SANDBOX=enforce`: on a Landlock-capable kernel a normal command still runs
+    /// green (enforcement succeeds); on a kernel without Landlock the helper REFUSES (non-green) rather
+    /// than silently degrading to an unconfined run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enforce_mode_gates_on_landlock() {
+        let dir = workdir("enforce");
+        let outcome = run(&dir, "exit 0", &[("HULL_CI_SANDBOX", "enforce")]);
+        if kernel_has_landlock() {
+            assert!(
+                matches!(outcome.status, CiStatus::Green),
+                "enforce + landlock: a normal command should run green: {}",
+                outcome.summary
+            );
+        } else {
+            assert!(
+                !matches!(outcome.status, CiStatus::Green),
+                "enforce without landlock must refuse (non-green): {}",
+                outcome.summary
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
