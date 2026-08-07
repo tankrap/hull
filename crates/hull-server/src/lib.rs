@@ -21,6 +21,7 @@ pub mod jsonstore;
 pub mod keeld;
 pub mod mirror;
 pub mod nostr;
+pub mod observability;
 pub mod passkey;
 pub mod reposettings;
 pub mod plugins;
@@ -434,6 +435,14 @@ async fn health() -> Response {
     (StatusCode::OK, "ok").into_response()
 }
 
+/// `/ready` — readiness probe (distinct from `/health` liveness). 200 `{"ready":true}` when the store
+/// backend can serve (Postgres: a live pooled connection + `SELECT 1`; local backends: always/true),
+/// else 503 `{"ready":false}`. Unauthenticated and held OUT of the heavy middleware so orchestrators
+/// (k8s/compose) can poll it cheaply and frequently.
+async fn ready(State(app): State<App>) -> Response {
+    observability::ready_response(app.store.ready().await)
+}
+
 fn make_router(app: App) -> Router {
     eprintln!("hull-server: hosting keel repos under {}", app.repos.root().display());
     // Long-lived / large-body routes are held OUT of the timeout, body-cap, and concurrency layers:
@@ -556,10 +565,27 @@ fn make_router(app: App) -> Router {
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(SLOW_REQUEST_TIMEOUT_SECS)))
         .layer(GlobalConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS));
 
-    api.merge(slow)
+    // Request observability (one structured log line + counter/gauge updates per request). It's a
+    // `from_fn` layer that emits on the response HEAD, so it does NOT buffer streaming bodies — SSE,
+    // git smart-HTTP, and the tar download keep streaming (see `observability::observe`). Applied to
+    // the real API surface (api + slow + streaming) but NOT to `/ready`/`/metrics` below, so a
+    // health/metrics scrape isn't logged or counted (avoids self-referential metric churn).
+    let observed = api
+        .merge(slow)
         .merge(streaming)
-        // The panic guard wraps EVERY route (streaming included): a handler panic becomes a logged,
-        // counted 500 instead of a reset connection.
+        .layer(axum::middleware::from_fn(observability::observe));
+
+    // Operational probes: unauthenticated, and deliberately OUTSIDE the timeout/body/concurrency AND
+    // the observability layers so they stay cheap under load and don't count their own scrapes.
+    // `/ready` reads the store; `/metrics` renders atomics only.
+    let probes = Router::new()
+        .route("/ready", get(ready))
+        .route("/metrics", get(observability::metrics_handler));
+
+    observed
+        .merge(probes)
+        // The panic guard wraps EVERY route (streaming + probes included): a handler panic becomes a
+        // logged, counted 500 instead of a reset connection.
         .layer(CatchPanicLayer::custom(handle_panic))
         .with_state(app)
 }
@@ -595,6 +621,8 @@ fn ingress_addr() -> Option<std::net::SocketAddr> {
 /// Run the server. `register_plugins` is the open-core hook: core built-ins are installed first,
 /// then this closure runs to add any extra (hosted) plugins.
 pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
+    // Install the tracing subscriber ONCE, before anything logs. Idempotent (guards double-init).
+    observability::init_tracing();
     // Fail fast in the prod profile: refuse to boot with an unsafe/missing security config rather than
     // silently running open. A no-op unless `HULL_PROFILE=prod` / `HULL_PROD=1` is set (the default).
     enforce_prod_profile();
@@ -642,7 +670,7 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     seed_if_empty(&*store).await;
     let router = make_router(build_app(registry, hub, store));
     let listener = tokio::net::TcpListener::bind(&opts.addr).await.expect("bind");
-    eprintln!("hull-server listening on http://{}", opts.addr);
+    tracing::info!(addr = %opts.addr, "hull-server listening on http://{}", opts.addr);
     // Graceful shutdown on SIGTERM/SIGINT: stop accepting, let in-flight requests drain, then flush
     // the activity ranking one last time so a redeploy doesn't drop the last (≤5s) window of events.
     // The drain is BOUNDED: long-lived SSE (`/api/feed`) connections never close on their own, so an
@@ -6804,6 +6832,58 @@ mod tests {
         set_private(&app, "acme/web", false);
         assert_eq!(mirror_status(State(app.clone()), Path(t.clone()), axum::http::HeaderMap::new()).await.status(), StatusCode::OK, "mirror_status: public repo is open to anonymous");
         assert_eq!(get_repo_autonomy(State(app.clone()), Path(t.clone()), axum::http::HeaderMap::new()).await.status(), StatusCode::OK, "get_repo_autonomy: public repo is open to anonymous");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── observability: probes reachable without auth; metrics counter increments ────────────────
+
+    /// Extract the `hull_http_requests_total{class="2xx"}` value from a Prometheus scrape body.
+    fn scrape_2xx(body: &str) -> u64 {
+        body.lines()
+            .find_map(|l| l.strip_prefix("hull_http_requests_total{class=\"2xx\"} "))
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .expect("2xx counter line present in /metrics")
+    }
+
+    #[tokio::test]
+    async fn probes_reachable_without_auth_and_metrics_increment() {
+        let (app, tmp) = build_test_app("obs");
+        let router = make_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // /health (liveness), /ready (readiness), /metrics — all reachable with NO auth header.
+        let health = client.get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(health.status(), 200, "/health is unauthenticated 200");
+
+        let ready = client.get(format!("{base}/ready")).send().await.unwrap();
+        assert_eq!(ready.status(), 200, "/ready is unauthenticated 200 (InMemory backend is always ready)");
+        let ready_body: serde_json::Value = ready.json().await.unwrap();
+        assert_eq!(ready_body["ready"], serde_json::Value::Bool(true));
+
+        let m1 = client.get(format!("{base}/metrics")).send().await.unwrap();
+        assert_eq!(m1.status(), 200, "/metrics is unauthenticated 200");
+        let m1txt = m1.text().await.unwrap();
+        // Valid exposition: HELP/TYPE lines + the three required metric families.
+        assert!(m1txt.contains("# TYPE hull_http_requests_total counter"), "counter TYPE line");
+        assert!(m1txt.contains("hull_http_requests_total{class=\"2xx\"}"), "2xx series");
+        assert!(m1txt.contains("# TYPE hull_http_requests_in_flight gauge"), "in-flight gauge");
+        assert!(m1txt.contains("# TYPE hull_process_uptime_seconds gauge"), "uptime gauge");
+
+        // Metrics itself is NOT observed, so scraping doesn't inflate the counter. Hitting an OBSERVED
+        // route (/health) must bump the 2xx total.
+        let before = scrape_2xx(&m1txt);
+        let _ = client.get(format!("{base}/health")).send().await.unwrap();
+        let m2txt = client.get(format!("{base}/metrics")).send().await.unwrap().text().await.unwrap();
+        let after = scrape_2xx(&m2txt);
+        assert!(after > before, "an observed 2xx request must increment the counter: {before} -> {after}");
+
+        handle.abort();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
