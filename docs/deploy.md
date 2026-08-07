@@ -225,7 +225,98 @@ these at once; override individually only if you want them elsewhere.
 | `HULL_CI_URL`     | External CI endpoint to POST job payloads to. Unset → built-in local runner. | (unset) |
 | `HULL_CI_SECRET`  | Shared secret for signing/verifying CI callbacks.           | (empty) |
 | `HULL_CI_CMD`     | Override test command for the built-in runner (via `sh -c`).| auto-detect (Cargo/npm) |
-| `HULL_CI_TIMEOUT` | Built-in runner timeout, seconds.                           | `600` |
+| `HULL_CI_TIMEOUT` | Built-in runner timeout (wall-clock), seconds.              | `600` |
+
+### CI sandbox (built-in runner)
+
+The built-in local runner is the one place Hull executes **attacker-controlled repo code** — a
+repo's `build.rs`/proc-macro or `.cargo/config.toml` runner (the cargo path), its `package.json`
+`test` script (the npm path), or an explicit `HULL_CI_CMD`, all run during an ordinary check. On unix
+that spawn is confined by default (a `SandboxedCiRunner`); it does **not** apply to the external CI
+dispatch path (`HULL_CI_URL`), which runs on your own CI system.
+
+**What's confined** (each holds regardless of what the repo's command does):
+
+- **Scrubbed environment** — the child gets `env_clear()` + a curated allow-list only (`PATH`, a
+  per-run scratch `HOME`/`CARGO_HOME`/`npm_config_cache`/`TMPDIR`, `RUSTUP_HOME` if present,
+  `LANG`/`LC_ALL`, `TERM=dumb`). No `HULL_*`, `GITHUB_*`, `*_API_KEY`, or `HULL_CI_SECRET` reaches
+  the repo command, so secrets and the `~/.hull/*` stores can't leak.
+- **Non-dumpable server → no `/proc/<server-pid>/environ` leak** — the CI child runs as the **same
+  uid** as `hull-server` and its **parent is the server**, so `env_clear` on the child alone would
+  NOT stop it reading the server's own environment via `cat /proc/$PPID/environ`. At startup the
+  server calls `prctl(PR_SET_DUMPABLE, 0)` (Linux), which makes its `/proc/[pid]/{environ,maps,mem}`
+  **root-owned and unreadable** to the same-uid child — closing that exfiltration path while the
+  server keeps normal access to its own `/proc/self`. (See the shared-uid caveat below.)
+- **Process group + group-kill + descendant sweep** — the command runs in its own process group; on
+  timeout (or on cleanup) the **whole group** is `SIGKILL`ed, and on Linux any descendant that left
+  the group via `setpgid`/`setsid` but is still in the helper's process tree is swept too. The server
+  also sets `PR_SET_CHILD_SUBREAPER(1)` so a fully-detached escapee reparents to the server (not init)
+  to be reaped. (See the setpgid residual below.)
+- **Resource limits** (`setrlimit`) — address space, CPU seconds, process count, and max file size
+  are capped (see the table). A memory/fork/disk bomb is killed by the cap, not left to the wall clock.
+- **Filesystem confinement (Linux, Landlock)** — the command may read+write only the checkout and the
+  per-run scratch dir, read+execute the toolchain + a fixed system set, and read+write `/dev`.
+  Everything else — the `~/.hull/*` stores, other tenants' checkouts, and the rest of `/` — is
+  **denied**, closing the planted-symlink escape. The system set is deliberately tight:
+  - Granted read+execute: `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/proc`, `/sys`.
+  - **Not** granted: `/opt` (a common secret-material location, rarely needed by a build).
+  - `/etc` is **not** granted wholesale — only the specific entries a build needs for TLS + name
+    resolution: `/etc/ssl`, `/etc/ca-certificates(.conf)`, `/etc/resolv.conf`, `/etc/hosts`,
+    `/etc/nsswitch.conf`, `/etc/passwd`, `/etc/group`. Anything else under `/etc` (e.g. `/etc/hull/*`)
+    stays denied.
+
+> **Where to keep deployment secrets.** Because `/proc`, `/usr`, and the `/etc` TLS/DNS entries above
+> are readable inside the jail, secret files pointed at by `HULL_SECRET_FILE_*` MUST live under a
+> **denied** path — e.g. `/var/lib/hull` or `/run/secrets` — never under a granted root (not under
+> `/etc/ssl`, `/opt`, `/usr`, …).
+
+**Landlock kernel note.** Filesystem confinement needs Landlock (Linux **≥ 5.13** with the Landlock
+LSM enabled). By default it is applied **best-effort**: on an older kernel or a Landlock-less LSM
+config it degrades to a logged warning and a no-op — the env-scrub, non-dumpable server,
+process-group, and resource-limit protections still apply. Set `HULL_CI_SANDBOX=enforce` to make this
+**fail-closed** instead: if Landlock cannot be enforced the helper **refuses to run** the CI command
+(the run errors) rather than executing it unconfined. On macOS the Landlock step is skipped (dev only;
+`RLIMIT_AS` is also not enforced there — CPU/file-size caps still are), and `enforce` refuses there.
+
+**Network is intentionally left open** — cargo/npm need to fetch dependencies on first build. Network
+isolation (a network namespace or egress proxy) is a deferred follow-up increment.
+
+| Var                | Purpose                                                                  | Default |
+|--------------------|--------------------------------------------------------------------------|---------|
+| `HULL_CI_SANDBOX`  | `off` = raw unconfined runner (debugging); `on` = best-effort sandbox; `enforce` = fail-closed (refuse to run if Landlock can't be enforced). | on (unix) |
+| `HULL_CI_MEM_MB`   | `RLIMIT_AS` address-space cap, MiB. Raise for memory-hungry builds.      | `4096` |
+| `HULL_CI_CPU_SECS` | `RLIMIT_CPU` cap, seconds.                                               | `HULL_CI_TIMEOUT` (`600`) |
+| `HULL_CI_NPROC`    | `RLIMIT_NPROC` cap (max tasks for the runtime uid — caps fork bombs).    | `2048` |
+| `HULL_CI_FSIZE_MB` | `RLIMIT_FSIZE` cap, MiB (max size of a single written file).             | `2048` |
+
+> If a legitimate build breaks under the sandbox, first raise the relevant `HULL_CI_*` cap; the
+> `HULL_CI_SANDBOX=off` escape hatch exists as a last resort. `HULL_CI_NPROC` counts **all** of the
+> runtime user's processes host-wide, so a host packing many server processes under one uid may need
+> it raised.
+
+### Known limitations of the shared-uid, in-process model
+
+The sandbox runs the CI command as the **same OS uid** as `hull-server`, inside the same host. That
+is deliberately low-friction (no extra infrastructure) and, with the protections above, an escaped or
+forked CI process **cannot steal secrets** (env is scrubbed, and the server's `/proc` environ is
+root-owned via `PR_SET_DUMPABLE`) — it can only consume **bounded** resources until it is killed.
+Two residuals remain, both fully closed only by moving CI off the shared uid:
+
+- **`RLIMIT_NPROC` is a per-uid, host-wide cap.** It bounds a fork bomb's blast radius, but because it
+  counts *all* of the uid's tasks, a CI fork bomb can still transiently starve the server of new
+  threads/processes (a self-DoS) until the caps + timeout kill it. The complete fix is a **dedicated
+  CI uid**, a **cgroup v2 `pids.max`**, or a **PID namespace** (Phase-3 increment-2).
+- **`setpgid`/`setsid` group escape.** The group-kill + descendant sweep catch escapees still in the
+  helper's process tree, and the subreaper reparents fully-detached double-forks to the server so they
+  don't leak to init. A process that detaches *and* is missed by the sweep survives until the next
+  reap — bounded and secret-less, but a residual. The complete fix is again a **PID namespace /
+  dedicated uid**.
+
+**Agent-login residual.** The transient PTY child spawned during an interactive agent-subscription
+login (`agentlogin.rs`) inherits the server's environment and — unlike the server — is dumpable after
+`execve`. Its environment is stripped of secret-shaped vars (`HULL_*`, `GITHUB_*`, `*_API_KEY`) before
+spawn, so its `/proc/<pid>/environ` no longer exposes them; the residual is limited to the brief,
+admin-triggered login window and does not involve attacker-controlled code.
 
 ### Mirroring to a forge
 

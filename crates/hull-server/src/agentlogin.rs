@@ -101,15 +101,30 @@ pub fn begin(command: &str, session: &str, dir: &Path) -> Result<Begun, String> 
             cmd.arg("--device-auth");
         }
     }
+    // `CommandBuilder::new` seeds the child env with the FULL server environment (`get_base_env` →
+    // `std::env::vars_os()`), and the PTY child is `execve`-dumpable (unlike the non-dumpable server),
+    // so its `/proc/<pid>/environ` would expose any inherited secret to a same-uid CI job running
+    // concurrently during the (interactive, ≤15 min) login window. portable_pty exposes no `pre_exec`,
+    // so `PR_SET_DUMPABLE(0)` can't be set on the PTY child; instead we `env_clear` and rebuild from a
+    // curated ALLOW-LIST. An allow-list (not the old denylist of `HULL_*`/`GITHUB_*`/`*_API_KEY`) is the
+    // mechanism: a denylist misses operator secrets it doesn't name — `GH_TOKEN`, `AWS_SECRET_ACCESS_KEY`,
+    // etc. The login CLI drives its own OAuth and needs none of the server's secrets.
+    cmd.env_clear();
+    for (k, v) in std::env::vars() {
+        // TERM/LANG/LC_* keep the CLI's TUI rendering correct under the PTY; nothing secret-shaped.
+        if k == "TERM" || k == "LANG" || k.starts_with("LC_") {
+            cmd.env(k, v);
+        }
+    }
     // Codex keys credentials off its bundle dir; Claude's setup-token doesn't use it (it prints a
     // token), but we still isolate its scratch state there.
     cmd.env(config_env(command), dir.to_string_lossy().to_string());
     cmd.env("BROWSER", "true"); // never try to launch a browser on a headless server
     if let Ok(home) = std::env::var("HOME") {
-        cmd.env("HOME", home);
+        cmd.env("HOME", home); // the CLI reads its config/keyring under $HOME
     }
     if let Ok(path) = std::env::var("PATH") {
-        cmd.env("PATH", path);
+        cmd.env("PATH", path); // locate the login CLI binary
     }
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| format!("spawn {command} login: {e} (installed?)"))?;

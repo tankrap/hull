@@ -13,6 +13,7 @@ pub mod agentsession;
 pub mod artifacts;
 pub mod autonomy;
 pub mod ci;
+pub mod ci_sandbox;
 pub mod connections;
 pub mod claims;
 pub mod reviewcache;
@@ -27,6 +28,10 @@ pub mod reposettings;
 pub mod plugins;
 pub mod quic;
 pub mod repos;
+
+/// Convenience re-export: the CI sandbox helper dispatch, called as the first line of `main` (and by
+/// a hosted binary's `main`) so a `ci-sandbox` re-exec is intercepted before the runtime boots.
+pub use ci_sandbox::dispatch_if_invoked;
 
 use activity::{ActivityEvent, ActivityHub};
 use axum::{
@@ -623,6 +628,10 @@ fn ingress_addr() -> Option<std::net::SocketAddr> {
 pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     // Install the tracing subscriber ONCE, before anything logs. Idempotent (guards double-init).
     observability::init_tracing();
+    // Harden the server process before it serves any request: on Linux, make it non-dumpable (so a
+    // same-uid CI child can't read the server's own /proc/<pid>/environ secrets) and a child-subreaper
+    // (so a CI descendant that escapes its process group reparents here to be reaped). No-op elsewhere.
+    ci_sandbox::harden_server_process();
     // Fail fast in the prod profile: refuse to boot with an unsafe/missing security config rather than
     // silently running open. A no-op unless `HULL_PROFILE=prod` / `HULL_PROD=1` is set (the default).
     enforce_prod_profile();
@@ -1617,7 +1626,13 @@ async fn ai_agents_detect(State(app): State<App>, headers: axum::http::HeaderMap
     let agents: Vec<Value> = [("claude-code", "claude", "Claude Code"), ("codex", "codex", "Codex")]
         .iter()
         .map(|(kind, cmd, label)| {
-            let installed = std::process::Command::new(cmd).arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+            // Scrub the env + make the child non-dumpable like the other agent-CLI spawns (less
+            // sensitive — no token — but same treatment for consistency; still inherits HULL_*/GITHUB_*
+            // otherwise).
+            let mut c = std::process::Command::new(cmd);
+            c.arg("--version");
+            ci_sandbox::harden_agent_cli(&mut c);
+            let installed = c.output().map(|o| o.status.success()).unwrap_or(false);
             json!({ "kind": kind, "command": cmd, "label": label, "installed": installed })
         })
         .collect();
@@ -1783,11 +1798,14 @@ fn agent_auth_identity(command: &str, dir: &std::path::Path) -> Result<Value, St
     if command == "codex" {
         return codex_identity(dir);
     }
-    let out = std::process::Command::new(command)
-        .args(["auth", "status", "--json"])
-        .env("CLAUDE_CONFIG_DIR", dir)
-        .output()
-        .map_err(|e| format!("{command} auth status: {e}"))?;
+    // Scrub the inherited server env to a curated allow-list + make the child non-dumpable, so this
+    // spawn can't leak HULL_*/GITHUB_*/*_API_KEY (and its config dir isn't readable) via /proc/environ.
+    // `harden_agent_cli` must precede the call-specific `.env` (it `env_clear`s).
+    let mut cmd = std::process::Command::new(command);
+    cmd.args(["auth", "status", "--json"]);
+    ci_sandbox::harden_agent_cli(&mut cmd);
+    cmd.env("CLAUDE_CONFIG_DIR", dir);
+    let out = cmd.output().map_err(|e| format!("{command} auth status: {e}"))?;
     let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| format!("{command} auth status returned no JSON"))?;
     if !v.get("loggedIn").and_then(Value::as_bool).unwrap_or(false) {
         return Err("login did not complete — the bundle is not authenticated".into());
@@ -1808,12 +1826,17 @@ fn verify_claude_token(token: &str) -> Result<(), String> {
     }
     let scratch = agentsession::sessions_root().join(".verify").join(uuid::Uuid::new_v4().simple().to_string());
     let _ = std::fs::create_dir_all(&scratch);
-    let out = std::process::Command::new("claude")
-        .args(["-p", "Reply with the single word: ok"])
-        .env("CLAUDE_CODE_OAUTH_TOKEN", token)
+    // Scrub the env to a curated allow-list + make the child non-dumpable BEFORE attaching the victim's
+    // OAuth token: without this the token (and every HULL_*/GITHUB_*/*_API_KEY) would be readable via
+    // this child's /proc/<pid>/environ by a same-uid CI job. `harden_agent_cli` `env_clear`s, so it must
+    // run before the token/config `.env` calls below.
+    let mut cmd = std::process::Command::new("claude");
+    cmd.args(["-p", "Reply with the single word: ok"]);
+    ci_sandbox::harden_agent_cli(&mut cmd);
+    cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token)
         .env("CLAUDE_CONFIG_DIR", &scratch)
-        .stdin(std::process::Stdio::null())
-        .output();
+        .stdin(std::process::Stdio::null());
+    let out = cmd.output();
     let _ = std::fs::remove_dir_all(&scratch);
     let out = out.map_err(|e| format!("verify token: {e}"))?;
     let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1827,11 +1850,14 @@ fn verify_claude_token(token: &str) -> Result<(), String> {
 /// Codex identity from the credentials it persisted: confirm `login status` reports logged-in, then
 /// read `auth.json` (email decoded from the id_token JWT's claims, plan from `auth_mode`).
 fn codex_identity(dir: &std::path::Path) -> Result<Value, String> {
-    let status = std::process::Command::new("codex")
-        .args(["login", "status"])
-        .env("CODEX_HOME", dir)
-        .output()
-        .map_err(|e| format!("codex login status: {e}"))?;
+    // Scrub the env to a curated allow-list + make the child non-dumpable (before the CODEX_HOME `.env`,
+    // which `harden_agent_cli`'s `env_clear` would otherwise drop), so the codex identity check can't
+    // leak HULL_*/GITHUB_*/*_API_KEY via /proc/<pid>/environ.
+    let mut cmd = std::process::Command::new("codex");
+    cmd.args(["login", "status"]);
+    ci_sandbox::harden_agent_cli(&mut cmd);
+    cmd.env("CODEX_HOME", dir);
+    let status = cmd.output().map_err(|e| format!("codex login status: {e}"))?;
     let text = String::from_utf8_lossy(&status.stdout);
     if !text.to_lowercase().contains("logged in") {
         return Err("login did not complete — codex is not authenticated".into());
