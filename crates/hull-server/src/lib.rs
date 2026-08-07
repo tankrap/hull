@@ -296,6 +296,12 @@ fn data_path() -> std::path::PathBuf {
 /// the domain tables are replaced with the snapshot. Invoked by the `import-postgres` subcommand.
 /// Returns `Err` (never panics on the operator's behalf) so the binary can print + exit non-zero.
 pub fn import_postgres() -> Result<(), String> {
+    // The blocking `postgres` client spins its OWN tokio runtime; run the whole import on a dedicated
+    // OS thread so it never nests inside a caller's runtime (the bin's `#[tokio::main]`), which panics.
+    std::thread::scope(|s| s.spawn(import_postgres_inner).join().map_err(|_| "hull: import thread panicked".to_string())?)
+}
+
+fn import_postgres_inner() -> Result<(), String> {
     let url = std::env::var("HULL_DATABASE_URL")
         .ok()
         .filter(|u| !u.is_empty())
