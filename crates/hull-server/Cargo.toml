@@ -67,3 +67,8 @@ base64 = "0.22"
 portable-pty = "0.8"
 # Encrypt per-user credential bundles at rest (AEAD, server-key sealed tarball).
 chacha20poly1305 = "0.10"
+# Structured, leveled logging. `env-filter` reads RUST_LOG; `json` gives machine-parseable lines in
+# the prod profile (dev stays human-readable/compact). One request-log line per request is emitted
+# from the observability middleware; startup lines go through tracing too.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
