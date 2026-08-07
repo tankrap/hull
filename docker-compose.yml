@@ -1,0 +1,72 @@
+# Self-host / local-prod bring-up for the OSS Hull server, backed by Postgres.
+# Quickstart:  docker compose up --build
+# See docs/deploy.md for the full env-var reference and the first-run migration path.
+#
+# BEFORE going to production, replace every CHANGEME_* value below (see the comments). The server
+# boots under the `prod` profile, which fail-fasts on an insecure/missing security config.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: hull
+      POSTGRES_PASSWORD: CHANGEME_pg_password   # CHANGEME: DB password (must match HULL_DATABASE_URL below)
+      POSTGRES_DB: hull
+    volumes:
+      - hull-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hull -d hull"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  hull-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # ── Domain store: Postgres ──────────────────────────────────────────────────────────────────
+      # Host `postgres` is the service name above; password must match POSTGRES_PASSWORD.
+      HULL_DATABASE_URL: postgres://hull:CHANGEME_pg_password@postgres:5432/hull
+
+      # ── Bind addresses: 0.0.0.0 so the ports are reachable from outside the container ────────────
+      # (the code defaults to 127.0.0.1, which would be unreachable across the container boundary).
+      HULL_ADDR: 0.0.0.0:8930
+      HULL_INGRESS_ADDR: 0.0.0.0:8931
+
+      # ── On-disk state (repos + JSON stores + activity ranking) lives under $HOME/.hull ──────────
+      # HOME=/var/lib/hull is baked into the image and mounted as a volume below, so everything
+      # persists. HULL_DATA_DIR is set explicitly for clarity (it is the default given HOME).
+      HULL_DATA_DIR: /var/lib/hull/.hull/data
+
+      # ── prod profile fail-fast requirements (enforce_prod_profile) ──────────────────────────────
+      HULL_PROFILE: prod
+      # 1) git smart-HTTP auth must be enforced (no anonymous push/fetch).
+      HULL_GIT_AUTH: enforce
+      # 2) The QUIC coordination ingress must require a token.
+      #    CHANGEME: generate with `openssl rand -hex 32`.
+      HULL_INGRESS_TOKEN: CHANGEME_ingress_token
+      # 3) The AEAD session key MUST be exactly 64 hex chars (no on-disk fallback in prod).
+      #    CHANGEME: generate with `openssl rand -hex 32`.
+      HULL_SESSION_KEY: CHANGEME_session_key_replace_with_openssl_rand_hex_32_value
+      # 4) HULL_DEMO_MODE is intentionally NOT set — enabling it opens a published-key owner backdoor.
+
+      # ── Public URL / passkey (WebAuthn) origin — set these to your real host behind the proxy ────
+      # CHANGEME: the externally reachable URL and passkey relying-party settings.
+      HULL_PUBLIC_URL: https://hull.example.com
+      HULL_WEBAUTHN_RP_ID: hull.example.com
+      HULL_WEBAUTHN_ORIGIN: https://hull.example.com
+    volumes:
+      - hull-data:/var/lib/hull   # repos, agent-sessions, artifacts/autonomy/review-cache JSON, activity ranking
+    ports:
+      - "8930:8930"       # HTTP/JSON API + SSE
+      - "8931:8931/udp"   # QUIC coordination ingress
+    restart: unless-stopped
+
+volumes:
+  hull-pgdata:
+  hull-data:
