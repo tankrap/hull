@@ -2692,7 +2692,7 @@ mod tests {
         };
         match host.plan_merge("t", "r", "main", Some(&base_hex), &head_hex) {
             Err(MergeError::Conflict(m)) => assert!(m.contains("multiple merge bases"), "message flags complex history: {m}"),
-            other => panic!("expected a complex-history conflict; got ok={}", matches!(other, Ok(_))),
+            other => panic!("expected a complex-history conflict; got ok={}", other.is_ok()),
         }
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -829,11 +829,11 @@ impl PostgresStore {
 /// we accept the standard libpq URL form) into a [`deadpool_postgres::Config`]. deadpool builds its
 /// own `tokio_postgres::Config` internally, so we bridge the parsed URL's host/port/user/etc. across.
 fn copy_pg_config(src: &tokio_postgres::Config, dst: &mut PgConfig) {
-    if let Some(host) = src.get_hosts().iter().find_map(|h| match h {
-        tokio_postgres::config::Host::Tcp(s) => Some(s.clone()),
+    if let Some(host) = src.get_hosts().iter().map(|h| match h {
+        tokio_postgres::config::Host::Tcp(s) => s.clone(),
         #[cfg(unix)]
-        tokio_postgres::config::Host::Unix(p) => Some(p.to_string_lossy().into_owned()),
-    }) {
+        tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
+    }).next() {
         dst.host = Some(host);
     }
     if let Some(port) = src.get_ports().first() {

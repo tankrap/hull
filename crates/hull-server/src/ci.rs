@@ -304,6 +304,18 @@ pub fn finalize(repos: &RepoHost, memo: &CiMemo, config: &CiConfig, tenant: &str
     st
 }
 
+fn apply_verification(repos: &RepoHost, tenant: &str, repo: &str, change: &str, status: CiStatus) {
+    match status {
+        CiStatus::Green => {
+            repos.set_verification(tenant, repo, change, true);
+        }
+        CiStatus::Red => {
+            repos.set_verification(tenant, repo, change, false);
+        }
+        CiStatus::Errored => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,17 +410,5 @@ mod tests {
         config.clear_inflight("tree-1");
         assert!(!config.is_inflight("tree-1"));
         assert!(config.mark_inflight("tree-1"), "re-claimable after clear");
-    }
-}
-
-fn apply_verification(repos: &RepoHost, tenant: &str, repo: &str, change: &str, status: CiStatus) {
-    match status {
-        CiStatus::Green => {
-            repos.set_verification(tenant, repo, change, true);
-        }
-        CiStatus::Red => {
-            repos.set_verification(tenant, repo, change, false);
-        }
-        CiStatus::Errored => {}
     }
 }
