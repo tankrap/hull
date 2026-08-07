@@ -251,6 +251,13 @@ mod unix {
         };
 
         // Reap any stragglers the command backgrounded even on a clean exit, then drop the scratch.
+        // On the clean-exit path the helper (the group leader, whose pid == `pgid`) was already reaped
+        // by `try_wait` above, so `pgid` could in principle name a recycled pid. This is safe: while ANY
+        // process remains in the group, the kernel keeps `pgid` reserved (the leader pid can't be
+        // reused) and `kill(-pgid)` correctly targets those backgrounded members; once the group is
+        // empty `kill(-pgid)` is an `ESRCH` no-op. The only residual is a sub-microsecond race (leader
+        // reaped → pid freed → reused by a brand-new group leader) which `reap_tree` may then signal —
+        // negligible, and the documented full fix is a dedicated CI uid/PID namespace (see docs/deploy.md).
         reap_tree(pgid);
         let _ = std::fs::remove_dir_all(&scratch);
         outcome
@@ -321,11 +328,30 @@ mod unix {
                 break;
             }
         }
-        for pid in descendants {
+        for &pid in &descendants {
             if pid > 1 {
                 unsafe {
                     libc::kill(pid, libc::SIGKILL);
                 }
+            }
+        }
+        // Reap the ones that have reparented to us. The server is `PR_SET_CHILD_SUBREAPER(1)`
+        // (see `harden_server_process`) but has no async child-reaper (tokio is built without the
+        // `process` feature), so a SIGKILLed grandchild reparented to the server would otherwise linger
+        // as a zombie (bounded only by RLIMIT_NPROC, cleared on restart). `waitpid(WNOHANG)` clears it.
+        // Best-effort: WNOHANG never blocks; a short bounded retry since SIGKILL delivery + exit is
+        // near-instant. `r == pid` reaped; `r == 0` alive-but-not-yet-reapable (retry); `r < 0` ECHILD
+        // (not our child yet — still parented to a live intermediate — or already reaped): stop.
+        for &pid in &descendants {
+            if pid <= 1 {
+                continue;
+            }
+            for _ in 0..5 {
+                let r = unsafe { libc::waitpid(pid, std::ptr::null_mut::<libc::c_int>(), libc::WNOHANG) };
+                if r != 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
         }
     }
@@ -483,6 +509,64 @@ pub fn harden_server_process() {
     }
 }
 
+/// Harden an **agent-CLI** child spawn (the `claude`/`codex` `auth status` / `-p` verify / `--version`
+/// detect calls in `lib.rs`): scrub the inherited server environment down to a curated non-secret
+/// allow-list, and — on Linux — mark the child **non-dumpable** so the OAuth token / config-dir it
+/// legitimately carries is NOT readable via `/proc/<pid>/environ` by another same-uid process (e.g. a
+/// concurrent CI job polling `/proc`).
+///
+/// **Call this on a fresh `Command` BEFORE adding the call-specific vars** (`CLAUDE_CONFIG_DIR`,
+/// `CODEX_HOME`, `CLAUDE_CODE_OAUTH_TOKEN`): the `env_clear` here would otherwise wipe them.
+///
+/// Allow-list (nothing else): `PATH` (locate the CLI binary), `HOME` (claude/codex read their real
+/// config/keyring under `$HOME`), `TERM`, `LANG`, and any `LC_*`. Deliberately excluded: every
+/// `HULL_*` (`HULL_SESSION_KEY`/`HULL_CI_SECRET`/`HULL_MIRROR_SECRET`/`HULL_NOSTR_SECRET`/
+/// `HULL_INGRESS_TOKEN`), `GITHUB_*`, `GH_TOKEN`, `AWS_*`, any `*_API_KEY`, etc.
+pub fn harden_agent_cli(cmd: &mut std::process::Command) {
+    // env_clear + re-add only the allow-list, so a var we don't name (an operator secret like
+    // GH_TOKEN / AWS_SECRET_ACCESS_KEY) can never reach the child — an allow-list, not a denylist.
+    cmd.env_clear();
+    for (k, v) in std::env::vars_os() {
+        if let Some(ks) = k.to_str() {
+            if ks == "PATH" || ks == "HOME" || ks == "TERM" || ks == "LANG" || ks.starts_with("LC_") {
+                cmd.env(&k, &v);
+            }
+        }
+    }
+    #[cfg(unix)]
+    set_nondumpable_preexec(cmd);
+}
+
+/// Register a `pre_exec` hook that marks the child **non-dumpable** (`PR_SET_DUMPABLE(0)`) on Linux, so
+/// the child's `/proc/<pid>/environ` (which, post-scrub, still carries the legitimate OAuth token /
+/// config-dir) becomes root-owned and unreadable by a same-uid non-root process. No-op on non-Linux.
+///
+/// The closure runs post-`fork`, pre-`execvp`, in the child: it does a single async-signal-safe `prctl`
+/// syscall and touches no allocator or shared state, so it is safe from a multi-threaded parent.
+#[cfg(unix)]
+pub fn set_nondumpable_preexec(cmd: &mut std::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure performs only a single `prctl(PR_SET_DUMPABLE, 0, …)` syscall — no memory
+        // is dereferenced, no allocation happens, so it is async-signal-safe in the forked child.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+                    // Fail the spawn rather than exec a dumpable child that would leak its token via
+                    // /proc/<pid>/environ. In practice PR_SET_DUMPABLE(0) does not fail.
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// Read this process's argv robustly. `dispatch_if_invoked` runs at the very start of `main` — but the
 /// sandbox tests also drive it from a pre-`main` constructor (to intercept the `ci-sandbox` re-exec of
 /// the *test* binary before libtest's harness swallows the argv). `std::env::args()` is unreliable that
@@ -636,8 +720,8 @@ mod helper {
     /// The allow-list is deliberately tight on secret-bearing roots:
     /// - `/opt` is NOT granted (rarely needed by a build, a common place for deployment secret material).
     /// - `/etc` is NOT granted wholesale — only the specific entries a build needs for TLS + name
-    ///   resolution (`/etc/ssl`, `/etc/ca-certificates{,.conf}`, `/etc/resolv.conf`, `/etc/hosts`,
-    ///   `/etc/nsswitch.conf`, `/etc/passwd`, `/etc/group`). This denies `/etc/hull/*` and any other
+    ///   resolution (`/etc/ssl`, `/etc/pki`, `/etc/ca-certificates{,.conf}`, `/etc/resolv.conf`,
+    ///   `/etc/hosts`, `/etc/nsswitch.conf`, `/etc/passwd`, `/etc/group`). This denies `/etc/hull/*` and any other
     ///   deployment secret file under `/etc`.
     /// - `/proc` and `/sys` ARE granted (toolchains need them). With the server made **non-dumpable**
     ///   at startup ([`super::harden_server_process`]), `/proc/<server-pid>/environ` no longer leaks the
@@ -672,6 +756,7 @@ mod helper {
         // specific paths instead of all of `/etc` keeps deployment secrets (`/etc/hull/*`, …) denied.
         let etc_ro = [
             "/etc/ssl",
+            "/etc/pki", // RHEL/Fedora CA trust store (alongside /etc/ssl on Debian/Ubuntu)
             "/etc/ca-certificates",
             "/etc/ca-certificates.conf",
             "/etc/resolv.conf",
@@ -994,6 +1079,40 @@ mod tests {
             "non-dumpable server must DENY a same-uid child reading its /proc/<pid>/environ — got {} bytes",
             denied.len()
         );
+    }
+
+    /// The agent-CLI spawn hardening (`harden_agent_cli`, used by `verify_claude_token`/
+    /// `agent_auth_identity`/`codex_identity`/detect) scrubs the inherited env to a curated allow-list:
+    /// planted secrets (`HULL_*`, `GH_TOKEN`, `*_API_KEY`) are ABSENT from the child, while the
+    /// call-specific var added after `harden_agent_cli` (mirroring the real callers) and `PATH` survive.
+    #[test]
+    fn agent_cli_env_is_scrubbed_of_secrets() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("HULL_SESSION_KEY", "leak-me-session-key");
+        std::env::set_var("GH_TOKEN", "leak-me-gh-token");
+        std::env::set_var("MY_FAKE_API_KEY", "leak-me-api-key");
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("env");
+        super::harden_agent_cli(&mut cmd);
+        // Call-specific var attached AFTER hardening (as verify_claude_token/agent_auth_identity do)
+        // must survive the earlier env_clear.
+        cmd.env("CLAUDE_CONFIG_DIR", "/tmp/hull-agent-cli-cfg");
+        let out = cmd.output().expect("run env dump");
+
+        std::env::remove_var("HULL_SESSION_KEY");
+        std::env::remove_var("GH_TOKEN");
+        std::env::remove_var("MY_FAKE_API_KEY");
+
+        assert!(out.status.success(), "env dump ran");
+        let dump = String::from_utf8_lossy(&out.stdout);
+        assert!(!dump.contains("leak-me-session-key"), "HULL_SESSION_KEY leaked into agent-CLI env:\n{dump}");
+        assert!(!dump.contains("leak-me-gh-token"), "GH_TOKEN (operator secret) leaked — a denylist would miss it:\n{dump}");
+        assert!(!dump.contains("leak-me-api-key"), "*_API_KEY leaked into agent-CLI env:\n{dump}");
+        assert!(!dump.contains("HULL_SESSION_KEY"), "HULL_* var name leaked:\n{dump}");
+        // The curated allow-list + call-specific var are present (so the CLI is locatable and configured).
+        assert!(dump.contains("CLAUDE_CONFIG_DIR=/tmp/hull-agent-cli-cfg"), "call-specific var missing:\n{dump}");
+        assert!(dump.contains("PATH="), "PATH missing — the CLI would not be locatable:\n{dump}");
     }
 
     /// Fail-closed `HULL_CI_SANDBOX=enforce`: on a Landlock-capable kernel a normal command still runs
