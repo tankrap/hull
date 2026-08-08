@@ -25,6 +25,7 @@ pub mod mirror;
 pub mod nostr;
 pub mod observability;
 pub mod passkey;
+pub mod ratelimit;
 pub mod reposettings;
 pub mod plugins;
 pub mod quic;
@@ -233,6 +234,9 @@ struct App {
     /// be handed the same number. One global async lock is ample for this single-process server's
     /// create volume; the `UNIQUE(repo, number)` index is the database-level backstop.
     number_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Fixed-window limiter for the unauthenticated sovereign wrapped-key fetch (throttles bulk
+    /// enumeration / harvesting; the per-account defense is still the client Argon2id KDF).
+    rate: Arc<ratelimit::RateLimiter>,
     /// Decentralized ref transport: if a nostr key + relays are configured, a repo's branch pointer is
     /// published as a signed event (kind 31900) each time it lands, so history isn't hostage to one
     /// host. `None` unless configured (OSS default is off).
@@ -324,6 +328,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         number_lock: Arc::new(tokio::sync::Mutex::new(())),
         nostr_refs,
         blossom,
+        rate: Arc::new(ratelimit::RateLimiter::new()),
     }
 }
 
@@ -2702,9 +2707,15 @@ async fn sovereign_register(State(app): State<App>, Json(body): Json<Value>) -> 
 /// SECURITY: because this is unauthenticated, an attacker can harvest a username's bundle and brute-
 /// force the passphrase OFFLINE — so the whole account's security rests on the CLIENT KDF. The browser
 /// MUST wrap with a strong memory-hard KDF (Argon2id, high params); Hull can't verify that on an opaque
-/// blob. Deployment follow-up: rate-limit this route (and it enumerates sovereign usernames: 200 vs 404).
+/// blob. This route is rate-limited (global + per-username fixed windows) to throttle bulk enumeration
+/// and harvesting; it still enumerates a sovereign username via 200-vs-404 for the throttled attacker.
 async fn sovereign_wrapped(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
     let username = sanitize_handle(q.get("username").map(String::as_str).unwrap_or(""));
+    // Throttle bulk automated abuse: at most 60 fetches/min across all callers, and 6/min per username.
+    let now = now();
+    if !app.rate.check("wrapped:global", 60, 60, now) || !app.rate.check(&format!("wrapped:{username}"), 6, 60, now) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited — try again shortly").into_response();
+    }
     match app.store.user_by_username(&username).await.and_then(|u| u.wrapped_key.map(|w| (u.actor, w))) {
         Some((actor, wrapped)) => Json(json!({ "actor": actor, "wrapped_key": wrapped })).into_response(),
         None => (StatusCode::NOT_FOUND, "no sovereign account with that username").into_response(),
@@ -7124,6 +7135,39 @@ mod tests {
         assert_eq!(bad["signatures_valid"], true, "the signature really is valid (attacker holds the key)");
         assert_eq!(bad["accountable"], false, "but a REVOKED actor must not read as accountable");
         assert_eq!(bad["authorized"], false, "and therefore not authorized");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn sovereign_wrapped_is_rate_limited_per_username() {
+        let (app, tmp) = build_test_app("wrapped-rl");
+        app.store.put_actor(actor("sov", ActorKind::Human)).await;
+        app.store
+            .put_user(User {
+                id: "s1".into(),
+                username: "nomad".into(),
+                email: "n@x.co".into(),
+                actor: "sov".into(),
+                secret_key: String::new(),
+                wrapped_key: Some("ENC".into()),
+                passkeys: vec![],
+                created_unix: 0,
+                bio: String::new(),
+            })
+            .await;
+        let call = |app: App| async move {
+            sovereign_wrapped(
+                axum::extract::State(app),
+                axum::extract::Query(std::collections::HashMap::from([("username".to_string(), "nomad".to_string())])),
+            )
+            .await
+            .status()
+        };
+        // 6 fetches/min per username are allowed; the 7th in the window is throttled.
+        for _ in 0..6 {
+            assert_eq!(call(app.clone()).await, axum::http::StatusCode::OK);
+        }
+        assert_eq!(call(app.clone()).await, axum::http::StatusCode::TOO_MANY_REQUESTS, "over the per-username window");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
