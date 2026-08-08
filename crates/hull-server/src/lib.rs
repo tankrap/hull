@@ -645,6 +645,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/federation", get(federation_view))
         .route("/api/repos/:tenant/:repo/labels", get(repo_labels))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
+        .route("/api/repos/:tenant/:repo/change/:id/provenance", post(submit_provenance))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
@@ -4597,19 +4598,38 @@ async fn perform_merge(
     // instance holds that key (custodial/demo accounts); a SOVEREIGN author's key is client-held, so
     // its provenance must be signed client-side — a follow-up (the same primitives, signed in-browser).
     if let (Some(refs), false) = (app.nostr_refs.clone(), announced.is_empty()) {
-        let demo_id = identity::human_from_secret("demo", DEMO_OWNER_SECRET).map(|m| m.actor.id).unwrap_or_default();
-        let author_secret = if pr.author == demo_id {
-            Some(DEMO_OWNER_SECRET.to_string())
-        } else {
-            app.store.user_by_actor(&pr.author).await.map(|u| u.secret_key).filter(|s| !s.is_empty())
-        };
-        if let Some(secret) = author_secret {
-            let (author, repo_key, change, intent) = (pr.author.clone(), key.clone(), announced.clone(), pr.title.clone());
+        // Prefer a SOVEREIGN author's client-signed provenance if one was submitted for this change: the
+        // instance never held their key, so this is the only genuinely human-non-repudiable attestation.
+        // The bundle was verified + bound to (change, repo) at submit; re-check the binding and re-verify
+        // the signature (publish_signed_provenance does the latter) before transporting it.
+        let sovereign = pr
+            .sovereign_provenance
+            .get(&announced)
+            .and_then(|s| serde_json::from_str::<nostr::SignedProvenance>(s).ok())
+            .filter(|sp| sp.claim.change == announced && sp.claim.repo == key);
+        if let Some(sp) = sovereign {
+            let (refs2, change) = (refs.clone(), announced.clone());
             std::thread::spawn(move || {
-                if let Some(ev) = refs.publish_provenance(&secret, &change, &author, &repo_key, &intent) {
-                    eprintln!("nostr: published provenance for {change} by {}… ({}…)", &author[..author.len().min(12)], &ev.id[..12]);
+                if let Some(ev) = refs2.publish_signed_provenance(&sp) {
+                    eprintln!("nostr: published client-signed provenance for {change} ({}…)", &ev.id[..12]);
                 }
             });
+        } else {
+            // Custodial/demo fallback: the instance holds the author's key, so it signs on their behalf.
+            let demo_id = identity::human_from_secret("demo", DEMO_OWNER_SECRET).map(|m| m.actor.id).unwrap_or_default();
+            let author_secret = if pr.author == demo_id {
+                Some(DEMO_OWNER_SECRET.to_string())
+            } else {
+                app.store.user_by_actor(&pr.author).await.map(|u| u.secret_key).filter(|s| !s.is_empty())
+            };
+            if let Some(secret) = author_secret {
+                let (author, repo_key, change, intent) = (pr.author.clone(), key.clone(), announced.clone(), pr.title.clone());
+                std::thread::spawn(move || {
+                    if let Some(ev) = refs.publish_provenance(&secret, &change, &author, &repo_key, &intent) {
+                        eprintln!("nostr: published provenance for {change} by {}… ({}…)", &author[..author.len().min(12)], &ev.id[..12]);
+                    }
+                });
+            }
         }
     }
     // Mirror the landed change's blob content to Blossom (sha256-addressed) so the content lives off
@@ -5946,6 +5966,70 @@ async fn verify_change(
     }
 }
 
+/// Submit client-signed provenance for a change (`POST /api/repos/:tenant/:repo/change/:id/provenance`
+/// with a `SignedProvenance` body `{claim:{v,change,actor,repo,intent,ts}, ed_sig}`). This is the
+/// sovereign path: the author's Ed25519 key is client-held, so they sign the claim in the browser/CLI
+/// and hand the server only the signature to embed in the substrate at land. The server stores it on
+/// the PR (keyed by change id) after checking: the claim binds to THIS change and repo, its Ed25519
+/// signature verifies, the caller is the claimed actor, and that actor is an accountable repo member.
+/// It never signs anything here — it only records a verified self-attestation for later publishing.
+async fn submit_provenance(
+    State(app): State<App>,
+    Path((tenant, repo, id)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let key = format!("{tenant}/{repo}");
+    let sp: nostr::SignedProvenance = match serde_json::from_value(body) {
+        Ok(sp) => sp,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("expected a SignedProvenance bundle: {e}")).into_response(),
+    };
+    // Bind the claim to the URL: a signature is only meaningful for the change and repo it names, and we
+    // must never let a bundle signed for one change be filed under another.
+    if sp.claim.change != id || sp.claim.repo != key {
+        return (StatusCode::BAD_REQUEST, "claim.change / claim.repo must match the URL").into_response();
+    }
+    // The Ed25519 signature must verify for the claimed actor (strict: rejects small-order keys).
+    if nostr::verify_provenance(&sp).is_none() {
+        return (StatusCode::BAD_REQUEST, "claim signature does not verify for claim.actor").into_response();
+    }
+    let actor = match require_actor(&app, &headers, &sp.claim.actor).await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    // You attest as yourself: the authenticated caller must be the actor the claim names.
+    if actor.id != sp.claim.actor {
+        return (StatusCode::FORBIDDEN, "you can only submit provenance for your own actor").into_response();
+    }
+    // And that actor must be accountable (live, delegation chain intact) and a member of the repo — the
+    // same gate the substrate consumer applies before treating an attestation as authorized.
+    if accountable(&app, &actor).await.is_err() {
+        return (StatusCode::FORBIDDEN, "actor is not accountable").into_response();
+    }
+    let human = actor.human_principal().cloned();
+    let authorized = is_repo_member(&app, &tenant, &repo, &actor.id).await
+        || match &human {
+            Some(h) => is_repo_member(&app, &tenant, &repo, h).await,
+            None => false,
+        };
+    if !authorized {
+        return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
+    }
+    // Attach to the PR that proposes this change. Guard the read-modify-write with the alloc lock so a
+    // concurrent submit/land can't clobber it.
+    let _guard = app.number_lock.lock().await;
+    let Some(mut pr) = app.store.prs(&key).await.into_iter().find(|p| p.changes.iter().any(|c| c == &id)) else {
+        return (StatusCode::NOT_FOUND, "no open PR proposes this change").into_response();
+    };
+    let stored = match serde_json::to_string(&sp) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e}")).into_response(),
+    };
+    pr.sovereign_provenance.insert(id.clone(), stored);
+    app.store.replace_pr(pr).await;
+    Json(json!({ "stored": true, "change": id, "actor": sp.claim.actor })).into_response()
+}
+
 /// Open a PR (`POST /api/repos/:tenant/:repo/prs`). It proposes real keel changes: `changes` may be
 /// given explicitly, else it anchors to the repo's current HEAD change (content-addressed). Author
 /// is gated by the accountability rule. Verification mirrors keel and starts Unverified.
@@ -6011,6 +6095,7 @@ async fn create_pr(
         reviewers: reviewers.clone(),
         state: PrState::Open,
         merged_by: None,
+        sovereign_provenance: std::collections::HashMap::new(),
         created_unix: now(),
     };
     if !owners.is_empty() {
@@ -6664,6 +6749,7 @@ mod tests {
             reviewers: vec![],
             state: PrState::Open,
             merged_by: None,
+            sovereign_provenance: std::collections::HashMap::new(),
             created_unix: 0,
         }).await;
     }
@@ -7166,6 +7252,48 @@ mod tests {
         assert!(!seen.contains(&"for-bob"), "must NOT leak another actor's inbox; got {seen:?}");
         assert!(!seen.contains(&"private-broadcast"), "must NOT leak a private repo's broadcast; got {seen:?}");
         assert!(!seen.contains(&"malformed-broadcast"), "a broadcast with an unparseable repo is default-denied; got {seen:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn submit_provenance_stores_a_verified_self_attestation() {
+        let (app, tmp) = build_test_app("submit-prov");
+        let author = hull_core::identity::mint_human("nomad");
+        let aid = author.actor.id.clone();
+        app.store.put_actor(author.actor.clone()).await;
+        setup_org_repo(&app, "acme", "web", false, &[(&aid, Role::Write)]).await;
+        let change = app.repos.test_commit("acme", "web", "", None, &[("f.txt", "hi\n")]);
+        put_pr(&app, "acme/web", 1, &aid, &change).await;
+        mint_token(&app, "tok", &aid);
+        let path = || axum::extract::Path(("acme".to_string(), "web".to_string(), change.clone()));
+
+        // The client signs its own claim (as a browser/CLI would), then submits the bundle.
+        let claim = crate::nostr::ProvenanceClaim { v: 1, change: change.clone(), actor: aid.clone(), repo: "acme/web".into(), intent: "authored it".into(), ts: 1_700_000_000 };
+        let sp = crate::nostr::sign_provenance(&author.secret_key, claim).unwrap();
+        let body = serde_json::to_value(&sp).unwrap();
+        let r = submit_provenance(State(app.clone()), path(), bearer("tok"), Json(body.clone())).await;
+        assert_eq!(r.status(), StatusCode::OK, "an accountable member submits provenance for its own change");
+        let pr = app.store.prs("acme/web").await.into_iter().find(|p| p.number == 1).unwrap();
+        assert_eq!(pr.sovereign_provenance.get(&change).cloned(), Some(serde_json::to_string(&sp).unwrap()), "the exact bundle is stored on the PR");
+
+        // Someone else's token cannot file provenance under this actor.
+        let other = hull_core::identity::mint_human("someone");
+        app.store.put_actor(other.actor.clone()).await;
+        mint_token(&app, "tok2", &other.actor.id);
+        let r = submit_provenance(State(app.clone()), path(), bearer("tok2"), Json(body)).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "you can only submit for your own actor");
+
+        // A bundle whose signature no longer covers the claim is rejected.
+        let mut tampered = sp.clone();
+        tampered.claim.intent = "changed after signing".into();
+        let r = submit_provenance(State(app.clone()), path(), bearer("tok"), Json(serde_json::to_value(&tampered).unwrap())).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "the claim signature must verify");
+
+        // A claim bound to a different change than the URL is rejected.
+        let claim2 = crate::nostr::ProvenanceClaim { v: 1, change: "blake3:other".into(), actor: aid.clone(), repo: "acme/web".into(), intent: "x".into(), ts: 1 };
+        let sp2 = crate::nostr::sign_provenance(&author.secret_key, claim2).unwrap();
+        let r = submit_provenance(State(app.clone()), path(), bearer("tok"), Json(serde_json::to_value(&sp2).unwrap())).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "claim.change must match the URL");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
