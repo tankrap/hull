@@ -87,6 +87,23 @@ impl Event {
     }
 }
 
+/// Set read+write timeouts on a websocket's underlying TCP socket, for BOTH plain `ws://` and TLS
+/// `wss://` — so a relay that accepts the connection but never replies (no EOSE) can't hang the
+/// caller. tungstenite only exposes the socket per-variant; the plain path alone (as before) would
+/// leave `wss` reads blocking forever.
+fn set_ws_timeouts(ws: &tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, d: std::time::Duration) {
+    use tungstenite::stream::MaybeTlsStream;
+    let sock: Option<&std::net::TcpStream> = match ws.get_ref() {
+        MaybeTlsStream::Plain(s) => Some(s),
+        MaybeTlsStream::Rustls(s) => Some(s.get_ref()),
+        _ => None,
+    };
+    if let Some(s) = sock {
+        let _ = s.set_read_timeout(Some(d));
+        let _ = s.set_write_timeout(Some(d));
+    }
+}
+
 /// Publish `event` to each relay (wss/ws url) best-effort; returns how many accepted the connection.
 /// Bounded per-relay by a short timeout so a dead relay can't stall the caller. Fire-and-forget: the
 /// notification path never fails because a relay is down.
@@ -97,9 +114,7 @@ pub fn publish(relays: &[String], event: &Event) -> usize {
     for url in relays {
         match tungstenite::connect(url) {
             Ok((mut ws, _resp)) => {
-                if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
-                    let _ = s.set_write_timeout(Some(Duration::from_secs(4)));
-                }
+                set_ws_timeouts(&ws, Duration::from_secs(4));
                 if ws.send(tungstenite::Message::Text(frame.clone())).is_ok() {
                     sent += 1;
                 }
@@ -173,10 +188,7 @@ pub fn fetch_events(relays: &[String], filter: serde_json::Value) -> Vec<Event> 
     let mut seen = std::collections::HashSet::new();
     for url in relays {
         let Ok((mut ws, _)) = tungstenite::connect(url) else { continue };
-        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
-            let _ = s.set_read_timeout(Some(Duration::from_secs(4)));
-            let _ = s.set_write_timeout(Some(Duration::from_secs(4)));
-        }
+        set_ws_timeouts(&ws, Duration::from_secs(4));
         if ws.send(tungstenite::Message::Text(req.clone())).is_err() {
             let _ = ws.close(None);
             continue;
@@ -249,8 +261,20 @@ impl NostrRefs {
     /// Read the newest published commit for `repo`'s `branch` back from the relays (own-authored refs).
     pub fn fetch_ref(&self, repo: &str, branch: &str) -> Option<String> {
         let author = pubkey_of(&self.secret_hex)?;
-        let filter = serde_json::json!({ "kinds": [KIND_REF], "authors": [author], "#d": [format!("{repo}#{branch}")] });
-        newest_commit(&fetch_events(&self.relays, filter))
+        let dtag = format!("{repo}#{branch}");
+        let filter = serde_json::json!({ "kinds": [KIND_REF], "authors": [author], "#d": [dtag] });
+        // Re-check author + kind + d-tag CLIENT-SIDE: a relay can ignore the REQ filter and return a
+        // validly-signed event by a different key. We only trust refs authored by our own instance key,
+        // so a foreign (even if self-consistent) event can never masquerade as this repo's ref.
+        let mine: Vec<Event> = fetch_events(&self.relays, filter)
+            .into_iter()
+            .filter(|e| {
+                e.pubkey == author
+                    && e.kind == KIND_REF
+                    && e.tags.iter().any(|t| t.len() == 2 && t[0] == "d" && t[1] == format!("{repo}#{branch}"))
+            })
+            .collect();
+        newest_commit(&mine)
     }
 }
 
