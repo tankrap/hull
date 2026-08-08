@@ -4422,6 +4422,26 @@ async fn perform_merge(
             }
         });
     }
+    // Actor-signed provenance (kind 1900): attest the landed change under the AUTHOR's Ed25519 key so
+    // the substrate carries verifiable delegated authority, not just the instance's word. Only when the
+    // instance holds that key (custodial/demo accounts); a SOVEREIGN author's key is client-held, so
+    // its provenance must be signed client-side — a follow-up (the same primitives, signed in-browser).
+    if let (Some(refs), false) = (app.nostr_refs.clone(), announced.is_empty()) {
+        let demo_id = identity::human_from_secret("demo", DEMO_OWNER_SECRET).map(|m| m.actor.id).unwrap_or_default();
+        let author_secret = if pr.author == demo_id {
+            Some(DEMO_OWNER_SECRET.to_string())
+        } else {
+            app.store.user_by_actor(&pr.author).await.map(|u| u.secret_key).filter(|s| !s.is_empty())
+        };
+        if let Some(secret) = author_secret {
+            let (author, repo_key, change, intent) = (pr.author.clone(), key.clone(), announced.clone(), pr.title.clone());
+            std::thread::spawn(move || {
+                if let Some(ev) = refs.publish_provenance(&secret, &change, &author, &repo_key, &intent) {
+                    eprintln!("nostr: published provenance for {change} by {}… ({}…)", &author[..author.len().min(12)], &ev.id[..12]);
+                }
+            });
+        }
+    }
     // Outbound mirror on change-land — guarded by loop prevention + idempotency.
     if let Some(change) = landed_change.as_ref().or_else(|| pr.changes.first()) {
         mirror_out(app, tenant, repo, change).await;
