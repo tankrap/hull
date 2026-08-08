@@ -7,8 +7,8 @@ const BASE = 'inline-flex items-center justify-center gap-1.5 font-medium cursor
 const PRESS = 'transition-[transform,box-shadow,background-color,border-color,color,filter] duration-150 active:translate-y-px active:scale-[0.99]';
 
 const VARIANT = {
-  // Solid ink with a little lift — a subtle shadow gives it presence; hover brightens, press flattens.
-  primary: 'bg-ink text-surface border border-ink font-semibold shadow-[0_1px_2px_rgba(15,23,42,0.14)] hover:brightness-[1.12] hover:shadow-[0_3px_10px_-3px_rgba(15,23,42,0.32)] active:shadow-none',
+  // GitLab "confirm": solid blue, white label, subtle press. The brand accent, not ink-contrast.
+  primary: 'bg-steel text-white border border-steel font-semibold shadow-[0_1px_2px_rgba(0,0,0,0.16)] hover:brightness-[1.08] active:brightness-95 active:shadow-none',
   // ADS default: translucent-neutral fill with a hairline for crispness.
   secondary: 'bg-ink/[0.05] text-body border border-ink/[0.07] hover:bg-ink/[0.09] hover:border-ink/[0.11] active:bg-ink/[0.15]',
   ghost: 'bg-transparent text-steel-text border border-transparent hover:bg-steel-wash active:bg-steel-wash/80',

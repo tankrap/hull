@@ -10,7 +10,8 @@ module.exports = {
   theme: {
     extend: {
       fontFamily: {
-        sans: ['"Mona Sans"', '"Helvetica Neue"', 'Helvetica', 'system-ui', 'sans-serif'],
+        sans: ['Inter', '"GitLab Sans"', '-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'system-ui', 'sans-serif'],
+        mono: ['"JetBrains Mono"', '"GitLab Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
       },
       colors: {
         shell: a('var(--shell)'),
@@ -34,12 +35,13 @@ module.exports = {
         ramp: { 1: '#2563EB', 2: '#4C7BEF', 3: '#6E96F3', 4: '#93B4F6', 5: '#C7D8FA' },
       },
       borderRadius: {
-        card: '10px',   // cards, alerts, modals — softer, GitLab-ward
-        ctl: '7px',     // controls
-        'ctl-sm': '6px',
-        chip: '5px',    // selection chips
+        // GitLab/Pajamas radii: 4px default control, 8px for cards/panels — crisp, not pillowy.
+        card: '8px',    // cards, alerts, modals
+        ctl: '6px',     // controls (buttons / inputs)
+        'ctl-sm': '4px',
+        chip: '4px',    // selection chips
         badge: '4px',   // lozenge radius
-        frame: '14px',  // chart frames / content well
+        frame: '10px',  // chart frames / content-well corner
       },
       height: {
         ctl: '32px', 'ctl-sm': '26px', 'ctl-lg': '40px',

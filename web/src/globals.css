@@ -1,4 +1,6 @@
-@import url('https://fonts.googleapis.com/css2?family=Mona+Sans:ital,wght@0,400;0,500;0,600;0,800;1,400&display=swap');
+/* GitLab Sans is built on Inter (with the cv05 single-story ‘l’); Inter is the faithful web stand-in. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap');
 /* keel/hull globals — the ONLY raw CSS. Palette vars consumed by tailwind.config.js.
    Toggle theme by setting data-theme="dark" on <html>. */
 @tailwind base;
@@ -9,64 +11,73 @@
    Neutrals: navy-tinted N-ramp. Accent: ADS Blue (#0C66E4). Semantics use ADS subtle
    backgrounds + accessible text pairs. Bold vars feed status dots/bars; *-wash are the ADS
    "subtle" surfaces used behind lozenges and diff lines. */
+/* Palette re-based on GitLab's Pajamas design tokens: WARM-NEUTRAL grays (not navy), GitLab blue as
+   the interactive accent (#1f75cb light / #428fdc dark), and Pajamas semantic green/amber/red. */
 :root {
-  --shell: #FFFFFF;       /* app chrome (top bar / nav / footer) — light mode keeps it white */
-  --paper: #F7F8F9;       /* elevation.surface.sunken — page ground / content well */
-  --surface: #FFFFFF;     /* elevation.surface — cards */
-  --rule: #DBDDE1;        /* color.border */
-  --rule2: #EBECF0;       /* color.border (subtle) */
-  --rule3: #F1F2F4;
-  --ctl-border: #B3B9C4;  /* input outline */
-  --ink: #172B4D;         /* color.text */
-  --body: #44546F;        /* color.text (paragraph) */
-  --dim: #5E6C84;         /* color.text.subtle */
-  --muted: #626F86;       /* color.text.subtlest */
-  --faint: #8590A2;       /* color.text.disabled */
-  --steel: #0C66E4;       /* color.background.brand.bold / Blue */
-  --steel-text: #0C66E4;  /* color.text.brand / link */
-  --steel-wash: #E9F2FF;  /* color.background.information / selected */
-  --brass: #E2B203;       /* Yellow (warning) bold */
-  --brass-text: #974F0C;  /* color.text.warning */
-  --brass-wash: #FFF7D6;  /* color.background.warning */
-  --clear: #22A06B;       /* Green (success) bold */
-  --clear-text: #216E4E;  /* color.text.success */
-  --clear-wash: #DCFFF1;  /* color.background.success */
-  --fault: #CA3521;       /* Red (danger) bold */
-  --fault-text: #AE2E24;  /* color.text.danger */
-  --fault-wash: #FFECEB;  /* color.background.danger */
+  --shell: #FFFFFF;       /* app chrome — light mode chrome stays white */
+  --paper: #F5F4F5;       /* content well — neutral-10 */
+  --surface: #FFFFFF;     /* cards */
+  --rule: #DCDCDE;        /* neutral-100 border */
+  --rule2: #ECECEF;       /* neutral-50 subtle border */
+  --rule3: #F3F2F3;
+  --ctl-border: #BFBFC3;  /* neutral-200 input outline */
+  --ink: #1F1E24;         /* neutral-950 text */
+  --body: #4F4D54;        /* neutral-700 paragraph */
+  --dim: #626168;         /* neutral-600 */
+  --muted: #737278;       /* neutral-500 */
+  --faint: #939298;       /* neutral-300 disabled */
+  --steel: #1F75CB;       /* GitLab blue-500 — primary / active */
+  --steel-text: #1068BF;  /* GitLab link */
+  --steel-wash: #E9F3FC;  /* selected / information */
+  --brass: #C17D10;       /* amber-500 */
+  --brass-text: #8F4700;  /* amber text */
+  --brass-wash: #FDF1DD;  /* amber subtle */
+  --clear: #108548;       /* green-500 */
+  --clear-text: #24663B;  /* green text */
+  --clear-wash: #ECF4EE;  /* green subtle */
+  --fault: #DD2B0E;       /* red-500 */
+  --fault-text: #AE1800;  /* red text */
+  --fault-wash: #FCEFEE;  /* red subtle */
 }
 
 [data-theme="dark"] {
-  /* GitLab-style app shell: the chrome (top bar / nav / footer) is a step LIGHTER than the content,
-     the content well is the darkest layer, and cards sit just barely above the well + lean on borders.
-     Cool neutral gray ramp (a hint of blue), the accents stay Hull's steel/brass. */
-  --shell: #2B3036;       /* app chrome — the lighter frame around the work */
-  --paper: #17191C;       /* content well — the darkest layer the work sits on */
-  --surface: #202429;     /* cards — a hair above the well, separated mainly by borders */
-  --rule: #363B41;
-  --rule2: #292E33;
-  --rule3: #23272C;
-  --ctl-border: #3C434A;
-  --ink: #E7E9EC;
-  --body: #B4BAC1;
-  --dim: #99A0A8;
-  --muted: #8E959D;       /* ≥4.5:1 on the well + cards (AA body) */
-  --faint: #7C838C;       /* ≥3:1 on every surface incl. the lighter chrome (AA UI/large) */
-  --steel: #579DFF;
-  --steel-text: #85B8FF;
-  --steel-wash: #17263B;
-  --brass: #F5CD47;
-  --brass-text: #F5CD47;
-  --brass-wash: #332E1B;
-  --clear: #7EE2B8;
-  --clear-text: #7EE2B8;
-  --clear-wash: #1C3329;
-  --fault: #F87168;
-  --fault-text: #FD9891;
-  --fault-wash: #42221F;
+  /* GitLab dark: warm-neutral ramp (neutral-950 #18171d work surface), chrome one step lighter,
+     GitLab blue accent. Cards sit just above the well and lean on borders. */
+  --shell: #2B2A32;       /* chrome — the lighter frame around the work (neutral-875) */
+  --paper: #19181E;       /* content well — the darkest layer (neutral-950) */
+  --surface: #211F27;     /* cards — a hair above the well (neutral-900) */
+  --rule: #3B3A43;        /* neutral-700 border */
+  --rule2: #2C2B33;
+  --rule3: #242229;
+  --ctl-border: #46454F;  /* neutral-600 outline */
+  --ink: #ECECEF;         /* neutral-50 */
+  --body: #C3C2C8;        /* neutral-200 */
+  --dim: #A6A5AC;         /* neutral-300 */
+  --muted: #8E8D95;       /* neutral-400 — ≥4.5:1 on the work surface */
+  --faint: #817F89;       /* neutral-500 — ≥3:1 on every surface incl. chrome */
+  --steel: #1F75CB;       /* GitLab blue — solid fills (primary button, active bar); white passes AA */
+  --steel-text: #7EB0EA;  /* GitLab link (dark) — bright for legibility on the dark surface */
+  --steel-wash: #1B2A3D;  /* selected / information */
+  --brass: #E9BE74;
+  --brass-text: #E9BE74;
+  --brass-wash: #38301C;
+  --clear: #52B87A;
+  --clear-text: #7FD4A0;
+  --clear-wash: #173327;
+  --fault: #EE7A63;
+  --fault-text: #F3A18C;
+  --fault-wash: #3C201C;
 }
 
-body { @apply font-sans text-ink bg-paper antialiased; text-wrap: pretty; }
+body {
+  @apply font-sans text-ink bg-paper antialiased;
+  text-wrap: pretty;
+  /* Inter tuned to read like GitLab Sans: single-story ‘l’ (cv05) + open ‘a/g’ + slightly tighter tracking. */
+  font-feature-settings: 'cv05' 1, 'cv08' 1, 'cv11' 1;
+  letter-spacing: -0.0055em;
+}
+/* GitLab-style: headings a touch tighter still. */
+h1, h2, h3 { letter-spacing: -0.014em; }
 
 /* Diff jump target (from "What changed here"). Pulses once on arrival, then STAYS highlighted so
    you can always find your place — it only moves when you jump to a different line. */
