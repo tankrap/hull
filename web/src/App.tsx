@@ -21,6 +21,7 @@ import { ContributionHeatmap, type HeatDay } from "./components/ContributionHeat
 import { RepoGraph } from "./components/RepoGraph";
 import { Boundary, Card, SectionHeader } from "./components/primitives";
 import { RepoFiles } from "./components/RepoFiles";
+import { SubstrateView } from "./components/SubstrateView";
 
 
 const hexToBytes = (h: string) => Uint8Array.from((h.match(/../g) ?? []).map((x) => parseInt(x, 16)));
@@ -99,7 +100,7 @@ type RouteState = {
   openIssue: number | null;
   openPr: number | null;
 };
-type RepoTab = "issues" | "prs" | "files" | "graph" | "settings";
+type RepoTab = "issues" | "prs" | "files" | "graph" | "substrate" | "settings";
 function parseRoute(path: string): RouteState {
   const seg = path.split("?")[0].split("/").filter(Boolean).map(decodeURIComponent);
   const r: RouteState = { view: "home", authPage: null, orgHandle: null, tenant: "", issueRepo: "", tab: "issues", openIssue: null, openPr: null };
@@ -113,6 +114,7 @@ function parseRoute(path: string): RouteState {
     if (s === "settings") r.tab = "settings";
     else if (s === "files" || s === "tree" || s === "code") r.tab = "files";
     else if (s === "graph") r.tab = "graph";
+    else if (s === "substrate") r.tab = "substrate";
     else if (s === "issues" && n) { r.openIssue = Number(n); r.tab = "issues"; }
     else if (s === "voyages" && n) { r.openPr = Number(n); r.tab = "prs"; }
     else if (s === "voyages") r.tab = "prs";
@@ -2087,6 +2089,9 @@ export function App() {
             <button className={sideCls(tab === "graph")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/graph`)}>
               <SIco d="M18 20V10M12 20V4M6 20v-7" /><span>Graph</span>
             </button>
+            <button className={sideCls(tab === "substrate")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/substrate`)}>
+              <SIco d="M12 2 2 7l10 5 10-5zM2 17l10 5 10-5M2 12l10 5 10-5" /><span>Substrate</span>
+            </button>
             {isTenantOwner && (
               <button className={sideCls(tab === "settings")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/settings`)}>
                 <SIco d="M4 21v-6M4 11V3M12 21v-9M12 7V3M20 21v-4M20 13V3M1 15h6M9 9h6M17 15h6" /><span>Settings</span>
@@ -3206,9 +3211,9 @@ export function App() {
           {/* Desktop navigates the repo via the contextual sidebar; the tab bar is the mobile fallback. */}
           <div className="md:hidden flex items-end justify-between gap-4 border-b border-rule2 mb-7">
             <HTabs
-              items={[`Issues ${openIssues}`, `Pull requests ${prs.length}`, "Files", "Graph", ...(isTenantOwner ? ["Settings"] : [])]}
-              value={tab === "issues" ? 0 : tab === "prs" ? 1 : tab === "files" ? 2 : tab === "graph" ? 3 : 4}
-              onChange={(i: number) => navigate([repoBase(), `${repoBase()}/voyages`, `${repoBase()}/files`, `${repoBase()}/graph`, `${repoBase()}/settings`][i])} />
+              items={[`Issues ${openIssues}`, `Pull requests ${prs.length}`, "Files", "Graph", "Substrate", ...(isTenantOwner ? ["Settings"] : [])]}
+              value={tab === "issues" ? 0 : tab === "prs" ? 1 : tab === "files" ? 2 : tab === "graph" ? 3 : tab === "substrate" ? 4 : 5}
+              onChange={(i: number) => navigate([repoBase(), `${repoBase()}/voyages`, `${repoBase()}/files`, `${repoBase()}/graph`, `${repoBase()}/substrate`, `${repoBase()}/settings`][i])} />
           </div>
 
           {(tab === "issues" || tab === "prs") && (
@@ -3390,6 +3395,10 @@ export function App() {
 
           {tab === "graph" && (
             <RepoGraph tenant={tenant} repo={issueRepo} authHeaders={authHeaders} onOpenFile={(p, branch) => navigate(`${repoBase()}/files?path=${encodeURIComponent(p)}&branch=${encodeURIComponent(branch)}`)} />
+          )}
+
+          {tab === "substrate" && (
+            <SubstrateView tenant={tenant} repo={issueRepo} authHeaders={authHeaders} handleOf={(id) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 10)} />
           )}
 
           {tab === "settings" && !isTenantOwner && (
