@@ -130,7 +130,7 @@ export function PromptModal({ open, title, label, placeholder, initial = '', san
           <input autoFocus value={val} placeholder={placeholder}
             onChange={(e) => setVal(sanitize ? sanitize(e.target.value) : e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') onCancel(); }}
-            className={cx('w-full box-border h-ctl px-2.5 rounded-ctl border bg-paper font-sans text-[13.5px] text-ink outline-none transition-colors duration-150', blocked ? 'border-fault' : 'border-ctl focus:border-body')} />
+            className={cx('w-full box-border h-ctl px-2.5 rounded-ctl border bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none transition-colors duration-150', blocked ? 'border-fault' : 'border-ctl focus:border-body')} />
           {validate && val.trim() && (
             <div className={cx('text-[12px] mt-1.5', checking ? 'text-muted' : status?.available ? 'text-clear-text' : 'text-fault-text')}>
               {checking ? 'checking…' : status ? (status.available ? `✓ ${val.trim()} is available` : `✗ ${status.hint || 'taken'}`) : ''}

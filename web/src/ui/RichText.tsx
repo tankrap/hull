@@ -74,8 +74,8 @@ export function RichText({ value, onChange, placeholder, rows = 4, linkBase = nu
   const ico = (d: React.ReactNode) => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{d}</svg>;
   return (
     <div className="relative">
-    <div className="border border-ctl rounded-ctl overflow-hidden bg-paper focus-within:border-steel focus-within:ring-2 focus-within:ring-steel/30 transition-[border-color,box-shadow]">
-      <div className="flex items-center justify-between gap-2 border-b border-rule2 bg-paper px-1.5 py-1 flex-wrap">
+    <div className="border border-[var(--field-border)] rounded-ctl overflow-hidden bg-[var(--field-bg)] focus-within:border-[var(--field-border-focus)] focus-within:ring-2 focus-within:ring-steel/40 transition-[border-color,box-shadow]">
+      <div className="flex items-center justify-between gap-2 border-b border-rule2 px-1.5 py-1 flex-wrap">
         <div className="inline-flex rounded-ctl-sm overflow-hidden border border-rule2">
           {(["write", "preview"] as const).map((t) => (
             <button key={t} type="button" onClick={() => setTab(t)} className={`px-2.5 py-[3px] text-[12px] font-medium capitalize ${tab === t ? "bg-surface text-ink" : "text-muted hover:text-ink"}`}>{t}</button>
@@ -108,7 +108,7 @@ export function RichText({ value, onChange, placeholder, rows = 4, linkBase = nu
             if (onSubmit && e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); onSubmit(); }
           }}
           placeholder={placeholder}
-          className="w-full box-border px-2.5 py-2 bg-paper font-sans text-[13.5px] text-ink outline-none resize-y leading-[1.5] placeholder:text-faint" />
+          className="w-full box-border px-2.5 py-2 bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none resize-y leading-[1.5] placeholder:text-faint" />
       ) : (
         <div className="px-2.5 py-2 min-h-[72px] text-[13.5px] text-body">{value.trim() ? <Markdown text={value} linkBase={linkBase} /> : <span className="text-faint">Nothing to preview</span>}</div>
       )}

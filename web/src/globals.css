@@ -21,8 +21,20 @@
   --rule2: #ECECEF;       /* neutral-50 subtle border */
   --rule3: #F3F2F3;
   --ctl-border: #BFBFC3;  /* neutral-200 input outline */
-  --ctl-fill: #FFFFFF;        /* default/secondary button + select face */
-  --ctl-fill-hover: #ECECEF;  /* its hover */
+  /* ── GitLab @gitlab/ui button + control tokens (resolved from source) ──────────────
+     CONFIRM/primary is NEUTRAL high-contrast (not blue); blue is links/focus/selection only. */
+  --btn-cta-bg: #3A383F;         /* neutral-800 */
+  --btn-cta-bg-hover: #18171D;   /* neutral-950 */
+  --btn-cta-fg: #FFFFFF;         /* neutral-0 */
+  --btn-neu-bg: #FFFFFF;         /* neutral-0 */
+  --btn-neu-bg-hover: #ECECEF;   /* neutral-50 */
+  --btn-neu-fg: #3A383F;         /* neutral-800 */
+  --btn-neu-border: #BFBFC3;     /* neutral-200 */
+  --btn-neu-border-hover: #89888D; /* neutral-400 */
+  --field-bg: #FFFFFF;           /* neutral-0 */
+  --field-border: #89888D;       /* neutral-400 — a strong, visible input outline */
+  --field-border-focus: #28272D; /* neutral-900 — focus border is high-contrast neutral + blue ring */
+  --btn-dis-bg: #FBFAFD; --btn-dis-fg: #737278; --btn-dis-border: #DCDCDE; /* neutral-10/500/100 */
   --ink: #1F1E24;         /* neutral-950 text */
   --body: #4F4D54;        /* neutral-700 paragraph */
   --dim: #626168;         /* neutral-600 */
@@ -52,8 +64,21 @@
   --rule2: #2C2B33;
   --rule3: #242229;
   --ctl-border: #46454F;  /* neutral-600 outline */
-  --ctl-fill: #333139;        /* neutral-800 — default button face, a step ABOVE the card */
-  --ctl-fill-hover: #403E48;  /* neutral-750 — its hover */
+  /* ── GitLab dark button + control tokens (resolved from @gitlab/ui) ────────────────
+     CONFIRM/primary inverts to near-WHITE; the default button is a translucent gray fill
+     with NO border; inputs sink into a dark inset with a strong border. */
+  --btn-cta-bg: #ECECEF;         /* neutral-50 */
+  --btn-cta-bg-hover: #FBFAFD;   /* neutral-10 */
+  --btn-cta-fg: #18171D;         /* neutral-950 */
+  --btn-neu-bg: rgba(137,136,141,0.40);   /* neutral-400 @ 40% — translucent fill */
+  --btn-neu-bg-hover: rgba(137,136,141,0.64);
+  --btn-neu-fg: #ECECEF;         /* neutral-50 */
+  --btn-neu-border: transparent; /* alpha-0 — dark default button has no border */
+  --btn-neu-border-hover: transparent;
+  --field-bg: #16151B;           /* inset field, a step below the card */
+  --field-border: #737278;       /* neutral-500 — strong input outline */
+  --field-border-focus: #ECECEF; /* neutral-50 — focus border is high-contrast neutral + blue ring */
+  --btn-dis-bg: rgba(137,136,141,0.16); --btn-dis-fg: #89888D; --btn-dis-border: transparent;
   --ink: #ECECEF;         /* neutral-50 */
   --body: #C3C2C8;        /* neutral-200 */
   --dim: #A6A5AC;         /* neutral-300 */
