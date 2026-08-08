@@ -13,6 +13,7 @@ module.exports = {
         sans: ['"Mona Sans"', '"Helvetica Neue"', 'Helvetica', 'system-ui', 'sans-serif'],
       },
       colors: {
+        shell: a('var(--shell)'),
         paper: a('var(--paper)'),
         surface: a('var(--surface)'),
         frame: '#F7F8FA',

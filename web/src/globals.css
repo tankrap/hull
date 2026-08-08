@@ -10,7 +10,8 @@
    backgrounds + accessible text pairs. Bold vars feed status dots/bars; *-wash are the ADS
    "subtle" surfaces used behind lozenges and diff lines. */
 :root {
-  --paper: #F7F8F9;       /* elevation.surface.sunken — page ground */
+  --shell: #FFFFFF;       /* app chrome (top bar / nav / footer) — light mode keeps it white */
+  --paper: #F7F8F9;       /* elevation.surface.sunken — page ground / content well */
   --surface: #FFFFFF;     /* elevation.surface — cards */
   --rule: #DBDDE1;        /* color.border */
   --rule2: #EBECF0;       /* color.border (subtle) */
@@ -36,20 +37,24 @@
 }
 
 [data-theme="dark"] {
-  --paper: #1D2125;       /* dark surface.sunken */
-  --surface: #22272B;     /* dark elevation.surface (raised) */
-  --rule: #38414A;
-  --rule2: #2C333A;
-  --rule3: #262B31;
-  --ctl-border: #454F59;
-  --ink: #DEE4EA;
-  --body: #B6C2CF;
-  --dim: #9FADBC;
-  --muted: #96A0AE;
-  --faint: #738496;
+  /* GitLab-style app shell: the chrome (top bar / nav / footer) is a step LIGHTER than the content,
+     the content well is the darkest layer, and cards sit just barely above the well + lean on borders.
+     Cool neutral gray ramp (a hint of blue), the accents stay Hull's steel/brass. */
+  --shell: #2B3036;       /* app chrome — the lighter frame around the work */
+  --paper: #17191C;       /* content well — the darkest layer the work sits on */
+  --surface: #202429;     /* cards — a hair above the well, separated mainly by borders */
+  --rule: #363B41;
+  --rule2: #292E33;
+  --rule3: #23272C;
+  --ctl-border: #3C434A;
+  --ink: #E7E9EC;
+  --body: #B4BAC1;
+  --dim: #99A0A8;
+  --muted: #868D95;
+  --faint: #646B73;
   --steel: #579DFF;
   --steel-text: #85B8FF;
-  --steel-wash: #1C2B41;
+  --steel-wash: #17263B;
   --brass: #F5CD47;
   --brass-text: #F5CD47;
   --brass-wash: #332E1B;
