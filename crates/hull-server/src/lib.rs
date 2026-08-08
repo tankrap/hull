@@ -3610,7 +3610,11 @@ async fn upload_pack_handler(
 /// no side-band, so the report goes in the response body directly (no sideband framing). We report
 /// `unpack ok` (the pack is simply never ingested — nothing is written) followed by an `ng` for the
 /// protected ref; git treats the `ng` as a rejection and fails the push, leaving the branch untouched.
-fn protected_push_rejection(default_branch: &str) -> Response {
+///
+/// `rejected` is the list of `(refname, reason)` pairs to reject — one per ref the client tried to push
+/// that we refuse. The pack is never ingested regardless, so every un-mentioned ref is also left
+/// untouched; the `ng` lines exist only so `git push` prints a clean per-ref rejection.
+fn reject_push(rejected: &[(String, &str)]) -> Response {
     fn pkt(line: &str) -> Vec<u8> {
         // A git pkt-line: a 4-hex length prefix (covering the 4 bytes) followed by the payload.
         let mut v = format!("{:04x}", line.len() + 4).into_bytes();
@@ -3619,7 +3623,9 @@ fn protected_push_rejection(default_branch: &str) -> Response {
     }
     let mut body = Vec::new();
     body.extend(pkt("unpack ok\n"));
-    body.extend(pkt(&format!("ng refs/heads/{default_branch} protected: land changes via a reviewed PR\n")));
+    for (refname, reason) in rejected {
+        body.extend(pkt(&format!("ng {refname} {reason}\n")));
+    }
     body.extend_from_slice(b"0000"); // flush-pkt
     (
         StatusCode::OK,
@@ -3630,6 +3636,24 @@ fn protected_push_rejection(default_branch: &str) -> Response {
         body,
     )
         .into_response()
+}
+
+/// Reject a push that targets the protected default branch (the branch is known).
+fn protected_push_rejection(default_branch: &str) -> Response {
+    reject_push(&[(format!("refs/heads/{default_branch}"), "protected: land changes via a reviewed PR")])
+}
+
+/// Fail-closed rejection for a protected repo whose real default branch could NOT be resolved: since we
+/// can't tell which ref to guard, we reject EVERY ref the client tried to push (falling back to
+/// `refs/heads/main` if the command list is empty). The pack is never ingested, so nothing advances.
+fn protected_push_rejection_unresolved(commands: &[(String, String)]) -> Response {
+    const REASON: &str = "protected: repo default branch could not be resolved; retry the push";
+    let rejected: Vec<(String, &str)> = if commands.is_empty() {
+        vec![("refs/heads/main".to_string(), REASON)]
+    } else {
+        commands.iter().map(|(_new, refname)| (refname.clone(), REASON)).collect()
+    };
+    reject_push(&rejected)
 }
 
 async fn receive_pack_handler(
@@ -3647,8 +3671,15 @@ async fn receive_pack_handler(
     // unaffected. When protection is off this whole block is skipped — the config-off no-op.
     let key = format!("{tenant}/{repo}");
     if app.repo_settings.get(&key).protects_default_branch() {
-        let default_branch = find_repo(&app, &tenant, &repo).await.map(|r| r.default_branch).unwrap_or_else(|| "main".into());
         let commands = repos::parse_receive_refs(&repos::maybe_gunzip(&headers, body.to_vec()));
+        // Fail CLOSED: on a protected repo we must know the *real* default branch before deciding. If
+        // `find_repo` can't resolve it (e.g. a transient store read), reject rather than fall back to a
+        // literal "main" — a repo whose default branch isn't "main" would otherwise let a push to its
+        // true protected branch slip past the gate while we guarded the wrong ref.
+        let Some(default_branch) = find_repo(&app, &tenant, &repo).await.map(|r| r.default_branch) else {
+            eprintln!("hull: ⚠ receive-pack on protected {tenant}/{repo} but default branch unresolved; failing closed");
+            return protected_push_rejection_unresolved(&commands);
+        };
         if repos::touches_protected(&commands, &default_branch) {
             return protected_push_rejection(&default_branch);
         }

@@ -913,6 +913,28 @@ fn write_entry(fp: &std::path::Path, bytes: &[u8], mode: u32) -> io::Result<()> 
     Ok(())
 }
 
+/// Reject a merged-edit `path` whose *ancestor* directories, as materialized under the checkout `dir`,
+/// include a symlink. The checkout-then-patch design (`materialize_merge`, `compose_independence_tree`)
+/// writes each edit via `dir.join(path)`; keel's `checkout` already rejects `..`/absolute entry names,
+/// so the only residual way a write could land OUTSIDE `dir` is a symlinked path *prefix* — either
+/// pre-existing in the base tree, or created by an earlier symlink edit in the same merge. We walk each
+/// ancestor component under `dir` and return the offending path if any existing one is a symlink; a
+/// component that doesn't exist yet is fine (`create_dir_all` only ever makes real directories).
+fn symlinked_prefix(dir: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+    let mut cur = dir.to_path_buf();
+    // Only ancestor components (all but the leaf) can be a *traversed* prefix; the leaf itself is
+    // `remove_file`'d before the write, so a leaf symlink is replaced, not followed.
+    for comp in &comps[..comps.len().saturating_sub(1)] {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(md) if md.file_type().is_symlink() => return Some(cur),
+            _ => {} // real dir, or not present yet
+        }
+    }
+    None
+}
+
 /// Committer stamped on a synthesized git merge commit — the land was performed by Hull's merge
 /// queue, not authored by a person. Stable so a re-export is deterministic.
 const HULL_COMMITTER: &str = "Hull Merge Queue <merge@hull.local>";
@@ -1368,6 +1390,11 @@ impl RepoHost {
         }
         // Neutralize each touched test: restore the parent's copy, or drop it if the change added it.
         for path in &changed_tests {
+            // Same checkout-then-patch escape as `materialize_merge`: never copy/delete through a
+            // symlinked path prefix. Best-effort compose — skip such a path rather than traverse it.
+            if symlinked_prefix(&newdir, path).is_some() {
+                continue;
+            }
             let target = newdir.join(path);
             let parent_copy = pdir.join(path);
             if parent_copy.is_file() {
@@ -1593,6 +1620,16 @@ impl RepoHost {
             return Err(MergeError::Internal("checkout of base tree failed".into()));
         }
         for (path, resolved) in edits {
+            // Defense-in-depth: refuse to write/delete through a symlinked path prefix, which could
+            // escape the checkout dir (a latent risk in the checkout-then-patch design). Reject the
+            // whole merge rather than materialize a tree derived from a traversal outside `dir`.
+            if let Some(link) = symlinked_prefix(&dir, path) {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(MergeError::Internal(format!(
+                    "refusing merge: symlinked path prefix {} for edit {path}",
+                    link.display()
+                )));
+            }
             let fp = dir.join(path);
             match resolved {
                 Some((id, mode)) => {
@@ -2672,6 +2709,32 @@ mod tests {
         let c = tree_contents(&store, &tree_hex);
         assert_eq!(c.get("other.txt").map(String::as_str), Some("2\n"), "base's edit to other.txt survives");
         assert_eq!(c.get("link").map(String::as_str), Some("other.txt"), "the symlink's content is its target path");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // LOW hardening: a base tree whose directory-position entry is a SYMLINK must not let a later
+    // merged write traverse it and escape the checkout dir. `materialize_merge` rejects the merge.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_merge_rejects_symlinked_path_prefix() {
+        use keel_store::snapshot::{snapshot_uncached, MODE_FILE};
+        let (tmp, host) = merge_host("symlinkprefix");
+        let store = host.store("t", "r", true).unwrap().unwrap();
+        // `escape` is an out-of-checkout directory the symlink points at; nothing may be written into it.
+        let escape = tmp.join("escape-target");
+        std::fs::create_dir_all(&escape).unwrap();
+        // Base tree: a real file plus `d`, a symlink standing in a directory position.
+        let base_dir = tmp.join("base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(base_dir.join("keep.txt"), "1\n").unwrap();
+        std::os::unix::fs::symlink(&escape, base_dir.join("d")).unwrap();
+        let base_tree = snapshot_uncached(&store, &base_dir).unwrap();
+        // An edit that writes UNDER the symlinked prefix `d/…`.
+        let blob = store.put(&Object::Blob(b"pwned\n".to_vec())).unwrap();
+        let edits = vec![("d/inner.txt".to_string(), Some((blob, MODE_FILE)))];
+        let res = host.materialize_merge(&store, base_tree, &edits);
+        assert!(res.is_err(), "a merge write through a symlinked prefix must be rejected");
+        assert!(!escape.join("inner.txt").exists(), "nothing escaped into the symlink target");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
