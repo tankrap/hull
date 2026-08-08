@@ -1877,7 +1877,11 @@ async fn ai_agent_login_cancel(State(app): State<App>, Path(id): Path<String>, h
         return resp;
     }
     let session = body.get("session").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    if !session.is_empty() {
+    // Guard the filesystem sink: `agentsession::remove` joins `session` into a path and
+    // `remove_dir_all`s it, so a `..`-laden value from the body could delete a directory outside the
+    // sessions root. Session ids are server-generated UUIDs; anything that isn't a safe path segment
+    // is not a real session — ignore it rather than let it reach the path helpers.
+    if !session.is_empty() && repos::safe_segment(&session) {
         agentlogin::abort(&session);
         agentsession::remove(&session);
     }
@@ -3413,7 +3417,7 @@ async fn notify_ci(app: &App, tenant: &str, repo: &str, change: &str, status: &s
     app.registry.notify(&hull_plugin::NotifyEvent {
         kind: if status == "green" { "ci_passed".into() } else { "ci_failed".into() },
         to: vec![],
-        summary: format!("checks {status} for {tenant}/{repo}@{}: {}", &change[..change.len().min(12)], summary),
+        summary: format!("checks {status} for {tenant}/{repo}@{}: {}", change.chars().take(12).collect::<String>(), summary),
         change: Some(change.to_string()),
         repo: Some(format!("{tenant}/{repo}")),
         target_kind: None,
@@ -3433,13 +3437,22 @@ async fn ci_result(
 ) -> Response {
     let key = format!("{tenant}/{repo}");
     let (cfg, _src) = app.ci_config.resolve(&key);
-    // If a secret is configured, the callback must present it.
-    if let Some(ci::RepoCi { secret, .. }) = cfg.as_ref() {
-        if !secret.is_empty() {
-            let presented = headers.get("X-Hull-CI-Secret").and_then(|v| v.to_str().ok()).unwrap_or("");
-            if !ct_eq(presented.as_bytes(), secret.as_bytes()) {
-                return (StatusCode::UNAUTHORIZED, "bad or missing X-Hull-CI-Secret").into_response();
-            }
+    // The `ci-result` callback is the EXTERNAL-CI half of the contract. The built-in local runner
+    // reports its verdict in-process (see `resolve_check`), so when no external CI is configured for
+    // this repo there is NO legitimate caller — refuse. Otherwise an anonymous request could POST
+    // `{status:"green"}` for any real change and drive `set_verification`, poisoning the merge gate
+    // that `verify_change` otherwise reserves to owners/admins.
+    let Some(ci::RepoCi { secret, .. }) = cfg.as_ref() else {
+        return (StatusCode::FORBIDDEN, "no external CI is configured for this repo; the built-in runner reports its own verdicts").into_response();
+    };
+    // A configured endpoint that set a secret must present it. Compare fixed-size SHA-256 digests so
+    // the check is length-independent — a raw `ct_eq` short-circuits on length, leaking the secret's
+    // length via timing (matching `verify_service_secret`).
+    if !secret.is_empty() {
+        let presented = headers.get("X-Hull-CI-Secret").and_then(|v| v.to_str().ok()).unwrap_or("");
+        use sha2::{Digest, Sha256};
+        if !ct_eq(&Sha256::digest(presented.as_bytes()), &Sha256::digest(secret.as_bytes())) {
+            return (StatusCode::UNAUTHORIZED, "bad or missing X-Hull-CI-Secret").into_response();
         }
     }
     let status = body.get("status").and_then(Value::as_str).unwrap_or("").to_string();
@@ -6741,6 +6754,46 @@ mod tests {
         assert!(!is_repo_admin(&app, "acme", "web", "dev").await, "Write is a member but not an admin");
         assert!(!is_repo_admin(&app, "acme", "web", "reader").await, "Read is a member but not an admin");
         assert!(!is_repo_admin(&app, "acme", "web", "outsider").await);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn ci_result_callback_requires_configured_external_ci_and_secret() {
+        // Regression for the authz bypass: the `ci-result` callback is the EXTERNAL-CI half of the
+        // contract. With the default built-in local runner (no external CI configured) there is no
+        // legitimate caller, so an anonymous callback MUST be refused — otherwise anyone could POST
+        // `{status:"green"}` for a real change and drive `set_verification`, defeating the merge gate.
+        let (app, tmp) = build_test_app("ci-result-auth");
+        setup_org_repo(&app, "acme", "web", false, &[("owner", Role::Owner)]).await;
+        let route = |id: &str| axum::extract::Path((String::from("acme"), String::from("web"), id.to_string()));
+        let call = |app: App, hdrs: axum::http::HeaderMap| async move {
+            ci_result(axum::extract::State(app), route("deadbeefcafebabe"), hdrs, axum::Json(serde_json::json!({ "status": "green" }))).await
+        };
+
+        // (1) No external CI configured → refuse anonymous callbacks (the bypass).
+        let resp = call(app.clone(), axum::http::HeaderMap::new()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN, "no external CI configured → callback refused");
+
+        // Configure an external endpoint WITH a secret for this repo.
+        app.ci_config.set("acme/web", crate::ci::RepoCi { url: "http://ci.example".into(), secret: "s3cr3t".into() });
+
+        // (2) Configured, no secret header → 401.
+        let resp = call(app.clone(), axum::http::HeaderMap::new()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED, "missing secret → 401");
+
+        // (3) Configured, wrong secret → 401.
+        let mut wrong = axum::http::HeaderMap::new();
+        wrong.insert("X-Hull-CI-Secret", "nope".parse().unwrap());
+        let resp = call(app.clone(), wrong).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED, "wrong secret → 401");
+
+        // (4) Configured, correct secret → accepted (200). (The fake change id resolves to no tree, so
+        // no verification is written, but the callback is authorized and records the verdict.)
+        let mut ok = axum::http::HeaderMap::new();
+        ok.insert("X-Hull-CI-Secret", "s3cr3t".parse().unwrap());
+        let resp = call(app.clone(), ok).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "correct secret → accepted");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

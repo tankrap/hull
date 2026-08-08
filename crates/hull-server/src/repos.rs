@@ -1196,6 +1196,20 @@ impl RepoHost {
         }
         // Apply each edit; abort (clean up, return None) if any search string isn't present.
         for (path, search, replace) in edits {
+            // The edit `path` comes from the fixer (LLM output), so — unlike the keel-derived paths in
+            // `materialize_merge`/`compose_independence_tree` — it is untrusted. Guard the checkout
+            // boundary: reject an absolute path (`join` would replace `dir`), any `..`/root traversal,
+            // and an empty `search` (which `replacen` would blindly prepend to the file). Then, like
+            // the siblings, refuse to write through a symlinked path prefix that could escape `dir`.
+            let rel = std::path::Path::new(path.as_str());
+            let unsafe_path = search.is_empty()
+                || rel.is_absolute()
+                || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+                || symlinked_prefix(&dir, path).is_some();
+            if unsafe_path {
+                let _ = std::fs::remove_dir_all(&dir);
+                return None;
+            }
             let fp = dir.join(path);
             let Ok(content) = std::fs::read_to_string(&fp) else {
                 let _ = std::fs::remove_dir_all(&dir);
