@@ -451,6 +451,12 @@ pub struct PullRequest {
     /// The accountable actor who merged it, once merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_by: Option<ActorId>,
+    /// Client-signed provenance for this PR's change(s): change id → serialized `SignedProvenance` JSON.
+    /// A sovereign author's Ed25519 key is client-held, so the instance can't sign provenance for them;
+    /// they submit it here (signed in the browser/CLI) and the server embeds it in the substrate at land.
+    /// The value is opaque to hull-core (the crypto lives in hull-server::nostr); it is transport JSON.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub sovereign_provenance: std::collections::HashMap<KeelId, String>,
     pub created_unix: u64,
 }
 
