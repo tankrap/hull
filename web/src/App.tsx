@@ -985,9 +985,10 @@ export function App() {
     return <Dialog open title={req.title} body={req.body} cancelLabel={null} actionLabel="OK" onClose={() => closeModal(undefined)} onAction={() => closeModal(undefined)} />;
   })();
 
-  // Theme: light-first (the design's default), dark via [data-theme] on <html>. Persisted.
+  // Theme: dark-first (the situation-room shell is designed for it), light via the toggle. A stored
+  // preference always wins; new visitors get dark. [data-theme] on <html>. Persisted.
   const [theme, setTheme] = useState<string>(
-    () => localStorage.getItem("hull_theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"),
+    () => localStorage.getItem("hull_theme") || "dark",
   );
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -2038,7 +2039,7 @@ export function App() {
         {shortcutsNode}
         {createModalsNode}
 
-        <header className="h-14 border-b border-rule2 bg-surface flex items-center px-6">
+        <header className="h-14 border-b border-rule2 bg-shell flex items-center px-6">
           <button className="flex items-center gap-2.5 cursor-pointer" onClick={() => navigate("/")}>
             <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
             <span className="text-[19px] font-extrabold tracking-tight">hull</span>
@@ -2341,7 +2342,7 @@ export function App() {
 
   // ── shared chrome (top bar + notifications drawer) ────────────────────────
   const topBar = (
-    <header className="h-14 border-b border-rule2 bg-surface flex items-center gap-5 px-6 sticky top-0 z-40">
+    <header className="h-14 border-b border-rule2 bg-shell flex items-center gap-5 px-6 sticky top-0 z-40">
       <button className="flex items-center gap-2.5 cursor-pointer shrink-0" onClick={() => navigate("/")} title="situation room">
         <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
         <span className="text-[19px] font-extrabold tracking-tight">hull</span>
