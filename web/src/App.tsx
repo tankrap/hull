@@ -1454,16 +1454,21 @@ export function App() {
   const [q, setQ] = useState("");
   const matchQ = (s: string) => q.trim() === "" || s.toLowerCase().includes(q.trim().toLowerCase());
 
-  // Notifications inbox, scoped to the acting actor (addressed-to-them + broadcasts). Polled.
+  // Notifications inbox for the authenticated actor (addressed-to-them + visible broadcasts). The
+  // server derives the actor from the bearer token, so there's no client-supplied ?actor= to spoof;
+  // with no token there's no inbox to show.
   useEffect(() => {
+    if (!token) { setNotifs([]); return; }
     const load = () => {
-      const url = actingAs ? `/api/notifications?actor=${encodeURIComponent(actingAs)}` : "/api/notifications";
-      fetch(url).then((r) => r.json()).then((d) => setNotifs(d.notifications ?? [])).catch(() => {});
+      fetch("/api/notifications", { headers: authHeaders() })
+        .then((r) => (r.ok ? r.json() : { notifications: [] }))
+        .then((d) => setNotifs(d.notifications ?? []))
+        .catch(() => {});
     };
     load();
     const t = setInterval(load, 4000);
     return () => clearInterval(t);
-  }, [actingAs]);
+  }, [token]);
 
   // Two views: Home (situation room) and a focused Repo view with Issues / PRs tabs.
   const [view, setView] = useState<"home" | "repo">(() => parseRoute(location.pathname).view);
