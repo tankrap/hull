@@ -14,7 +14,7 @@ export function TextField({ label, help, error, className, ...rest }: TextFieldP
   return (
     <div>
       {label && <Label>{label}</Label>}
-      <input className={cx(FIELD, error ? 'border-fault' : 'border-ctl focus:border-body', className)} {...rest} />
+      <input className={cx(FIELD, error ? 'border-fault' : 'border-ctl focus:border-steel focus:ring-2 focus:ring-steel/30', className)} {...rest} />
       {(error || help) && <div className={cx('text-xs mt-[5px]', error ? 'text-fault-text' : 'text-muted')}>{error || help}</div>}
     </div>
   );
@@ -23,7 +23,7 @@ export function TextField({ label, help, error, className, ...rest }: TextFieldP
 // Search input with leading icon and trailing shortcut chip.
 export function SearchInput({ shortcut = '⌘K', ...rest }: React.InputHTMLAttributes<HTMLInputElement> & { shortcut?: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-2 h-ctl px-2.5 rounded-ctl border border-ctl bg-surface transition-colors duration-150 focus-within:border-body">
+    <div className="flex items-center gap-2 h-ctl px-2.5 rounded-ctl border border-ctl bg-surface transition-colors duration-150 focus-within:border-steel focus-within:ring-2 focus-within:ring-steel/30">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none">
         <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
       </svg>
@@ -36,7 +36,7 @@ export function SearchInput({ shortcut = '⌘K', ...rest }: React.InputHTMLAttri
 export function Switch({ on, onChange }: { on?: boolean; onChange: (v: boolean) => void }) {
   return (
     <div onClick={() => onChange(!on)}
-      className={cx('w-9 h-5 rounded-full p-0.5 box-border cursor-pointer flex-none transition-colors duration-150', on ? 'bg-steel' : 'bg-[oklch(0.85_0.008_250)]')}>
+      className={cx('w-9 h-5 rounded-full p-0.5 box-border cursor-pointer flex-none transition-colors duration-150', on ? 'bg-steel' : 'bg-ctl')}>
       <div className={cx('w-4 h-4 rounded-full bg-white shadow-[0_1px_2px_rgba(25,28,33,0.2)] transition-transform duration-150', on && 'translate-x-4')} />
     </div>
   );

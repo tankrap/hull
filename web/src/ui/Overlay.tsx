@@ -7,7 +7,7 @@ import { TextField } from './Field';
 
 const cx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(' ');
 
-function Backdrop({ onClose, strength = 'bg-black/55', z = 'z-40' }: {
+function Backdrop({ onClose, strength = 'bg-[rgba(0,0,0,0.68)]', z = 'z-40' }: {
   onClose?: () => void;
   strength?: string;
   z?: string;
@@ -62,7 +62,7 @@ export function Dialog({ open, onClose, icon, title, body, cancelLabel = 'Cancel
   if (!open) return null;
   return (
     <>
-      <Backdrop onClose={onClose} strength="bg-black/40" z="z-[65]" />
+      <Backdrop onClose={onClose} strength="bg-[rgba(0,0,0,0.55)]" z="z-[65]" />
       <div role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
         className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-[70] w-[400px] max-w-[90vw] bg-surface border border-rule rounded-card shadow-modal p-4 animate-ov-in">
         <div className="flex gap-2.5 items-start">
@@ -121,7 +121,7 @@ export function PromptModal({ open, title, label, placeholder, initial = '', san
   const submit = () => { if (ok) onConfirm(val.trim()); };
   return (
     <>
-      <Backdrop onClose={onCancel} strength="bg-black/40" z="z-[65]" />
+      <Backdrop onClose={onCancel} strength="bg-[rgba(0,0,0,0.55)]" z="z-[65]" />
       <div role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
         className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-[70] w-[420px] max-w-[90vw] bg-surface border border-rule rounded-card shadow-modal p-4 animate-ov-in">
         <div className="text-[14.5px] font-semibold">{title}</div>
@@ -157,7 +157,7 @@ export function Drawer({ open, onClose, title, children, footer }: {
   if (!open) return null;
   return (
     <>
-      <Backdrop onClose={onClose} strength="bg-black/40" />
+      <Backdrop onClose={onClose} strength="bg-[rgba(0,0,0,0.55)]" />
       <div role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
         className="fixed right-0 top-0 bottom-0 z-50 w-[380px] max-w-[85vw] bg-surface border-l border-rule2 shadow-drawer flex flex-col animate-dw-in">
         <div className="flex justify-between items-center px-3.5 py-3 border-b border-rule2">

@@ -363,7 +363,7 @@ function LabelEditor({ labels, onChange }: { labels: RepoLabel[]; onChange: (l: 
           <button type="button" onClick={() => setDraft((d) => ({ ...d, color: randomHexColor() }))} className="h-7 px-2 rounded-ctl border border-rule text-[12px] text-dim hover:text-ink hover:border-dim inline-flex items-center gap-1.5"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="3" /><circle cx="8.5" cy="8.5" r="1" fill="currentColor" /><circle cx="15.5" cy="15.5" r="1" fill="currentColor" /><circle cx="15.5" cy="8.5" r="1" fill="currentColor" /><circle cx="8.5" cy="15.5" r="1" fill="currentColor" /></svg>random</button>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[180px]" placeholder="label name" value={draft.name} onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
+          <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint w-[180px]" placeholder="label name" value={draft.name} onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
           {draft.name.trim() && <Label name={draft.name.trim()} color={draft.color} icon={draft.icon} />}
           <Button size="sm" className="ml-auto" disabled={!draft.name.trim()} onClick={add}>Add label</Button>
         </div>
@@ -400,7 +400,7 @@ function CodeOwnersEditor({ rules, actors, handleOf, onSave }: { rules: OwnerRul
       {draft.map((r, i) => (
         <div key={i} className="grid gap-2 border border-rule2 rounded-ctl p-3 bg-paper/40">
           <div className="flex items-center gap-2">
-            <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-mono text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint flex-1 min-w-0" placeholder="path glob, e.g. crates/** or *.rs" value={r.glob} onChange={(e) => setRow(i, { glob: e.target.value })} />
+            <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-mono text-[12.5px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint flex-1 min-w-0" placeholder="path glob, e.g. crates/** or *.rs" value={r.glob} onChange={(e) => setRow(i, { glob: e.target.value })} />
             <button className="text-muted hover:text-fault-text cursor-pointer px-1 flex-none" title="remove rule" onClick={() => setDraft((d) => d.filter((_, j) => j !== i))}>×</button>
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
@@ -416,7 +416,7 @@ function CodeOwnersEditor({ rules, actors, handleOf, onSave }: { rules: OwnerRul
         </div>
       ))}
       <div className="flex items-center gap-2 flex-wrap border-t border-rule3 pt-3">
-        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-mono text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint w-[220px]" placeholder="add a rule: path glob…" value={newGlob} onChange={(e) => setNewGlob(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addRow(); }} />
+        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-mono text-[12.5px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint w-[220px]" placeholder="add a rule: path glob…" value={newGlob} onChange={(e) => setNewGlob(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addRow(); }} />
         <div className="w-[200px]"><Picker size="sm" block value={newOwner} placeholder="owner (optional)…" onChange={setNewOwner} options={actors.map(actorOption)} /></div>
         <Button size="sm" variant="secondary" disabled={!newGlob.trim()} onClick={addRow}>Add rule</Button>
         <Button size="sm" className="ml-auto" disabled={!dirty || saving} onClick={save}>{saving ? "Saving…" : "Save code owners"}</Button>
@@ -611,7 +611,7 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
                   </li>
                   <li className="flex items-center gap-2.5">
                     <span className="w-5 h-5 flex-none grid place-items-center rounded-full bg-rule2 text-[11px] font-semibold text-muted tabular-nums">2</span>
-                    <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="paste code here" autoFocus className="box-border flex-1 min-w-[200px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" onKeyDown={(e) => { if (e.key === "Enter") completeAgentLogin(); }} />
+                    <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="paste code here" autoFocus className="box-border flex-1 min-w-[200px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint" onKeyDown={(e) => { if (e.key === "Enter") completeAgentLogin(); }} />
                     <Button size="sm" disabled={!code.trim() || busy} onClick={completeAgentLogin}>{busy ? "Verifying…" : "Finish"}</Button>
                     <button onClick={cancelAgentLogin} className="text-[12px] text-muted hover:text-fault-text">Cancel</button>
                   </li>
@@ -641,8 +641,8 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
             <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">Or add an API key</span>
             <div className="flex flex-wrap items-end gap-2">
               <div className="w-[180px]"><Picker size="sm" block value={provider} onChange={setProvider} options={PROVIDERS} /></div>
-              <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="label (optional)" className="box-border h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[160px]" />
-              <input value={key} onChange={(e) => setKey(e.target.value)} type="password" placeholder="API key" className="box-border flex-1 min-w-[180px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" />
+              <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="label (optional)" className="box-border h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint w-[160px]" />
+              <input value={key} onChange={(e) => setKey(e.target.value)} type="password" placeholder="API key" className="box-border flex-1 min-w-[180px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint" />
               <Button size="sm" disabled={!key.trim() || busy} onClick={add}>{busy ? "Connecting…" : "Connect"}</Button>
             </div>
           </div>
@@ -688,7 +688,7 @@ function ModalShell({ title, onClose, children, width = 480 }: { title: string; 
   }, [onClose]);
   return (
     <>
-      <div aria-hidden="true" className="fixed inset-0 z-40 bg-black/55 animate-bd-in" onClick={onClose} />
+      <div aria-hidden="true" className="fixed inset-0 z-40 bg-[rgba(0,0,0,0.68)] animate-bd-in" onClick={onClose} />
       <div role="dialog" aria-modal="true" style={{ width }} className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-[93vw] max-h-[88vh] overflow-auto bg-surface border border-rule rounded-card shadow-modal animate-ov-in">
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-rule2 sticky top-0 bg-surface">
           <h2 className="text-[15px] font-semibold">{title}</h2>
@@ -706,7 +706,7 @@ const Field = ({ label, hint, children }: { label: string; hint?: string; childr
     {children}
   </div>
 );
-const modalInput = "w-full box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint";
+const modalInput = "w-full box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint";
 
 // New repository modal: owner/name shown inline (owner ∕ name), a live name-availability check like
 // org handles, a Public/Unlisted/Private dropdown, and the default branch.
@@ -836,7 +836,7 @@ function SearchableList<T>({ items, renderItem, searchOf, initial = 15, searchTh
       {items.length >= searchThreshold && (
         <div className="relative">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="absolute left-2 top-1/2 -translate-y-1/2 text-faint pointer-events-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={placeholder} className="w-full box-border h-ctl-sm pl-7 pr-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={placeholder} className="w-full box-border h-ctl-sm pl-7 pr-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint" />
         </div>
       )}
       <div className="grid gap-1">{shown.map(renderItem)}</div>
@@ -1946,7 +1946,7 @@ export function App() {
   }, [view, tenant, issueRepo, isTenantOwner]);
   const shortcutsNode = showShortcuts ? (
     <>
-      <div onClick={() => setShowShortcuts(false)} className="fixed inset-0 z-40 bg-black/50 animate-bd-in" />
+      <div onClick={() => setShowShortcuts(false)} className="fixed inset-0 z-40 bg-[rgba(0,0,0,0.62)] animate-bd-in" />
       <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[440px] max-w-[92vw] bg-surface border border-rule rounded-card shadow-modal border border-rule animate-ov-in overflow-hidden">
         <div className="px-5 py-3.5 border-b border-rule2 flex items-center justify-between">
           <span className="text-[14.5px] font-semibold">Keyboard shortcuts</span>
@@ -2150,14 +2150,14 @@ export function App() {
             {errBox}
             <div className="grid gap-1.5">
               <label className="text-[12.5px] font-semibold text-body">username</label>
-              <input className={`box-border h-ctl px-2.5 rounded-ctl border bg-surface font-sans text-[13.5px] text-ink outline-none placeholder:text-faint transition-colors ${usernameAvail && !usernameAvail.available ? "border-fault" : "border-ctl focus:border-body"}`} placeholder="e.g. mira" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} autoFocus />
+              <input className={`box-border h-ctl px-2.5 rounded-ctl border bg-surface font-sans text-[13.5px] text-ink outline-none placeholder:text-faint transition-colors ${usernameAvail && !usernameAvail.available ? "border-fault" : "border-ctl focus:border-steel focus:ring-2 focus:ring-steel/30"}`} placeholder="e.g. mira" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} autoFocus />
               {authForm.username.trim() && usernameAvail && (
                 <div className={`text-[12px] ${usernameAvail.available ? "text-clear-text" : "text-fault-text"}`}><span className="inline-flex items-center gap-1.5">{usernameAvail.available ? <><IcoCheck size={12} />{`${authForm.username} is available`}</> : <><IcoX size={12} />that username is taken</>}</span></div>
               )}
             </div>
             <div className="grid gap-1.5">
               <label className="text-[12.5px] font-semibold text-body">email</label>
-              <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="you@example.com" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value.trim() })} onKeyDown={(e) => e.key === "Enter" && signupPasskey()} />
+              <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint" placeholder="you@example.com" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value.trim() })} onKeyDown={(e) => e.key === "Enter" && signupPasskey()} />
             </div>
             {!sovereignMode ? (
               <>
@@ -2169,7 +2169,7 @@ export function App() {
               <>
                 <div className="grid gap-1.5">
                   <label className="text-[12.5px] font-semibold text-body">passphrase</label>
-                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="a strong passphrase you'll remember" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signupSovereign()} />
+                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint" placeholder="a strong passphrase you'll remember" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signupSovereign()} />
                 </div>
                 <Button disabled={authBusy || (!!usernameAvail && !usernameAvail.available)} onClick={signupSovereign}>{authBusy ? "generating your key…" : "Create sovereign account"}</Button>
                 <p className="text-[12.5px] text-muted leading-[1.55]">Your Ed25519 key is generated in this browser and encrypted with your passphrase — Hull only ever stores the public key and the encrypted bundle, and can never sign for you. There is no reset: lose the passphrase and the account is unrecoverable.</p>
@@ -2189,7 +2189,7 @@ export function App() {
             {errBox}
             <div className="grid gap-1.5">
               <label className="text-[12.5px] font-semibold text-body">username</label>
-              <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="your username" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} onKeyDown={(e) => e.key === "Enter" && loginPasskey(authForm.username)} autoFocus />
+              <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint" placeholder="your username" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} onKeyDown={(e) => e.key === "Enter" && loginPasskey(authForm.username)} autoFocus />
             </div>
             {!sovereignMode ? (
               <>
@@ -2200,7 +2200,7 @@ export function App() {
               <>
                 <div className="grid gap-1.5">
                   <label className="text-[12.5px] font-semibold text-body">passphrase</label>
-                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="your passphrase" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && loginSovereign()} />
+                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint" placeholder="your passphrase" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && loginSovereign()} />
                 </div>
                 <Button disabled={authBusy} onClick={loginSovereign}>{authBusy ? "unlocking your key…" : "Log in with your passphrase"}</Button>
                 <p className="text-[12.5px] text-muted leading-[1.55]">Your key is decrypted in this browser; Hull never sees your passphrase.</p>
@@ -2212,7 +2212,7 @@ export function App() {
               <details className="text-[12.5px]">
                 <summary className="text-muted cursor-pointer">Advanced: key login</summary>
                 <div className="grid gap-2 mt-2.5">
-                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="ed25519 secret key (hex)" value={secretInput} onChange={(e) => setSecretInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signIn()} />
+                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint" placeholder="ed25519 secret key (hex)" value={secretInput} onChange={(e) => setSecretInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signIn()} />
                   <div className="flex gap-2 items-center">
                     <Button size="sm" variant="secondary" onClick={signIn}>Sign in with key</Button>
                     <LinkButton onClick={registerAndSignIn}>new raw identity</LinkButton>
@@ -2247,7 +2247,7 @@ export function App() {
               <div className="mt-4 max-w-[560px]">
                 {bioDraft !== null ? (
                   <div className="grid gap-2">
-                    <textarea autoFocus value={bioDraft} onChange={(e) => setBioDraft(e.target.value.slice(0, 280))} rows={2} placeholder="Tell people what you work on…" className="w-full box-border px-2.5 py-2 rounded-ctl border border-ctl bg-surface font-sans text-[14px] text-ink outline-none focus:border-body resize-y" />
+                    <textarea autoFocus value={bioDraft} onChange={(e) => setBioDraft(e.target.value.slice(0, 280))} rows={2} placeholder="Tell people what you work on…" className="w-full box-border px-2.5 py-2 rounded-ctl border border-ctl bg-surface font-sans text-[14px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 resize-y" />
                     <div className="flex items-center gap-2"><Button size="sm" onClick={() => saveBio(bioDraft)}>Save</Button><LinkButton onClick={() => setBioDraft(null)}>cancel</LinkButton><span className="text-[12px] text-faint ml-auto">{bioDraft.length}/280</span></div>
                   </div>
                 ) : (profileStats?.bio || "").trim() ? (
@@ -2371,11 +2371,11 @@ export function App() {
                 <div className="px-6 py-5 grid gap-4 max-w-[420px]">
                   <div className="grid gap-1.5">
                     <label className="text-[12.5px] font-semibold text-body">username</label>
-                    <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body" value={account.username} onChange={(e) => setAccount({ ...account, username: e.target.value })} />
+                    <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30" value={account.username} onChange={(e) => setAccount({ ...account, username: e.target.value })} />
                   </div>
                   <div className="grid gap-1.5">
                     <label className="text-[12.5px] font-semibold text-body">email</label>
-                    <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body" value={account.email} onChange={(e) => setAccount({ ...account, email: e.target.value })} />
+                    <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30" value={account.email} onChange={(e) => setAccount({ ...account, email: e.target.value })} />
                   </div>
                   <div><Button size="sm" onClick={() => saveAccount({ username: account.username, email: account.email })}>Save</Button></div>
                 </div>
@@ -2432,7 +2432,7 @@ export function App() {
 
   // ── shared chrome (top bar + notifications drawer) ────────────────────────
   const topBar = (
-    <header className="h-14 shrink-0 bg-shell flex items-center gap-5 px-6 z-40">
+    <header className="h-14 shrink-0 bg-shell flex items-center gap-5 px-6 z-30">
       <button className="flex items-center gap-2.5 cursor-pointer shrink-0" onClick={() => navigate("/")} title="situation room">
         <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
         <span className="text-[19px] font-extrabold tracking-tight">hull</span>
@@ -3054,7 +3054,7 @@ export function App() {
                   </Card>
                 </div>
                 <div>
-                  <Eyebrow label="Teams" right={amAdmin ? <span className="flex gap-2 items-center"><input className="box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-xs text-ink outline-none focus:border-body placeholder:text-faint" placeholder="new team…" value={teamDraft} onChange={(e) => setTeamDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { createTeam(acct.id, teamDraft); setTeamDraft(""); } }} /><Button size="sm" onClick={() => { createTeam(acct.id, teamDraft); setTeamDraft(""); }}>Create</Button></span> : undefined} />
+                  <Eyebrow label="Teams" right={amAdmin ? <span className="flex gap-2 items-center"><input className="box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-xs text-ink outline-none focus:border-steel focus:ring-2 focus:ring-steel/30 placeholder:text-faint" placeholder="new team…" value={teamDraft} onChange={(e) => setTeamDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { createTeam(acct.id, teamDraft); setTeamDraft(""); } }} /><Button size="sm" onClick={() => { createTeam(acct.id, teamDraft); setTeamDraft(""); }}>Create</Button></span> : undefined} />
                   {teams.length === 0 && <div className="text-[13px] text-muted py-4">no teams yet</div>}
                   <div className="grid gap-4">
                     {teams.map((t) => (
@@ -3980,7 +3980,7 @@ function ReviewPage({
       {/* Full-task overlay — the session summary shows a clipped task; this is the whole thing. */}
       {taskModal && change?.session && createPortal(
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={() => setTaskModal(false)}>
-          <div className="absolute inset-0 bg-black/55" />
+          <div className="absolute inset-0 bg-[rgba(0,0,0,0.68)]" />
           <div className="relative bg-surface border border-rule rounded-card shadow-modal max-w-[680px] w-full max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
               <span className="text-[13.5px] font-semibold text-ink">Agent task</span>

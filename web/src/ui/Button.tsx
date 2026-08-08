@@ -10,9 +10,9 @@ const VARIANT = {
   // GitLab "confirm": solid blue, white label, subtle press. The brand accent, not ink-contrast.
   primary: 'bg-steel text-white border border-steel font-semibold shadow-[0_1px_2px_rgba(0,0,0,0.16)] hover:brightness-[1.08] active:brightness-95 active:shadow-none',
   // ADS default: translucent-neutral fill with a hairline for crispness.
-  secondary: 'bg-ink/[0.05] text-body border border-ink/[0.07] hover:bg-ink/[0.09] hover:border-ink/[0.11] active:bg-ink/[0.15]',
+  secondary: 'bg-surface text-body border border-ctl hover:bg-rule3 hover:border-dim active:bg-rule2',
   ghost: 'bg-transparent text-steel-text border border-transparent hover:bg-steel-wash active:bg-steel-wash/80',
-  destructive: 'bg-fault/[0.08] text-fault-text border border-fault/[0.12] hover:bg-fault/[0.15] hover:border-fault/20 active:bg-fault/20',
+  destructive: 'bg-surface text-fault-text border border-fault/45 hover:bg-fault-wash hover:border-fault/70 active:bg-fault-wash',
 };
 
 const SIZE = {
