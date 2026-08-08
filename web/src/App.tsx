@@ -670,6 +670,13 @@ const Module = ({ title, children, tone = "" }: { title: string; children: React
     <div className="px-4 py-3.5 grid gap-2.5 text-[13px]">{children}</div>
   </div>
 );
+// GitLab panel header bar: a titled strip with a bottom rule, for full-width list cards.
+const PanelHead = ({ title, right }: { title: React.ReactNode; right?: React.ReactNode }) => (
+  <div className="flex items-center justify-between gap-3 px-5 h-[46px] border-b border-rule2">
+    <span className="text-[13.5px] font-semibold text-ink">{title}</span>
+    {right != null && right !== "" && <span className="text-[12.5px] text-muted tabular-nums">{right}</span>}
+  </div>
+);
 // label-left / value-right stat line inside a Module.
 const Stat = ({ k, v }: { k: React.ReactNode; v: React.ReactNode }) => (
   <div className="flex items-baseline justify-between gap-3">
@@ -2712,12 +2719,12 @@ export function App() {
           <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-x-12 gap-y-9">
             <section className="min-w-0 grid gap-8 content-start">
               {(homePrs.length > 0 || homeIssues.length > 0) && (
-                <div className="bg-surface border border-rule rounded-card p-5">
-                  <Eyebrow label="Needs your attention" right={`${homePrs.length + homeIssues.length}`} />
+                <div className="bg-surface border border-rule rounded-card overflow-hidden">
+                  <PanelHead title="Needs your attention" right={`${homePrs.length + homeIssues.length}`} />
                   <div className="[&>button:last-child]:border-b-0">
                     {homePrs.map((p) => (
                       <button key={`pr-${p.tenant}/${p.repo}#${p.number}`} onClick={() => navigate(`/${encodeURIComponent(p.tenant)}/${encodeURIComponent(p.repo)}/voyages/${p.number}`)} className="group w-full text-left block border-b border-rule2">
-                        <div className="flex items-start gap-3 py-3 -mx-3 px-3 rounded-ctl group-hover:bg-shell transition-colors">
+                        <div className="flex items-start gap-3 px-5 py-3 group-hover:bg-shell transition-colors">
                           <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-clear-text mt-0.5 flex-none"><path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354Z" /></svg>
                           <div className="flex-1 min-w-0">
                             <div className="text-[14px] font-medium group-hover:text-steel-text transition-colors truncate">{p.title}</div>
@@ -2728,7 +2735,7 @@ export function App() {
                     ))}
                     {homeIssues.map((it) => (
                       <button key={`is-${it.tenant}/${it.repo}#${it.number}`} onClick={() => navigate(`/${encodeURIComponent(it.tenant)}/${encodeURIComponent(it.repo)}/issues/${it.number}`)} className="group w-full text-left block border-b border-rule2">
-                        <div className="flex items-start gap-3 py-3 -mx-3 px-3 rounded-ctl group-hover:bg-shell transition-colors">
+                        <div className="flex items-start gap-3 px-5 py-3 group-hover:bg-shell transition-colors">
                           <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-clear-text mt-0.5 flex-none"><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" /><path fillRule="evenodd" d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0ZM1.5 8a6.5 6.5 0 1 1 13 0 6.5 6.5 0 0 1-13 0Z" /></svg>
                           <div className="flex-1 min-w-0">
                             <div className="text-[14px] font-medium group-hover:text-steel-text transition-colors truncate">{it.title}</div>
@@ -2740,10 +2747,10 @@ export function App() {
                   </div>
                 </div>
               )}
-              <div className="bg-surface border border-rule rounded-card p-5">
-              <Eyebrow label="Active repositories" right="by live activity" />
+              <div className="bg-surface border border-rule rounded-card overflow-hidden">
+              <PanelHead title="Active repositories" right="by live activity" />
               {activeRepos.length === 0 && (
-                <div className="py-8 text-[13px] text-muted">
+                <div className="px-5 py-8 text-[13px] text-muted">
                   {repos.length === 0
                     ? <>No repos yet. Create one, import from GitHub, or <code className="text-body">git push http://localhost:8930/&lt;org&gt;/&lt;repo&gt; main</code>.</>
                     : <>No active repositories right now — <button className="text-steel-text hover:underline" onClick={() => navigate("/me")}>see all {repos.length} on your profile →</button></>}
@@ -2752,7 +2759,7 @@ export function App() {
               <div className="[&>button:last-child>div]:border-b-0">
                 {activeRepos.map((r) => (
                   <button key={`${r.tenant}/${r.repo}`} onClick={() => navigate(`/${encodeURIComponent(r.tenant)}/${encodeURIComponent(r.repo)}`)} className="group w-full text-left block">
-                    <div className="flex items-start gap-4 py-4 -mx-3 px-3 rounded-ctl border-b border-rule2 group-hover:bg-shell transition-colors">
+                    <div className="flex items-start gap-4 px-5 py-4 border-b border-rule2 group-hover:bg-shell transition-colors">
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2.5">
                           <span className="text-[16px] font-medium group-hover:text-steel-text transition-colors"><span className="text-faint font-normal">{r.tenant}/</span>{r.repo}</span>
@@ -2781,7 +2788,7 @@ export function App() {
                 ))}
               </div>
               {repos.length > 0 && (
-                <button onClick={() => navigate("/me")} className="mt-3 inline-flex items-center gap-1.5 text-[13px] font-medium text-steel-text hover:underline">
+                <button onClick={() => navigate("/me")} className="px-5 py-3 inline-flex items-center gap-1.5 text-[13px] font-medium text-steel-text hover:underline">
                   All {repos.length} {repos.length === 1 ? "repository" : "repositories"} on your profile
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg>
                 </button>

@@ -51,12 +51,12 @@ export function Segmented({ items, value, onChange }: {
   onChange?: (i: number) => void;
 }) {
   return (
-    <div className="inline-flex h-ctl rounded-ctl overflow-hidden border border-ctl">
+    <div className="inline-flex h-ctl rounded-ctl overflow-hidden border border-ctl bg-paper">
       {items.map((label, i) => (
         <span key={label} onClick={() => onChange?.(i)}
-          className={cx('text-[13px] font-medium px-3 flex items-center cursor-pointer transition-colors duration-150',
+          className={cx('text-[13px] px-3.5 flex items-center cursor-pointer select-none transition-colors duration-150',
             i && 'border-l border-ctl',
-            value === i ? 'bg-ink text-surface' : 'text-dim hover:bg-[oklch(0.97_0.003_250)]')}>
+            value === i ? 'bg-surface text-ink font-semibold' : 'text-dim font-medium hover:bg-rule2 hover:text-body')}>
           {label}
         </span>
       ))}
