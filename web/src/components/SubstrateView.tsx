@@ -23,6 +23,7 @@ type Substrate = {
   blob_servers?: string[];
   ref?: { branch: string; commit: string; source: string } | null;
   provenance?: Prov[];
+  _error?: number; // set client-side when the fetch failed (status, or 0 for network) — distinct from enabled:false
 };
 type Instance = { instance: string; commit: string; self: boolean };
 type Federation = {
@@ -60,15 +61,31 @@ export function SubstrateView({ tenant, repo, authHeaders, handleOf }: {
   const [loading, setLoading] = useState(true);
   useEffect(() => {
     setLoading(true);
-    Promise.all([
-      fetch(`${base}/substrate`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : { enabled: false })).catch(() => ({ enabled: false })),
-      fetch(`${base}/federation`, { headers: authHeaders() }).then((r) => (r.ok ? r.json() : { enabled: false })).catch(() => ({ enabled: false })),
-    ])
+    // Preserve a fetch failure as `_error` instead of collapsing it to enabled:false — a 403 (can't read
+    // the repo) or a 500 is not the same as "the operator didn't configure nostr".
+    const load = (path: string) =>
+      fetch(`${base}${path}`, { headers: authHeaders() })
+        .then((r) => (r.ok ? r.json() : { _error: r.status }))
+        .catch(() => ({ _error: 0 }));
+    Promise.all([load("/substrate"), load("/federation")])
       .then(([s, f]) => { setSub(s); setFed(f); })
       .finally(() => setLoading(false));
   }, [tenant, repo]);
 
   if (loading) return <div className="py-16 text-center text-[13px] text-muted">reading the substrate…</div>;
+
+  if (sub?._error != null) {
+    return (
+      <Card>
+        <div className="px-6 py-10 grid gap-2 max-w-[640px]">
+          <h2 className="text-[16px] font-semibold text-ink">Couldn't load the substrate</h2>
+          <p className="text-[13.5px] text-muted">
+            {sub._error === 403 ? "You don't have access to this repo's substrate." : sub._error === 0 ? "The request failed — check your connection and retry." : `The server returned an error (${sub._error}).`}
+          </p>
+        </div>
+      </Card>
+    );
+  }
 
   if (!sub?.enabled) {
     return (
@@ -157,7 +174,7 @@ export function SubstrateView({ tenant, repo, authHeaders, handleOf }: {
                 </div>
                 {p.intent && <div className="text-[12.5px] text-muted truncate" title={p.intent}>{p.intent}</div>}
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  <Pill ok={p.signatures_valid} label="signatures valid" />
+                  <Pill ok={p.signatures_valid} label={p.signatures_valid ? "signatures valid" : "signatures invalid"} />
                   <Pill ok={p.accountable} warn={!p.accountable} label={p.accountable ? "accountable" : "not accountable"} />
                   <Pill ok={p.authorized} warn={!p.authorized} label={p.authorized ? "authorized" : "not a member"} />
                 </div>
