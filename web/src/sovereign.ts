@@ -4,6 +4,7 @@
 // client half of the sovereign-account backend (`/api/auth/sovereign/*`).
 import * as ed from "@noble/ed25519";
 import { argon2id } from "@noble/hashes/argon2.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 
 // Argon2id params — memory-hard, tuned strong on purpose: the wrapped bundle is fetchable pre-auth
@@ -49,4 +50,22 @@ export function unwrapSecret(bundle: string, passphrase: string): string {
 /** Sign a utf8 message with a hex secret → hex signature (matches the server's `identity::verify`). */
 export async function signMessage(secretHex: string, message: string): Promise<string> {
   return bytesToHex(await ed.signAsync(utf8(message), hexToBytes(secretHex)));
+}
+
+// Provenance: a sovereign author attests, client-side, that they authored a landed change. The server
+// only stores + relays it (it can't sign — the key is here). Mirror of hull-server's ProvenanceClaim.
+export type ProvenanceClaim = { v: number; change: string; actor: string; repo: string; intent: string; ts: number };
+export type SignedProvenance = { claim: ProvenanceClaim; ed_sig: string };
+
+/** The exact bytes the actor signs — must byte-match Rust `ProvenanceClaim::signing_bytes`: a flat,
+ *  domain-separated form (NOT JSON, which serde and JSON.stringify serialize differently), with the
+ *  free-text intent folded to its SHA-256 so newlines/unicode can't break the line structure. */
+function provenanceSigningBytes(c: ProvenanceClaim): string {
+  const intentSha = bytesToHex(sha256(utf8(c.intent)));
+  return `hull-provenance:v1\nchange=${c.change}\nactor=${c.actor}\nrepo=${c.repo}\nintent_sha256=${intentSha}\nts=${c.ts}`;
+}
+
+/** Sign a provenance claim with a hex secret → the SignedProvenance bundle the server stores + embeds. */
+export async function signProvenance(secretHex: string, claim: ProvenanceClaim): Promise<SignedProvenance> {
+  return { claim, ed_sig: await signMessage(secretHex, provenanceSigningBytes(claim)) };
 }
