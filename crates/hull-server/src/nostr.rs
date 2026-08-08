@@ -337,10 +337,30 @@ pub fn verify_prov_event(ev: &Event) -> Option<String> {
 /// Publishes/reads repo refs as signed nostr events (kind 31900), decoupled from the notifier. Same
 /// env config as [`NostrNotifier`] (`HULL_NOSTR_SECRET` + `HULL_NOSTR_RELAYS`); signed by the instance
 /// key for transport authenticity. The Ed25519 keel-provenance bundle is a later increment.
+/// One instance's view of a repo's branch: which instance key published it, and at what commit. Used
+/// by [`NostrRefs::fetch_federated_ref`] to show where each federated instance says a branch points.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerRef {
+    /// The publishing instance's x-only nostr pubkey (its transport identity).
+    pub pubkey: String,
+    pub commit: String,
+    /// True if this is our own instance's ref (our key published it).
+    pub is_self: bool,
+}
+
+/// True if `s` is a syntactically valid x-only (32-byte) nostr pubkey in hex.
+fn valid_xonly(s: &str) -> bool {
+    hex::decode(s.trim()).ok().filter(|b| b.len() == 32).and_then(|b| XOnlyPublicKey::from_slice(&b).ok()).is_some()
+}
+
 #[derive(Clone)]
 pub struct NostrRefs {
     secret_hex: String,
     relays: Vec<String>,
+    /// Peer instance pubkeys (x-only hex) we federate refs with. Trust is explicit and non-transitive:
+    /// an instance appears here only because this instance was told to trust it. Each peer's refs are
+    /// transport-signed by that peer's key, so reading one proves the peer published it (never a relay).
+    peers: Vec<String>,
 }
 
 impl NostrRefs {
@@ -353,14 +373,39 @@ impl NostrRefs {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
-        (!relays.is_empty()).then_some(Self { secret_hex, relays })
+        // HULL_NOSTR_PEERS: comma/space-separated peer instance pubkeys (x-only hex). Malformed entries
+        // are dropped with a warning rather than failing startup — one bad pubkey shouldn't sink the set.
+        let peers: Vec<String> = std::env::var("HULL_NOSTR_PEERS")
+            .ok()
+            .unwrap_or_default()
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| {
+                if valid_xonly(s) {
+                    Some(s.to_string())
+                } else {
+                    eprintln!("nostr: ignoring malformed HULL_NOSTR_PEERS entry {s:?} (want 32-byte x-only hex)");
+                    None
+                }
+            })
+            .collect();
+        (!relays.is_empty()).then_some(Self { secret_hex, relays, peers })
     }
 
     pub fn new(secret_hex: String, relays: Vec<String>) -> Self {
-        Self { secret_hex, relays }
+        Self { secret_hex, relays, peers: Vec::new() }
+    }
+    /// Add federated peer instance pubkeys (x-only hex); invalid entries are dropped.
+    pub fn with_peers(mut self, peers: Vec<String>) -> Self {
+        self.peers = peers.into_iter().filter(|p| valid_xonly(p)).collect();
+        self
     }
     pub fn relays(&self) -> &[String] {
         &self.relays
+    }
+    pub fn peers(&self) -> &[String] {
+        &self.peers
     }
 
     /// Publish `repo`'s `branch` → `commit` (best-effort across relays). Returns the signed event.
@@ -401,20 +446,58 @@ impl NostrRefs {
     /// Read the newest published commit for `repo`'s `branch` back from the relays (own-authored refs).
     pub fn fetch_ref(&self, repo: &str, branch: &str) -> Option<String> {
         let author = pubkey_of(&self.secret_hex)?;
+        self.fetch_ref_from(&author, repo, branch)
+    }
+
+    /// Read the newest commit for `repo`'s `branch` published by a SPECIFIC instance key (`author`,
+    /// x-only hex). Author + kind + d-tag are re-checked CLIENT-SIDE: a relay can ignore the REQ filter
+    /// and hand back a validly-signed event by a different key, so a foreign event can never masquerade
+    /// as this author's ref for this repo.
+    pub fn fetch_ref_from(&self, author: &str, repo: &str, branch: &str) -> Option<String> {
         let dtag = format!("{repo}#{branch}");
         let filter = serde_json::json!({ "kinds": [KIND_REF], "authors": [author], "#d": [dtag] });
-        // Re-check author + kind + d-tag CLIENT-SIDE: a relay can ignore the REQ filter and return a
-        // validly-signed event by a different key. We only trust refs authored by our own instance key,
-        // so a foreign (even if self-consistent) event can never masquerade as this repo's ref.
         let mine: Vec<Event> = fetch_events(&self.relays, filter)
             .into_iter()
-            .filter(|e| {
-                e.pubkey == author
-                    && e.kind == KIND_REF
-                    && e.tags.iter().any(|t| t.len() == 2 && t[0] == "d" && t[1] == format!("{repo}#{branch}"))
-            })
+            .filter(|e| e.pubkey == author && e.kind == KIND_REF && e.tags.iter().any(|t| t.len() == 2 && t[0] == "d" && t[1] == dtag))
             .collect();
         newest_commit(&mine)
+    }
+
+    /// Federated view of `repo`'s `branch`: the newest commit each trusted instance (ourselves plus the
+    /// configured [`peers`](Self::peers)) says it points at. One relay sweep for the whole author set,
+    /// then newest-wins per author. An instance that never published this ref is simply absent. Callers
+    /// compare commits to spot divergence; each entry is transport-signed by that instance's own key.
+    pub fn fetch_federated_ref(&self, repo: &str, branch: &str) -> Vec<PeerRef> {
+        let own = pubkey_of(&self.secret_hex);
+        // Trusted author set: self first, then peers, deduped (a peer list that repeats self is fine).
+        let mut authors: Vec<String> = Vec::new();
+        if let Some(a) = &own {
+            authors.push(a.clone());
+        }
+        for p in &self.peers {
+            if !authors.contains(p) {
+                authors.push(p.clone());
+            }
+        }
+        if authors.is_empty() {
+            return Vec::new();
+        }
+        let dtag = format!("{repo}#{branch}");
+        let filter = serde_json::json!({ "kinds": [KIND_REF], "authors": authors, "#d": [dtag] });
+        // fetch_events already verified each event's schnorr sig; still re-check author ∈ our set, kind,
+        // and d-tag client-side (a relay may return extra events the filter should have excluded).
+        let events: Vec<Event> = fetch_events(&self.relays, filter)
+            .into_iter()
+            .filter(|e| e.kind == KIND_REF && authors.iter().any(|a| a == &e.pubkey) && e.tags.iter().any(|t| t.len() == 2 && t[0] == "d" && t[1] == dtag))
+            .collect();
+        let mut out: Vec<PeerRef> = Vec::new();
+        for author in &authors {
+            let per: Vec<Event> = events.iter().filter(|e| &e.pubkey == author).cloned().collect();
+            if let Some(commit) = newest_commit(&per) {
+                out.push(PeerRef { pubkey: author.clone(), commit, is_self: own.as_deref() == Some(author.as_str()) });
+            }
+        }
+        out
     }
 }
 
@@ -669,6 +752,38 @@ mod tests {
         let ev = refs.publish_ref("tankrap/hull", "main", "deadbeefcommit", None).expect("publish builds an event");
         assert!(ev.verify());
         assert_eq!(refs.fetch_ref("tankrap/hull", "main").as_deref(), Some("deadbeefcommit"), "the published commit reads back");
+    }
+
+    #[test]
+    fn federation_reads_refs_across_trusted_peer_instances() {
+        const SK2: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+        const SK3: &str = "0000000000000000000000000000000000000000000000000000000000000003";
+        let url = spawn_loopback_relay();
+        // A trusts B as a peer; A and B publish the same repo#branch at different commits.
+        let a = NostrRefs::new(SK.into(), vec![url.clone()]).with_peers(vec![pubkey_of(SK2).unwrap()]);
+        let b = NostrRefs::new(SK2.into(), vec![url.clone()]);
+        a.publish_ref("tankrap/hull", "main", "commitA", None).unwrap();
+        b.publish_ref("tankrap/hull", "main", "commitB", None).unwrap();
+
+        let fed = a.fetch_federated_ref("tankrap/hull", "main");
+        assert_eq!(fed.len(), 2, "self + one peer; got {fed:?}");
+        let me = fed.iter().find(|p| p.is_self).expect("our own ref is present");
+        assert_eq!(me.commit, "commitA");
+        assert_eq!(me.pubkey, pubkey_of(SK).unwrap());
+        let peer = fed.iter().find(|p| !p.is_self).expect("the peer's ref is present");
+        assert_eq!(peer.commit, "commitB");
+        assert_eq!(peer.pubkey, pubkey_of(SK2).unwrap());
+
+        // An instance we do NOT list as a peer publishes the same ref — it must not appear.
+        let c = NostrRefs::new(SK3.into(), vec![url.clone()]);
+        c.publish_ref("tankrap/hull", "main", "commitC", None).unwrap();
+        let fed2 = a.fetch_federated_ref("tankrap/hull", "main");
+        assert_eq!(fed2.len(), 2, "an untrusted instance is not federated in");
+        assert!(fed2.iter().all(|p| p.commit != "commitC"));
+
+        // malformed peer pubkeys are dropped by with_peers.
+        let d = NostrRefs::new(SK.into(), vec![url]).with_peers(vec!["not-hex".into(), "00".into()]);
+        assert!(d.peers().is_empty());
     }
 
     #[test]
