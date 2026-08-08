@@ -68,6 +68,13 @@ async function apiError(res: Response): Promise<string> {
 // submit) so multi-word handles like "new org" -> "new_org" type through naturally.
 const sanitizeHandle = (s: string) =>
   s.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/\.\.+/g, "_").replace(/^[._]+/, "");
+// EXACT parity with the server's `sanitize_handle` (Rust): unlike the lenient `sanitizeHandle` above
+// (which keeps `_` and trailing separators so a handle types through naturally), this treats `_` as a
+// separator (collapsing runs) and strips trailing separators — the form the SERVER stores and verifies.
+// Use it at submit for anything the server will re-sanitize AND cryptographically check (the sovereign
+// proof-of-possession), so the value the client signs matches the handle the server computes. Idempotent.
+const serverHandle = (s: string) =>
+  s.replace(/[^A-Za-z0-9.-]+/g, "_").replace(/\.\.+/g, "_").replace(/^[._]+/, "").replace(/[._-]+$/, "");
 
 // Compact relative time ("3h ago") from a unix seconds timestamp.
 const timeAgo = (unix: number) => {
@@ -1205,7 +1212,7 @@ export function App() {
   // bundle and can never sign for you — the browser signs delegations itself. ──
   const signupSovereign = async () => {
     setAuthError("");
-    const u = sanitizeHandle(authForm.username);
+    const u = serverHandle(authForm.username);
     if (!u) { setAuthError("username is required"); return; }
     if (authPass.length < 10) { setAuthError("use a passphrase of at least 10 characters — it's the only thing protecting your key"); return; }
     setAuthBusy(true);
@@ -1231,7 +1238,7 @@ export function App() {
   };
   const loginSovereign = async () => {
     setAuthError("");
-    const u = sanitizeHandle(authForm.username);
+    const u = serverHandle(authForm.username);
     if (!u || !authPass) { setAuthError("username and passphrase are required"); return; }
     setAuthBusy(true);
     try {
