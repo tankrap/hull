@@ -4190,7 +4190,11 @@ async fn perform_merge(
     let agent_approve_counts = match eff.tier {
         hull_core::AutonomyTier::T0 | hull_core::AutonomyTier::T1 => false,
         hull_core::AutonomyTier::T2 => low_risk,
-        hull_core::AutonomyTier::T3 => !protected, // protected paths ALWAYS need a human (D11)
+        // T3 is the most autonomous tier, but a RED independent verification (`contradicted` — the
+        // change broke or weakened a pre-existing on-disk test) is a hard signal that must block an
+        // agent-only auto-merge at EVERY tier; otherwise a change that self-approves by weakening a
+        // real test would land on one agent approval. (Protected paths ALWAYS need a human — D11.)
+        hull_core::AutonomyTier::T3 => !protected && !contradicted,
     };
     let approved = human_approval || (agent_approval && agent_approve_counts);
     if !approved && !override_ok {
@@ -5188,7 +5192,16 @@ async fn perform_auto_review(
     // changed diff OR a flipped verification re-reviews; an identical (tree, verification) is cached.
     // (Fix from the dogfood review of PR !1: keying on tree alone would serve a stale verdict after a
     // red→green flip on the same tree.)
-    let cache_key = format!("{tree}:{}", app.repos.verification(tenant, repo, &change).unwrap_or_default());
+    // Namespace the key by repo AND a hash of the review intent, not just the content-addressed tree.
+    // Trees are content-addressed, so two repos (or a fork) with byte-identical trees share a `tree`
+    // id — a cached `approve` warmed in a throwaway repo would otherwise be served in a victim repo,
+    // skipping the model's intent reconciliation. The intent (which folds in the closing issue's
+    // acceptance criteria) is a real verdict input, so a different intent must re-review.
+    let intent_hash = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(review_intent.as_bytes()))
+    };
+    let cache_key = format!("{tenant}/{repo}:{tree}:{}:{intent_hash}", app.repos.verification(tenant, repo, &change).unwrap_or_default());
     match app.review_cache.get(&cache_key) {
         Some(cr) => {
             let v = match cr.verdict.as_str() {
