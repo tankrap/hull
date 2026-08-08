@@ -1101,9 +1101,17 @@ async fn notifications_list(State(app): State<App>, headers: axum::http::HeaderM
         if !addressed && !broadcast {
             continue;
         }
+        // A repo-scoped broadcast is delivered only if the actor can read that repo. A malformed repo
+        // key (present but not `tenant/repo`) is treated as unreadable — default-deny, so a future
+        // producer that mis-sets `repo` can't fail open and leak private activity. A repo-less
+        // broadcast (`None`) is a genuine server-wide notice and is delivered.
         if broadcast {
-            if let Some((t, r)) = x.repo.as_deref().and_then(|rk| rk.split_once('/')) {
-                if !can_read_repo(&app, Some(&actor.id), t, r).await {
+            if let Some(rk) = x.repo.as_deref() {
+                let visible = match rk.split_once('/') {
+                    Some((t, r)) => can_read_repo(&app, Some(&actor.id), t, r).await,
+                    None => false,
+                };
+                if !visible {
                     continue;
                 }
             }
@@ -6698,6 +6706,8 @@ mod tests {
             n.push(mk("mention", vec!["bob".into()], "for-bob", 2, None));
             n.push(mk("ci", vec![], "public-broadcast", 3, Some("acme/pubrepo".into())));
             n.push(mk("ci", vec![], "private-broadcast", 4, Some("acme/secret".into())));
+            n.push(mk("ci", vec![], "malformed-broadcast", 5, Some("no-slash-here".into())));
+            n.push(mk("sys", vec![], "server-wide", 6, None));
         }
 
         // No token → 401, no inbox.
@@ -6713,8 +6723,10 @@ mod tests {
             body["notifications"].as_array().unwrap().iter().map(|x| x["summary"].as_str().unwrap()).collect();
         assert!(seen.contains(&"for-alice"), "own notification delivered; got {seen:?}");
         assert!(seen.contains(&"public-broadcast"), "public broadcast delivered; got {seen:?}");
+        assert!(seen.contains(&"server-wide"), "repo-less server-wide broadcast delivered; got {seen:?}");
         assert!(!seen.contains(&"for-bob"), "must NOT leak another actor's inbox; got {seen:?}");
         assert!(!seen.contains(&"private-broadcast"), "must NOT leak a private repo's broadcast; got {seen:?}");
+        assert!(!seen.contains(&"malformed-broadcast"), "a broadcast with an unparseable repo is default-denied; got {seen:?}");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
