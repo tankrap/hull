@@ -4685,7 +4685,9 @@ async fn perform_merge(
     // structure won't be recoverable). Best-effort, off-thread, only when nostr is configured.
     if let (Some(refs), false) = (app.nostr_refs.clone(), announced.is_empty()) {
         const MAX_OBJS: usize = 256;
-        const MAX_BYTES: usize = 256 * 1024;
+        // Budget on RAW bytes, but leave headroom: the event base64-encodes these (~4/3) plus JSON
+        // framing, and many relays cap messages at ~256 KB. 180 KB raw ≈ 240 KB on the wire.
+        const MAX_BYTES: usize = 180 * 1024;
         match app.repos.change_objects(tenant, repo, &announced, MAX_OBJS, MAX_BYTES) {
             Some((_, true)) => eprintln!("nostr: change {announced} structure exceeds the bundle cap; skipping bundle (blobs still mirror)"),
             Some((objects, false)) if !objects.is_empty() => {
@@ -6110,13 +6112,33 @@ async fn restore_change(State(app): State<App>, Path((tenant, repo, id)): Path<(
         return (StatusCode::UNPROCESSABLE_ENTITY, "substrate not configured (needs HULL_NOSTR_*)").into_response();
     };
     // 1. Structure: rebuild the Change + Trees from the bundle (blocking relay read off the runtime).
+    // Each id may have several candidate byte-strings (a hostile relay can publish a bundle carrying a
+    // real id with garbage) — try each until one re-derives to the id.
     let (rf, change) = (refs.clone(), id.clone());
     let bundle = tokio::task::spawn_blocking(move || rf.fetch_change_bundle(&change)).await.unwrap_or_default();
     let mut objects_restored = 0usize;
-    for (oid, bytes) in &bundle {
-        if !app.repos.has_object(&tenant, &repo, oid) && app.repos.restore_object(&tenant, &repo, oid, bytes) {
-            objects_restored += 1;
+    for (oid, candidates) in &bundle {
+        if app.repos.has_object(&tenant, &repo, oid) {
+            continue;
         }
+        for bytes in candidates {
+            if app.repos.restore_object(&tenant, &repo, oid, bytes) {
+                objects_restored += 1;
+                break;
+            }
+        }
+    }
+    // If the structure isn't fully present after phase 1 (bundle missing, incomplete, flooded, or
+    // poisoned), STOP: missing_blobs silently returns nothing when the change/a tree is absent, so
+    // proceeding would report a clean success over a repo that wasn't actually reconstructed.
+    if !app.repos.structure_present(&tenant, &repo, &id) {
+        return Json(json!({
+            "structure_complete": false,
+            "objects_restored": objects_restored,
+            "blobs_restored": 0,
+            "note": "change structure could not be fully reconstructed from the bundle — blob restore skipped",
+        }))
+        .into_response();
     }
     // 2. Blobs: with the structure present, enumerate what's still missing and pull it from Blossom.
     let missing = app.repos.missing_blobs(&tenant, &repo, &id);
@@ -6124,8 +6146,8 @@ async fn restore_change(State(app): State<App>, Path((tenant, repo, id)): Path<(
     let mut still_missing: Vec<String> = Vec::new();
     if !missing.is_empty() {
         let Some(blossom) = app.blossom.clone() else {
-            // Structure may have been restored, but without Blossom the blobs can't be fetched.
-            return Json(json!({ "objects_restored": objects_restored, "blobs_restored": 0, "missing_blobs": missing.len(), "still_missing": missing })).into_response();
+            // Structure was restored, but without Blossom the blobs can't be fetched.
+            return Json(json!({ "structure_complete": true, "objects_restored": objects_restored, "blobs_restored": 0, "missing_blobs": missing.len(), "still_missing": missing })).into_response();
         };
         let (rf2, change2) = (refs.clone(), id.clone());
         let map = tokio::task::spawn_blocking(move || rf2.fetch_blob_manifest(&change2)).await.unwrap_or_default();
@@ -6148,7 +6170,7 @@ async fn restore_change(State(app): State<App>, Path((tenant, repo, id)): Path<(
             }
         }
     }
-    Json(json!({ "objects_restored": objects_restored, "blobs_restored": blobs_restored, "missing_blobs": missing.len(), "still_missing": still_missing })).into_response()
+    Json(json!({ "structure_complete": true, "objects_restored": objects_restored, "blobs_restored": blobs_restored, "missing_blobs": missing.len(), "still_missing": still_missing })).into_response()
 }
 
 /// Open a PR (`POST /api/repos/:tenant/:repo/prs`). It proposes real keel changes: `changes` may be
@@ -7487,11 +7509,22 @@ mod tests {
         let resp = restore_change(State(app.clone()), axum::extract::Path(("acme".to_string(), "mirror".to_string(), change.clone())), bearer("tok")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v["structure_complete"], true);
         assert!(v["objects_restored"].as_u64().unwrap() >= 2, "change + tree structure rebuilt");
         assert_eq!(v["blobs_restored"], 1);
         assert_eq!(v["still_missing"].as_array().unwrap().len(), 0);
         assert!(app.repos.has_object("acme", "mirror", &change), "the change object is present after restore");
         assert!(app.repos.missing_blobs("acme", "mirror", &change).is_empty(), "content fully reconstructed");
+
+        // A change with NO published bundle can't be reconstructed — the endpoint says so plainly
+        // instead of reporting a clean success over an empty repo (the silent-success guard).
+        let orphan = app.repos.test_commit("acme", "src", "add2", None, &[("z.txt", "zed\n")]);
+        setup_org_repo(&app, "acme", "empty", false, &[("boss", Role::Owner)]).await;
+        let resp = restore_change(State(app.clone()), axum::extract::Path(("acme".to_string(), "empty".to_string(), orphan.clone())), bearer("tok")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v["structure_complete"], false, "no bundle → structure not reconstructed");
+        assert!(!app.repos.has_object("acme", "empty", &orphan));
 
         // A non-admin can't trigger a restore.
         app.store.put_actor(actor("rando", ActorKind::Human)).await;

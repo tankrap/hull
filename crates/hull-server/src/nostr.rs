@@ -557,11 +557,12 @@ impl NostrRefs {
         Some(ev)
     }
 
-    /// Fetch a change's structural objects from its bundle(s): `(id_hex, decoded bytes)` pairs, deduped
-    /// by id (own-authored bundle preferred, then newest). Any author is accepted — the restorer
-    /// re-derives each id from the bytes, so a bogus object is stored under ITS id (an orphan), never
-    /// under a referenced one. The SIGNED `change` field must match.
-    pub fn fetch_change_bundle(&self, change: &str) -> Vec<(String, Vec<u8>)> {
+    /// Fetch a change's structural objects from its bundle(s): a map of object id → CANDIDATE decoded
+    /// byte-strings, own-authored-first then newest. Any author is accepted, so a hostile relay could
+    /// publish a bundle carrying a real object id with garbage bytes; returning ALL candidates (not just
+    /// the first) lets the restorer try each until one re-derives to the id, so a poisoned bundle can't
+    /// shadow the honest object and block reconstruction. The SIGNED `change` field must match.
+    pub fn fetch_change_bundle(&self, change: &str) -> std::collections::HashMap<String, Vec<Vec<u8>>> {
         use base64::Engine;
         let filter = serde_json::json!({ "kinds": [KIND_CHANGE_BUNDLE], "#change": [change] });
         let own = self.own_pubkey();
@@ -570,8 +571,7 @@ impl NostrRefs {
             let (a_own, b_own) = (own.as_deref() == Some(a.pubkey.as_str()), own.as_deref() == Some(b.pubkey.as_str()));
             b_own.cmp(&a_own).then_with(|| b.created_at.cmp(&a.created_at)).then_with(|| b.id.cmp(&a.id))
         });
-        let mut seen = std::collections::HashSet::new();
-        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut out: std::collections::HashMap<String, Vec<Vec<u8>>> = std::collections::HashMap::new();
         for ev in &events {
             if ev.kind != KIND_CHANGE_BUNDLE {
                 continue;
@@ -583,11 +583,11 @@ impl NostrRefs {
             let Some(objs) = v.get("objects").and_then(|b| b.as_array()) else { continue };
             for entry in objs {
                 let (Some(id), Some(b64)) = (entry.get(0).and_then(|x| x.as_str()), entry.get(1).and_then(|x| x.as_str())) else { continue };
-                if !seen.insert(id.to_string()) {
-                    continue; // first (own/newest) bundle to carry this id wins
-                }
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                    out.push((id.to_string(), bytes));
+                    let cands = out.entry(id.to_string()).or_default();
+                    if !cands.contains(&bytes) {
+                        cands.push(bytes);
+                    }
                 }
             }
         }
@@ -1026,8 +1026,8 @@ mod tests {
         refs.publish_change_bundle("blake3:c1", &objects).expect("publish");
         let got = refs.fetch_change_bundle("blake3:c1");
         assert_eq!(got.len(), 2);
-        assert_eq!(got.iter().find(|(id, _)| id == "id_change").map(|(_, b)| b.clone()), Some(vec![1u8, 2, 3, 0, 255]));
-        assert_eq!(got.iter().find(|(id, _)| id == "id_tree").map(|(_, b)| b.clone()), Some(b"tree-bytes".to_vec()));
+        assert_eq!(got.get("id_change"), Some(&vec![vec![1u8, 2, 3, 0, 255]]));
+        assert_eq!(got.get("id_tree"), Some(&vec![b"tree-bytes".to_vec()]));
         assert!(refs.fetch_change_bundle("blake3:other").is_empty());
     }
 

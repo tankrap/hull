@@ -1097,6 +1097,24 @@ impl RepoHost {
         Some((out, over))
     }
 
+    /// True iff change `hex`'s Change object AND every Tree in its snapshot are present locally (blobs
+    /// are not required). This is what "the structure is fully reconstructed" means — and it's the
+    /// precondition for trusting [`missing_blobs`](Self::missing_blobs), which silently stops descending
+    /// at any tree it can't read. Bounded depth (mirrors flatten_tree's cap).
+    pub fn structure_present(&self, tenant: &str, repo: &str, hex: &str) -> bool {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return false };
+        let Some(cid) = ObjectId::from_hex(hex) else { return false };
+        let Some(Object::Change(c)) = store.get(&cid).ok().flatten() else { return false };
+        fn all_trees_present(store: &Store, tree: ObjectId, depth: u32) -> bool {
+            if depth > 64 {
+                return false;
+            }
+            let Some(Object::Tree(t)) = store.get(&tree).ok().flatten() else { return false };
+            t.entries.iter().all(|e| e.mode != MODE_DIR || all_trees_present(store, e.id, depth + 1))
+        }
+        all_trees_present(&store, c.tree, 0)
+    }
+
     /// True if object `id_hex` is present in the local store (presence only, no decode).
     pub fn has_object(&self, tenant: &str, repo: &str, id_hex: &str) -> bool {
         let Ok(Some(store)) = self.store(tenant, repo, false) else { return false };
@@ -2448,28 +2466,6 @@ impl RepoHost {
         id.to_hex()
     }
 
-    /// Test-only: copy `change`'s Change + tree objects from one repo into another, WITHOUT its blob
-    /// bytes — reproducing the state a restore recovers (a store that has the change's structure but not
-    /// its content). There is no delete API, so this is how tests create a genuinely-missing blob.
-    pub(crate) fn test_copy_change_without_blobs(&self, src_t: &str, src_r: &str, dst_t: &str, dst_r: &str, change: &str) {
-        fn copy_trees(src: &Store, dst: &Store, tree: ObjectId) {
-            if let Some(Object::Tree(t)) = src.get(&tree).ok().flatten() {
-                dst.put(&Object::Tree(t.clone())).unwrap();
-                for e in &t.entries {
-                    if e.mode == MODE_DIR {
-                        copy_trees(src, dst, e.id);
-                    }
-                }
-            }
-        }
-        let src = self.store(src_t, src_r, false).unwrap().unwrap();
-        let dst = self.store(dst_t, dst_r, true).unwrap().unwrap();
-        let cid = ObjectId::from_hex(change).unwrap();
-        if let Some(Object::Change(c)) = src.get(&cid).ok().flatten() {
-            copy_trees(&src, &dst, c.tree);
-            dst.put(&Object::Change(c)).unwrap();
-        }
-    }
 }
 
 #[cfg(test)]
