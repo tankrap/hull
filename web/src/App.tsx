@@ -2342,7 +2342,7 @@ export function App() {
 
   // ── shared chrome (top bar + notifications drawer) ────────────────────────
   const topBar = (
-    <header className="h-14 bg-shell flex items-center gap-5 px-6 sticky top-0 z-40">
+    <header className="h-14 shrink-0 bg-shell flex items-center gap-5 px-6 z-40">
       <button className="flex items-center gap-2.5 cursor-pointer shrink-0" onClick={() => navigate("/")} title="situation room">
         <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
         <span className="text-[19px] font-extrabold tracking-tight">hull</span>
@@ -2504,8 +2504,56 @@ export function App() {
   const currentIssue = openIssue != null ? issues.find((i) => i.number === openIssue) ?? null : null;
   const currentPr = openPr != null ? prs.find((p) => p.number === openPr) ?? null : null;
 
+  // ── left nav sidebar (chrome) — GitLab-style: global nav lives here, the top bar keeps search + user ──
+  const sideCls = (active: boolean) =>
+    `w-full flex items-center gap-2.5 px-2.5 h-8 rounded-ctl text-[13.5px] transition-colors ${active ? "bg-surface text-ink font-medium" : "text-body hover:bg-surface hover:text-ink"}`;
+  const SIco = ({ d }: { d: string }) => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className="flex-none text-muted"><path d={d} /></svg>
+  );
+  const sidebar = (
+    <aside className="w-[228px] shrink-0 bg-shell hidden md:flex flex-col">
+      <nav className="flex-1 overflow-y-auto px-3 pt-4 grid gap-0.5 content-start">
+        <button className={sideCls(view === "home" && !orgHandle)} onClick={() => navigate("/")}>
+          <SIco d="M3 10.5 12 3l9 7.5M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5" /><span>Home</span>
+        </button>
+        {me && (
+          <button className={sideCls(false)} onClick={() => navigate("/me")}>
+            <SIco d="M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4zM20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z" /><span>Your repositories</span>
+          </button>
+        )}
+        {me && (
+          <>
+            <div className="px-2.5 pt-4 pb-1.5 text-[10.5px] font-semibold uppercase tracking-[0.09em] text-faint">Organizations</div>
+            {myAccounts.length === 0 && <div className="px-2.5 pb-1 text-[12.5px] text-faint">none yet</div>}
+            {myAccounts.map((h) => (
+              <button key={h} className={sideCls(!!orgHandle && orgHandle === h)} onClick={() => navigate(`/orgs/${encodeURIComponent(h)}`)}>
+                <SIco d="M3 21h18M6 21V7l6-4 6 4v14M10 9h.01M14 9h.01M10 13h.01M14 13h.01M10 17h4" /><span className="truncate">{h}</span>
+              </button>
+            ))}
+          </>
+        )}
+        {!me && (
+          <button className={sideCls(false)} onClick={() => navigate("/login")}>
+            <SIco d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" /><span>Log in</span>
+          </button>
+        )}
+      </nav>
+      <div className="px-3 py-3 border-t border-rule2 grid gap-0.5">
+        <button className={sideCls(false)} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+          {theme === "dark"
+            ? <SIco d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z" />
+            : <SIco d="M12 3v2M12 19v2M5 5l1.5 1.5M17.5 17.5 19 19M3 12h2M19 12h2M5 19l1.5-1.5M17.5 6.5 19 5M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" />}
+          <span>{theme === "dark" ? "Light mode" : "Dark mode"}</span>
+        </button>
+        <a className={sideCls(false)} href="https://github.com/tankrap/hull" target="_blank" rel="noreferrer">
+          <SIco d="M9 18c-4.5 1.5-4.5-2.5-6-3m12 6v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.3 4.3 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6 0C7.3 1.3 6.3 1.6 6.3 1.6a4.3 4.3 0 0 0-.1 3.2A4.6 4.6 0 0 0 5 8c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V20" /><span>Docs</span>
+        </a>
+      </div>
+    </aside>
+  );
+
   return (
-    <div className="bg-shell min-h-screen text-ink">
+    <div className="bg-shell h-dvh flex flex-col text-ink overflow-hidden">
       {uiModalNode}
       {cmdNode}
       {shortcutsNode}
@@ -2514,9 +2562,11 @@ export function App() {
       {topBar}
       {notifDrawer}
 
-      {/* The content sits in an inset, rounded "well" one shade darker than the chrome around it —
-          the GitLab app-shell look: lighter frame (top bar / edges), darker work surface. */}
-      <main className="bg-paper rounded-t-[14px] mx-2 min-h-[calc(100dvh-3.5rem)] overflow-x-clip border-x border-t border-rule2/70">
+      {/* GitLab app-shell: lighter chrome (top bar + left sidebar) frames a darker content "well"
+          that is inset and rounded at the inner corner and scrolls on its own. */}
+      <div className="flex flex-1 min-h-0">
+        {sidebar}
+        <main className="flex-1 min-w-0 overflow-y-auto overflow-x-clip bg-paper rounded-tl-[16px] border-l border-t border-rule2/70">
 
       {/* ── HOME · your work ──────────────────────────────────────────────── */}
       {view === "home" && !orgHandle && !me && (
@@ -3328,7 +3378,8 @@ export function App() {
           })()}
         </div>
       )}
-      </main>
+        </main>
+      </div>
     </div>
   );
 }
