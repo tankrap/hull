@@ -35,6 +35,12 @@
   --field-border: #89888D;       /* neutral-400 — a strong, visible input outline */
   --field-border-focus: #28272D; /* neutral-900 — focus border is high-contrast neutral + blue ring */
   --btn-dis-bg: #FBFAFD; --btn-dis-fg: #737278; --btn-dis-border: #DCDCDE; /* neutral-10/500/100 */
+  /* GitLab gl-badge: light = tint-100 fill + tint-700 text. */
+  --badge-success-bg: #C3E6CD; --badge-success-fg: #306440;
+  --badge-danger-bg:  #FDD4CD; --badge-danger-fg:  #A32C12;
+  --badge-warning-bg: #F5D9A8; --badge-warning-fg: #894B16;
+  --badge-info-bg:    #CBE2F9; --badge-info-fg:    #2F5CA0;
+  --badge-neutral-bg: #DCDCDE; --badge-neutral-fg: #4C4B51;
   --ink: #1F1E24;         /* neutral-950 text */
   --body: #4F4D54;        /* neutral-700 paragraph */
   --dim: #626168;         /* neutral-600 */
@@ -79,6 +85,12 @@
   --field-border: #737278;       /* neutral-500 — strong input outline */
   --field-border-focus: #ECECEF; /* neutral-50 — focus border is high-contrast neutral + blue ring */
   --btn-dis-bg: rgba(137,136,141,0.16); --btn-dis-fg: #89888D; --btn-dis-border: transparent;
+  /* GitLab gl-badge (dark): a BRIGHT tint-300 fill + near-black tint-950 text. */
+  --badge-success-bg: #52B87A; --badge-success-fg: #17291C;
+  --badge-danger-bg:  #F6806D; --badge-danger-fg:  #3E1A14;
+  --badge-warning-bg: #D99530; --badge-warning-fg: #382315;
+  --badge-info-bg:    #63A6E9; --badge-info-fg:    #1D283E;
+  --badge-neutral-bg: #A4A3A8; --badge-neutral-fg: #18171D;
   --ink: #ECECEF;         /* neutral-50 */
   --body: #C3C2C8;        /* neutral-200 */
   --dim: #A6A5AC;         /* neutral-300 */

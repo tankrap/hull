@@ -2821,7 +2821,7 @@ export function App() {
               {issueRepo} · issues
             </button>
             <div className="group flex items-center gap-3 flex-wrap mb-1.5">
-              <StatusBadge kind={it.status.state === "open" ? "running" : "queued"}>{it.status.state === "open" ? "open" : it.status.reason ?? "closed"}</StatusBadge>
+              <StatusBadge kind={it.status.state === "open" ? "open" : (it.status.reason === "completed" || !it.status.reason) ? "merged" : "closed"}>{it.status.state === "open" ? "open" : it.status.reason ?? "closed"}</StatusBadge>
               {editingIssue === it.number
                 ? <input autoFocus value={issueTitleDraft} onChange={(e) => setIssueTitleDraft(e.target.value)} placeholder="Issue title" className={`${modalInput} flex-1 min-w-[240px] !text-[20px] !h-auto py-1.5 font-semibold tracking-tight`} />
                 : <h1 className="text-[24px] font-semibold tracking-tight">{it.title}</h1>}
@@ -2884,10 +2884,9 @@ export function App() {
               <aside className="grid gap-5 content-start">
                 <Module title="Details">
                   <Stat k="status" v={
-                    <span className={`inline-flex items-center gap-1 text-[12px] font-medium px-1.5 py-[2px] rounded-badge ${it.status.state === "open" ? "bg-clear-wash text-clear-text" : it.status.reason === "completed" || !it.status.reason ? "bg-steel-wash text-steel-text" : "bg-rule2 text-dim"}`}>
-                      <span className={`w-1.5 h-1.5 rounded-full ${it.status.state === "open" ? "bg-clear" : it.status.reason === "completed" || !it.status.reason ? "bg-steel" : "bg-muted"}`} />
+                    <StatusBadge kind={it.status.state === "open" ? "open" : (it.status.reason === "completed" || !it.status.reason) ? "merged" : "closed"}>
                       {it.status.state === "open" ? "open" : it.status.reason ?? "closed"}
-                    </span>
+                    </StatusBadge>
                   } />
                   <Stat k="author" v={handleOf(it.author)} />
                   <div className="grid gap-1.5 pt-1">
