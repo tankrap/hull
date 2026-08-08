@@ -2041,30 +2041,62 @@ export function App() {
   const sidebar = (
     <aside className="w-[228px] shrink-0 bg-shell hidden md:flex flex-col">
       <nav className="flex-1 overflow-y-auto px-3 pt-3 grid gap-0.5 content-start">
-        <div className="px-2.5 pt-1 pb-2 text-[15px] font-semibold tracking-tight">Your work</div>
-        <button className={sideCls(view === "home" && !orgHandle && !authPage)} onClick={() => navigate("/")}>
-          <SIco d="M3 10.5 12 3l9 7.5M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5" /><span>Home</span>
-        </button>
-        {me && (
-          <button className={sideCls(authPage === "profile")} onClick={() => navigate("/me")}>
-            <SIco d="M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4zM20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z" /><span>Your repositories</span>
-          </button>
-        )}
-        {me && (
+        {view === "repo" && !authPage && issueRepo ? (
           <>
-            <div className="px-2.5 pt-4 pb-1.5 text-[10.5px] font-semibold uppercase tracking-[0.09em] text-faint">Organizations</div>
-            {myAccounts.length === 0 && <div className="px-2.5 pb-1 text-[12.5px] text-faint">none yet</div>}
-            {myAccounts.map((h) => (
-              <button key={h} className={sideCls(!!orgHandle && orgHandle === h)} onClick={() => navigate(`/orgs/${encodeURIComponent(h)}`)}>
-                <SIco d="M3 21h18M6 21V7l6-4 6 4v14M10 9h.01M14 9h.01M10 13h.01M14 13h.01M10 17h4" /><span className="truncate">{h}</span>
+            {/* Inside a project, the sidebar becomes the project nav — GitLab's pattern. */}
+            <button className="w-full flex items-center gap-1.5 px-2.5 h-7 rounded-ctl text-[12.5px] text-muted hover:text-ink hover:bg-surface transition-colors" onClick={() => navigate("/")}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-none"><polyline points="15 18 9 12 15 6" /></svg><span>Your work</span>
+            </button>
+            <div className="flex items-center gap-2 px-2.5 pt-2 pb-2 min-w-0">
+              <span className="w-7 h-7 rounded-ctl bg-steel-wash text-steel-text grid place-items-center text-[11px] font-bold uppercase flex-none">{issueRepo.slice(0, 2)}</span>
+              <span className="min-w-0"><span className="block text-[13.5px] font-semibold truncate leading-tight">{issueRepo}</span><span className="block text-[11px] text-faint truncate leading-tight">{tenant}</span></span>
+            </div>
+            <button className={sideCls(tab === "issues")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}`)}>
+              <SIco d="M12 22a10 10 0 1 1 0-20 10 10 0 0 1 0 20zM12 14a2 2 0 1 1 0-4 2 2 0 0 1 0 4z" /><span>Issues</span>
+            </button>
+            <button className={sideCls(tab === "prs")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/voyages`)}>
+              <SIco d="M6 9v6M6 21a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM6 9a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM18 6a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM18 6v6a3 3 0 0 1-3 3H8" /><span>Merge requests</span>
+            </button>
+            <button className={sideCls(tab === "files")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/files`)}>
+              <SIco d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6" /><span>Files</span>
+            </button>
+            <button className={sideCls(tab === "graph")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/graph`)}>
+              <SIco d="M18 20V10M12 20V4M6 20v-7" /><span>Graph</span>
+            </button>
+            {isTenantOwner && (
+              <button className={sideCls(tab === "settings")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/settings`)}>
+                <SIco d="M4 21v-6M4 11V3M12 21v-9M12 7V3M20 21v-4M20 13V3M1 15h6M9 9h6M17 15h6" /><span>Settings</span>
               </button>
-            ))}
+            )}
           </>
-        )}
-        {!me && (
-          <button className={sideCls(false)} onClick={() => navigate("/login")}>
-            <SIco d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" /><span>Log in</span>
-          </button>
+        ) : (
+          <>
+            <div className="px-2.5 pt-1 pb-2 text-[15px] font-semibold tracking-tight">Your work</div>
+            <button className={sideCls(view === "home" && !orgHandle && !authPage)} onClick={() => navigate("/")}>
+              <SIco d="M3 10.5 12 3l9 7.5M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5" /><span>Home</span>
+            </button>
+            {me && (
+              <button className={sideCls(authPage === "profile")} onClick={() => navigate("/me")}>
+                <SIco d="M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4zM20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z" /><span>Your repositories</span>
+              </button>
+            )}
+            {me && (
+              <>
+                <div className="px-2.5 pt-4 pb-1.5 text-[10.5px] font-semibold uppercase tracking-[0.09em] text-faint">Organizations</div>
+                {myAccounts.length === 0 && <div className="px-2.5 pb-1 text-[12.5px] text-faint">none yet</div>}
+                {myAccounts.map((h) => (
+                  <button key={h} className={sideCls(!!orgHandle && orgHandle === h)} onClick={() => navigate(`/orgs/${encodeURIComponent(h)}`)}>
+                    <SIco d="M3 21h18M6 21V7l6-4 6 4v14M10 9h.01M14 9h.01M10 13h.01M14 13h.01M10 17h4" /><span className="truncate">{h}</span>
+                  </button>
+                ))}
+              </>
+            )}
+            {!me && (
+              <button className={sideCls(false)} onClick={() => navigate("/login")}>
+                <SIco d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" /><span>Log in</span>
+              </button>
+            )}
+          </>
         )}
       </nav>
       <div className="px-3 py-3 border-t border-rule2 grid gap-0.5">
@@ -3121,7 +3153,8 @@ export function App() {
             </div>
           </div>
 
-          <div className="flex items-end justify-between gap-4 border-b border-rule2 mb-7">
+          {/* Desktop navigates the repo via the contextual sidebar; the tab bar is the mobile fallback. */}
+          <div className="md:hidden flex items-end justify-between gap-4 border-b border-rule2 mb-7">
             <HTabs
               items={[`Issues ${openIssues}`, `Pull requests ${prs.length}`, "Files", "Graph", ...(isTenantOwner ? ["Settings"] : [])]}
               value={tab === "issues" ? 0 : tab === "prs" ? 1 : tab === "files" ? 2 : tab === "graph" ? 3 : 4}
