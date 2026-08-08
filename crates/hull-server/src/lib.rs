@@ -4410,7 +4410,7 @@ async fn perform_merge(
     force: bool,
 ) -> Result<(PullRequest, Vec<u64>), (StatusCode, String)> {
     let key = format!("{tenant}/{repo}");
-    let Some(mut pr) = app.store.prs(&key).await.into_iter().find(|p| p.number == number) else {
+    let Some(pr) = app.store.prs(&key).await.into_iter().find(|p| p.number == number) else {
         return Err((StatusCode::NOT_FOUND, "no such PR".into()));
     };
     if pr.state == PrState::Merged {
@@ -4572,9 +4572,18 @@ async fn perform_merge(
             return Err((StatusCode::CONFLICT, "branch moved during merge; retry".into()));
         }
     }
-    pr.state = PrState::Merged;
-    pr.merged_by = Some(actor.id.clone());
-    app.store.replace_pr(pr.clone()).await;
+    // Finalize the PR. Re-read it FRESH under number_lock and apply the state change to that record,
+    // not the snapshot taken at the top of this function: a concurrent submit_provenance (which holds
+    // the same lock for its write) would otherwise be lost when we write back a stale snapshot — wiping
+    // the author's just-submitted provenance AND making land fall through to the custodial path.
+    let pr = {
+        let _guard = app.number_lock.lock().await;
+        let mut fresh = app.store.prs(&key).await.into_iter().find(|p| p.number == number).unwrap_or(pr);
+        fresh.state = PrState::Merged;
+        fresh.merged_by = Some(actor.id.clone());
+        app.store.replace_pr(fresh.clone()).await;
+        fresh
+    };
     // Announce the change that now sits at the branch tip — the synthesized merge change on a
     // protected land, else the PR's head change (today's behavior).
     let announced = landed_change.clone().or_else(|| pr.changes.first().cloned()).unwrap_or_default();
@@ -4598,20 +4607,19 @@ async fn perform_merge(
     // instance holds that key (custodial/demo accounts); a SOVEREIGN author's key is client-held, so
     // its provenance must be signed client-side — a follow-up (the same primitives, signed in-browser).
     if let (Some(refs), false) = (app.nostr_refs.clone(), announced.is_empty()) {
-        // Prefer a SOVEREIGN author's client-signed provenance if one was submitted for this change: the
-        // instance never held their key, so this is the only genuinely human-non-repudiable attestation.
-        // The bundle was verified + bound to (change, repo) at submit; re-check the binding and re-verify
-        // the signature (publish_signed_provenance does the latter) before transporting it.
-        let sovereign = pr
-            .sovereign_provenance
-            .get(&announced)
-            .and_then(|s| serde_json::from_str::<nostr::SignedProvenance>(s).ok())
-            .filter(|sp| sp.claim.change == announced && sp.claim.repo == key);
-        if let Some(sp) = sovereign {
-            let (refs2, change) = (refs.clone(), announced.clone());
+        // Prefer a SOVEREIGN author's client-signed provenance: the instance never held their key, so
+        // this is the only genuinely human-non-repudiable attestation. A bundle attests the author's OWN
+        // declared change, NOT `announced` — on a protected branch `announced` is a server-synthesized
+        // merge id the client never signed, so keying on it would silently skip every sovereign author on
+        // exactly the repos that enable protection.
+        let sovereign = sovereign_bundles_to_publish(&pr, &key);
+        if !sovereign.is_empty() {
+            let refs2 = refs.clone();
             std::thread::spawn(move || {
-                if let Some(ev) = refs2.publish_signed_provenance(&sp) {
-                    eprintln!("nostr: published client-signed provenance for {change} ({}…)", &ev.id[..12]);
+                for sp in &sovereign {
+                    if let Some(ev) = refs2.publish_signed_provenance(sp) {
+                        eprintln!("nostr: published client-signed provenance for {} ({}…)", sp.claim.change, &ev.id[..12]);
+                    }
                 }
             });
         } else {
@@ -5966,6 +5974,19 @@ async fn verify_change(
     }
 }
 
+/// The client-signed provenance bundles to publish for a landed PR: every stored bundle that still
+/// binds to one of the PR's declared changes and this repo. Keyed on the author's OWN change id, never
+/// on the (possibly server-synthesized) announced merge id — see the call site in `perform_merge`.
+/// `publish_signed_provenance` re-verifies each bundle's Ed25519 signature before it hits a relay.
+fn sovereign_bundles_to_publish(pr: &PullRequest, repo_key: &str) -> Vec<nostr::SignedProvenance> {
+    pr.changes
+        .iter()
+        .filter_map(|c| pr.sovereign_provenance.get(c))
+        .filter_map(|s| serde_json::from_str::<nostr::SignedProvenance>(s).ok())
+        .filter(|sp| sp.claim.repo == repo_key && pr.changes.contains(&sp.claim.change))
+        .collect()
+}
+
 /// Submit client-signed provenance for a change (`POST /api/repos/:tenant/:repo/change/:id/provenance`
 /// with a `SignedProvenance` body `{claim:{v,change,actor,repo,intent,ts}, ed_sig}`). This is the
 /// sovereign path: the author's Ed25519 key is client-held, so they sign the claim in the browser/CLI
@@ -6015,12 +6036,18 @@ async fn submit_provenance(
     if !authorized {
         return (StatusCode::FORBIDDEN, "not a member of this repo").into_response();
     }
-    // Attach to the PR that proposes this change. Guard the read-modify-write with the alloc lock so a
-    // concurrent submit/land can't clobber it.
+    // Attach to the OPEN PR that proposes this change. Guard the read-modify-write with number_lock, the
+    // same lock perform_merge takes for its final PR write, so a concurrent land can't clobber it.
     let _guard = app.number_lock.lock().await;
-    let Some(mut pr) = app.store.prs(&key).await.into_iter().find(|p| p.changes.iter().any(|c| c == &id)) else {
+    let Some(mut pr) = app.store.prs(&key).await.into_iter().find(|p| p.state == PrState::Open && p.changes.iter().any(|c| c == &id)) else {
         return (StatusCode::NOT_FOUND, "no open PR proposes this change").into_response();
     };
+    // Only the PR author may attest its changes. Without this, any accountable member could file (or,
+    // since the map is last-writer-wins, overwrite) provenance for a change they didn't author, and land
+    // prefers the stored bundle — so a non-author could misattribute the published attestation.
+    if sp.claim.actor != pr.author {
+        return (StatusCode::FORBIDDEN, "provenance actor must be the PR author").into_response();
+    }
     let stored = match serde_json::to_string(&sp) {
         Ok(s) => s,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e}")).into_response(),
@@ -7294,7 +7321,42 @@ mod tests {
         let sp2 = crate::nostr::sign_provenance(&author.secret_key, claim2).unwrap();
         let r = submit_provenance(State(app.clone()), path(), bearer("tok"), Json(serde_json::to_value(&sp2).unwrap())).await;
         assert_eq!(r.status(), StatusCode::BAD_REQUEST, "claim.change must match the URL");
+
+        // A repo MEMBER who is not the PR author cannot file (or clobber) provenance for the change.
+        let bob = hull_core::identity::mint_human("bob");
+        app.store.put_actor(bob.actor.clone()).await;
+        setup_org_repo(&app, "acme", "web", false, &[(&aid, Role::Write), (&bob.actor.id, Role::Write)]).await;
+        mint_token(&app, "tok-bob", &bob.actor.id);
+        let bob_claim = crate::nostr::ProvenanceClaim { v: 1, change: change.clone(), actor: bob.actor.id.clone(), repo: "acme/web".into(), intent: "not mine".into(), ts: 1 };
+        let bob_sp = crate::nostr::sign_provenance(&bob.secret_key, bob_claim).unwrap();
+        let r = submit_provenance(State(app.clone()), path(), bearer("tok-bob"), Json(serde_json::to_value(&bob_sp).unwrap())).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "only the PR author may attest its change");
+        // the author's stored bundle is untouched
+        let pr = app.store.prs("acme/web").await.into_iter().find(|p| p.number == 1).unwrap();
+        assert_eq!(pr.sovereign_provenance.get(&change).cloned(), Some(serde_json::to_string(&sp).unwrap()), "author's bundle not clobbered");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sovereign_bundles_publish_by_authors_change_not_announced() {
+        // Regression for the protected-branch key mismatch: on a protected land `announced` is a
+        // server-synthesized merge id the client never signed, but the bundle must still be selected by
+        // the author's OWN declared change.
+        let author = hull_core::identity::mint_human("nomad");
+        let claim = crate::nostr::ProvenanceClaim { v: 1, change: "blake3:authored".into(), actor: author.actor.id.clone(), repo: "acme/web".into(), intent: "did it".into(), ts: 1 };
+        let sp = crate::nostr::sign_provenance(&author.secret_key, claim).unwrap();
+        let mut pr = PullRequest {
+            id: "pr-1".into(), repo: "acme/web".into(), number: 1, title: "t".into(), author: author.actor.id.clone(),
+            changes: vec!["blake3:authored".into()], verification: Verification::Unverified, reviewers: vec![],
+            state: PrState::Merged, merged_by: None, sovereign_provenance: std::collections::HashMap::new(), created_unix: 0,
+        };
+        pr.sovereign_provenance.insert("blake3:authored".into(), serde_json::to_string(&sp).unwrap());
+        // `announced` would be "blake3:merge-synth" here — irrelevant to selection.
+        let picked = sovereign_bundles_to_publish(&pr, "acme/web");
+        assert_eq!(picked.len(), 1, "the author's bundle is selected regardless of the announced id");
+        assert_eq!(picked[0].claim.change, "blake3:authored");
+        // wrong repo key selects nothing (defense against a cross-repo stored bundle)
+        assert!(sovereign_bundles_to_publish(&pr, "other/repo").is_empty());
     }
 
     #[tokio::test]
