@@ -328,6 +328,48 @@ async fn seed_if_empty(store: &dyn Store) {
     }
     backfill_members(store).await;
     backfill_accountability(store).await;
+    normalize_account_handles(store).await;
+}
+
+/// One-time, idempotent repair: an account handle persisted before [`sanitize_handle`] was
+/// strengthened (or written by an older client) can contain characters that [`repos::safe_segment`]
+/// rejects (`"new org"`, `"n;kkjkjk"`, …). Such an org can never create a repo, because
+/// [`repos::RepoHost::create_repo`] runs `safe_segment` on the tenant (= the handle). Rewrite every
+/// invalid handle to its `sanitize_handle` form, disambiguating with a short numeric suffix if that
+/// collides with an existing account. Repos are keyed by `account.id` (not handle) and the on-disk
+/// tenant dir is derived from the handle only at request time, so no repo dir is orphaned — and these
+/// broken orgs have no repos anyway (creation was impossible). No-op once all handles are valid.
+///
+/// Scoped to organizations on purpose. A personal account's handle is one leg of the load-bearing
+/// `User.username == Actor.handle == Account.handle` invariant that [`account_update`] keeps in sync;
+/// rewriting the account handle alone would desync the actor/username (breaking `@mention` lookups)
+/// and be silently reverted the next time the user saves their settings. Personal handles are
+/// repaired through the username path instead, not here.
+async fn normalize_account_handles(store: &dyn Store) {
+    let accounts = store.accounts().await;
+    // Handles already in use (lowercased), so a repaired handle doesn't collide with a valid one.
+    // Includes personal-account handles (which share the handle namespace) even though we don't
+    // rewrite them, so an org repair never lands on a name a personal account already holds.
+    let mut taken: std::collections::HashSet<String> = accounts.iter().map(|a| a.handle.to_lowercase()).collect();
+    for mut acct in accounts {
+        if acct.kind != hull_core::AccountKind::Organization || repos::safe_segment(&acct.handle) {
+            continue;
+        }
+        let base = sanitize_handle(&acct.handle);
+        let base = if base.is_empty() { format!("org-{}", acct.id) } else { base };
+        // Free the old (invalid) handle from the taken set so it doesn't block its own replacement.
+        taken.remove(&acct.handle.to_lowercase());
+        let mut candidate = base.clone();
+        let mut n = 2;
+        while taken.contains(&candidate.to_lowercase()) {
+            candidate = format!("{base}-{n}");
+            n += 1;
+        }
+        taken.insert(candidate.to_lowercase());
+        eprintln!("hull: normalized invalid account handle {:?} -> {:?} (id {})", acct.handle, candidate, acct.id);
+        acct.handle = candidate;
+        store.put_account(acct).await;
+    }
 }
 
 /// Whether the local/demo affordances are enabled. Truthy values (`enforce`/`on`/`true`/`1`/`yes`,
@@ -1133,10 +1175,37 @@ fn parse_role(s: Option<&str>) -> Role {
     }
 }
 
-/// Normalize a user/org/repo handle: trim, and collapse any run of whitespace to a single `_`. The
-/// canonical form the UI shows while typing and the server stores.
+/// Normalize a user/org/repo handle to a safe path segment. Keep only `[A-Za-z0-9._-]`; map any run
+/// of other characters (whitespace, punctuation, non-ASCII, emoji) to a single `_`; collapse `..` to
+/// `_` (no path traversal); and strip leading dots/underscores and trailing separators. The result
+/// ALWAYS satisfies [`repos::safe_segment`], or is empty (which every caller rejects with a
+/// "handle/name is required" error). This is the canonical form the UI shows while typing and the
+/// server stores, so a tenant path derived from a stored handle can never fail `safe_segment`.
 fn sanitize_handle(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join("_")
+    // Map every disallowed char to a space, then treat runs of space as one `_` boundary.
+    let mut out = String::with_capacity(s.len());
+    let mut pending_sep = false;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' {
+            if pending_sep && !out.is_empty() {
+                out.push('_');
+            }
+            pending_sep = false;
+            out.push(ch);
+        } else {
+            // A literal `_` is allowed but, like any disallowed char (whitespace, punctuation,
+            // non-ASCII, emoji), is treated as a separator so runs collapse to a single `_`.
+            pending_sep = true;
+        }
+    }
+    // `pending_sep` left set means trailing separators — drop them (no trailing `_`).
+    // Collapse any `..` (would fail `safe_segment`) to a single `_`.
+    while out.contains("..") {
+        out = out.replace("..", "_");
+    }
+    // Strip leading dots (dotfiles are rejected) / underscores, and trailing separators. After this the
+    // result cannot start with `.` nor be `.`/`..`, so it satisfies `safe_segment` (or is empty).
+    out.trim_start_matches(['.', '_']).trim_end_matches(['.', '_', '-']).to_string()
 }
 
 /// `GET /api/accounts/available?handle=X` — is an org/account handle free? Returns the sanitized form.
@@ -1425,6 +1494,16 @@ async fn create_repo_handler(State(app): State<App>, headers: axum::http::Header
         return (StatusCode::BAD_REQUEST, "name is required").into_response();
     }
     let tenant = acct.handle.clone();
+    // Defense: if the org's own handle isn't a safe path segment, `create_repo` would fail with the
+    // misleading "invalid repo name". Startup normalization repairs such handles, so this shouldn't
+    // trigger for existing orgs, but return a message that points at the real problem.
+    if !repos::safe_segment(&tenant) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("this organization's handle (\"{tenant}\") is invalid — rename the org"),
+        )
+            .into_response();
+    }
     // Case-INSENSITIVE, matching the `rename` guard and the PG `repos_owner_lower_name` unique
     // index — so a case-variant duplicate (`web` next to `Web`) is rejected here with CONFLICT
     // rather than passing the guard and panicking on the index violation under Postgres.
@@ -5914,6 +5993,71 @@ mod tests {
         assert!(!tokens.contains_key("stale"), "a token exactly at the TTL boundary must be dropped");
         assert!(!tokens.contains_key("ancient"), "a long-expired token must be dropped");
         assert_eq!(tokens.len(), 2, "only unexpired tokens remain — the map cannot grow unbounded");
+    }
+
+    #[test]
+    fn sanitize_handle_always_yields_a_safe_segment() {
+        // Every nasty input must sanitize to something `safe_segment` accepts (or empty, which every
+        // caller rejects with "handle/name is required"). This is the invariant that keeps a stored
+        // handle from ever failing `safe_segment` at repo-create time (the org-page bug).
+        let nasty = [
+            "n;kkjkjk", "new org", ".hidden", "a..b", "foo/bar", "café", "  ", "--", "🚀🚀",
+            "UPPER_case-1", "...", "__leading", "trailing__", "a b c", "path\\to\\thing",
+            "semi;colon;chain", "tab\there", "\u{200b}zero-width", "..", ".",
+        ];
+        for input in nasty {
+            let out = sanitize_handle(input);
+            assert!(
+                out.is_empty() || repos::safe_segment(&out),
+                "sanitize_handle({input:?}) = {out:?} is neither empty nor a safe_segment",
+            );
+        }
+        // Spot-check the two handles that broke the user's orgs resolve to the expected safe forms.
+        assert_eq!(sanitize_handle("new org"), "new_org");
+        assert_eq!(sanitize_handle("n;kkjkjk"), "n_kkjkjk");
+        // A leading dot is stripped (no dotfiles); `..` collapses (no traversal).
+        assert_eq!(sanitize_handle(".hidden"), "hidden");
+        assert_eq!(sanitize_handle("a..b"), "a_b");
+        // An already-valid handle is unchanged (idempotent on good input).
+        assert_eq!(sanitize_handle("UPPER_case-1"), "UPPER_case-1");
+        assert_eq!(sanitize_handle("tankrap"), "tankrap");
+    }
+
+    #[tokio::test]
+    async fn normalize_account_handles_repairs_invalid_and_disambiguates() {
+        use hull_core::{Account, AccountKind};
+        let store = InMemory::new();
+        // Two broken orgs (the user's real ones) plus a valid one and a would-be collision target.
+        for (id, handle) in [
+            ("acct_a", "new org"),
+            ("acct_b", "n;kkjkjk"),
+            ("acct_c", "new_org"), // already occupies the sanitized form of "new org" -> forces a suffix
+            ("acct_d", "tankrap"), // already valid — must be left untouched
+        ] {
+            store.put_account(Account { id: id.into(), kind: AccountKind::Organization, handle: handle.into(), members: vec![] }).await;
+        }
+        // A personal account with an equally invalid handle: it must be LEFT UNTOUCHED, because its
+        // handle is one leg of the User.username/Actor.handle invariant and rewriting it here alone
+        // would desync those. Personal handles are repaired via the username path, not this migration.
+        store.put_account(Account { id: "acct_p".into(), kind: AccountKind::Personal, handle: "bad;personal".into(), members: vec![] }).await;
+        normalize_account_handles(&store).await;
+        let handles = store.accounts().await;
+        let by_id = |id: &str| handles.iter().find(|a| a.id == id).unwrap().handle.clone();
+        // "new org" wanted "new_org" but that's taken by acct_c, so it disambiguates.
+        assert_eq!(by_id("acct_a"), "new_org-2");
+        assert_eq!(by_id("acct_b"), "n_kkjkjk");
+        assert_eq!(by_id("acct_c"), "new_org"); // valid handle, unchanged
+        assert_eq!(by_id("acct_d"), "tankrap"); // valid handle, unchanged
+        assert_eq!(by_id("acct_p"), "bad;personal"); // personal — untouched despite being invalid
+        // Every ORG handle now passes safe_segment — repos can be created under all of them.
+        for a in store.accounts().await.into_iter().filter(|a| a.kind == AccountKind::Organization) {
+            assert!(repos::safe_segment(&a.handle), "{:?} still not a safe segment", a.handle);
+        }
+        // Idempotent: a second pass changes nothing.
+        let before: Vec<_> = store.accounts().await.into_iter().map(|a| (a.id, a.handle)).collect();
+        normalize_account_handles(&store).await;
+        let after: Vec<_> = store.accounts().await.into_iter().map(|a| (a.id, a.handle)).collect();
+        assert_eq!(before, after, "second normalization pass must be a no-op");
     }
 
     // ── merge gate (`perform_merge`) ──────────────────────────────────────────────────────────────
