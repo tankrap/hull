@@ -2670,21 +2670,28 @@ async fn account_update(State(app): State<App>, headers: axum::http::HeaderMap, 
     let Some(mut user) = app.store.user_by_actor(&a.id).await else {
         return (StatusCode::NOT_FOUND, "not a hosted account").into_response();
     };
-    if let Some(un) = body.get("username").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(other) = app.store.user_by_username(un).await {
+    if let Some(raw) = body.get("username").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        // The username doubles as the actor + personal-account HANDLE (a path segment / tenant), so it
+        // must be sanitized like every other create/rename path — a raw value here would otherwise
+        // corrupt the handle and could lock the user out of passkey login.
+        let un = sanitize_handle(raw);
+        if un.is_empty() {
+            return (StatusCode::BAD_REQUEST, "username must contain at least one letter or digit").into_response();
+        }
+        if let Some(other) = app.store.user_by_username(&un).await {
             if other.id != user.id {
                 return (StatusCode::CONFLICT, "that username is taken").into_response();
             }
         }
-        user.username = un.to_string();
+        user.username = un.clone();
         // keep the display handle on the actor + personal account aligned with the username
         if let Some(mut actor) = app.store.actor(&user.actor).await {
-            actor.handle = un.to_string();
+            actor.handle = un.clone();
             app.store.put_actor(actor).await;
         }
         let acct_id = format!("acct_{}", user.id);
         if let Some(mut acct) = app.store.accounts().await.into_iter().find(|x| x.id == acct_id) {
-            acct.handle = un.to_string();
+            acct.handle = un.clone();
             app.store.put_account(acct).await;
         }
     }
@@ -3942,12 +3949,14 @@ async fn set_repo_autonomy(
     let Some(tier) = body.get("tier").and_then(Value::as_str).and_then(tier_from_str) else {
         return (StatusCode::BAD_REQUEST, "tier must be t0 | t1 | t2 | t3").into_response();
     };
-    let protected_paths = body
+    // Patch-merge (atomic under the store lock): overwrite protected_paths only when the key is
+    // PRESENT. A tier-only change (the UI sends just {tier}) PRESERVES the existing protected paths,
+    // not silently wiping the human-gated set — dropping them would quietly widen agent auto-merge.
+    let paths = body
         .get("protected_paths")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
-        .unwrap_or_default();
-    app.autonomy.set_repo(&tenant, &repo, hull_core::AutonomyPolicy { tier, protected_paths });
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect());
+    app.autonomy.set_repo_tier(&tenant, &repo, tier, paths);
     Json(json!({ "tier": tier })).into_response()
 }
 
@@ -3976,12 +3985,12 @@ async fn set_account_autonomy(
     let Some(tier) = body.get("tier").and_then(Value::as_str).and_then(tier_from_str) else {
         return (StatusCode::BAD_REQUEST, "tier must be t0 | t1 | t2 | t3").into_response();
     };
-    let protected_paths = body
+    // Patch-merge (see set_repo_autonomy): preserve existing protected_paths on a tier-only change.
+    let paths = body
         .get("protected_paths")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
-        .unwrap_or_default();
-    app.autonomy.set_account(&id, hull_core::AutonomyPolicy { tier, protected_paths });
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect());
+    app.autonomy.set_account_tier(&id, tier, paths);
     Json(json!({ "tier": tier })).into_response()
 }
 
@@ -6686,6 +6695,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn account_update_sanitizes_the_username_into_a_safe_handle() {
+        // Regression (H1): PUT /api/account only trimmed the username, then copied it verbatim onto
+        // the actor + personal-account HANDLE (a path segment / tenant) — a raw value could corrupt the
+        // handle and lock the user out of passkey login. It must sanitize like every other handle path.
+        let (app, tmp) = build_test_app("account-sanitize");
+        app.store.put_actor(actor("u1actor", ActorKind::Human)).await;
+        app.store
+            .put_user(User {
+                id: "u1".into(),
+                username: "old".into(),
+                email: "u@x.co".into(),
+                actor: "u1actor".into(),
+                secret_key: "00".into(),
+                passkeys: vec![],
+                created_unix: 0,
+                bio: String::new(),
+            })
+            .await;
+        mint_token(&app, "tok", "u1actor");
+
+        let call = |app: App, un: &str| {
+            let body = serde_json::json!({ "username": un });
+            async move { account_update(axum::extract::State(app), bearer("tok"), axum::Json(body)).await }
+        };
+        // a messy username is sanitized, not stored raw — and the actor handle is kept aligned + safe.
+        assert_eq!(call(app.clone(), "new org!!").await.status(), axum::http::StatusCode::OK);
+        assert_eq!(app.store.user_by_actor("u1actor").await.unwrap().username, "new_org", "username sanitized");
+        assert_eq!(app.store.actor("u1actor").await.unwrap().handle, "new_org", "actor handle sanitized + aligned");
+        // an all-symbol username sanitizes to empty → rejected, never stored as a broken handle.
+        assert_eq!(call(app.clone(), "!!!").await.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(app.store.user_by_actor("u1actor").await.unwrap().username, "new_org", "rejected update left it unchanged");
+        // email updates independently of the username block.
+        let resp = account_update(
+            axum::extract::State(app.clone()),
+            bearer("tok"),
+            axum::Json(serde_json::json!({ "email": "fresh@x.co" })),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let u = app.store.user_by_actor("u1actor").await.unwrap();
+        assert_eq!((u.email.as_str(), u.username.as_str()), ("fresh@x.co", "new_org"), "email updated, username untouched");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn set_repo_autonomy_preserves_protected_paths_on_a_tier_only_change() {
+        // Regression (H2): a tier-only PUT …/autonomy (the UI sends just {tier}) rebuilt the policy with
+        // an empty protected_paths, silently WIPING the human-gated set and widening what agents may
+        // auto-merge. It must patch-merge: preserve protected_paths unless the key is present.
+        let (app, tmp) = build_test_app("autonomy-merge");
+        setup_org_repo(&app, "acme", "web", false, &[("admin", Role::Admin)]).await;
+        app.store.put_actor(actor("admin", ActorKind::Human)).await;
+        mint_token(&app, "tok", "admin");
+        app.autonomy.set_repo(
+            "acme",
+            "web",
+            hull_core::AutonomyPolicy { tier: hull_core::AutonomyTier::T2, protected_paths: vec!["src/secret.rs".into()] },
+        );
+
+        let call = |app: App, body: Value| async move {
+            set_repo_autonomy(
+                axum::extract::State(app),
+                axum::extract::Path(("acme".to_string(), "web".to_string())),
+                bearer("tok"),
+                axum::Json(body),
+            )
+            .await
+        };
+        // tier-only change → protected paths PRESERVED
+        assert_eq!(call(app.clone(), serde_json::json!({ "tier": "t3" })).await.status(), axum::http::StatusCode::OK);
+        let pol = app.autonomy.get_repo("acme", "web").unwrap();
+        assert_eq!(pol.tier, hull_core::AutonomyTier::T3, "tier updated");
+        assert_eq!(pol.protected_paths, vec!["src/secret.rs".to_string()], "protected paths preserved on a tier-only change");
+        // explicitly sending protected_paths DOES replace them
+        assert_eq!(
+            call(app.clone(), serde_json::json!({ "tier": "t3", "protected_paths": ["a", "b"] })).await.status(),
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(app.autonomy.get_repo("acme", "web").unwrap().protected_paths, vec!["a".to_string(), "b".to_string()]);
+
+        // same patch-merge behavior for the account-level setter (identical code path).
+        app.autonomy.set_account(
+            "acct-acme",
+            hull_core::AutonomyPolicy { tier: hull_core::AutonomyTier::T1, protected_paths: vec!["acct/keep.rs".into()] },
+        );
+        let resp = set_account_autonomy(
+            axum::extract::State(app.clone()),
+            axum::extract::Path("acct-acme".to_string()),
+            bearer("tok"),
+            axum::Json(serde_json::json!({ "tier": "t2" })),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let apol = app.autonomy.get_account("acct-acme").unwrap();
+        assert_eq!(apol.tier, hull_core::AutonomyTier::T2);
+        assert_eq!(apol.protected_paths, vec!["acct/keep.rs".to_string()], "account protected paths preserved on tier-only change");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
     async fn notifications_require_auth_and_scope_to_the_authenticated_actor() {
         // Regression (B2): `/api/notifications` was unauthenticated and trusted a `?actor=` query
         // param — any anon caller could read any inbox, or (no param) the whole-server firehose. It
@@ -6727,7 +6836,6 @@ mod tests {
         assert!(!seen.contains(&"for-bob"), "must NOT leak another actor's inbox; got {seen:?}");
         assert!(!seen.contains(&"private-broadcast"), "must NOT leak a private repo's broadcast; got {seen:?}");
         assert!(!seen.contains(&"malformed-broadcast"), "a broadcast with an unparseable repo is default-denied; got {seen:?}");
-
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

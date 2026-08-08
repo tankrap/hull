@@ -1438,6 +1438,17 @@ export function App() {
   }, []);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
   const kindOf = (id: string) => actors.find((a) => a.id === id)?.kind;
+  // Does a PR have an independent approval that would actually let it LAND — mirroring the server gate
+  // (perform_merge): a non-author HUMAN approval always counts; a non-author AGENT approval counts only
+  // when the repo's autonomy tier lets an agent stand in for a human (T2/T3). Counting any agent
+  // approve here (the old bug) lit the Merge button for an approval the server then 409s at T0/T1.
+  const independentlyApproved = (revs: Review[], author: string): boolean => {
+    const approvals = revs.filter((r) => r.verdict === "approve" && r.reviewer !== author);
+    const human = approvals.some((r) => kindOf(r.reviewer) === "human");
+    const agent = approvals.some((r) => kindOf(r.reviewer) === "agent");
+    const tierAllowsAgent = autonomy?.tier === "t2" || autonomy?.tier === "t3";
+    return human || (agent && tierAllowsAgent);
+  };
   // Human-readable label for an actor token that may be a known id, a bare pubkey, or a raw git-author
   // string ("Rando <rando@x>"). Resolves handles, strips emails, shortens naked pubkeys.
   const actorLabel = (a: string) => {
@@ -2648,7 +2659,7 @@ export function App() {
         const primary = (prReviews[0] ?? { id: "live", target: `pr:${p.number}`, reviewer: "", verdict: "comment", summary: "", findings: [] }) as Review;
         const checksOk = p.verification === "green";
         const changesRequested = prReviews.some((r) => r.verdict === "request_changes" || r.verdict === "reject");
-        const hasApproval = prReviews.some((r) => r.verdict === "approve" && r.reviewer !== p.author);
+        const hasApproval = independentlyApproved(prReviews, p.author);
         const blockers = prReviews.reduce((n, r) => n + (r.findings ?? []).filter((f) => f.severity === "blocker").length, 0);
         // The merge gate must agree with the checklist below: an unresolved blocker blocks landing.
         const canLand = checksOk && hasApproval && !changesRequested && blockers === 0;
@@ -2664,7 +2675,9 @@ export function App() {
         ) : (
           <div className="flex items-center gap-2.5 flex-wrap justify-end">
             <Button disabled={!canLand} onClick={() => mergePr(p.number)} className={canLand ? "!bg-clear !border-clear !text-white font-semibold hover:!bg-[oklch(0.5_0.11_150)]" : ""}><span className="inline-flex items-center gap-1.5">{mergeGlyph}Merge</span></Button>
-            {!canLand && isTenantOwner && <Button size="sm" variant="secondary" onClick={() => mergePr(p.number, true)}>Merge without checks</Button>}
+            {/* The tenant owner's override is ALWAYS available — never hidden by the gate — so a wedged
+                or misconfigured check (or an agent-only approval the tier won't accept) can't trap them. */}
+            {isTenantOwner && <Button size="sm" variant="secondary" onClick={() => mergePr(p.number, true)}>Merge without checks</Button>}
           </div>
         );
         // Secondary review actions (the primary comment/approve/request-changes flow lives in the
@@ -2684,6 +2697,7 @@ export function App() {
             review={primary}
             reviews={prReviews}
             landGate={gate}
+            independentApproval={hasApproval}
             reviewTools={reviewTools}
             onReviewsChanged={loadReviews}
             canFix={caps.ai_fix}
@@ -3040,7 +3054,7 @@ export function App() {
                                 <span className="text-[15px] font-semibold group-hover:text-steel-text transition-colors">{p.title}</span>
                                 {p.state === "open" && (() => {
                                   const vChanges = prReviews.some((r) => r.verdict === "request_changes" || r.verdict === "reject");
-                                  const vApprove = prReviews.some((r) => r.verdict === "approve" && r.reviewer !== p.author);
+                                  const vApprove = independentlyApproved(prReviews, p.author);
                                   const vBlockers = prReviews.some((r) => (r.findings ?? []).some((f) => f.severity === "blocker"));
                                   const cks = [p.verification === "green", !vBlockers, vApprove && !vChanges];
                                   const pass = cks.filter(Boolean).length;
@@ -3279,6 +3293,7 @@ function ReviewPage({
   review,
   reviews = [],
   landGate,
+  independentApproval,
   reviewTools,
   onReviewsChanged,
   canFix = true,
@@ -3297,6 +3312,7 @@ function ReviewPage({
   review: Review;
   reviews?: Review[];
   landGate?: React.ReactNode;
+  independentApproval?: boolean;
   reviewTools?: React.ReactNode;
   onReviewsChanged?: () => void;
   canFix?: boolean;
@@ -3519,7 +3535,9 @@ function ReviewPage({
 
   // ── landing checks: the gate, surfaced as a checklist reachable from the top badge ──
   const supportedN = briefClaims.filter((c) => ["verified_mechanically", "verified_read_only", "self_attested"].includes(c.status)).length;
-  const hasApproval = reviews.some((r) => r.verdict === "approve" && (!pr || r.reviewer !== pr.author));
+  // Prefer the parent's gate-accurate value (human/agent + tier); fall back to the plain heuristic
+  // only if a caller didn't pass it, so this checklist row can't say "approved" when the gate won't land.
+  const hasApproval = independentApproval ?? reviews.some((r) => r.verdict === "approve" && (!pr || r.reviewer !== pr.author));
   const changesRequested = reviews.some((r) => r.verdict === "request_changes" || r.verdict === "reject");
   type Check = { label: string; tone: "ok" | "bad" | "warn" | "wait"; detail: string };
   const checks: Check[] = [
