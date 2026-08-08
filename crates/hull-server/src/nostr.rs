@@ -267,6 +267,11 @@ pub const KIND_PROV: u16 = 1900;
 /// bridge). Regular/append-only; the newest manifest per change wins on read.
 pub const KIND_BLOB_MANIFEST: u16 = 1901;
 
+/// Change bundle event kind: carries a change's STRUCTURAL objects (the Change + its Trees) inline, so
+/// a peer with neither can rebuild the structure before restoring blobs from Blossom. Blobs are never
+/// in here (they go to Blossom by sha256). Regular/append-only.
+pub const KIND_CHANGE_BUNDLE: u16 = 1902;
+
 /// The actor's claim about a landed change. Field order is the canonical signing order — the Ed25519
 /// signature is over `serde_json::to_string(claim)`, and a verifier recomputes the same string.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -527,6 +532,61 @@ impl NostrRefs {
                     let cands = out.entry(id.to_string()).or_default();
                     if !cands.iter().any(|s| s == sha) {
                         cands.push(sha.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Publish a change bundle (kind 1902): the change's structural objects `(id_hex, encoded bytes)`
+    /// carried inline (base64), so a peer can rebuild the Change + Trees before restoring blobs. Signed
+    /// by the instance for transport only — a restorer re-derives each object's id from the bytes, so a
+    /// forged bundle can't inject an object under a referenced id. Best-effort.
+    pub fn publish_change_bundle(&self, change: &str, objects: &[(String, Vec<u8>)]) -> Option<Event> {
+        use base64::Engine;
+        let created_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let objs: Vec<serde_json::Value> = objects
+            .iter()
+            .map(|(id, bytes)| serde_json::json!([id, base64::engine::general_purpose::STANDARD.encode(bytes)]))
+            .collect();
+        let content = serde_json::json!({ "change": change, "objects": objs }).to_string();
+        let tags = vec![vec!["change".to_string(), change.to_string()], vec!["t".to_string(), "keel-bundle".to_string()]];
+        let ev = build_event(&self.secret_hex, created_at, KIND_CHANGE_BUNDLE, tags, &content)?;
+        publish(&self.relays, &ev);
+        Some(ev)
+    }
+
+    /// Fetch a change's structural objects from its bundle(s): a map of object id → CANDIDATE decoded
+    /// byte-strings, own-authored-first then newest. Any author is accepted, so a hostile relay could
+    /// publish a bundle carrying a real object id with garbage bytes; returning ALL candidates (not just
+    /// the first) lets the restorer try each until one re-derives to the id, so a poisoned bundle can't
+    /// shadow the honest object and block reconstruction. The SIGNED `change` field must match.
+    pub fn fetch_change_bundle(&self, change: &str) -> std::collections::HashMap<String, Vec<Vec<u8>>> {
+        use base64::Engine;
+        let filter = serde_json::json!({ "kinds": [KIND_CHANGE_BUNDLE], "#change": [change] });
+        let own = self.own_pubkey();
+        let mut events = fetch_events(&self.relays, filter);
+        events.sort_by(|a, b| {
+            let (a_own, b_own) = (own.as_deref() == Some(a.pubkey.as_str()), own.as_deref() == Some(b.pubkey.as_str()));
+            b_own.cmp(&a_own).then_with(|| b.created_at.cmp(&a.created_at)).then_with(|| b.id.cmp(&a.id))
+        });
+        let mut out: std::collections::HashMap<String, Vec<Vec<u8>>> = std::collections::HashMap::new();
+        for ev in &events {
+            if ev.kind != KIND_CHANGE_BUNDLE {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&ev.content) else { continue };
+            if v.get("change").and_then(|c| c.as_str()) != Some(change) {
+                continue;
+            }
+            let Some(objs) = v.get("objects").and_then(|b| b.as_array()) else { continue };
+            for entry in objs {
+                let (Some(id), Some(b64)) = (entry.get(0).and_then(|x| x.as_str()), entry.get(1).and_then(|x| x.as_str())) else { continue };
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                    let cands = out.entry(id.to_string()).or_default();
+                    if !cands.contains(&bytes) {
+                        cands.push(bytes);
                     }
                 }
             }
@@ -950,6 +1010,25 @@ mod tests {
         assert_eq!(map.get("id_bbb"), Some(&vec!["sha_bbb".to_string()]));
         // a manifest for a different change isn't returned
         assert!(refs.fetch_blob_manifest("blake3:other").is_empty());
+    }
+
+    #[test]
+    fn change_bundle_round_trips_through_a_relay() {
+        let url = spawn_loopback_relay();
+        let refs = NostrRefs::new(SK.into(), vec![url]);
+        assert!(refs.fetch_change_bundle("blake3:c1").is_empty());
+        // structural objects carried inline as (id, raw bytes) — arbitrary bytes here; the round trip
+        // must preserve them exactly (base64 in, decoded out).
+        let objects = vec![
+            ("id_change".to_string(), vec![1u8, 2, 3, 0, 255]),
+            ("id_tree".to_string(), b"tree-bytes".to_vec()),
+        ];
+        refs.publish_change_bundle("blake3:c1", &objects).expect("publish");
+        let got = refs.fetch_change_bundle("blake3:c1");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.get("id_change"), Some(&vec![vec![1u8, 2, 3, 0, 255]]));
+        assert_eq!(got.get("id_tree"), Some(&vec![b"tree-bytes".to_vec()]));
+        assert!(refs.fetch_change_bundle("blake3:other").is_empty());
     }
 
     #[test]
