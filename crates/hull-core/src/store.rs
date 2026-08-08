@@ -777,7 +777,10 @@ impl Store for FileStore {
 
 /// Embedded, ordered schema migrations. Index `i` is version `i + 1`; applied once, tracked in
 /// `_hull_schema_version`. Append new files here (never edit an applied one) to evolve the schema.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_init.sql"),
+    include_str!("migrations/0002_unique_issue_pr_number.sql"),
+];
 
 /// A durable [`Store`] backed by Postgres. Chosen at runtime when `HULL_DATABASE_URL` is set; the
 /// default (unset) path keeps [`FileStore`]. Content/provenance still live in keel — this persists
