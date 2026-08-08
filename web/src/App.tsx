@@ -50,7 +50,11 @@ const FRIENDLY_STATUS: Record<number, string> = {
   502: "Something went wrong on the server.",
   503: "Something went wrong on the server.",
 };
+// Set by the App so any 401 surfaced through `apiError` drops the (now-expired) session to the
+// signed-out state, instead of leaving a half-authed UI whose write buttons keep 401-ing.
+let onUnauthorized: (() => void) | null = null;
 async function apiError(res: Response): Promise<string> {
+  if (res.status === 401) onUnauthorized?.();
   if (FRIENDLY_STATUS[res.status]) return FRIENDLY_STATUS[res.status];
   const text = await res.text().catch(() => "");
   return text.trim() || "Something went wrong.";
@@ -1084,6 +1088,14 @@ export function App() {
     setMe(null);
     sessionSecret.current = "";
   };
+  // Expose signOut to the module-level `apiError` so a mid-session token expiry (a 401 on any call)
+  // drops us to the signed-out state and offers login, rather than stranding a half-authed UI.
+  useEffect(() => {
+    onUnauthorized = signOut;
+    return () => {
+      onUnauthorized = null;
+    };
+  });
   // Mint an agent that cryptographically chains to you. The delegation hop is signed **client-side**
   // with your key (kept in memory for the session, never persisted), so Hull never sees the agent's
   // secret — it only stores a signed delegation it can verify. Matches the server's canonical
@@ -1386,6 +1398,14 @@ export function App() {
     const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/settings`, { method: "PUT", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(patch) });
     if (!res.ok) return uiAlert(await apiError(res));
     setRepoSettings(await res.json());
+    // A labels edit changes repoLabels (issue label colors + the assign-label picker), which is
+    // otherwise only refetched on repo change — refresh it now so the UI isn't stale until navigation.
+    if (tenant && issueRepo) {
+      fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/labels`, { headers: authHeaders() })
+        .then((r) => (r.ok ? r.json() : { labels: [] }))
+        .then((d) => setRepoLabels(d.labels ?? []))
+        .catch(() => {});
+    }
   };
   // Persist the full code-owner rule set (the endpoint replaces, not merges).
   const saveOwners = async (rules: OwnerRule[]) => {
@@ -2655,6 +2675,7 @@ export function App() {
         ) : null;
         return (
           <ReviewPage
+            key={p.number}
             review={primary}
             reviews={prReviews}
             landGate={gate}
