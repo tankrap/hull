@@ -447,6 +447,19 @@ impl NostrRefs {
         Some(ev)
     }
 
+    /// Publish an ALREADY-signed provenance bundle (kind 1900): the actor's Ed25519 signature was
+    /// produced elsewhere — a SOVEREIGN author signs in the browser/CLI, since the instance never holds
+    /// their key — and this only wraps it in the instance's schnorr transport event. `None` if the
+    /// bundle's own Ed25519 signature doesn't verify (we never transport an unverifiable claim) or the
+    /// instance key is bad. Best-effort delivery.
+    pub fn publish_signed_provenance(&self, sp: &SignedProvenance) -> Option<Event> {
+        verify_provenance(sp)?; // refuse to relay a bundle whose actor signature doesn't check out
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let ev = prov_event(&self.secret_hex, sp, ts)?;
+        publish(&self.relays, &ev);
+        Some(ev)
+    }
+
     /// Read back FULLY-VERIFIED provenance attestations for `repo` from the relays: each returned
     /// bundle passed both the schnorr (transport) and Ed25519 (actor) checks via [`verify_prov_event`],
     /// and its SIGNED `claim.repo` matches `repo` (we trust the signed field, never the mutable event
@@ -848,5 +861,34 @@ mod tests {
             .expect("publish");
         let still = refs.fetch_provenance("tankrap/hull");
         assert!(still.iter().all(|sp| sp.claim.change != "blake3:evil"), "an attestation for another repo isn't returned");
+    }
+
+    #[test]
+    fn publish_signed_provenance_relays_a_client_signed_bundle() {
+        // The sovereign path: the actor signs the claim itself (as a browser/CLI would), and the
+        // instance only transports it — it never holds the actor secret. The read-back must show the
+        // actor's own signature, not the instance's.
+        let url = spawn_loopback_relay();
+        let refs = NostrRefs::new(SK.into(), vec![url]);
+        let actor = hull_core::identity::mint_human("sovereign");
+        let claim = ProvenanceClaim {
+            v: 1,
+            change: "blake3:c9".into(),
+            actor: actor.actor.id.clone(),
+            repo: "tankrap/hull".into(),
+            intent: "authored in the browser".into(),
+            ts: 1_700_000_000,
+        };
+        let sp = sign_provenance(&actor.secret_key, claim).expect("client signs its own claim");
+        refs.publish_signed_provenance(&sp).expect("instance transports the pre-signed bundle");
+        let got = refs.fetch_provenance("tankrap/hull");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].claim.actor, actor.actor.id, "the actor's own key signed it");
+        assert_eq!(got[0].ed_sig, sp.ed_sig, "the relayed signature is the client's, unchanged");
+
+        // A bundle whose actor signature is broken is never relayed.
+        let mut tampered = sp.clone();
+        tampered.claim.change = "blake3:swapped".into(); // ed_sig no longer covers the claim
+        assert!(refs.publish_signed_provenance(&tampered).is_none(), "refuse to transport an unverifiable bundle");
     }
 }
