@@ -174,7 +174,14 @@ impl RepoHost {
             return Ok(None);
         }
         let key = format!("{tenant}/{repo}");
-        if let Some(s) = self.open.lock().unwrap().get(&key) {
+        // Hold the cache lock across the whole check-open-insert. Releasing it between the miss and the
+        // `Store::open` would let two concurrent first-touches of the same repo each open the LMDB
+        // environment — opening one env twice in a process is undefined behavior and can corrupt it.
+        // A second caller that arrives mid-open waits here, then hits the cache. Opens are one-time
+        // per repo, so the added serialization is a rare, brief stall; nothing under this section
+        // re-enters `store()`/locks `open`, so there is no deadlock.
+        let mut open = self.open.lock().unwrap();
+        if let Some(s) = open.get(&key) {
             return Ok(Some(s.clone()));
         }
         let path = self.root.join(tenant).join(repo).join(".keel/store");
@@ -183,7 +190,7 @@ impl RepoHost {
         }
         std::fs::create_dir_all(&path)?;
         let store = Store::open(&path).map_err(|e| io::Error::other(e.to_string()))?;
-        self.open.lock().unwrap().insert(key, store.clone());
+        open.insert(key, store.clone());
         Ok(Some(store))
     }
 
@@ -2312,6 +2319,26 @@ mod tests {
         std::fs::create_dir_all(tmp.join("acme/not-a-repo")).unwrap(); // no .keel/store → skipped
         let host = RepoHost::new(&tmp);
         assert_eq!(host.list(), vec!["acme/api".to_string(), "acme/web".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn concurrent_first_open_caches_a_single_env() {
+        // Two concurrent first-touches of the same repo must not each open the LMDB environment
+        // (opening one env twice in a process is UB). Hammer store() from many threads for a
+        // brand-new repo: every call succeeds and exactly one env ends up cached under the key.
+        let tmp = std::env::temp_dir().join(format!("hull-repos-conc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let host = Arc::new(RepoHost::new(&tmp));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let h = host.clone();
+            handles.push(std::thread::spawn(move || h.store("acme", "web", true).map(|o| o.is_some()).unwrap_or(false)));
+        }
+        for hnd in handles {
+            assert!(hnd.join().unwrap(), "every concurrent first-open succeeds");
+        }
+        assert_eq!(host.open.lock().unwrap().len(), 1, "exactly one cached env for the repo");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
