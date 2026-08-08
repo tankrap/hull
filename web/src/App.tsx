@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 // Code-split the heavy Shiki-powered @pierre viewers into their own chunk (kept out of the initial bundle).
 const PierrePatch = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.PatchDiff })));
 import * as ed from "@noble/ed25519";
-import { generateIdentity, wrapSecret, unwrapSecret, signMessage, signProvenance } from "./sovereign";
+import { generateIdentity, wrapSecretAsync, unwrapSecretAsync, signMessage, signProvenance, passphraseStrength } from "./sovereign";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
 import { SearchInput, Switch, TextField } from "./ui/Field";
@@ -1228,7 +1228,7 @@ export function App() {
     setAuthBusy(true);
     try {
       const id = await generateIdentity();
-      const wrapped = wrapSecret(id.secret, authPass); // Argon2id + XChaCha20, in-browser
+      const wrapped = await wrapSecretAsync(id.secret, authPass); // Argon2id + XChaCha20, off the main thread
       const signature = await signMessage(id.secret, `hull-sovereign:v1\nusername=${u}\npubkey=${id.pub}`);
       const res = await fetch("/api/auth/sovereign/register", {
         method: "POST", headers: { "content-type": "application/json" },
@@ -1257,7 +1257,14 @@ export function App() {
       if (!w.ok) { setAuthError("no sovereign account with that username"); return; }
       const { actor, wrapped_key } = await w.json();
       let secret: string;
-      try { secret = unwrapSecret(wrapped_key, authPass); } catch { setAuthError("wrong passphrase"); return; }
+      try {
+        secret = await unwrapSecretAsync(wrapped_key, authPass);
+      } catch (e: any) {
+        // A decrypt failure is a wrong passphrase; a bad/unsupported bundle is something else — don't
+        // send a user with the correct passphrase into the "there is no reset" panic over an infra issue.
+        setAuthError(String(e?.message || "").includes("unsupported") ? "this account's key bundle is unsupported" : "wrong passphrase");
+        return;
+      }
       const ch = await fetch("/api/auth/challenge");
       const { nonce } = await ch.json();
       const signature = await signMessage(secret, `hull-login:${nonce}`);
@@ -2254,6 +2261,20 @@ export function App() {
                 <div className="grid gap-1.5">
                   <label className="text-[12.5px] font-semibold text-body">passphrase</label>
                   <input type="password" className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint" placeholder="a strong passphrase you'll remember" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signupSovereign()} />
+                  {authPass && (() => {
+                    const s = passphraseStrength(authPass);
+                    const color = ["", "bg-fault", "bg-brass", "bg-steel", "bg-clear"][s.score];
+                    return (
+                      <div className="flex items-center gap-2">
+                        <div className="flex gap-1 flex-1">
+                          {[1, 2, 3, 4].map((n) => (
+                            <span key={n} className={`h-1 flex-1 rounded-full ${n <= s.score ? color : "bg-rule2"}`} />
+                          ))}
+                        </div>
+                        <span className="text-[11.5px] text-muted w-10 text-right">{s.label}</span>
+                      </div>
+                    );
+                  })()}
                 </div>
                 <Button disabled={authBusy || (!!usernameAvail && !usernameAvail.available)} onClick={signupSovereign}>{authBusy ? "generating your key…" : "Create sovereign account"}</Button>
                 <p className="text-[12.5px] text-muted leading-[1.55]">Your Ed25519 key is generated in this browser and encrypted with your passphrase — Hull only ever stores the public key and the encrypted bundle, and can never sign for you. There is no reset: lose the passphrase and the account is unrecoverable.</p>

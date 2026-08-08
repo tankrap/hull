@@ -47,6 +47,96 @@ export function unwrapSecret(bundle: string, passphrase: string): string {
   return bytesToHex(pt);
 }
 
+// ── off-main-thread KDF ─────────────────────────────────────────────────────────────────────────
+// The Argon2id step takes ~1s and would jank the UI if run inline. wrapSecretAsync/unwrapSecretAsync
+// offload it to a worker; if Workers are unavailable OR the worker fails to run for ANY reason, they
+// fall back to the sync path (which still works, it just blocks). Results are byte-identical either
+// way, so a broken worker degrades performance, never correctness — a wrong passphrase still surfaces
+// as a genuine decrypt throw, not a worker error.
+type Op = "wrap" | "unwrap";
+const runSync = (op: Op, a: string, b: string): string => (op === "wrap" ? wrapSecret(a, b) : unwrapSecret(a, b));
+let _worker: Worker | null = null;
+let _workerBroken = false; // once the worker fails to load, stop trying it and go straight to sync
+let _seq = 0;
+type Pending = { op: Op; a: string; b: string; resolve: (v: string) => void; reject: (e: unknown) => void };
+const _pending = new Map<number, Pending>();
+// Re-drive a pending call on the sync KDF (used when the worker dies or times out) so the caller still
+// gets a real result instead of a hang or a spurious failure.
+const settleSync = (p: Pending) => {
+  try { p.resolve(runSync(p.op, p.a, p.b)); } catch (e) { p.reject(e); }
+};
+function kdfWorker(): Worker | null {
+  if (_workerBroken || typeof Worker === "undefined") return null;
+  if (_worker) return _worker;
+  try {
+    const w = new Worker(new URL("./sovereign.worker.ts", import.meta.url), { type: "module" });
+    w.onmessage = (e: MessageEvent) => {
+      const { id, ok, result, error } = e.data as { id: number; ok: boolean; result?: string; error?: string };
+      const p = _pending.get(id);
+      if (!p) return;
+      _pending.delete(id);
+      ok ? p.resolve(result as string) : p.reject(new Error(error));
+    };
+    w.onerror = () => {
+      // The worker failed to RUN (CSP/worker-src, a 404 on the chunk, a load/import error) — this fires
+      // asynchronously, after construction succeeded. Disable it for good and re-drive every in-flight
+      // call on the sync path so callers succeed; future calls then take the sync path directly.
+      _workerBroken = true;
+      _worker = null;
+      const inflight = [..._pending.values()];
+      _pending.clear();
+      inflight.forEach(settleSync);
+    };
+    _worker = w;
+    return w;
+  } catch {
+    _workerBroken = true;
+    return null;
+  }
+}
+function runOnWorker(op: Op, a: string, b: string): Promise<string> {
+  const w = kdfWorker();
+  if (!w) {
+    try { return Promise.resolve(runSync(op, a, b)); } catch (e) { return Promise.reject(e); }
+  }
+  return new Promise<string>((resolve, reject) => {
+    const id = ++_seq;
+    // Watchdog: if the worker loads but never posts back and never errors, don't hang the UI forever —
+    // fall back to sync. Generous (30s) so a slow device's legitimately-running KDF isn't pre-empted.
+    const timer = setTimeout(() => {
+      const p = _pending.get(id);
+      if (!p) return;
+      _pending.delete(id);
+      settleSync(p);
+    }, 30_000);
+    _pending.set(id, {
+      op, a, b,
+      resolve: (v) => { clearTimeout(timer); resolve(v); },
+      reject: (e) => { clearTimeout(timer); reject(e); },
+    });
+    w.postMessage({ id, op, a, b });
+  });
+}
+/** [`wrapSecret`] off the main thread (falls back to sync if Workers are unavailable). */
+export const wrapSecretAsync = (secretHex: string, passphrase: string) => runOnWorker("wrap", secretHex, passphrase);
+/** [`unwrapSecret`] off the main thread. Rejects on a wrong passphrase, same as the sync version throws. */
+export const unwrapSecretAsync = (bundle: string, passphrase: string) => runOnWorker("unwrap", bundle, passphrase);
+
+/** A rough passphrase-strength estimate for the signup meter. Dependency-free: entropy = length ×
+ *  log2(character-pool). NOT a dictionary check — it can't tell that "password1234" is weak — so it's
+ *  a guide, not a gate. The real protection is the memory-hard KDF plus a long passphrase. */
+export function passphraseStrength(pass: string): { score: 0 | 1 | 2 | 3 | 4; label: string } {
+  if (!pass) return { score: 0, label: "" };
+  const pool =
+    (/[a-z]/.test(pass) ? 26 : 0) +
+    (/[A-Z]/.test(pass) ? 26 : 0) +
+    (/[0-9]/.test(pass) ? 10 : 0) +
+    (/[^a-zA-Z0-9]/.test(pass) ? 32 : 0);
+  const bits = pass.length * Math.log2(Math.max(pool, 1));
+  const score = bits < 40 ? 1 : bits < 60 ? 2 : bits < 80 ? 3 : 4;
+  return { score, label: ["", "weak", "fair", "good", "strong"][score] };
+}
+
 /** Sign a utf8 message with a hex secret → hex signature (matches the server's `identity::verify`). */
 export async function signMessage(secretHex: string, message: string): Promise<string> {
   return bytesToHex(await ed.signAsync(utf8(message), hexToBytes(secretHex)));
