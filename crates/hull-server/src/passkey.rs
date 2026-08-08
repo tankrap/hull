@@ -22,21 +22,25 @@ pub fn build() -> Webauthn {
 }
 
 /// In-flight signup registration (new user): the pending identity + the WebAuthn registration state.
+/// `created_unix` drives TTL pruning of abandoned ceremonies (see `CEREMONY_TTL_SECS` in lib.rs).
 pub struct RegFlow {
     pub username: String,
     pub email: String,
     pub uuid: Uuid,
     pub state: PasskeyRegistration,
+    pub created_unix: u64,
 }
 
 /// In-flight "add a passkey to an existing account" registration.
 pub struct AddFlow {
     pub user_id: String,
     pub state: PasskeyRegistration,
+    pub created_unix: u64,
 }
 
 /// In-flight authentication: which user is proving possession + the challenge state.
 pub struct AuthFlow {
     pub user_id: String,
     pub state: PasskeyAuthentication,
+    pub created_unix: u64,
 }

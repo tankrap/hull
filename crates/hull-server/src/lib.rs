@@ -172,6 +172,10 @@ impl Notifier for RecordingNotifier {
 /// dropped — bounding both the blast radius of a leaked token and the unbounded growth of the token
 /// map (nothing else ever evicts a token besides expiry and explicit logout).
 const SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60; // 30 days
+/// TTL for an in-flight passkey ceremony (register / add-passkey / authenticate). Abandoned flows are
+/// pruned on the next insert into the same map, so an unauthenticated `.../start` loop cannot grow the
+/// flow maps without bound. 5 minutes, matching the login-challenge TTL.
+const CEREMONY_TTL_SECS: u64 = 300;
 
 /// Login challenges (nonce → issue time) and issued session tokens (token → (actor id, issued time)).
 /// In-memory (crash-only); a hosted deployment would back this with the domain store / a cache.
@@ -2493,7 +2497,11 @@ async fn register_start(State(app): State<App>, Json(body): Json<Value>) -> Resp
     match app.webauthn.start_passkey_registration(uuid, &username, &username, None) {
         Ok((ccr, state)) => {
             let flow = identity::random_hex(16);
-            app.auth.lock().unwrap().reg_flows.insert(flow.clone(), passkey::RegFlow { username, email, uuid, state });
+            {
+                let mut a = app.auth.lock().unwrap();
+                a.reg_flows.retain(|_, f| now().saturating_sub(f.created_unix) < CEREMONY_TTL_SECS);
+                a.reg_flows.insert(flow.clone(), passkey::RegFlow { username, email, uuid, state, created_unix: now() });
+            }
             Json(json!({ "flow_id": flow, "options": ccr })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("could not start registration: {e}")).into_response(),
@@ -2525,6 +2533,12 @@ async fn register_finish(State(app): State<App>, Json(body): Json<Value>) -> Res
         Ok(v) => v,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("could not persist passkey: {e}")).into_response(),
     };
+    // Re-check username uniqueness at FINISH: `register_start`'s check is TOCTOU (a flow started while
+    // the name was free could otherwise create a second user + personal account with a duplicate
+    // handle, or panic on Postgres's `users_lower_username` UNIQUE index). Reject gracefully instead.
+    if app.store.user_by_username(&flow.username).await.is_some() {
+        return (StatusCode::CONFLICT, "that username was taken while you were registering").into_response();
+    }
     let user = User {
         id: flow.uuid.to_string(),
         username: flow.username.clone(),
@@ -2561,7 +2575,11 @@ async fn passkey_start(State(app): State<App>, Json(body): Json<Value>) -> Respo
     match app.webauthn.start_passkey_authentication(&passkeys) {
         Ok((rcr, state)) => {
             let flow = identity::random_hex(16);
-            app.auth.lock().unwrap().auth_flows.insert(flow.clone(), passkey::AuthFlow { user_id: user.id.clone(), state });
+            {
+                let mut a = app.auth.lock().unwrap();
+                a.auth_flows.retain(|_, f| now().saturating_sub(f.created_unix) < CEREMONY_TTL_SECS);
+                a.auth_flows.insert(flow.clone(), passkey::AuthFlow { user_id: user.id.clone(), state, created_unix: now() });
+            }
             Json(json!({ "flow_id": flow, "options": rcr })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("could not start authentication: {e}")).into_response(),
@@ -2654,7 +2672,11 @@ async fn account_passkey_start(State(app): State<App>, headers: axum::http::Head
     match app.webauthn.start_passkey_registration(uuid, &user.username, &user.username, Some(exclude)) {
         Ok((ccr, state)) => {
             let flow = identity::random_hex(16);
-            app.auth.lock().unwrap().add_flows.insert(flow.clone(), passkey::AddFlow { user_id: user.id.clone(), state });
+            {
+                let mut a = app.auth.lock().unwrap();
+                a.add_flows.retain(|_, f| now().saturating_sub(f.created_unix) < CEREMONY_TTL_SECS);
+                a.add_flows.insert(flow.clone(), passkey::AddFlow { user_id: user.id.clone(), state, created_unix: now() });
+            }
             Json(json!({ "flow_id": flow, "options": ccr })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("could not start: {e}")).into_response(),
@@ -2682,11 +2704,18 @@ async fn account_passkey_finish(State(app): State<App>, headers: axum::http::Hea
         Ok(p) => p,
         Err(e) => return (StatusCode::UNAUTHORIZED, format!("failed: {e}")).into_response(),
     };
+    // Serialize up front and fail on error — mirror `register_finish`. Storing `Null` here (the old
+    // `unwrap_or`) returned 200 with a passkey that `passkey_start` silently drops, so the user thinks
+    // they added a working credential but can never authenticate with it.
+    let pk_data = match serde_json::to_value(&pk) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("could not persist passkey: {e}")).into_response(),
+    };
     user.passkeys.push(PasskeyCred {
         id: b64u(pk.cred_id().as_ref()),
         name: if name.is_empty() { "passkey".into() } else { name },
         created_unix: now(),
-        data: serde_json::to_value(&pk).unwrap_or(Value::Null),
+        data: pk_data,
     });
     app.store.put_user(user.clone()).await;
     let passkeys: Vec<Value> = user.passkeys.iter().map(|p| json!({ "id": p.id, "name": p.name, "created_unix": p.created_unix })).collect();
@@ -6516,6 +6545,30 @@ mod tests {
         let mut h = axum::http::HeaderMap::new();
         h.insert(axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
         h
+    }
+
+    #[tokio::test]
+    async fn abandoned_passkey_flows_are_pruned_on_next_start() {
+        // Regression: the register/add/auth ceremony maps had no TTL prune, so an unauthenticated
+        // `.../start` loop grew memory without bound. Start a real ceremony, backdate it past the TTL,
+        // then start another — the abandoned flow must be pruned, leaving only the fresh one.
+        let (app, tmp) = build_test_app("passkey-ttl");
+        let start = |app: App, name: &str| {
+            let body = serde_json::json!({ "username": name, "email": format!("{name}@example.com") });
+            async move { register_start(axum::extract::State(app), axum::Json(body)).await.status() }
+        };
+        assert_eq!(start(app.clone(), "alice").await, axum::http::StatusCode::OK);
+        // Backdate the in-flight flow to simulate an abandoned ceremony.
+        {
+            let mut a = app.auth.lock().unwrap();
+            assert_eq!(a.reg_flows.len(), 1, "one ceremony in flight");
+            for f in a.reg_flows.values_mut() {
+                f.created_unix = now().saturating_sub(CEREMONY_TTL_SECS + 1);
+            }
+        }
+        assert_eq!(start(app.clone(), "bob").await, axum::http::StatusCode::OK);
+        assert_eq!(app.auth.lock().unwrap().reg_flows.len(), 1, "the abandoned flow was pruned; only the fresh one remains");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
