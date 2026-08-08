@@ -341,7 +341,9 @@ impl Store for InMemory {
         self.users.read().unwrap().get(id).cloned()
     }
     async fn user_by_username(&self, username: &str) -> Option<User> {
-        self.users.read().unwrap().values().find(|u| u.username.eq_ignore_ascii_case(username)).cloned()
+        // Unicode-lowercase match to mirror Postgres `lower(username) = lower($1)` — `eq_ignore_ascii_case`
+        // would diverge on non-ASCII case variants (and disagree with the register uniqueness pre-check).
+        self.users.read().unwrap().values().find(|u| u.username.to_lowercase() == username.to_lowercase()).cloned()
     }
     async fn user_by_actor(&self, actor: &str) -> Option<User> {
         self.users.read().unwrap().values().find(|u| u.actor == actor).cloned()
@@ -722,7 +724,8 @@ impl Store for FileStore {
         self.inner.read().unwrap().users.get(id).cloned()
     }
     async fn user_by_username(&self, username: &str) -> Option<User> {
-        self.inner.read().unwrap().users.values().find(|u| u.username.eq_ignore_ascii_case(username)).cloned()
+        // Unicode-lowercase match to mirror Postgres `lower()` (see the in-memory impl above).
+        self.inner.read().unwrap().users.values().find(|u| u.username.to_lowercase() == username.to_lowercase()).cloned()
     }
     async fn user_by_actor(&self, actor: &str) -> Option<User> {
         self.inner.read().unwrap().users.values().find(|u| u.actor == actor).cloned()
@@ -966,7 +969,7 @@ impl Store for PostgresStore {
             .await.expect("put_issue");
     }
     async fn issues(&self, repo: &str) -> Vec<Issue> {
-        self.conn().await.query("SELECT data FROM issues WHERE repo = $1", &[&repo]).await.expect("issues").into_iter().map(|r| from_json(r.get(0))).collect()
+        self.conn().await.query("SELECT data FROM issues WHERE repo = $1 ORDER BY number", &[&repo]).await.expect("issues").into_iter().map(|r| from_json(r.get(0))).collect()
     }
     async fn replace_issue(&self, issue: Issue) -> bool {
         // UPDATE … WHERE (repo, number) RETURNING — no read-your-write-in-memory assumption. The
@@ -1004,7 +1007,7 @@ impl Store for PostgresStore {
             .await.expect("put_pr");
     }
     async fn prs(&self, repo: &str) -> Vec<PullRequest> {
-        self.conn().await.query("SELECT data FROM prs WHERE repo = $1", &[&repo]).await.expect("prs").into_iter().map(|r| from_json(r.get(0))).collect()
+        self.conn().await.query("SELECT data FROM prs WHERE repo = $1 ORDER BY number", &[&repo]).await.expect("prs").into_iter().map(|r| from_json(r.get(0))).collect()
     }
     async fn replace_pr(&self, pr: PullRequest) -> bool {
         self.conn().await
@@ -1026,7 +1029,7 @@ impl Store for PostgresStore {
             .await.expect("put_comment");
     }
     async fn comments(&self, repo: &str) -> Vec<Comment> {
-        self.conn().await.query("SELECT data FROM comments WHERE repo = $1", &[&repo]).await.expect("comments").into_iter().map(|r| from_json(r.get(0))).collect()
+        self.conn().await.query("SELECT data FROM comments WHERE repo = $1 ORDER BY (data->>'created_unix')::bigint", &[&repo]).await.expect("comments").into_iter().map(|r| from_json(r.get(0))).collect()
     }
     async fn remove_comment(&self, repo: &str, id: &str) -> bool {
         self.conn().await.execute("DELETE FROM comments WHERE repo = $1 AND id = $2", &[&repo, &id]).await.expect("remove_comment") > 0
@@ -1068,7 +1071,7 @@ impl Store for PostgresStore {
             .await.expect("put_ai_connection");
     }
     async fn ai_connections(&self, owner: &str) -> Vec<AiConnection> {
-        self.conn().await.query("SELECT data FROM ai_connections WHERE owner = $1", &[&owner]).await.expect("ai_connections").into_iter().map(|r| from_json(r.get(0))).collect()
+        self.conn().await.query("SELECT data FROM ai_connections WHERE owner = $1 ORDER BY (data->>'created_unix')::bigint", &[&owner]).await.expect("ai_connections").into_iter().map(|r| from_json(r.get(0))).collect()
     }
     async fn remove_ai_connection(&self, owner: &str, id: &str) -> bool {
         self.conn().await.execute("DELETE FROM ai_connections WHERE owner = $1 AND id = $2", &[&owner, &id]).await.expect("remove_ai_connection") > 0
