@@ -260,8 +260,12 @@ pub struct ProvenanceClaim {
 }
 
 impl ProvenanceClaim {
+    /// The exact bytes the actor signs. Domain-separated with a `hull-provenance:v1` prefix (matching
+    /// `hull-login:` / `hull-delegation:v1` / `hull-sovereign:v1`) so a provenance signature can never
+    /// be replayed as, or collide with, any other message the actor's Ed25519 key signs. Field order is
+    /// the struct's declaration order (deterministic), so signer and verifier reconstruct identical bytes.
     fn signing_bytes(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        format!("hull-provenance:v1\n{}", serde_json::to_string(self).unwrap_or_default())
     }
 }
 
