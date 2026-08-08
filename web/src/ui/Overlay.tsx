@@ -31,7 +31,7 @@ export function ConfirmModal({ open, onClose, title, body, confirmId, actionLabe
   return (
     <>
       <Backdrop onClose={onClose} />
-      <div onClick={(e) => e.stopPropagation()}
+      <div role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
         className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[420px] max-w-[90vw] bg-surface border border-rule rounded-card shadow-modal p-4 animate-ov-in">
         <div className="text-[14.5px] font-semibold">{title}</div>
         <div className="text-[12.5px] text-dim leading-[1.55] mt-1.5">{body}</div>
@@ -63,7 +63,7 @@ export function Dialog({ open, onClose, icon, title, body, cancelLabel = 'Cancel
   return (
     <>
       <Backdrop onClose={onClose} strength="bg-black/40" z="z-[65]" />
-      <div onClick={(e) => e.stopPropagation()}
+      <div role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
         className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-[70] w-[400px] max-w-[90vw] bg-surface border border-rule rounded-card shadow-modal p-4 animate-ov-in">
         <div className="flex gap-2.5 items-start">
           {icon && <div className="w-7 h-7 rounded-ctl bg-steel-wash flex items-center justify-center flex-none">{icon}</div>}
@@ -122,7 +122,7 @@ export function PromptModal({ open, title, label, placeholder, initial = '', san
   return (
     <>
       <Backdrop onClose={onCancel} strength="bg-black/40" z="z-[65]" />
-      <div onClick={(e) => e.stopPropagation()}
+      <div role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
         className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-[70] w-[420px] max-w-[90vw] bg-surface border border-rule rounded-card shadow-modal p-4 animate-ov-in">
         <div className="text-[14.5px] font-semibold">{title}</div>
         <div className="mt-3">
@@ -158,7 +158,7 @@ export function Drawer({ open, onClose, title, children, footer }: {
   return (
     <>
       <Backdrop onClose={onClose} strength="bg-black/40" />
-      <div onClick={(e) => e.stopPropagation()}
+      <div role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
         className="fixed right-0 top-0 bottom-0 z-50 w-[380px] max-w-[85vw] bg-surface border-l border-rule2 shadow-drawer flex flex-col animate-dw-in">
         <div className="flex justify-between items-center px-3.5 py-3 border-b border-rule2">
           <span className="text-[13.5px] font-semibold">{title}</span>

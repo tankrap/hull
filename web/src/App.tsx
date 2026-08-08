@@ -688,8 +688,8 @@ function ModalShell({ title, onClose, children, width = 480 }: { title: string; 
   }, [onClose]);
   return (
     <>
-      <div className="fixed inset-0 z-40 bg-black/55 animate-bd-in" onClick={onClose} />
-      <div style={{ width }} className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-[93vw] max-h-[88vh] overflow-auto bg-surface border border-rule rounded-card shadow-modal animate-ov-in">
+      <div aria-hidden="true" className="fixed inset-0 z-40 bg-black/55 animate-bd-in" onClick={onClose} />
+      <div role="dialog" aria-modal="true" style={{ width }} className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-[93vw] max-h-[88vh] overflow-auto bg-surface border border-rule rounded-card shadow-modal animate-ov-in">
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-rule2 sticky top-0 bg-surface">
           <h2 className="text-[15px] font-semibold">{title}</h2>
           <button onClick={onClose} className="w-6 h-6 grid place-items-center rounded-ctl text-muted hover:text-ink hover:bg-paper" aria-label="close"><IcoX size={15} /></button>
