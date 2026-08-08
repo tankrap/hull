@@ -339,12 +339,20 @@ async fn seed_if_empty(store: &dyn Store) {
 /// collides with an existing account. Repos are keyed by `account.id` (not handle) and the on-disk
 /// tenant dir is derived from the handle only at request time, so no repo dir is orphaned — and these
 /// broken orgs have no repos anyway (creation was impossible). No-op once all handles are valid.
+///
+/// Scoped to organizations on purpose. A personal account's handle is one leg of the load-bearing
+/// `User.username == Actor.handle == Account.handle` invariant that [`account_update`] keeps in sync;
+/// rewriting the account handle alone would desync the actor/username (breaking `@mention` lookups)
+/// and be silently reverted the next time the user saves their settings. Personal handles are
+/// repaired through the username path instead, not here.
 async fn normalize_account_handles(store: &dyn Store) {
     let accounts = store.accounts().await;
     // Handles already in use (lowercased), so a repaired handle doesn't collide with a valid one.
+    // Includes personal-account handles (which share the handle namespace) even though we don't
+    // rewrite them, so an org repair never lands on a name a personal account already holds.
     let mut taken: std::collections::HashSet<String> = accounts.iter().map(|a| a.handle.to_lowercase()).collect();
     for mut acct in accounts {
-        if repos::safe_segment(&acct.handle) {
+        if acct.kind != hull_core::AccountKind::Organization || repos::safe_segment(&acct.handle) {
             continue;
         }
         let base = sanitize_handle(&acct.handle);
@@ -6028,6 +6036,10 @@ mod tests {
         ] {
             store.put_account(Account { id: id.into(), kind: AccountKind::Organization, handle: handle.into(), members: vec![] }).await;
         }
+        // A personal account with an equally invalid handle: it must be LEFT UNTOUCHED, because its
+        // handle is one leg of the User.username/Actor.handle invariant and rewriting it here alone
+        // would desync those. Personal handles are repaired via the username path, not this migration.
+        store.put_account(Account { id: "acct_p".into(), kind: AccountKind::Personal, handle: "bad;personal".into(), members: vec![] }).await;
         normalize_account_handles(&store).await;
         let handles = store.accounts().await;
         let by_id = |id: &str| handles.iter().find(|a| a.id == id).unwrap().handle.clone();
@@ -6036,8 +6048,9 @@ mod tests {
         assert_eq!(by_id("acct_b"), "n_kkjkjk");
         assert_eq!(by_id("acct_c"), "new_org"); // valid handle, unchanged
         assert_eq!(by_id("acct_d"), "tankrap"); // valid handle, unchanged
-        // Every handle now passes safe_segment — repos can be created under all of them.
-        for a in store.accounts().await {
+        assert_eq!(by_id("acct_p"), "bad;personal"); // personal — untouched despite being invalid
+        // Every ORG handle now passes safe_segment — repos can be created under all of them.
+        for a in store.accounts().await.into_iter().filter(|a| a.kind == AccountKind::Organization) {
             assert!(repos::safe_segment(&a.handle), "{:?} still not a safe segment", a.handle);
         }
         // Idempotent: a second pass changes nothing.
