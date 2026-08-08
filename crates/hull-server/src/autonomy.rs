@@ -65,6 +65,23 @@ impl AutonomyStore {
         m.insert(account_scope(account), p);
         self.persist(&m);
     }
+    /// Atomically set a scope's tier, replacing `protected_paths` only when `paths` is `Some` — else
+    /// the existing paths are PRESERVED. The read-merge-write happens under a single lock, so a
+    /// concurrent tier-only change can't clobber a concurrent path-replace (or vice-versa).
+    fn update_tier(&self, scope: String, tier: AutonomyTier, paths: Option<Vec<String>>) {
+        let mut m = self.map.lock().unwrap();
+        let protected_paths = paths.unwrap_or_else(|| m.get(&scope).map(|p| p.protected_paths.clone()).unwrap_or_default());
+        m.insert(scope, AutonomyPolicy { tier, protected_paths });
+        self.persist(&m);
+    }
+    /// Set a repo's tier, preserving its protected paths unless `paths` is given. See [`Self::update_tier`].
+    pub fn set_repo_tier(&self, tenant: &str, repo: &str, tier: AutonomyTier, paths: Option<Vec<String>>) {
+        self.update_tier(repo_scope(tenant, repo), tier, paths);
+    }
+    /// Set an account's tier, preserving its protected paths unless `paths` is given.
+    pub fn set_account_tier(&self, account: &str, tier: AutonomyTier, paths: Option<Vec<String>>) {
+        self.update_tier(account_scope(account), tier, paths);
+    }
     /// Drop a repo's autonomy override (on repo delete).
     pub fn delete_repo(&self, tenant: &str, repo: &str) {
         let mut m = self.map.lock().unwrap();

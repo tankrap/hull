@@ -3929,14 +3929,14 @@ async fn set_repo_autonomy(
     let Some(tier) = body.get("tier").and_then(Value::as_str).and_then(tier_from_str) else {
         return (StatusCode::BAD_REQUEST, "tier must be t0 | t1 | t2 | t3").into_response();
     };
-    // Patch-merge: only overwrite protected_paths when the key is PRESENT. A tier-only change (the UI
-    // sends just {tier}) must PRESERVE the existing protected paths, not silently wipe the human-gated
-    // set — dropping them would quietly widen what agents may auto-merge.
-    let protected_paths = match body.get("protected_paths").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
-        None => app.autonomy.get_repo(&tenant, &repo).map(|p| p.protected_paths).unwrap_or_default(),
-    };
-    app.autonomy.set_repo(&tenant, &repo, hull_core::AutonomyPolicy { tier, protected_paths });
+    // Patch-merge (atomic under the store lock): overwrite protected_paths only when the key is
+    // PRESENT. A tier-only change (the UI sends just {tier}) PRESERVES the existing protected paths,
+    // not silently wiping the human-gated set — dropping them would quietly widen agent auto-merge.
+    let paths = body
+        .get("protected_paths")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect());
+    app.autonomy.set_repo_tier(&tenant, &repo, tier, paths);
     Json(json!({ "tier": tier })).into_response()
 }
 
@@ -3966,11 +3966,11 @@ async fn set_account_autonomy(
         return (StatusCode::BAD_REQUEST, "tier must be t0 | t1 | t2 | t3").into_response();
     };
     // Patch-merge (see set_repo_autonomy): preserve existing protected_paths on a tier-only change.
-    let protected_paths = match body.get("protected_paths").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
-        None => app.autonomy.get_account(&id).map(|p| p.protected_paths).unwrap_or_default(),
-    };
-    app.autonomy.set_account(&id, hull_core::AutonomyPolicy { tier, protected_paths });
+    let paths = body
+        .get("protected_paths")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect());
+    app.autonomy.set_account_tier(&id, tier, paths);
     Json(json!({ "tier": tier })).into_response()
 }
 
@@ -6706,6 +6706,16 @@ mod tests {
         // an all-symbol username sanitizes to empty → rejected, never stored as a broken handle.
         assert_eq!(call(app.clone(), "!!!").await.status(), axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(app.store.user_by_actor("u1actor").await.unwrap().username, "new_org", "rejected update left it unchanged");
+        // email updates independently of the username block.
+        let resp = account_update(
+            axum::extract::State(app.clone()),
+            bearer("tok"),
+            axum::Json(serde_json::json!({ "email": "fresh@x.co" })),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let u = app.store.user_by_actor("u1actor").await.unwrap();
+        assert_eq!((u.email.as_str(), u.username.as_str()), ("fresh@x.co", "new_org"), "email updated, username untouched");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6744,6 +6754,23 @@ mod tests {
             axum::http::StatusCode::OK
         );
         assert_eq!(app.autonomy.get_repo("acme", "web").unwrap().protected_paths, vec!["a".to_string(), "b".to_string()]);
+
+        // same patch-merge behavior for the account-level setter (identical code path).
+        app.autonomy.set_account(
+            "acct-acme",
+            hull_core::AutonomyPolicy { tier: hull_core::AutonomyTier::T1, protected_paths: vec!["acct/keep.rs".into()] },
+        );
+        let resp = set_account_autonomy(
+            axum::extract::State(app.clone()),
+            axum::extract::Path("acct-acme".to_string()),
+            bearer("tok"),
+            axum::Json(serde_json::json!({ "tier": "t2" })),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let apol = app.autonomy.get_account("acct-acme").unwrap();
+        assert_eq!(apol.tier, hull_core::AutonomyTier::T2);
+        assert_eq!(apol.protected_paths, vec!["acct/keep.rs".to_string()], "account protected paths preserved on tier-only change");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
