@@ -47,6 +47,67 @@ export function unwrapSecret(bundle: string, passphrase: string): string {
   return bytesToHex(pt);
 }
 
+// ── off-main-thread KDF ─────────────────────────────────────────────────────────────────────────
+// The Argon2id step takes ~1s and would jank the UI if run inline. wrapSecretAsync/unwrapSecretAsync
+// offload it to a worker; if Workers are unavailable (or the worker fails to load) they fall back to
+// the sync path, which still works — it just blocks. Results are byte-identical either way.
+let _worker: Worker | null = null;
+let _seq = 0;
+const _pending = new Map<number, { resolve: (v: string) => void; reject: (e: unknown) => void }>();
+function kdfWorker(): Worker | null {
+  if (typeof Worker === "undefined") return null;
+  if (_worker) return _worker;
+  try {
+    const w = new Worker(new URL("./sovereign.worker.ts", import.meta.url), { type: "module" });
+    w.onmessage = (e: MessageEvent) => {
+      const { id, ok, result, error } = e.data as { id: number; ok: boolean; result?: string; error?: string };
+      const p = _pending.get(id);
+      if (!p) return;
+      _pending.delete(id);
+      ok ? p.resolve(result as string) : p.reject(new Error(error));
+    };
+    w.onerror = () => {
+      // The worker itself failed to run — reject anything in flight and drop it so the next call falls
+      // back to the sync path instead of hanging forever on a dead worker.
+      for (const { reject } of _pending.values()) reject(new Error("kdf worker error"));
+      _pending.clear();
+      _worker = null;
+    };
+    _worker = w;
+    return w;
+  } catch {
+    return null;
+  }
+}
+function runOnWorker(op: "wrap" | "unwrap", a: string, b: string): Promise<string> {
+  const w = kdfWorker();
+  if (!w) return Promise.resolve(op === "wrap" ? wrapSecret(a, b) : unwrapSecret(a, b));
+  return new Promise((resolve, reject) => {
+    const id = ++_seq;
+    _pending.set(id, { resolve, reject });
+    w.postMessage({ id, op, a, b });
+  });
+}
+/** [`wrapSecret`] off the main thread (falls back to sync if Workers are unavailable). */
+export const wrapSecretAsync = (secretHex: string, passphrase: string) => runOnWorker("wrap", secretHex, passphrase);
+/** [`unwrapSecret`] off the main thread. Rejects on a wrong passphrase, same as the sync version throws. */
+export const unwrapSecretAsync = (bundle: string, passphrase: string) => runOnWorker("unwrap", bundle, passphrase);
+
+/** A rough passphrase-strength estimate for the signup meter. Dependency-free: entropy = length ×
+ *  log2(character-pool). NOT a dictionary check — it can't tell that "password1234" is weak — so it's
+ *  a guide, not a gate. The real protection is the memory-hard KDF plus a long passphrase. */
+export function passphraseStrength(pass: string): { score: 0 | 1 | 2 | 3 | 4; label: string } {
+  if (!pass) return { score: 0, label: "" };
+  const pool =
+    (/[a-z]/.test(pass) ? 26 : 0) +
+    (/[A-Z]/.test(pass) ? 26 : 0) +
+    (/[0-9]/.test(pass) ? 10 : 0) +
+    (/[^a-zA-Z0-9]/.test(pass) ? 32 : 0);
+  const bits = pass.length * Math.log2(Math.max(pool, 1));
+  const score = bits < 40 ? 1 : bits < 60 ? 2 : bits < 80 ? 3 : 4;
+  return { score, label: ["", "weak", "fair", "good", "strong"][score] };
+}
+
 /** Sign a utf8 message with a hex secret → hex signature (matches the server's `identity::verify`). */
 export async function signMessage(secretHex: string, message: string): Promise<string> {
   return bytesToHex(await ed.signAsync(utf8(message), hexToBytes(secretHex)));
