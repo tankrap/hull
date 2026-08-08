@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 // Code-split the heavy Shiki-powered @pierre viewers into their own chunk (kept out of the initial bundle).
 const PierrePatch = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.PatchDiff })));
 import * as ed from "@noble/ed25519";
-import { generateIdentity, wrapSecret, unwrapSecret, signMessage } from "./sovereign";
+import { generateIdentity, wrapSecret, unwrapSecret, signMessage, signProvenance } from "./sovereign";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
 import { SearchInput, Switch, TextField } from "./ui/Field";
@@ -141,7 +141,7 @@ type ActivityEvent =
   | { kind: "issue"; repo: string; number: number; action: string; actor: string; ts: number };
 
 type Actor = { id: string; handle: string; kind: "human" | "agent"; accountable: boolean; human_root: string | null; email?: string };
-type PR = { number: number; title: string; author: string; changes: string[]; verification: string; state: string; reviewers: string[] };
+type PR = { number: number; title: string; author: string; changes: string[]; verification: string; state: string; reviewers: string[]; sovereign_provenance?: Record<string, string> };
 type Finding = { path: string; line?: number; severity: string; note: string };
 type ClaimEv = { kind: string; detail: string; supports: boolean };
 type LedgerSnap = { change: string; claims: { id: string; text: string; source: string; status: string; evidence: ClaimEv[] }[]; unclaimed?: string[] };
@@ -1864,6 +1864,23 @@ export function App() {
     if (res.ok) loadPrs();
     else uiAlert(await apiError(res));
   };
+  // Sovereign authorship attestation: a sovereign author (their Ed25519 key is in memory this session)
+  // signs a provenance claim over their change locally and hands the server only the signature. The
+  // server stores it and embeds it in the decentralized substrate at land — it never holds the key.
+  // Custodial accounts don't use this (the server signs for them); the UI gates it on `canAttest`.
+  const attestAuthorship = async (changeId: string, intent: string): Promise<{ ok: boolean; error?: string }> => {
+    if (!me || !sessionSecret.current) return { ok: false, error: "no sovereign key in this session" };
+    try {
+      const claim = { v: 1, change: changeId, actor: me.id, repo: `${tenant}/${issueRepo}`, intent, ts: Math.floor(Date.now() / 1000) };
+      const bundle = await signProvenance(sessionSecret.current, claim);
+      const res = await fetch(`/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/change/${changeId}/provenance`, {
+        method: "POST", headers: { "content-type": "application/json", ...authHeaders() }, body: JSON.stringify(bundle),
+      });
+      return res.ok ? { ok: true } : { ok: false, error: await apiError(res) };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || "could not sign provenance" };
+    }
+  };
   // What AI capabilities this instance can fulfill — hide AI actions it can't run.
   const [caps, setCaps] = useState<{ ai_fix: boolean; ai_review: boolean }>({ ai_fix: true, ai_review: true });
   useEffect(() => { fetch("/api/capabilities").then((r) => r.json()).then(setCaps).catch(() => {}); }, []);
@@ -2986,6 +3003,8 @@ export function App() {
             repo={issueRepo}
             token={token}
             me={me}
+            canAttest={!!me && me.id === p.author && !!sessionSecret.current}
+            onAttest={attestAuthorship}
             theme={theme}
             onBack={() => navigate(`${repoBase()}/voyages`)}
           />
@@ -3585,6 +3604,8 @@ function ReviewPage({
   repo,
   token,
   me,
+  canAttest = false,
+  onAttest,
   theme,
   onBack,
 }: {
@@ -3604,6 +3625,8 @@ function ReviewPage({
   repo: string;
   token: string;
   me: { id: string; handle: string; kind: string } | null;
+  canAttest?: boolean;
+  onAttest?: (changeId: string, intent: string) => Promise<{ ok: boolean; error?: string }>;
   theme: string;
   onBack: () => void;
 }) {
@@ -3638,6 +3661,11 @@ function ReviewPage({
   const [ledger, setLedger] = useState<Ledger | null>(null);
   const handleOf = (id: string) => actors.find((a) => a.id === id)?.handle ?? id.slice(0, 8);
   const changeId = pr?.changes[0];
+  // Sovereign authorship: an author holding their own key this session can sign provenance for the change.
+  // Seed "attested" from any bundle already stored on the PR so a reload doesn't offer to re-sign.
+  const [attesting, setAttesting] = useState(false);
+  const [attested, setAttested] = useState<boolean>(() => !!(changeId && pr?.sovereign_provenance?.[changeId]));
+  const [attestErr, setAttestErr] = useState<string | null>(null);
   const loadChange = () => {
     if (!changeId) return;
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}`, { headers: authHeaders() })
@@ -4128,6 +4156,32 @@ function ReviewPage({
             </div>
           </Popover>
         </div>
+
+        {/* Sovereign authorship: the author signs this change with their own key (held only in this
+            session), and the server embeds that signature in the decentralized substrate at land. */}
+        {canAttest && changeId && pr?.state !== "merged" && (
+          <div className="flex items-center gap-3 px-4 py-2.5 rounded-ctl border border-ctl bg-surface">
+            <button
+              type="button"
+              disabled={attesting || attested || !change}
+              onClick={async () => {
+                // Sign the change's own intent, never the pr.title fallback — so wait for `change` to load
+                // (guarded by the disabled state) and pass its canonical intent.
+                if (!onAttest || !changeId || !change) return;
+                setAttesting(true); setAttestErr(null);
+                const r = await onAttest(changeId, change.intent);
+                setAttesting(false);
+                if (r.ok) setAttested(true); else setAttestErr(r.error || "could not attest");
+              }}
+              className="inline-flex items-center gap-1.5 h-ctl-sm px-2.5 rounded-ctl-sm border bg-surface text-[12.5px] font-medium cursor-pointer transition-colors border-ctl text-dim hover:text-ink hover:border-dim disabled:opacity-60"
+            >
+              {attested ? "Authorship signed" : attesting ? "Signing…" : !change ? "Loading…" : "Sign authorship"}
+            </button>
+            <span className="text-[12px] text-muted">
+              {attestErr ? attestErr : attested ? "your signature will be published to the substrate when this lands" : "sign this change with your sovereign key — non-repudiable, embedded at land"}
+            </span>
+          </div>
+        )}
 
         {/* One consistent 24px rhythm for every top-level section on the page. */}
         <div className="grid gap-6">
