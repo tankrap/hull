@@ -2040,7 +2040,8 @@ export function App() {
   );
   const sidebar = (
     <aside className="w-[228px] shrink-0 bg-shell hidden md:flex flex-col">
-      <nav className="flex-1 overflow-y-auto px-3 pt-4 grid gap-0.5 content-start">
+      <nav className="flex-1 overflow-y-auto px-3 pt-3 grid gap-0.5 content-start">
+        <div className="px-2.5 pt-1 pb-2 text-[15px] font-semibold tracking-tight">Your work</div>
         <button className={sideCls(view === "home" && !orgHandle && !authPage)} onClick={() => navigate("/")}>
           <SIco d="M3 10.5 12 3l9 7.5M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5" /><span>Home</span>
         </button>
@@ -2627,13 +2628,28 @@ export function App() {
         const activeRepos = repos.filter((r) => r.score > 0);
         return (
         <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
-          <div className="flex flex-wrap items-end justify-between gap-4 mb-8">
-            <div>
-              <h1 className="text-[27px] font-semibold tracking-tight leading-none">Your work</h1>
-              <p className="text-[13.5px] text-muted mt-2.5">
-                {activeRepos.length} active {activeRepos.length === 1 ? "repo" : "repos"} · {homePrs.length + homeIssues.length} {homePrs.length + homeIssues.length === 1 ? "item" : "items"} needing you
-              </p>
+          {/* Greeting header — GitLab "Your work" dashboard style. */}
+          <div className="flex items-center gap-4 mb-7">
+            <Avatar id={me.id} handle={me.handle} kind={me.kind} size={52} />
+            <div className="min-w-0">
+              <h1 className="text-[22px] font-semibold tracking-tight leading-tight truncate">{me.handle}</h1>
+              <p className="text-[13.5px] text-muted mt-1">Hey there — here's the work across your organizations.</p>
             </div>
+          </div>
+          {/* Stat tiles — the signature GitLab dashboard row. */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-7">
+            {[
+              { label: "Reviews", n: homePrs.length, sub: "Pull requests waiting on you", to: "" },
+              { label: "Issues", n: homeIssues.length, sub: "Assigned to you", to: "" },
+              { label: "Repositories", n: activeRepos.length, sub: "Active right now", to: "/me" },
+              { label: "Organizations", n: myAccounts.length, sub: "You're a member of", to: "/me" },
+            ].map((t) => (
+              <button key={t.label} onClick={() => t.to && navigate(t.to)} className="text-left bg-surface border border-rule rounded-card px-4 py-3.5 hover:border-dim transition-colors">
+                <div className="text-[12.5px] text-muted">{t.label}</div>
+                <div className="text-[30px] font-semibold tracking-tight mt-1.5 leading-none tabular-nums">{t.n}</div>
+                <div className="text-[12.5px] text-body mt-1.5 truncate">{t.sub}</div>
+              </button>
+            ))}
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-x-12 gap-y-9">
