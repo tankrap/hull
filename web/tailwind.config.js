@@ -34,12 +34,12 @@ module.exports = {
         ramp: { 1: '#2563EB', 2: '#4C7BEF', 3: '#6E96F3', 4: '#93B4F6', 5: '#C7D8FA' },
       },
       borderRadius: {
-        card: '8px',    // cards, alerts — ADS border.radius.200
-        ctl: '6px',     // controls — ADS border.radius.100/150
-        'ctl-sm': '5px',
-        chip: '4px',    // selection chips
-        badge: '3px',   // ADS lozenge radius
-        frame: '12px',  // chart frames
+        card: '10px',   // cards, alerts, modals — softer, GitLab-ward
+        ctl: '7px',     // controls
+        'ctl-sm': '6px',
+        chip: '5px',    // selection chips
+        badge: '4px',   // lozenge radius
+        frame: '14px',  // chart frames / content well
       },
       height: {
         ctl: '32px', 'ctl-sm': '26px', 'ctl-lg': '40px',
@@ -48,9 +48,11 @@ module.exports = {
         ctl: '32px', 'ctl-sm': '26px', 'ctl-lg': '40px',
       },
       boxShadow: {
-        menu: '0 8px 24px -8px rgba(15,23,42,0.25)',
-        modal: '0 16px 40px -12px rgba(15,23,42,0.4)',
-        drawer: '-12px 0 32px -12px rgba(15,23,42,0.3)',
+        // Neutral-black shadows read correctly in BOTH themes (a navy-tinted shadow vanishes on the
+        // dark shell). Paired with a hairline border, modals/menus sit crisply on either ground.
+        menu: '0 10px 28px -10px rgba(0,0,0,0.45)',
+        modal: '0 24px 60px -16px rgba(0,0,0,0.6)',
+        drawer: '-14px 0 40px -16px rgba(0,0,0,0.5)',
         'chart-card': '0 0 1.76px rgba(0,0,0,0.08), 0 1px 1.76px rgba(25,28,33,0.06), 0 0 0 1px rgba(25,28,33,0.04)',
       },
       transitionTimingFunction: {

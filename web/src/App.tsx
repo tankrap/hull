@@ -688,8 +688,8 @@ function ModalShell({ title, onClose, children, width = 480 }: { title: string; 
   }, [onClose]);
   return (
     <>
-      <div className="fixed inset-0 z-40 bg-ink/40 animate-bd-in" onClick={onClose} />
-      <div style={{ width }} className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-[93vw] max-h-[88vh] overflow-auto bg-surface rounded-card shadow-modal animate-ov-in">
+      <div className="fixed inset-0 z-40 bg-black/55 animate-bd-in" onClick={onClose} />
+      <div style={{ width }} className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-[93vw] max-h-[88vh] overflow-auto bg-surface border border-rule rounded-card shadow-modal animate-ov-in">
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-rule2 sticky top-0 bg-surface">
           <h2 className="text-[15px] font-semibold">{title}</h2>
           <button onClick={onClose} className="w-6 h-6 grid place-items-center rounded-ctl text-muted hover:text-ink hover:bg-paper" aria-label="close"><IcoX size={15} /></button>
@@ -1946,8 +1946,8 @@ export function App() {
   }, [view, tenant, issueRepo, isTenantOwner]);
   const shortcutsNode = showShortcuts ? (
     <>
-      <div onClick={() => setShowShortcuts(false)} className="fixed inset-0 z-40 bg-ink/30 animate-bd-in" />
-      <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[440px] max-w-[92vw] bg-surface rounded-[13px] shadow-modal border border-rule animate-ov-in overflow-hidden">
+      <div onClick={() => setShowShortcuts(false)} className="fixed inset-0 z-40 bg-black/50 animate-bd-in" />
+      <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[440px] max-w-[92vw] bg-surface border border-rule rounded-card shadow-modal border border-rule animate-ov-in overflow-hidden">
         <div className="px-5 py-3.5 border-b border-rule2 flex items-center justify-between">
           <span className="text-[14.5px] font-semibold">Keyboard shortcuts</span>
           <button type="button" aria-label="Close" onClick={() => setShowShortcuts(false)} className="text-muted hover:text-ink"><IcoX size={16} /></button>
@@ -3938,7 +3938,7 @@ function ReviewPage({
       {/* Full-task overlay — the session summary shows a clipped task; this is the whole thing. */}
       {taskModal && change?.session && createPortal(
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={() => setTaskModal(false)}>
-          <div className="absolute inset-0 bg-ink/40" />
+          <div className="absolute inset-0 bg-black/55" />
           <div className="relative bg-surface border border-rule rounded-card shadow-modal max-w-[680px] w-full max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
               <span className="text-[13.5px] font-semibold text-ink">Agent task</span>
