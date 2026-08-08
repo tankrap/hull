@@ -1083,28 +1083,48 @@ async fn repos_list(State(app): State<App>) -> Json<Value> {
 /// Recent notifications recorded by the core `Notifier` capability (newest first). Demonstrates the
 /// plugin seam: these were fanned out by `registry.notify`, and a hosted plugin would also deliver
 /// them over a real channel.
-async fn notifications_list(
-    State(app): State<App>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Json<Value> {
+async fn notifications_list(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    // The inbox is the AUTHENTICATED actor's, derived from the bearer token — never a spoofable
+    // `?actor=` query param, and never the whole-server firehose to an anonymous caller.
+    let Some(actor) = authed_actor(&app, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    };
     let mut n = app.notifications.lock().unwrap().clone();
     n.reverse();
-    // Scope to an actor when `?actor=<id>` is given: deliver notifications addressed to them plus
-    // broadcasts (empty `to`, e.g. CI results / mirror pushes). No actor → the full firehose.
-    if let Some(actor) = q.get("actor").filter(|a| !a.is_empty()) {
-        n.retain(|x| x.to.is_empty() || x.to.contains(actor));
-    }
-    // Resolve recipient handles for display. Explicit loops rather than `.map(async)` — the handle
-    // lookups now `.await`.
+    // Deliver notifications addressed to this actor, plus broadcasts (empty `to`, e.g. CI results /
+    // mirror pushes) — but gate a broadcast about a PRIVATE repo on read access, so private-repo
+    // activity doesn't leak to non-members. Addressed notifications are for this actor, so kept as-is.
     let mut items: Vec<Value> = Vec::new();
     for x in n.iter() {
+        let addressed = x.to.contains(&actor.id);
+        let broadcast = x.to.is_empty();
+        if !addressed && !broadcast {
+            continue;
+        }
+        // A repo-scoped broadcast is delivered only if the actor can read that repo. A malformed repo
+        // key (present but not `tenant/repo`) is treated as unreadable — default-deny, so a future
+        // producer that mis-sets `repo` can't fail open and leak private activity. A repo-less
+        // broadcast (`None`) is a genuine server-wide notice and is delivered.
+        if broadcast {
+            if let Some(rk) = x.repo.as_deref() {
+                let visible = match rk.split_once('/') {
+                    Some((t, r)) => can_read_repo(&app, Some(&actor.id), t, r).await,
+                    None => false,
+                };
+                if !visible {
+                    continue;
+                }
+            }
+        }
+        // Resolve recipient handles for display. Explicit loops rather than `.map(async)` — the handle
+        // lookups now `.await`.
         let mut to_handles: Vec<String> = Vec::new();
         for id in &x.to {
             to_handles.push(app.store.actor(id).await.map(|a| a.handle).unwrap_or_else(|| id.chars().take(8).collect()));
         }
         items.push(json!({ "kind": x.kind, "summary": x.summary, "change": x.change, "ts": x.ts, "to": to_handles, "broadcast": x.to.is_empty(), "repo": x.repo, "target_kind": x.target_kind, "target_number": x.target_number }));
     }
-    Json(json!({ "notifications": items }))
+    Json(json!({ "notifications": items })).into_response()
 }
 
 /// Accounts (orgs / personal) with their members (handle + role) and owned repos.
@@ -6662,6 +6682,52 @@ mod tests {
             v.1 = now().saturating_sub(FEED_TICKET_TTL_SECS + 1);
         }
         assert_eq!(resolve_feed_ticket(&app, &ticket), None, "expired ticket → nobody");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn notifications_require_auth_and_scope_to_the_authenticated_actor() {
+        // Regression (B2): `/api/notifications` was unauthenticated and trusted a `?actor=` query
+        // param — any anon caller could read any inbox, or (no param) the whole-server firehose. It
+        // must require a token, derive the actor from it, and gate broadcasts about a PRIVATE repo on
+        // read access so private activity doesn't leak.
+        let (app, tmp) = build_test_app("notifications-auth");
+        app.store.put_actor(actor("alice", ActorKind::Human)).await;
+        app.store.put_actor(actor("bob", ActorKind::Human)).await;
+        mint_token(&app, "atok", "alice");
+        // a private repo alice is NOT a member of (bob is)
+        setup_org_repo(&app, "acme", "secret", true, &[("bob", Role::Write)]).await;
+        {
+            let mk = |kind: &str, to: Vec<String>, summary: &str, ts: u64, repo: Option<String>| Notification {
+                kind: kind.into(), to, summary: summary.into(), change: None, ts, repo, target_kind: None, target_number: None,
+            };
+            let mut n = app.notifications.lock().unwrap();
+            n.push(mk("mention", vec!["alice".into()], "for-alice", 1, None));
+            n.push(mk("mention", vec!["bob".into()], "for-bob", 2, None));
+            n.push(mk("ci", vec![], "public-broadcast", 3, Some("acme/pubrepo".into())));
+            n.push(mk("ci", vec![], "private-broadcast", 4, Some("acme/secret".into())));
+            n.push(mk("ci", vec![], "malformed-broadcast", 5, Some("no-slash-here".into())));
+            n.push(mk("sys", vec![], "server-wide", 6, None));
+        }
+
+        // No token → 401, no inbox.
+        let resp = notifications_list(axum::extract::State(app.clone()), axum::http::HeaderMap::new()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED, "no token → no inbox");
+
+        // Alice: her own + the public broadcast; NOT bob's inbox, NOT the private-repo broadcast.
+        let resp = notifications_list(axum::extract::State(app.clone()), bearer("atok")).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let seen: Vec<&str> =
+            body["notifications"].as_array().unwrap().iter().map(|x| x["summary"].as_str().unwrap()).collect();
+        assert!(seen.contains(&"for-alice"), "own notification delivered; got {seen:?}");
+        assert!(seen.contains(&"public-broadcast"), "public broadcast delivered; got {seen:?}");
+        assert!(seen.contains(&"server-wide"), "repo-less server-wide broadcast delivered; got {seen:?}");
+        assert!(!seen.contains(&"for-bob"), "must NOT leak another actor's inbox; got {seen:?}");
+        assert!(!seen.contains(&"private-broadcast"), "must NOT leak a private repo's broadcast; got {seen:?}");
+        assert!(!seen.contains(&"malformed-broadcast"), "a broadcast with an unparseable repo is default-denied; got {seen:?}");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
