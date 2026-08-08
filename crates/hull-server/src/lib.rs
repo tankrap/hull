@@ -2633,7 +2633,9 @@ async fn sovereign_register(State(app): State<App>, Json(body): Json<Value>) -> 
     // Proof of possession: the client signs the exact (username, pubkey) binding with the secret, so a
     // caller can't register a key it doesn't hold or squat a username against someone else's key.
     let msg = format!("hull-sovereign:v1\nusername={username}\npubkey={pubkey}");
-    if !identity::verify(&pubkey, msg.as_bytes(), signature) {
+    // STRICT verify: rejects small-order / non-canonical keys, so nobody can bind a "public" id whose
+    // signatures anyone can forge (a self-verifying small-order key would otherwise satisfy the PoP).
+    if !identity::verify_strict(&pubkey, msg.as_bytes(), signature) {
         return (StatusCode::UNAUTHORIZED, "signature does not prove possession of the secret key").into_response();
     }
     if app.store.user_by_username(&username).await.is_some() {
@@ -2672,7 +2674,13 @@ async fn sovereign_register(State(app): State<App>, Json(body): Json<Value>) -> 
 /// `GET /api/auth/sovereign/wrapped?username=X` — the passphrase-encrypted key bundle for a sovereign
 /// account, so the client can decrypt it (with the passphrase) and sign the login challenge from any
 /// device. The bundle is passphrase-protected — Hull can't read it — so serving it pre-auth is the
-/// standard encrypted-vault model. 404 for unknown or custodial accounts.
+/// standard encrypted-vault model. 404 for unknown or custodial accounts (no custodial-vs-missing
+/// oracle: both are 404).
+///
+/// SECURITY: because this is unauthenticated, an attacker can harvest a username's bundle and brute-
+/// force the passphrase OFFLINE — so the whole account's security rests on the CLIENT KDF. The browser
+/// MUST wrap with a strong memory-hard KDF (Argon2id, high params); Hull can't verify that on an opaque
+/// blob. Deployment follow-up: rate-limit this route (and it enumerates sovereign usernames: 200 vs 404).
 async fn sovereign_wrapped(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
     let username = sanitize_handle(q.get("username").map(String::as_str).unwrap_or(""));
     match app.store.user_by_username(&username).await.and_then(|u| u.wrapped_key.map(|w| (u.actor, w))) {

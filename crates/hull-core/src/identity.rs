@@ -44,6 +44,19 @@ pub fn verify_bytes(actor_id_hex: &str, message: &[u8], signature: &[u8]) -> boo
     vk.verify(message, &Signature::from_bytes(&sig)).is_ok()
 }
 
+/// Like [`verify`] but STRICT: rejects small-order / non-canonical public keys (ed25519-dalek's
+/// `verify_strict`). Use where the key is attacker-supplied and being *bound to an identity* — e.g. a
+/// sovereign account's proof-of-possession — so nobody can claim a small-order id whose signatures
+/// anyone can forge. (The lax [`verify`] stays for existing delegation-chain checks.)
+pub fn verify_strict(actor_id_hex: &str, message: &[u8], signature_hex: &str) -> bool {
+    let Ok(pk) = hex::decode(actor_id_hex) else { return false };
+    let Ok(pk): Result<[u8; 32], _> = pk.try_into() else { return false };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk) else { return false };
+    let Ok(sig) = hex::decode(signature_hex) else { return false };
+    let Ok(sig): Result<[u8; 64], _> = sig.try_into() else { return false };
+    vk.verify_strict(message, &Signature::from_bytes(&sig)).is_ok()
+}
+
 /// The canonical bytes a **parent** signs to delegate to a child — versioned so the format can
 /// evolve. Binding parent+child+kind+scope+expiry means a signature can't be replayed onto a
 /// different child, a widened scope, or a longer TTL.
