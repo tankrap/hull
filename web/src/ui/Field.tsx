@@ -4,7 +4,7 @@
 const cx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(' ');
 // Inputs use --field-* (bg / border / focus border) so the whole per-theme control language lives in
 // tokens: light = white with a neutral-400 outline; dark = a dark inset with a neutral-500 outline.
-const FIELD = 'w-full box-border h-ctl px-2.5 rounded-ctl border bg-[var(--field-bg)] font-sans text-[13.5px] text-ink placeholder:text-faint outline-none transition-colors duration-150';
+const FIELD = 'w-full box-border h-ctl px-3 rounded-ctl border bg-[var(--field-bg)] font-sans text-[13.5px] text-ink placeholder:text-faint outline-none transition-colors duration-150';
 const Label = ({ children }: { children?: React.ReactNode }) => <div className="text-[12.5px] font-semibold text-body mb-1.5">{children}</div>;
 
 type TextFieldProps = React.InputHTMLAttributes<HTMLInputElement> & {
@@ -17,7 +17,7 @@ export function TextField({ label, help, error, className, ...rest }: TextFieldP
   return (
     <div>
       {label && <Label>{label}</Label>}
-      <input className={cx(FIELD, error ? 'border-fault' : 'border-[var(--field-border)] focus:border-[var(--field-border-focus)] focus:ring-2 focus:ring-steel/40', className)} {...rest} />
+      <input className={cx(FIELD, error ? 'border-fault' : 'border-[var(--field-border)] focus:border-steel focus:ring-[3px] focus:ring-steel/25', className)} {...rest} />
       {(error || help) && <div className={cx('text-xs mt-[5px]', error ? 'text-fault-text' : 'text-muted')}>{error || help}</div>}
     </div>
   );
@@ -26,7 +26,7 @@ export function TextField({ label, help, error, className, ...rest }: TextFieldP
 // Search input with leading icon and trailing shortcut chip.
 export function SearchInput({ shortcut = '⌘K', ...rest }: React.InputHTMLAttributes<HTMLInputElement> & { shortcut?: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-2 h-ctl px-2.5 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] transition-colors duration-150 focus-within:border-[var(--field-border-focus)] focus-within:ring-2 focus-within:ring-steel/40">
+    <div className="flex items-center gap-2 h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] transition-colors duration-150 focus-within:border-steel focus-within:ring-[3px] focus-within:ring-steel/25">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none">
         <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
       </svg>

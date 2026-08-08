@@ -69,14 +69,14 @@ export function Picker({ value, onChange, options, placeholder = "Select…", wi
   const rich = options.some((o) => o.avatar || o.sub);
   return (
     <Popover align="left" width={width} block={block} direction={direction} onToggle={(o) => { if (!o) setQ(""); }} trigger={(open) => (
-      <span className={`inline-flex items-center justify-between gap-2 ${h} px-2.5 rounded-ctl border transition-[background-color,border-color,box-shadow] duration-200 bg-[var(--btn-neu-bg)] ${block ? "w-full" : ""} ${open ? "border-transparent shadow-[0_0_0_1px_var(--paper),0_0_0_3px_var(--steel)]" : "border-[var(--btn-neu-border)] hover:bg-[var(--btn-neu-bg-hover)] hover:border-[var(--btn-neu-border-hover)]"} ${className}`}>
+      <span className={`inline-flex items-center justify-between gap-2 ${h} px-3 rounded-ctl border transition-[background-color,border-color,box-shadow] duration-200 bg-[var(--btn-neu-bg)] ${block ? "w-full" : ""} ${open ? "border-transparent shadow-[0_0_0_1px_var(--paper),0_0_0_3px_var(--steel)]" : "border-[var(--btn-neu-border)] hover:bg-[var(--btn-neu-bg-hover)] hover:border-[var(--btn-neu-border-hover)]"} ${className}`}>
         <span className={`truncate ${cur ? "text-ink" : "text-faint"}`}>{cur?.label ?? placeholder}</span>
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`text-muted flex-none transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
       </span>
     )}>
       {searchable && (
         <div className="p-1.5 border-b border-rule2 sticky top-0 bg-surface" onClick={(e) => e.stopPropagation()}>
-          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…" className="w-full box-border h-ctl-sm px-2 rounded-ctl-sm border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[12.5px] text-ink outline-none focus:border-[var(--field-border-focus)] placeholder:text-faint" />
+          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search…" className="w-full box-border h-ctl-sm px-2 rounded-ctl-sm border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[12.5px] text-ink outline-none focus:border-steel placeholder:text-faint" />
         </div>
       )}
       <div className="py-1 max-h-[280px] overflow-y-auto overflow-x-hidden">

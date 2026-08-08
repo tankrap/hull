@@ -74,7 +74,7 @@ export function RichText({ value, onChange, placeholder, rows = 4, linkBase = nu
   const ico = (d: React.ReactNode) => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{d}</svg>;
   return (
     <div className="relative">
-    <div className="border border-[var(--field-border)] rounded-ctl overflow-hidden bg-[var(--field-bg)] focus-within:border-[var(--field-border-focus)] focus-within:ring-2 focus-within:ring-steel/40 transition-[border-color,box-shadow]">
+    <div className="border border-[var(--field-border)] rounded-ctl overflow-hidden bg-[var(--field-bg)] focus-within:border-steel focus-within:ring-[3px] focus-within:ring-steel/25 transition-[border-color,box-shadow]">
       <div className="flex items-center justify-between gap-2 border-b border-rule2 px-1.5 py-1 flex-wrap">
         <div className="inline-flex rounded-ctl-sm overflow-hidden border border-rule2">
           {(["write", "preview"] as const).map((t) => (
