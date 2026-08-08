@@ -642,6 +642,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/owners", get(owners_list).post(set_owners))
         .route("/api/repos/:tenant/:repo/settings", get(get_repo_settings).put(set_repo_settings))
         .route("/api/repos/:tenant/:repo/substrate", get(substrate_view))
+        .route("/api/repos/:tenant/:repo/federation", get(federation_view))
         .route("/api/repos/:tenant/:repo/labels", get(repo_labels))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
@@ -4135,6 +4136,59 @@ async fn substrate_view(State(app): State<App>, Path((tenant, repo)): Path<(Stri
     .into_response()
 }
 
+/// Federated view of a repo's default branch (`GET …/federation`): the commit each trusted instance
+/// (this one plus the configured peers) says the branch points at, read back from the relays. Each
+/// entry is transport-signed by that instance's own nostr key, so a relay can't forge a peer's ref;
+/// trust is explicit (an instance appears only if this instance lists it as a peer) and non-transitive.
+/// `diverged` is true when the RESPONDING instances don't agree on a single commit — the signal that one
+/// host has history the others don't (a fork, a stale mirror, or a censored/rewritten ref). It says
+/// nothing about instances that didn't answer: `missing` lists configured instances that returned no ref
+/// (never published, offline, or a relay suppressed them), so a client can tell silence from consensus.
+async fn federation_view(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
+        return r;
+    }
+    let Some(refs) = app.nostr_refs.clone() else {
+        return Json(json!({ "enabled": false })).into_response();
+    };
+    let key = format!("{tenant}/{repo}");
+    let branch = find_repo(&app, &tenant, &repo).await.map(|r| r.default_branch).unwrap_or_else(|| "main".into());
+    // Relay round-trips are blocking I/O — keep them off the async runtime.
+    let (rf, k, br) = (refs.clone(), key, branch.clone());
+    let peer_refs = tokio::task::spawn_blocking(move || rf.fetch_federated_ref(&k, &br)).await.unwrap_or_default();
+    let distinct: std::collections::HashSet<&str> = peer_refs.iter().map(|p| p.commit.as_str()).collect();
+    let instances: Vec<Value> = peer_refs
+        .iter()
+        .map(|p| json!({ "instance": p.pubkey, "commit": p.commit, "self": p.is_self }))
+        .collect();
+    // Configured set = self (if the instance key is valid) + peers. Anything configured but not in the
+    // responses is reported as missing, so diverged=false can't be read as "everyone agrees" when peers
+    // were simply silent or suppressed.
+    let responded: std::collections::HashSet<&str> = peer_refs.iter().map(|p| p.pubkey.as_str()).collect();
+    let mut expected: Vec<String> = Vec::new();
+    if let Some(own) = refs.own_pubkey() {
+        expected.push(own);
+    }
+    for p in refs.peers() {
+        if !expected.contains(p) {
+            expected.push(p.clone());
+        }
+    }
+    let missing: Vec<&String> = expected.iter().filter(|e| !responded.contains(e.as_str())).collect();
+    Json(json!({
+        "enabled": true,
+        "branch": branch,
+        "relays": refs.relays(),
+        "peers": refs.peers(),
+        "instances": instances,
+        "responded": peer_refs.len(),
+        "expected": expected.len(),
+        "missing": missing,
+        "diverged": distinct.len() > 1,
+    }))
+    .into_response()
+}
+
 /// The effective autonomy policy for a repo (`GET …/autonomy`) — the resolved tier, where it comes
 /// from, and the protected paths that always require a human.
 async fn get_repo_autonomy(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
@@ -7205,6 +7259,57 @@ mod tests {
         if now() / 60 == w_start {
             assert_eq!(over, axum::http::StatusCode::TOO_MANY_REQUESTS, "31st fetch from one IP is throttled");
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn federation_view_shows_peer_refs_and_flags_divergence() {
+        // This instance and a peer instance both publish acme/web#main to the same relay, at DIFFERENT
+        // commits. The federation view returns both (self marked) and flags divergence; an instance we
+        // don't list as a peer is absent.
+        let (mut app, tmp) = build_test_app("federation");
+        let url = crate::nostr::spawn_loopback_relay();
+        let self_sk = "0000000000000000000000000000000000000000000000000000000000000001";
+        let peer_sk = "0000000000000000000000000000000000000000000000000000000000000002";
+        let stranger_sk = "0000000000000000000000000000000000000000000000000000000000000003";
+        // a fourth instance we trust but which never publishes → it should show up as `missing`.
+        let silent_pub = crate::nostr::pubkey_of("0000000000000000000000000000000000000000000000000000000000000004").unwrap();
+        let peer_pub = crate::nostr::pubkey_of(peer_sk).unwrap();
+        app.nostr_refs = Some(std::sync::Arc::new(
+            crate::nostr::NostrRefs::new(self_sk.into(), vec![url.clone()]).with_peers(vec![peer_pub.clone(), silent_pub.clone()]),
+        ));
+        setup_org_repo(&app, "acme", "web", false, &[]).await;
+
+        // our own ref, the trusted peer's ref (different commit), and an untrusted stranger's ref.
+        app.nostr_refs.clone().unwrap().publish_ref("acme/web", "main", "blake3:ours", None).unwrap();
+        crate::nostr::NostrRefs::new(peer_sk.into(), vec![url.clone()]).publish_ref("acme/web", "main", "blake3:theirs", None).unwrap();
+        crate::nostr::NostrRefs::new(stranger_sk.into(), vec![url]).publish_ref("acme/web", "main", "blake3:stranger", None).unwrap();
+
+        let resp = federation_view(
+            axum::extract::State(app.clone()),
+            axum::extract::Path(("acme".to_string(), "web".to_string())),
+            axum::http::HeaderMap::new(), // public repo → readable without auth
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["diverged"], true, "instances disagree on the commit");
+        let inst = v["instances"].as_array().unwrap();
+        assert_eq!(inst.len(), 2, "self + one trusted peer; the stranger is excluded");
+        let me = inst.iter().find(|i| i["self"] == true).expect("our own instance row");
+        assert_eq!(me["commit"], "blake3:ours");
+        let peer = inst.iter().find(|i| i["self"] == false).expect("the peer's row");
+        assert_eq!(peer["commit"], "blake3:theirs");
+        assert_eq!(peer["instance"], peer_pub);
+        assert!(inst.iter().all(|i| i["commit"] != "blake3:stranger"), "an unlisted instance is not federated");
+        // silence is distinguishable from agreement: the trusted-but-silent peer is reported missing.
+        assert_eq!(v["responded"], 2, "self + the one peer that published");
+        assert_eq!(v["expected"], 3, "self + two configured peers");
+        let missing = v["missing"].as_array().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], silent_pub, "the configured peer that published nothing");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
