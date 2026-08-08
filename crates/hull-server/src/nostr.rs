@@ -238,10 +238,15 @@ pub fn fetch_events(relays: &[String], filter: serde_json::Value) -> Vec<Event> 
 }
 
 // ── provenance attestation: the ACTOR's Ed25519 signature over a landed change, carried inside the
-// schnorr-signed nostr event (kind 1900). A reader verifies BOTH: schnorr = "this instance transported
-// it"; Ed25519 = "the accountable actor authorized it" — keel's delegated authority, not just the
-// relay identity. This is the dual-signature "bridge" (Ed25519 keel authority ⇄ secp256k1 nostr
-// transport): a wrapping, not a key derivation. ──
+// schnorr-signed nostr event (kind 1900) — the dual-signature "bridge" (Ed25519 keel authority ⇄
+// secp256k1 nostr transport): a wrapping, not a key derivation. A reader verifies BOTH: schnorr = "this
+// instance transported it"; Ed25519 = "`claim.actor` authorized it".
+//
+// NOTE on the trust it actually delivers: this only becomes non-repudiable-by-the-human authorship for
+// SOVEREIGN accounts (the client signs — the follow-up). For the custodial/demo path shipped here the
+// instance holds BOTH keys, so the Ed25519 sig is really an instance attestation "we assert actor X
+// authored C" — same trust domain as the schnorr sig. The primitives are identical either way, so the
+// sovereign signer reuses them verbatim; the difference is only WHERE the actor secret lives. ──
 
 /// Regular (append-only) provenance attestation event kind.
 pub const KIND_PROV: u16 = 1900;
@@ -260,12 +265,19 @@ pub struct ProvenanceClaim {
 }
 
 impl ProvenanceClaim {
-    /// The exact bytes the actor signs. Domain-separated with a `hull-provenance:v1` prefix (matching
-    /// `hull-login:` / `hull-delegation:v1` / `hull-sovereign:v1`) so a provenance signature can never
-    /// be replayed as, or collide with, any other message the actor's Ed25519 key signs. Field order is
-    /// the struct's declaration order (deterministic), so signer and verifier reconstruct identical bytes.
+    /// The exact bytes the actor signs — a FLAT, domain-separated `key=value` form (like
+    /// `identity::hop_message`), NOT JSON: `JSON.stringify` (the future in-browser sovereign signer) and
+    /// `serde_json` disagree on number/escaping details, so a flat form is the only cross-language-stable
+    /// choice. The `hull-provenance:v1` prefix separates it from `hull-login:` / `hull-delegation:v1` /
+    /// `hull-sovereign:v1`. The free-text `intent` is signed by its SHA-256 (any bytes → fixed hex), so
+    /// newlines/unicode in it can't break the line-delimited structure; the other fields are
+    /// newline-free by construction (hex ids, a sanitized `tenant/repo`, a number).
     fn signing_bytes(&self) -> String {
-        format!("hull-provenance:v1\n{}", serde_json::to_string(self).unwrap_or_default())
+        let intent_sha256 = hex::encode(Sha256::digest(self.intent.as_bytes()));
+        format!(
+            "hull-provenance:v1\nchange={}\nactor={}\nrepo={}\nintent_sha256={}\nts={}",
+            self.change, self.actor, self.repo, intent_sha256, self.ts
+        )
     }
 }
 
@@ -282,14 +294,19 @@ pub struct SignedProvenance {
 pub fn sign_provenance(actor_secret_hex: &str, claim: ProvenanceClaim) -> Option<SignedProvenance> {
     let msg = claim.signing_bytes();
     let ed_sig = hull_core::identity::sign(actor_secret_hex, msg.as_bytes())?;
-    hull_core::identity::verify(&claim.actor, msg.as_bytes(), &ed_sig).then_some(SignedProvenance { claim, ed_sig })
+    hull_core::identity::verify_strict(&claim.actor, msg.as_bytes(), &ed_sig).then_some(SignedProvenance { claim, ed_sig })
 }
 
-/// Verify the Ed25519 half of a signed provenance bundle (sig valid for `claim.actor`). Returns the
-/// attested actor id. (Accountability of that actor — its delegation chain — is checked server-side
-/// against the actor store; this only proves the actor authorized the claim.)
+/// Verify the Ed25519 half of a signed provenance bundle: `ed_sig` is a STRICT-valid signature for
+/// `claim.actor` (strict rejects small-order/non-canonical attacker keys). Returns the attested actor
+/// id. **This proves only that `claim.actor` authorized the claim — NOT that `claim.actor` is an
+/// accountable hull actor.** A consumer that acts on provenance MUST additionally resolve
+/// `claim.actor`'s delegation chain to a human in the actor store and check its authority over
+/// `claim.repo`, and must trust ONLY the signed `claim` fields (never the event's schnorr pubkey or
+/// tags, which a re-wrapper can set freely). No such consumer exists yet — this is the publish + verify
+/// primitive only.
 pub fn verify_provenance(sp: &SignedProvenance) -> Option<String> {
-    hull_core::identity::verify(&sp.claim.actor, sp.claim.signing_bytes().as_bytes(), &sp.ed_sig).then(|| sp.claim.actor.clone())
+    hull_core::identity::verify_strict(&sp.claim.actor, sp.claim.signing_bytes().as_bytes(), &sp.ed_sig).then(|| sp.claim.actor.clone())
 }
 
 /// Build a kind:1900 provenance event: the actor-signed bundle in `content`, schnorr-signed by the
