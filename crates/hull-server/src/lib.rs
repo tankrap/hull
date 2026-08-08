@@ -625,6 +625,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/security", get(repo_security))
         .route("/api/repos/:tenant/:repo/owners", get(owners_list).post(set_owners))
         .route("/api/repos/:tenant/:repo/settings", get(get_repo_settings).put(set_repo_settings))
+        .route("/api/repos/:tenant/:repo/substrate", get(substrate_view))
         .route("/api/repos/:tenant/:repo/labels", get(repo_labels))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
@@ -4019,6 +4020,60 @@ fn tier_from_str(s: &str) -> Option<hull_core::AutonomyTier> {
     }
 }
 
+/// `GET /api/repos/:tenant/:repo/substrate` — read the repo's DECENTRALIZED substrate state back from
+/// the nostr relays and return a FULLY-VERIFIED view: the current ref (instance-signed, own-authored)
+/// and provenance attestations (schnorr + Ed25519 verified against the SIGNED claim, not relay-supplied
+/// tags), each annotated with whether `claim.actor` is an accountable hull actor (delegation chain to a
+/// human, per the local store) and authorized on this repo. This is the CONSUMER that makes the
+/// substrate load-bearing — proof that history isn't hostage to one host: it's readable + verifiable
+/// off public relays without trusting any single relay or even this instance's DB.
+async fn substrate_view(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
+        return r;
+    }
+    let Some(refs) = app.nostr_refs.clone() else {
+        return Json(json!({ "enabled": false })).into_response();
+    };
+    let key = format!("{tenant}/{repo}");
+    let default_branch = find_repo(&app, &tenant, &repo).await.map(|r| r.default_branch).unwrap_or_else(|| "main".into());
+    // Relay round-trips are blocking I/O — keep them off the async runtime.
+    let (rf, k, br) = (refs.clone(), key.clone(), default_branch.clone());
+    let (commit, provenance) =
+        tokio::task::spawn_blocking(move || (rf.fetch_ref(&k, &br), rf.fetch_provenance(&k))).await.unwrap_or((None, Vec::new()));
+    // Annotate each cryptographically-verified attestation with LOCAL accountability + repo authority:
+    // is claim.actor an accountable actor here, and is its human root a member of the owning account?
+    let owner_members: std::collections::HashSet<String> = match repo_owner_account(&app, &tenant, &repo).await {
+        Some(acct) => acct.members.iter().map(|m| m.actor.clone()).collect(),
+        None => Default::default(),
+    };
+    let mut prov: Vec<Value> = Vec::new();
+    for sp in provenance {
+        let actor = app.store.actor(&sp.claim.actor).await;
+        let human = actor.as_ref().and_then(|a| a.human_principal().cloned());
+        let accountable = actor.as_ref().map(|a| a.is_accountable()).unwrap_or(false);
+        let authorized = human.as_ref().map(|h| owner_members.contains(h)).unwrap_or(false);
+        prov.push(json!({
+            "change": sp.claim.change,
+            "actor": sp.claim.actor,
+            "actor_handle": actor.as_ref().map(|a| a.handle.clone()),
+            "human_root": human,
+            "intent": sp.claim.intent,
+            "ts": sp.claim.ts,
+            "verified": true,       // schnorr + Ed25519 both checked in fetch_provenance
+            "accountable": accountable,
+            "authorized": authorized,
+        }));
+    }
+    prov.sort_by(|a, b| b["ts"].as_u64().cmp(&a["ts"].as_u64())); // newest first
+    Json(json!({
+        "enabled": true,
+        "relays": refs.relays(),
+        "ref": commit.map(|c| json!({ "branch": default_branch, "commit": c, "source": "nostr" })),
+        "provenance": prov,
+    }))
+    .into_response()
+}
+
 /// The effective autonomy policy for a repo (`GET …/autonomy`) — the resolved tier, where it comes
 /// from, and the protected paths that always require a human.
 async fn get_repo_autonomy(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
@@ -6970,6 +7025,43 @@ mod tests {
         assert!(!seen.contains(&"for-bob"), "must NOT leak another actor's inbox; got {seen:?}");
         assert!(!seen.contains(&"private-broadcast"), "must NOT leak a private repo's broadcast; got {seen:?}");
         assert!(!seen.contains(&"malformed-broadcast"), "a broadcast with an unparseable repo is default-denied; got {seen:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn substrate_view_returns_verified_and_annotated_state() {
+        // The consumer: read a repo's ref + provenance back from the (loopback) relay through the
+        // handler and confirm the verified view + accountability/authority annotation.
+        let (mut app, tmp) = build_test_app("substrate");
+        let url = crate::nostr::spawn_loopback_relay();
+        let instance_sk = "0000000000000000000000000000000000000000000000000000000000000001";
+        app.nostr_refs = Some(std::sync::Arc::new(crate::nostr::NostrRefs::new(instance_sk.into(), vec![url])));
+        // an accountable human author who is a member of the repo's owning account
+        let author = hull_core::identity::mint_human("mira");
+        app.store.put_actor(author.actor.clone()).await;
+        setup_org_repo(&app, "acme", "web", false, &[(&author.actor.id, Role::Write)]).await;
+        // publish a ref + an actor-signed provenance attestation to the relay
+        let refs = app.nostr_refs.clone().unwrap();
+        refs.publish_ref("acme/web", "main", "blake3:tip", None).unwrap();
+        refs.publish_provenance(&author.secret_key, "blake3:tip", &author.actor.id, "acme/web", "landed it").unwrap();
+
+        let resp = substrate_view(
+            axum::extract::State(app.clone()),
+            axum::extract::Path(("acme".to_string(), "web".to_string())),
+            axum::http::HeaderMap::new(), // public repo → readable without auth
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["ref"]["commit"], "blake3:tip", "ref reads back from the relay");
+        let prov = v["provenance"].as_array().unwrap();
+        assert_eq!(prov.len(), 1, "one verified attestation; got {prov:?}");
+        assert_eq!(prov[0]["change"], "blake3:tip");
+        assert_eq!(prov[0]["verified"], true);
+        assert_eq!(prov[0]["accountable"], true, "human author chains to a human → accountable");
+        assert_eq!(prov[0]["authorized"], true, "author is a member of the owning account");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -383,6 +383,21 @@ impl NostrRefs {
         Some(ev)
     }
 
+    /// Read back FULLY-VERIFIED provenance attestations for `repo` from the relays: each returned
+    /// bundle passed both the schnorr (transport) and Ed25519 (actor) checks via [`verify_prov_event`],
+    /// and its SIGNED `claim.repo` matches `repo` (we trust the signed field, never the mutable event
+    /// tag). Accountability of `claim.actor` — its delegation chain to a human and authority over the
+    /// repo — is the CALLER's job (it needs the actor store); this only guarantees the signatures.
+    pub fn fetch_provenance(&self, repo: &str) -> Vec<SignedProvenance> {
+        let filter = serde_json::json!({ "kinds": [KIND_PROV], "#repo": [repo] });
+        fetch_events(&self.relays, filter)
+            .iter()
+            .filter(|ev| verify_prov_event(ev).is_some()) // schnorr + Ed25519 both valid
+            .filter_map(|ev| serde_json::from_str::<SignedProvenance>(&ev.content).ok())
+            .filter(|sp| sp.claim.repo == repo) // trust the SIGNED repo, not the relay-supplied tag/filter
+            .collect()
+    }
+
     /// Read the newest published commit for `repo`'s `branch` back from the relays (own-authored refs).
     pub fn fetch_ref(&self, repo: &str, branch: &str) -> Option<String> {
         let author = pubkey_of(&self.secret_hex)?;
@@ -471,6 +486,48 @@ impl Notifier for NostrNotifier {
             eprintln!("nostr: published {} to {n}/{} relay(s)", &ev.id[..12], relays.len());
         });
     }
+}
+
+/// A minimal in-process NIP-01 relay for tests (this crate's nostr tests AND lib.rs's substrate test):
+/// stores EVENTs, answers a REQ with all stored events + EOSE. Enough to prove the publish → relay →
+/// REQ → read-back → verify → parse path end to end. Serves connections sequentially with a store
+/// shared across them, so an event published on one connection is visible to a later REQ.
+#[cfg(test)]
+pub(crate) fn spawn_loopback_relay() -> String {
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let store: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { break };
+            let Ok(mut ws) = tungstenite::accept(stream) else { continue };
+            while let Ok(msg) = ws.read() {
+                let tungstenite::Message::Text(t) = msg else {
+                    break; // Close / non-text → this connection is done
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
+                let a = v.as_array().cloned().unwrap_or_default();
+                match a.first().and_then(|x| x.as_str()) {
+                    Some("EVENT") => {
+                        if let Some(ev) = a.get(1) {
+                            store.lock().unwrap().push(ev.clone());
+                        }
+                    }
+                    Some("REQ") => {
+                        let sub = a.get(1).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        for ev in store.lock().unwrap().iter() {
+                            let _ = ws.send(tungstenite::Message::Text(serde_json::json!(["EVENT", sub, ev]).to_string()));
+                        }
+                        let _ = ws.send(tungstenite::Message::Text(serde_json::json!(["EOSE", sub]).to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    url
 }
 
 #[cfg(test)]
@@ -566,46 +623,6 @@ mod tests {
         assert!(back.verify());
     }
 
-    // A minimal in-process NIP-01 relay: stores EVENTs, answers a REQ with all stored events + EOSE.
-    // Enough to prove the publish → relay → REQ → read-back → verify → parse path end to end. Serves
-    // connections sequentially (the test publishes on one connection, then fetches on another), with a
-    // store shared across connections so a published ref is visible to a later REQ.
-    fn spawn_loopback_relay() -> String {
-        use std::net::TcpListener;
-        use std::sync::{Arc, Mutex};
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            let store: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else { break };
-                let Ok(mut ws) = tungstenite::accept(stream) else { continue };
-                while let Ok(msg) = ws.read() {
-                    let tungstenite::Message::Text(t) = msg else {
-                        break; // Close / non-text → this connection is done
-                    };
-                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
-                    let a = v.as_array().cloned().unwrap_or_default();
-                    match a.first().and_then(|x| x.as_str()) {
-                        Some("EVENT") => {
-                            if let Some(ev) = a.get(1) {
-                                store.lock().unwrap().push(ev.clone());
-                            }
-                        }
-                        Some("REQ") => {
-                            let sub = a.get(1).and_then(|x| x.as_str()).unwrap_or("").to_string();
-                            for ev in store.lock().unwrap().iter() {
-                                let _ = ws.send(tungstenite::Message::Text(serde_json::json!(["EVENT", sub, ev]).to_string()));
-                            }
-                            let _ = ws.send(tungstenite::Message::Text(serde_json::json!(["EOSE", sub]).to_string()));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
-        url
-    }
 
     #[test]
     fn provenance_carries_a_verifiable_actor_signature() {
@@ -652,5 +669,28 @@ mod tests {
         let ev = refs.publish_ref("tankrap/hull", "main", "deadbeefcommit", None).expect("publish builds an event");
         assert!(ev.verify());
         assert_eq!(refs.fetch_ref("tankrap/hull", "main").as_deref(), Some("deadbeefcommit"), "the published commit reads back");
+    }
+
+    #[test]
+    fn publish_then_fetch_provenance_round_trips_and_rejects_forgeries() {
+        let url = spawn_loopback_relay();
+        let refs = NostrRefs::new(SK.into(), vec![url.clone()]);
+        let actor = hull_core::identity::mint_human("agent");
+        // publish an actor-signed provenance attestation, then read it back fully-verified.
+        refs.publish_provenance(&actor.secret_key, "blake3:c1", &actor.actor.id, "tankrap/hull", "did a thing")
+            .expect("publish");
+        let got = refs.fetch_provenance("tankrap/hull");
+        assert_eq!(got.len(), 1, "one verified attestation; got {got:?}");
+        assert_eq!(got[0].claim.change, "blake3:c1");
+        assert_eq!(got[0].claim.actor, actor.actor.id);
+
+        // a forgery: publish a raw event whose SIGNED claim.repo is a DIFFERENT repo — fetch_provenance
+        // for "tankrap/hull" must not return it (it trusts the signed claim, and here the ed_sig is over
+        // a mismatched claim so verify_prov_event also rejects the tampered pairing).
+        let other = hull_core::identity::mint_human("attacker");
+        refs.publish_provenance(&other.secret_key, "blake3:evil", &other.actor.id, "someone/else", "evil")
+            .expect("publish");
+        let still = refs.fetch_provenance("tankrap/hull");
+        assert!(still.iter().all(|sp| sp.claim.change != "blake3:evil"), "an attestation for another repo isn't returned");
     }
 }
