@@ -507,7 +507,13 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/tree/:tree/tar", get(tree_archive))
         .route("/:tenant/:repo/info/refs", get(info_refs_handler))
         .route("/:tenant/:repo/git-upload-pack", post(upload_pack_handler))
-        .route("/:tenant/:repo/git-receive-pack", post(receive_pack_handler));
+        .route("/:tenant/:repo/git-receive-pack", post(receive_pack_handler))
+        // These routes are exempt from the 8 MiB `MAX_BODY_BYTES` cap because a git push carries a
+        // packfile — but "no cap" let an anonymous client OOM the server with a huge (or gzip-bombed)
+        // body. Apply a generous, operator-tunable git cap instead (`HULL_GIT_MAX_BODY_MB`, default
+        // 512). The GET routes (feed/tar/info-refs) carry no request body, so the cap is a no-op there;
+        // `maybe_gunzip` caps the *decompressed* size to the same limit to stop gzip bombs.
+        .layer(RequestBodyLimitLayer::new(repos::git_max_body_bytes()));
 
     let api = Router::new()
         .route("/health", get(health))
@@ -3554,13 +3560,19 @@ async fn is_repo_member(app: &App, tenant: &str, repo: &str, actor: &str) -> boo
     if acct.members.iter().any(|m| m.actor == actor) {
         return true;
     }
-    // A member of a team the repo grants access to counts as a member (teams carry a repo role).
+    // A member of a team the repo grants a WRITE-CAPABLE role (admin/write, not read) counts as a
+    // write-side member. This is the write gate, so a read-only team grant must NOT pass it — reads
+    // go through `can_read_repo`, which (correctly) accepts any team grant. Ignoring the role here
+    // silently escalated a read grant to push.
     let settings = app.repo_settings.get(&format!("{tenant}/{repo}"));
     app.store
         .teams(&acct.id)
         .await
         .into_iter()
-        .any(|t| settings.team_access.iter().any(|ta| ta.team == t.id) && t.members.iter().any(|m| m.actor == actor))
+        .any(|t| {
+            settings.team_access.iter().any(|ta| ta.team == t.id && matches!(ta.role.as_str(), "admin" | "write"))
+                && t.members.iter().any(|m| m.actor == actor)
+        })
 }
 
 // ── git smart-HTTP authorization (closes authz-hardening area D) ────────────────────────────────
@@ -3638,11 +3650,19 @@ async fn git_auth_decision(app: &App, enforce: bool, tenant: &str, repo: &str, s
     if !enforce {
         return GitAuthDecision::Allow;
     }
+    // Resolve the token to an actor, but honor it only if the actor is still ACCOUNTABLE (not revoked;
+    // an agent's delegation chain valid + unexpired). The REST mutating path enforces this via
+    // `require_actor`; the git path did not, so a revoked actor's still-unexpired session token kept
+    // fetch/push working for up to the token TTL (~30 days). A non-accountable token is treated as no
+    // credential — anonymous rules then apply (public fetch still works; private/push is refused).
     let actor = match token {
         Some(t) => actor_for_token(app, t).await,
         None => None,
-    }
-    .map(|a| a.id);
+    };
+    let actor = match actor {
+        Some(a) if accountable(app, &a).await.is_ok() => Some(a.id),
+        _ => None,
+    };
     if service == "git-receive-pack" {
         // Push: always require a member. This also gates auto-create-on-push (an anonymous or
         // non-member actor can neither push to nor provision a repo).
@@ -3783,7 +3803,7 @@ async fn receive_pack_handler(
     // unaffected. When protection is off this whole block is skipped — the config-off no-op.
     let key = format!("{tenant}/{repo}");
     if app.repo_settings.get(&key).protects_default_branch() {
-        let commands = repos::parse_receive_refs(&repos::maybe_gunzip(&headers, body.to_vec()));
+        let commands = repos::parse_receive_refs(&repos::maybe_gunzip(&headers, body.to_vec(), repos::git_max_body_bytes()));
         // Fail CLOSED: on a protected repo we must know the *real* default branch before deciding. If
         // `find_repo` can't resolve it (e.g. a transient store read), reject rather than fall back to a
         // literal "main" — a repo whose default branch isn't "main" would otherwise let a push to its
@@ -6803,6 +6823,56 @@ mod tests {
         assert!(!is_repo_admin(&app, "acme", "web", "dev").await, "Write is a member but not an admin");
         assert!(!is_repo_admin(&app, "acme", "web", "reader").await, "Read is a member but not an admin");
         assert!(!is_repo_admin(&app, "acme", "web", "outsider").await);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn git_auth_denies_a_revoked_actor() {
+        // A revoked actor's still-unexpired session token must not keep git access — the git path now
+        // runs the same `accountable` check the REST path does. Regression: revoke set the flag but the
+        // git gate ignored it, so the token kept pushing until it expired (~30 days).
+        let (app, tmp) = build_test_app("git-revoked");
+        setup_org_repo(&app, "acme", "web", true, &[("member", Role::Write)]).await;
+        let mut a = actor("member", ActorKind::Human);
+        a.revoked = true;
+        app.store.put_actor(a).await;
+        mint_token(&app, "tok", "member");
+        // The token resolves to a repo member, but revocation makes it unaccountable → denied.
+        assert_eq!(
+            git_auth_decision(&app, true, "acme", "web", "git-receive-pack", Some("tok")).await,
+            GitAuthDecision::Unauthorized, "revoked actor cannot push",
+        );
+        assert_eq!(
+            git_auth_decision(&app, true, "acme", "web", "git-upload-pack", Some("tok")).await,
+            GitAuthDecision::Unauthorized, "revoked actor cannot fetch a private repo",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn read_only_team_grant_is_not_write_membership() {
+        // A team granted a "read" role can READ the repo but must NOT pass the write-side gate
+        // (`is_repo_member`, which feeds git push and every mutation). A "write"/"admin" grant does.
+        let (app, tmp) = build_test_app("team-role");
+        setup_org_repo(&app, "acme", "web", true, &[("owner", Role::Owner)]).await;
+        app.store.put_actor(actor("reader", ActorKind::Human)).await;
+        app.store.put_actor(actor("writer", ActorKind::Human)).await;
+        app.store.put_team(hull_core::Team { id: "team_r".into(), account: "acct-acme".into(), name: "readers".into(), members: vec![Membership { actor: "reader".into(), role: Role::Read }] }).await;
+        app.store.put_team(hull_core::Team { id: "team_w".into(), account: "acct-acme".into(), name: "writers".into(), members: vec![Membership { actor: "writer".into(), role: Role::Write }] }).await;
+        app.repo_settings.set("acme/web", crate::reposettings::RepoSettings {
+            private: true,
+            team_access: vec![
+                crate::reposettings::TeamAccess { team: "team_r".into(), role: "read".into() },
+                crate::reposettings::TeamAccess { team: "team_w".into(), role: "write".into() },
+            ],
+            ..Default::default()
+        });
+        // Read grant: can read, but is NOT a write-side member.
+        assert!(can_read_repo(&app, Some("reader"), "acme", "web").await, "read grant → readable");
+        assert!(!is_repo_member(&app, "acme", "web", "reader").await, "read grant must not confer push");
+        // Write grant: both.
+        assert!(can_read_repo(&app, Some("writer"), "acme", "web").await);
+        assert!(is_repo_member(&app, "acme", "web", "writer").await, "write grant confers push");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
