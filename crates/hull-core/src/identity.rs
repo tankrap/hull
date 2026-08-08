@@ -18,6 +18,15 @@ use rand::rngs::OsRng;
 /// unbounded re-delegation.
 pub const MAX_DELEGATION_DEPTH: usize = 8;
 
+/// Sign `message` with a hex Ed25519 secret key, returning the hex signature — the counterpart to
+/// [`verify`]. `None` if `secret_hex` isn't a 32-byte hex key. For sovereign accounts signing happens
+/// client-side (Hull never holds the secret); this exists for the demo/CLI paths and tests.
+pub fn sign(secret_hex: &str, message: &[u8]) -> Option<String> {
+    let bytes = hex::decode(secret_hex).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(hex::encode(SigningKey::from_bytes(&arr).sign(message).to_bytes()))
+}
+
 /// Verify that `signature_hex` is a valid Ed25519 signature of `message` by the actor whose id is
 /// `actor_id_hex` (the id **is** the public key). This is how an actor proves it holds the private
 /// key at login — authorship becomes cryptographic, not a claim.
@@ -202,6 +211,26 @@ pub fn mint_human(handle: &str) -> Minted {
         revoked: false,
     };
     Minted { actor, secret_key }
+}
+
+/// Build a human actor from a client-held **public** key (hex) — for a SOVEREIGN (non-custodial)
+/// account where Hull never sees the secret. Returns `None` if `pubkey_hex` isn't a valid 32-byte
+/// Ed25519 verifying key. The caller must separately verify a signature by this key (proof of
+/// possession) before trusting the binding — this only validates the key's shape and builds the actor.
+pub fn human_from_pubkey(handle: &str, pubkey_hex: &str) -> Option<Actor> {
+    let bytes = hex::decode(pubkey_hex).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    // Reject a non-canonical / non-curve point so the id is always a usable verifying key.
+    VerifyingKey::from_bytes(&arr).ok()?;
+    Some(Actor {
+        id: hex::encode(arr),
+        kind: ActorKind::Human,
+        lifetime: Lifetime::Static,
+        handle: handle.to_string(),
+        delegation: None,
+        nostr_pubkey: None,
+        revoked: false,
+    })
 }
 
 /// Mint a human from a **known** 32-byte secret key (hex) rather than a fresh random one — for a

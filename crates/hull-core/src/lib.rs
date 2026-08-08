@@ -297,10 +297,16 @@ pub struct User {
     pub email: String,
     /// The human actor this user drives (its id is that actor's public key).
     pub actor: ActorId,
-    /// Hex Ed25519 secret Hull holds to sign delegations for this user. Plaintext in the dev store;
-    /// a real deployment encrypts this at rest (KMS/enclave). This is the tradeoff the hosted-account
-    /// model accepts in exchange for passkey login.
+    /// Hex Ed25519 secret Hull holds to sign delegations for a CUSTODIAL (passkey) account. Plaintext
+    /// in the dev store; a real deployment encrypts this at rest (KMS/enclave). This is the tradeoff
+    /// the hosted-account model accepts in exchange for passkey login. **Empty for a SOVEREIGN
+    /// (non-custodial) account** — Hull then holds no signing key and refuses to sign for it.
     pub secret_key: String,
+    /// For a SOVEREIGN account: the user's Ed25519 secret, encrypted in-browser under their passphrase
+    /// (opaque bundle — KDF params + salt + nonce + ciphertext). Hull stores only this ciphertext so the
+    /// account is portable across devices; it can never decrypt it (no passphrase). `None` for custodial.
+    #[serde(default)]
+    pub wrapped_key: Option<String>,
     #[serde(default)]
     pub passkeys: Vec<PasskeyCred>,
     #[serde(default)]

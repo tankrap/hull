@@ -1642,6 +1642,7 @@ mod tests {
             email: "j@example.com".into(),
             actor: "actor-1".into(),
             secret_key: "deadbeef".into(),
+            wrapped_key: None,
             passkeys: vec![],
             created_unix: 0,
             bio: String::new(),

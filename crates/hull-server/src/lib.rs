@@ -555,6 +555,9 @@ fn make_router(app: App) -> Router {
         .route("/api/auth/register/finish", post(register_finish))
         .route("/api/auth/passkey/start", post(passkey_start))
         .route("/api/auth/passkey/finish", post(passkey_finish))
+        // sovereign (non-custodial) accounts: register a client-held key, fetch its wrapped bundle
+        .route("/api/auth/sovereign/register", post(sovereign_register))
+        .route("/api/auth/sovereign/wrapped", get(sovereign_wrapped))
         // account self-service (settings): username/email + passkey management
         .route("/api/account", get(account_get).put(account_update))
         .route("/api/profile", get(profile))
@@ -2269,6 +2272,12 @@ async fn register_actor(State(app): State<App>, headers: axum::http::HeaderMap, 
                     None => return (StatusCode::UNPROCESSABLE_ENTITY, "could not mint — parent is not accountable").into_response(),
                 }
             } else if let Some(user) = app.store.user_by_actor(&parent.id).await {
+                if user.secret_key.is_empty() {
+                    // SOVEREIGN (non-custodial) account: Hull holds no signing key for this user and must
+                    // NOT sign. The client signs the delegation itself and re-sends the pair (verified
+                    // by the client-signed branch above) — the whole point of a sovereign identity.
+                    return (StatusCode::UNPROCESSABLE_ENTITY, "sovereign account: sign the delegation client-side and send { child_pub, delegation_sig } (Hull holds no key for you)").into_response();
+                }
                 match identity::mint_agent(&handle, &parent, &user.secret_key, scope, lifetime) {
                     Some(m) => m,
                     None => return (StatusCode::UNPROCESSABLE_ENTITY, "could not mint — parent is not accountable").into_response(),
@@ -2580,6 +2589,7 @@ async fn register_finish(State(app): State<App>, Json(body): Json<Value>) -> Res
         email: flow.email,
         actor: minted.actor.id.clone(),
         secret_key: minted.secret_key,
+        wrapped_key: None,
         passkeys: vec![PasskeyCred { id: cred_id, name: "passkey".into(), created_unix: now(), data: pk_data }],
         created_unix: now(),
         bio: String::new(),
@@ -2595,6 +2605,80 @@ async fn register_finish(State(app): State<App>, Json(body): Json<Value>) -> Res
     let token = identity::random_hex(24);
     app.auth.lock().unwrap().tokens.insert(token.clone(), (user.actor.clone(), now()));
     (StatusCode::CREATED, Json(json!({ "token": token, "actor": user.actor, "username": user.username }))).into_response()
+}
+
+/// `POST /api/auth/sovereign/register` — `{username, email, pubkey, wrapped_key, signature}` creates a
+/// SOVEREIGN (non-custodial) account. The human's Ed25519 key lives client-side; Hull stores only the
+/// public key (as the actor id) and the passphrase-encrypted secret bundle (`wrapped_key`, opaque to
+/// Hull — it holds no passphrase). `signature` is the client's Ed25519 signature over
+/// `hull-sovereign:v1\nusername=<u>\npubkey=<pk>` — proof it holds the secret, so no one can bind a key
+/// (or squat a username) they don't control. Login afterward uses the normal challenge→sign flow (the
+/// client decrypts its key with the passphrase to sign the nonce); Hull never signs for this account.
+async fn sovereign_register(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let username = sanitize_handle(body.get("username").and_then(Value::as_str).unwrap_or("").trim());
+    let email = body.get("email").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let pubkey = body.get("pubkey").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let wrapped = body.get("wrapped_key").and_then(Value::as_str).unwrap_or("").to_string();
+    let signature = body.get("signature").and_then(Value::as_str).unwrap_or("");
+    if username.is_empty() {
+        return (StatusCode::BAD_REQUEST, "username must contain at least one letter or digit").into_response();
+    }
+    if wrapped.is_empty() {
+        return (StatusCode::BAD_REQUEST, "wrapped_key is required (the passphrase-encrypted secret)").into_response();
+    }
+    // Validate the public key and build the human actor from it.
+    let Some(actor) = identity::human_from_pubkey(&username, &pubkey) else {
+        return (StatusCode::BAD_REQUEST, "pubkey must be a 32-byte hex Ed25519 public key").into_response();
+    };
+    // Proof of possession: the client signs the exact (username, pubkey) binding with the secret, so a
+    // caller can't register a key it doesn't hold or squat a username against someone else's key.
+    let msg = format!("hull-sovereign:v1\nusername={username}\npubkey={pubkey}");
+    if !identity::verify(&pubkey, msg.as_bytes(), signature) {
+        return (StatusCode::UNAUTHORIZED, "signature does not prove possession of the secret key").into_response();
+    }
+    if app.store.user_by_username(&username).await.is_some() {
+        return (StatusCode::CONFLICT, "that username is taken").into_response();
+    }
+    if app.store.actor(&actor.id).await.is_some() {
+        return (StatusCode::CONFLICT, "that key is already registered").into_response();
+    }
+    let uuid = identity::random_hex(16);
+    let user = User {
+        id: uuid.clone(),
+        username: username.clone(),
+        email,
+        actor: actor.id.clone(),
+        secret_key: String::new(), // NON-CUSTODIAL: Hull holds no signing key for this user
+        wrapped_key: Some(wrapped),
+        passkeys: vec![],
+        created_unix: now(),
+        bio: String::new(),
+    };
+    app.store.put_actor(actor.clone()).await;
+    app.store.put_user(user.clone()).await;
+    app.store
+        .put_account(Account {
+            id: format!("acct_{uuid}"),
+            kind: AccountKind::Personal,
+            handle: username.clone(),
+            members: vec![Membership { actor: actor.id.clone(), role: Role::Owner }],
+        })
+        .await;
+    let token = identity::random_hex(24);
+    app.auth.lock().unwrap().tokens.insert(token.clone(), (actor.id.clone(), now()));
+    (StatusCode::CREATED, Json(json!({ "token": token, "actor": actor.id, "username": username }))).into_response()
+}
+
+/// `GET /api/auth/sovereign/wrapped?username=X` — the passphrase-encrypted key bundle for a sovereign
+/// account, so the client can decrypt it (with the passphrase) and sign the login challenge from any
+/// device. The bundle is passphrase-protected — Hull can't read it — so serving it pre-auth is the
+/// standard encrypted-vault model. 404 for unknown or custodial accounts.
+async fn sovereign_wrapped(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let username = sanitize_handle(q.get("username").map(String::as_str).unwrap_or(""));
+    match app.store.user_by_username(&username).await.and_then(|u| u.wrapped_key.map(|w| (u.actor, w))) {
+        Some((actor, wrapped)) => Json(json!({ "actor": actor, "wrapped_key": wrapped })).into_response(),
+        None => (StatusCode::NOT_FOUND, "no sovereign account with that username").into_response(),
+    }
 }
 
 /// `POST /api/auth/passkey/start` — `{username}` → a WebAuthn assertion challenge for that account.
@@ -6708,6 +6792,7 @@ mod tests {
                 email: "u@x.co".into(),
                 actor: "u1actor".into(),
                 secret_key: "00".into(),
+                wrapped_key: None,
                 passkeys: vec![],
                 created_unix: 0,
                 bio: String::new(),
@@ -6836,6 +6921,70 @@ mod tests {
         assert!(!seen.contains(&"for-bob"), "must NOT leak another actor's inbox; got {seen:?}");
         assert!(!seen.contains(&"private-broadcast"), "must NOT leak a private repo's broadcast; got {seen:?}");
         assert!(!seen.contains(&"malformed-broadcast"), "a broadcast with an unparseable repo is default-denied; got {seen:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn sovereign_account_is_non_custodial_end_to_end() {
+        // A sovereign (non-custodial) account: Hull stores the PUBLIC key + a passphrase-encrypted
+        // bundle, never a plaintext secret, and refuses to sign for it — yet the account still logs in
+        // via the normal challenge→sign flow (the client holds the key). This drives the whole path.
+        let (app, tmp) = build_test_app("sovereign");
+        // the client's keypair (in reality generated + kept in the browser)
+        let kp = identity::mint_human("whoever");
+        let pubkey = kp.actor.id.clone();
+        let secret = kp.secret_key.clone();
+
+        // register: sign the (username,pubkey) binding to prove possession, send only the pubkey + a
+        // (here opaque) wrapped bundle.
+        let proof = identity::sign(&secret, format!("hull-sovereign:v1\nusername=nomad\npubkey={pubkey}").as_bytes()).unwrap();
+        let reg = |app: App, body: Value| async move { sovereign_register(axum::extract::State(app), axum::Json(body)).await };
+        let good = serde_json::json!({ "username": "nomad", "email": "n@x.co", "pubkey": pubkey, "wrapped_key": "ENC(...)", "signature": proof });
+        assert_eq!(reg(app.clone(), good.clone()).await.status(), axum::http::StatusCode::CREATED);
+
+        // stored NON-custodially: no plaintext secret, but the wrapped bundle is kept, and the actor is
+        // the client's public key.
+        let u = app.store.user_by_username("nomad").await.unwrap();
+        assert!(u.secret_key.is_empty(), "Hull must hold NO plaintext secret for a sovereign account");
+        assert_eq!(u.wrapped_key.as_deref(), Some("ENC(...)"));
+        assert_eq!(u.actor, pubkey, "actor id is the client's public key");
+
+        // a bad proof-of-possession is rejected (can't bind a key you don't hold).
+        let forged = serde_json::json!({ "username": "imposter", "email": "", "pubkey": pubkey, "wrapped_key": "x", "signature": "00" });
+        assert_eq!(reg(app.clone(), forged).await.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // Hull REFUSES to server-sign a delegation for the sovereign parent (the core invariant).
+        mint_token(&app, "ntok", &pubkey);
+        let resp = register_actor(
+            axum::extract::State(app.clone()),
+            bearer("ntok"),
+            axum::Json(serde_json::json!({ "kind": "agent", "handle": "bot" })),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY, "Hull must not sign for a sovereign account");
+        let msg = String::from_utf8(axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(msg.contains("sovereign"), "error should explain the client must sign; got {msg:?}");
+
+        // yet the account LOGS IN through the normal flow — the client decrypts its key and signs the nonce.
+        let nonce = auth_challenge(axum::extract::State(app.clone())).await.0["nonce"].as_str().unwrap().to_string();
+        let login_sig = identity::sign(&secret, format!("hull-login:{nonce}").as_bytes()).unwrap();
+        let resp = auth_login(
+            axum::extract::State(app.clone()),
+            axum::Json(serde_json::json!({ "actor": pubkey, "nonce": nonce, "signature": login_sig })),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::CREATED, "sovereign login works via the existing challenge→sign flow");
+
+        // the wrapped bundle is fetchable (for cross-device login) by username.
+        let resp = sovereign_wrapped(
+            axum::extract::State(app.clone()),
+            axum::extract::Query(std::collections::HashMap::from([("username".to_string(), "nomad".to_string())])),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["wrapped_key"].as_str(), Some("ENC(...)"));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
