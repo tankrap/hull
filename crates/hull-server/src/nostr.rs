@@ -169,14 +169,21 @@ impl Event {
 
 /// The newest event's `commit` (parameterized-replaceable = latest-wins by `created_at`) — so a set of
 /// ref events for the same `repo#branch` collapses to the current commit. Pure; the client resolves
-/// latest-wins itself rather than trusting a single relay's collapse.
+/// latest-wins itself rather than trusting a single relay's collapse. Ties on `created_at` break by
+/// lowest event id (NIP-01), so client and relay agree deterministically on the winner.
 pub fn newest_commit(events: &[Event]) -> Option<String> {
     events
         .iter()
-        .max_by_key(|e| e.created_at)
+        .max_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| b.id.cmp(&a.id)))
         .and_then(|e| serde_json::from_str::<serde_json::Value>(&e.content).ok())
         .and_then(|c| c.get("commit").and_then(|x| x.as_str()).map(str::to_string))
 }
+
+/// Overall wall-clock budget for a [`fetch_events`] read across all relays, and a hard cap on events
+/// collected — so a chatty/hostile relay that streams events without ever sending `EOSE` (which keeps
+/// the per-read idle timeout from firing) can't hang the caller or grow memory without bound.
+const FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(6);
+const FETCH_MAX_EVENTS: usize = 512;
 
 /// Subscribe (NIP-01 `REQ`) for events matching `filter` across `relays`, collecting until `EOSE` or a
 /// short timeout, returning every VERIFIED event (deduped by id). This is the read half the notifier
@@ -186,7 +193,11 @@ pub fn fetch_events(relays: &[String], filter: serde_json::Value) -> Vec<Event> 
     let req = serde_json::json!(["REQ", "hull-ref", filter]).to_string();
     let mut out: Vec<Event> = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let start = std::time::Instant::now();
     for url in relays {
+        if start.elapsed() > FETCH_DEADLINE || out.len() >= FETCH_MAX_EVENTS {
+            break;
+        }
         let Ok((mut ws, _)) = tungstenite::connect(url) else { continue };
         set_ws_timeouts(&ws, Duration::from_secs(4));
         if ws.send(tungstenite::Message::Text(req.clone())).is_err() {
@@ -194,6 +205,11 @@ pub fn fetch_events(relays: &[String], filter: serde_json::Value) -> Vec<Event> 
             continue;
         }
         loop {
+            // Overall budget + cap: a relay that streams events without ever sending EOSE keeps the
+            // per-read idle timeout from firing, so bound the loop by wall-clock and event count too.
+            if start.elapsed() > FETCH_DEADLINE || out.len() >= FETCH_MAX_EVENTS {
+                break;
+            }
             match ws.read() {
                 Ok(tungstenite::Message::Text(t)) => {
                     let Ok(val) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
