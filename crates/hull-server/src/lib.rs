@@ -25,6 +25,7 @@ pub mod mirror;
 pub mod nostr;
 pub mod observability;
 pub mod passkey;
+pub mod ratelimit;
 pub mod reposettings;
 pub mod plugins;
 pub mod quic;
@@ -36,7 +37,7 @@ pub use ci_sandbox::dispatch_if_invoked;
 
 use activity::{ActivityEvent, ActivityHub};
 use axum::{
-    extract::{Path, Query, RawQuery, State},
+    extract::{ConnectInfo, Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
     response::{IntoResponse, Response},
@@ -233,6 +234,9 @@ struct App {
     /// be handed the same number. One global async lock is ample for this single-process server's
     /// create volume; the `UNIQUE(repo, number)` index is the database-level backstop.
     number_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Fixed-window limiter for the unauthenticated sovereign wrapped-key fetch (throttles bulk
+    /// enumeration / harvesting; the per-account defense is still the client Argon2id KDF).
+    rate: Arc<ratelimit::RateLimiter>,
     /// Decentralized ref transport: if a nostr key + relays are configured, a repo's branch pointer is
     /// published as a signed event (kind 31900) each time it lands, so history isn't hostage to one
     /// host. `None` unless configured (OSS default is off).
@@ -324,6 +328,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         number_lock: Arc::new(tokio::sync::Mutex::new(())),
         nostr_refs,
         blossom,
+        rate: Arc::new(ratelimit::RateLimiter::new()),
     }
 }
 
@@ -782,10 +787,13 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     // server 20s after startup, since `with_graceful_shutdown` only resolves after a signal.)
     let draining = std::sync::Arc::new(tokio::sync::Notify::new());
     let draining_signal = draining.clone();
-    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        draining_signal.notify_one(); // a signal arrived → the drain begins now
-    });
+    // into_make_service_with_connect_info so handlers (sovereign_wrapped's per-IP rate limit) can read
+    // the socket peer address. Handlers that don't ask for ConnectInfo are unaffected.
+    let server = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            draining_signal.notify_one(); // a signal arrived → the drain begins now
+        });
     let drain_cap = async move {
         draining.notified().await; // block until a shutdown signal has actually fired…
         tokio::time::sleep(Duration::from_secs(20)).await; // …then cap the drain at 20s
@@ -2699,11 +2707,43 @@ async fn sovereign_register(State(app): State<App>, Json(body): Json<Value>) -> 
 /// standard encrypted-vault model. 404 for unknown or custodial accounts (no custodial-vs-missing
 /// oracle: both are 404).
 ///
+/// Rate-limit key for a caller's IP: the address as-is for IPv4, collapsed to its /64 for IPv6. A
+/// single host is routinely handed a whole /64 (often a /48), so keying on the full v6 address would
+/// let one host mint unlimited buckets by varying the low bits and evade the per-IP cap.
+fn rate_ip_key(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+    }
+}
+
 /// SECURITY: because this is unauthenticated, an attacker can harvest a username's bundle and brute-
 /// force the passphrase OFFLINE — so the whole account's security rests on the CLIENT KDF. The browser
 /// MUST wrap with a strong memory-hard KDF (Argon2id, high params); Hull can't verify that on an opaque
-/// blob. Deployment follow-up: rate-limit this route (and it enumerates sovereign usernames: 200 vs 404).
-async fn sovereign_wrapped(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
+/// blob. It also enumerates a sovereign username via 200-vs-404.
+///
+/// Rate limiting is per-IP only (30/min, IPv6 collapsed to /64). That throttles enumeration and bulk
+/// harvesting from one source. There is deliberately NO global cap (a single ceiling shared by all
+/// callers on a login path locks out everyone) and NO per-username cap: the bundle is immutable, so
+/// re-pulling one username gains an attacker nothing, while a per-username cap keyed on a public,
+/// enumerable username would let anyone lock the real owner out of a new-device login for the cost of a
+/// few requests a minute. Behind a reverse proxy the peer is the proxy, so operators in that topology
+/// must throttle at the edge (see `ratelimit`). When connect-info isn't wired (some test servers) the
+/// cap is skipped. A single targeted account is not protected here — one fetch always succeeds, and
+/// that account's security rests on the client KDF.
+async fn sovereign_wrapped(
+    State(app): State<App>,
+    connect: Option<ConnectInfo<std::net::SocketAddr>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(ConnectInfo(peer)) = connect {
+        if !app.rate.check(&format!("wrapped-ip:{}", rate_ip_key(peer.ip())), 30, 60, now()) {
+            return (StatusCode::TOO_MANY_REQUESTS, "rate limited — try again shortly").into_response();
+        }
+    }
     let username = sanitize_handle(q.get("username").map(String::as_str).unwrap_or(""));
     match app.store.user_by_username(&username).await.and_then(|u| u.wrapped_key.map(|w| (u.actor, w))) {
         Some((actor, wrapped)) => Json(json!({ "actor": actor, "wrapped_key": wrapped })).into_response(),
@@ -7127,6 +7167,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn rate_ip_key_collapses_ipv6_to_a_64() {
+        use std::net::IpAddr;
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        assert_eq!(rate_ip_key(a), rate_ip_key(b), "two addresses in one /64 share a bucket");
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_ne!(rate_ip_key(a), rate_ip_key(c), "a different /64 is a different bucket");
+        let v4: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(rate_ip_key(v4), "203.0.113.7", "IPv4 is used whole");
+    }
+
+    #[tokio::test]
+    async fn sovereign_wrapped_per_ip_cap_throttles_enumeration() {
+        let (app, tmp) = build_test_app("wrapped-ip-rl");
+        // Enumeration varies the username; only the per-IP cap catches it. All requests come from one
+        // peer, each asking for a distinct (nonexistent) username → 404, but still counting against the
+        // IP. The 30/min budget allows 30, then blocks.
+        let peer: std::net::SocketAddr = "203.0.113.7:44444".parse().unwrap();
+        let call = |app: App, user: String| async move {
+            sovereign_wrapped(
+                axum::extract::State(app),
+                Some(axum::extract::ConnectInfo(peer)),
+                axum::extract::Query(std::collections::HashMap::from([("username".to_string(), user)])),
+            )
+            .await
+            .status()
+        };
+        let w_start = now() / 60;
+        for i in 0..30 {
+            assert_eq!(call(app.clone(), format!("nobody{i}")).await, axum::http::StatusCode::NOT_FOUND, "under the IP budget: {i}");
+        }
+        let over = call(app.clone(), "nobody999".to_string()).await;
+        // Assert the exact threshold only if the 31 calls stayed inside one fixed window. They run in
+        // well under a millisecond, so this holds in practice; the guard just removes any boundary flake.
+        if now() / 60 == w_start {
+            assert_eq!(over, axum::http::StatusCode::TOO_MANY_REQUESTS, "31st fetch from one IP is throttled");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[tokio::test]
     async fn sovereign_account_is_non_custodial_end_to_end() {
         // A sovereign (non-custodial) account: Hull stores the PUBLIC key + a passphrase-encrypted
@@ -7181,6 +7262,7 @@ mod tests {
         // the wrapped bundle is fetchable (for cross-device login) by username.
         let resp = sovereign_wrapped(
             axum::extract::State(app.clone()),
+            None,
             axum::extract::Query(std::collections::HashMap::from([("username".to_string(), "nomad".to_string())])),
         )
         .await;
