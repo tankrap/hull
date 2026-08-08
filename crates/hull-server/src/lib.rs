@@ -37,7 +37,7 @@ pub use ci_sandbox::dispatch_if_invoked;
 
 use activity::{ActivityEvent, ActivityHub};
 use axum::{
-    extract::{Path, Query, RawQuery, State},
+    extract::{ConnectInfo, Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::sse::{Event, Sse},
     response::{IntoResponse, Response},
@@ -787,10 +787,13 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     // server 20s after startup, since `with_graceful_shutdown` only resolves after a signal.)
     let draining = std::sync::Arc::new(tokio::sync::Notify::new());
     let draining_signal = draining.clone();
-    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        draining_signal.notify_one(); // a signal arrived → the drain begins now
-    });
+    // into_make_service_with_connect_info so handlers (sovereign_wrapped's per-IP rate limit) can read
+    // the socket peer address. Handlers that don't ask for ConnectInfo are unaffected.
+    let server = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            draining_signal.notify_one(); // a signal arrived → the drain begins now
+        });
     let drain_cap = async move {
         draining.notified().await; // block until a shutdown signal has actually fired…
         tokio::time::sleep(Duration::from_secs(20)).await; // …then cap the drain at 20s
@@ -2707,13 +2710,30 @@ async fn sovereign_register(State(app): State<App>, Json(body): Json<Value>) -> 
 /// SECURITY: because this is unauthenticated, an attacker can harvest a username's bundle and brute-
 /// force the passphrase OFFLINE — so the whole account's security rests on the CLIENT KDF. The browser
 /// MUST wrap with a strong memory-hard KDF (Argon2id, high params); Hull can't verify that on an opaque
-/// blob. This route is rate-limited (global + per-username fixed windows) to throttle bulk enumeration
-/// and harvesting; it still enumerates a sovereign username via 200-vs-404 for the throttled attacker.
-async fn sovereign_wrapped(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> Response {
+/// blob. It also enumerates a sovereign username via 200-vs-404.
+///
+/// Rate limiting: a per-IP cap is the real throttle on enumeration and bulk harvesting from one source,
+/// plus a per-username cap that bounds how fast one known account's bundle can be re-pulled. There is
+/// deliberately NO global cap: a single hard ceiling shared by all callers on a login-path endpoint is
+/// a trivial lockout of every user. The IP key is the socket peer; behind a reverse proxy that is the
+/// proxy, so operators in that topology must throttle at the edge (see `ratelimit` — we don't trust
+/// `X-Forwarded-For`). When connect-info isn't wired (some test servers) the per-IP cap is skipped.
+async fn sovereign_wrapped(
+    State(app): State<App>,
+    connect: Option<ConnectInfo<std::net::SocketAddr>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let username = sanitize_handle(q.get("username").map(String::as_str).unwrap_or(""));
-    // Throttle bulk automated abuse: at most 60 fetches/min across all callers, and 6/min per username.
     let now = now();
-    if !app.rate.check("wrapped:global", 60, 60, now) || !app.rate.check(&format!("wrapped:{username}"), 6, 60, now) {
+    // Per-IP: keyed on the peer address (port-stripped so a rotating source port doesn't reset it).
+    if let Some(ConnectInfo(peer)) = connect {
+        if !app.rate.check(&format!("wrapped-ip:{}", peer.ip()), 30, 60, now) {
+            return (StatusCode::TOO_MANY_REQUESTS, "rate limited — try again shortly").into_response();
+        }
+    }
+    // Per-username: bounds repeated harvesting of a single known account (does not cover enumeration,
+    // which varies the username — that's the per-IP cap's job).
+    if !app.rate.check(&format!("wrapped-user:{username}"), 6, 60, now) {
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited — try again shortly").into_response();
     }
     match app.store.user_by_username(&username).await.and_then(|u| u.wrapped_key.map(|w| (u.actor, w))) {
@@ -7155,9 +7175,11 @@ mod tests {
                 bio: String::new(),
             })
             .await;
+        // No connect-info → per-IP cap is skipped, so only the per-username cap applies.
         let call = |app: App| async move {
             sovereign_wrapped(
                 axum::extract::State(app),
+                None,
                 axum::extract::Query(std::collections::HashMap::from([("username".to_string(), "nomad".to_string())])),
             )
             .await
@@ -7168,6 +7190,33 @@ mod tests {
             assert_eq!(call(app.clone()).await, axum::http::StatusCode::OK);
         }
         assert_eq!(call(app.clone()).await, axum::http::StatusCode::TOO_MANY_REQUESTS, "over the per-username window");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn sovereign_wrapped_per_ip_cap_throttles_enumeration() {
+        let (app, tmp) = build_test_app("wrapped-ip-rl");
+        // Enumeration varies the username, so the per-username cap never trips; the per-IP cap must.
+        // All requests come from one peer; each asks for a distinct (nonexistent) username → 404, but
+        // still counts against the IP. The 30/min IP budget allows 30, then blocks.
+        let peer: std::net::SocketAddr = "203.0.113.7:44444".parse().unwrap();
+        let call = |app: App, user: String| async move {
+            sovereign_wrapped(
+                axum::extract::State(app),
+                Some(axum::extract::ConnectInfo(peer)),
+                axum::extract::Query(std::collections::HashMap::from([("username".to_string(), user)])),
+            )
+            .await
+            .status()
+        };
+        for i in 0..30 {
+            assert_eq!(call(app.clone(), format!("nobody{i}")).await, axum::http::StatusCode::NOT_FOUND, "under the IP budget: {i}");
+        }
+        assert_eq!(
+            call(app.clone(), "nobody999".to_string()).await,
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "31st distinct-username fetch from the same IP is throttled",
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -7225,6 +7274,7 @@ mod tests {
         // the wrapped bundle is fetchable (for cross-device login) by username.
         let resp = sovereign_wrapped(
             axum::extract::State(app.clone()),
+            None,
             axum::extract::Query(std::collections::HashMap::from([("username".to_string(), "nomad".to_string())])),
         )
         .await;
