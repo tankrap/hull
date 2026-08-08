@@ -497,16 +497,22 @@ impl NostrRefs {
         Some(ev)
     }
 
-    /// Fetch the blob manifest for `change`: a map of blob object id (hex) → Blossom sha256 (hex). The
-    /// newest manifest wins per id (events sorted newest-first). ANY author's manifest is accepted —
-    /// integrity is enforced downstream when the fetched bytes are re-hashed against the id, so a bogus
-    /// mapping can only fail a restore, not corrupt the store. The SIGNED `change` field must match (we
-    /// don't trust the relay-supplied tag).
-    pub fn fetch_blob_manifest(&self, change: &str) -> std::collections::HashMap<String, String> {
+    /// Fetch the blob manifest(s) for `change`: a map of blob object id (hex) → CANDIDATE Blossom sha256s
+    /// (hex), in preference order. ANY author's manifest is accepted, so a hostile relay could publish a
+    /// manifest that maps an honest id to a bogus sha256; returning ALL candidates (not just the newest)
+    /// lets the restorer try each until one re-hashes to the id, so poisoning can't durably block
+    /// recovery. Candidates are ordered own-authored-first (the mappings THIS instance published), then
+    /// newest — the trustworthy one is tried first. Integrity is still the restorer's re-hash. The SIGNED
+    /// `change` field must match (we don't trust the relay-supplied tag).
+    pub fn fetch_blob_manifest(&self, change: &str) -> std::collections::HashMap<String, Vec<String>> {
         let filter = serde_json::json!({ "kinds": [KIND_BLOB_MANIFEST], "#change": [change] });
+        let own = self.own_pubkey();
         let mut events = fetch_events(&self.relays, filter);
-        events.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id))); // newest first
-        let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        events.sort_by(|a, b| {
+            let (a_own, b_own) = (own.as_deref() == Some(a.pubkey.as_str()), own.as_deref() == Some(b.pubkey.as_str()));
+            b_own.cmp(&a_own).then_with(|| b.created_at.cmp(&a.created_at)).then_with(|| b.id.cmp(&a.id))
+        });
+        let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
         for ev in &events {
             if ev.kind != KIND_BLOB_MANIFEST {
                 continue;
@@ -518,7 +524,10 @@ impl NostrRefs {
             let Some(blobs) = v.get("blobs").and_then(|b| b.as_array()) else { continue };
             for entry in blobs {
                 if let (Some(id), Some(sha)) = (entry.get(0).and_then(|x| x.as_str()), entry.get(1).and_then(|x| x.as_str())) {
-                    out.entry(id.to_string()).or_insert_with(|| sha.to_string()); // newest-first ⇒ first seen wins
+                    let cands = out.entry(id.to_string()).or_default();
+                    if !cands.iter().any(|s| s == sha) {
+                        cands.push(sha.to_string());
+                    }
                 }
             }
         }
@@ -937,8 +946,8 @@ mod tests {
         ];
         refs.publish_blob_manifest("blake3:c1", &entries).expect("publish");
         let map = refs.fetch_blob_manifest("blake3:c1");
-        assert_eq!(map.get("id_aaa").map(String::as_str), Some("sha_aaa"));
-        assert_eq!(map.get("id_bbb").map(String::as_str), Some("sha_bbb"));
+        assert_eq!(map.get("id_aaa"), Some(&vec!["sha_aaa".to_string()]));
+        assert_eq!(map.get("id_bbb"), Some(&vec!["sha_bbb".to_string()]));
         // a manifest for a different change isn't returned
         assert!(refs.fetch_blob_manifest("blake3:other").is_empty());
     }

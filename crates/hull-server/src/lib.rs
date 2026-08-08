@@ -6097,13 +6097,17 @@ async fn restore_change(State(app): State<App>, Path((tenant, repo, id)): Path<(
     let mut restored = 0usize;
     let mut still_missing: Vec<String> = Vec::new();
     for blob_id in &missing {
-        let ok = match map.get(blob_id) {
-            Some(sha) => match blossom.get(sha).await {
-                Some(bytes) => app.repos.restore_blob(&tenant, &repo, blob_id, bytes),
-                None => false,
-            },
-            None => false,
-        };
+        // Try each candidate sha256 (own-authored first) until one fetches bytes that re-hash to the id.
+        // restore_blob rejects any that don't, so a poisoned mapping just moves on to the next candidate.
+        let mut ok = false;
+        for sha in map.get(blob_id).map(Vec::as_slice).unwrap_or(&[]) {
+            if let Some(bytes) = blossom.get(sha).await {
+                if app.repos.restore_blob(&tenant, &repo, blob_id, bytes) {
+                    ok = true;
+                    break;
+                }
+            }
+        }
         if ok {
             restored += 1;
         } else {

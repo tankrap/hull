@@ -992,16 +992,11 @@ impl RepoHost {
     /// points or whether the branch was advanced. Sorted by path, capped at `max_files` (files beyond
     /// the cap are dropped and the `bool` returns `true`) and skipping any blob over `max_bytes`. For
     /// mirroring a landed change's content to an external blob store.
-    pub fn change_blobs(&self, tenant: &str, repo: &str, hex: &str, max_files: usize, max_bytes: usize) -> (Vec<(String, Vec<u8>)>, bool) {
-        let (entries, over_cap) = self.change_blob_index(tenant, repo, hex, max_files, max_bytes);
-        (entries.into_iter().map(|e| (e.path, e.bytes)).collect(), over_cap)
-    }
-
-    /// Like [`change_blobs`](Self::change_blobs) but carries both of each blob's addresses: its local
-    /// keel object id (blake3 of the encoded blob — what the tree references) AND its Blossom address
-    /// (sha256 of the raw bytes — what a blob server is keyed by). The pair is the substrate's addressing
-    /// bridge: the mirror uploads by sha256, the manifest records id→sha256, and a restorer re-derives
-    /// the id from fetched bytes to verify. Same bounds as `change_blobs`.
+    /// Each blob of change `hex`'s tree (bounded by `max_files`/`max_bytes`) with BOTH of its addresses:
+    /// the local keel object id (blake3 of the encoded blob — what the tree references) AND the Blossom
+    /// address (sha256 of the raw bytes — what a blob server is keyed by). The pair is the substrate's
+    /// addressing bridge: the mirror uploads by sha256, the manifest records id→sha256, and a restorer
+    /// re-derives the id from fetched bytes to verify.
     pub fn change_blob_index(&self, tenant: &str, repo: &str, hex: &str, max_files: usize, max_bytes: usize) -> (Vec<BlobEntry>, bool) {
         let Ok(Some(store)) = self.store(tenant, repo, false) else { return (Vec::new(), false) };
         let Some(cid) = ObjectId::from_hex(hex) else { return (Vec::new(), false) };
@@ -1027,8 +1022,11 @@ impl RepoHost {
     }
 
     /// Blob object ids (hex) referenced by change `hex`'s tree that are ABSENT from the local store —
-    /// the set a restore needs to refetch. Empty in the normal case (everything present), and empty if
-    /// the change or its tree objects themselves can't be read (nothing to enumerate against).
+    /// the set a restore needs to refetch. Uses `store.has` (presence only, no decode/reassembly).
+    /// Empty in the normal case, and empty if the change or its top tree can't be read. NOTE: only
+    /// blobs are enumerated — this bridge doesn't restore tree objects, so if a SUBTREE object is
+    /// itself missing, blobs beneath it can't be discovered and won't appear here (a recovery blind
+    /// spot for a partially-populated store, not just an all-or-nothing one).
     pub fn missing_blobs(&self, tenant: &str, repo: &str, hex: &str) -> Vec<String> {
         let Ok(Some(store)) = self.store(tenant, repo, false) else { return Vec::new() };
         let Some(cid) = ObjectId::from_hex(hex) else { return Vec::new() };
@@ -1038,7 +1036,9 @@ impl RepoHost {
         };
         let mut map = HashMap::new();
         flatten_tree(&store, tree, "", &mut map, 0);
-        let mut missing: Vec<String> = map.into_values().filter(|blob| matches!(store.get(blob), Ok(None))).map(|b| b.to_hex()).collect();
+        // Ok(false) = definitively absent → missing. Ok(true)/Err → don't report (present, or a store
+        // error we shouldn't paper over with a spurious refetch).
+        let mut missing: Vec<String> = map.into_values().filter(|blob| matches!(store.has(blob), Ok(false))).map(|b| b.to_hex()).collect();
         missing.sort();
         missing.dedup();
         missing
