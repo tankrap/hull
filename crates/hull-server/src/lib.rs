@@ -4040,18 +4040,25 @@ async fn substrate_view(State(app): State<App>, Path((tenant, repo)): Path<(Stri
     let (rf, k, br) = (refs.clone(), key.clone(), default_branch.clone());
     let (commit, provenance) =
         tokio::task::spawn_blocking(move || (rf.fetch_ref(&k, &br), rf.fetch_provenance(&k))).await.unwrap_or((None, Vec::new()));
-    // Annotate each cryptographically-verified attestation with LOCAL accountability + repo authority:
-    // is claim.actor an accountable actor here, and is its human root a member of the owning account?
-    let owner_members: std::collections::HashSet<String> = match repo_owner_account(&app, &tenant, &repo).await {
-        Some(acct) => acct.members.iter().map(|m| m.actor.clone()).collect(),
-        None => Default::default(),
-    };
+    // Annotate each signature-verified attestation with LOCAL accountability + repo authority. Use
+    // Hull's real `accountable()` gate, which rejects a revoked actor AND verifies the delegation chain
+    // — not the structural `is_accountable()`, which would let a revoked or compromised key's forged
+    // provenance read as trustworthy. Authority mirrors the real write gate (`is_repo_member`, honoring
+    // team write grants), checked for the acting actor or its human root.
     let mut prov: Vec<Value> = Vec::new();
     for sp in provenance {
         let actor = app.store.actor(&sp.claim.actor).await;
         let human = actor.as_ref().and_then(|a| a.human_principal().cloned());
-        let accountable = actor.as_ref().map(|a| a.is_accountable()).unwrap_or(false);
-        let authorized = human.as_ref().map(|h| owner_members.contains(h)).unwrap_or(false);
+        let acct_ok = match &actor {
+            Some(a) => accountable(&app, a).await.is_ok(),
+            None => false,
+        };
+        let authorized = acct_ok
+            && (is_repo_member(&app, &tenant, &repo, &sp.claim.actor).await
+                || match &human {
+                    Some(h) => is_repo_member(&app, &tenant, &repo, h).await,
+                    None => false,
+                });
         prov.push(json!({
             "change": sp.claim.change,
             "actor": sp.claim.actor,
@@ -4059,8 +4066,10 @@ async fn substrate_view(State(app): State<App>, Path((tenant, repo)): Path<(Stri
             "human_root": human,
             "intent": sp.claim.intent,
             "ts": sp.claim.ts,
-            "verified": true,       // schnorr + Ed25519 both checked in fetch_provenance
-            "accountable": accountable,
+            // signatures_valid: schnorr + Ed25519 both checked in fetch_provenance. It means "a valid
+            // signature by claim.actor", NOT "trustworthy" — read it with accountable/authorized.
+            "signatures_valid": true,
+            "accountable": acct_ok,
             "authorized": authorized,
         }));
     }
@@ -7031,19 +7040,29 @@ mod tests {
     #[tokio::test]
     async fn substrate_view_returns_verified_and_annotated_state() {
         // The consumer: read a repo's ref + provenance back from the (loopback) relay through the
-        // handler and confirm the verified view + accountability/authority annotation.
+        // handler and confirm the verified view + accountability/authority annotation — including that a
+        // valid signature from a REVOKED member does NOT read as accountable/authorized.
         let (mut app, tmp) = build_test_app("substrate");
         let url = crate::nostr::spawn_loopback_relay();
         let instance_sk = "0000000000000000000000000000000000000000000000000000000000000001";
         app.nostr_refs = Some(std::sync::Arc::new(crate::nostr::NostrRefs::new(instance_sk.into(), vec![url])));
-        // an accountable human author who is a member of the repo's owning account
+        // an accountable human member...
         let author = hull_core::identity::mint_human("mira");
         app.store.put_actor(author.actor.clone()).await;
-        setup_org_repo(&app, "acme", "web", false, &[(&author.actor.id, Role::Write)]).await;
-        // publish a ref + an actor-signed provenance attestation to the relay
+        // ...and a member whose key was compromised, then revoked.
+        let gone = hull_core::identity::mint_human("gone");
+        let gone_secret = gone.secret_key.clone();
+        let gone_id = gone.actor.id.clone();
+        let mut gone_actor = gone.actor.clone();
+        gone_actor.revoked = true;
+        app.store.put_actor(gone_actor).await;
+        setup_org_repo(&app, "acme", "web", false, &[(&author.actor.id, Role::Write), (&gone_id, Role::Write)]).await;
+
         let refs = app.nostr_refs.clone().unwrap();
         refs.publish_ref("acme/web", "main", "blake3:tip", None).unwrap();
-        refs.publish_provenance(&author.secret_key, "blake3:tip", &author.actor.id, "acme/web", "landed it").unwrap();
+        refs.publish_provenance(&author.secret_key, "blake3:good", &author.actor.id, "acme/web", "landed it").unwrap();
+        // a genuinely-valid signature by the revoked member — the attacker holds the leaked key.
+        refs.publish_provenance(&gone_secret, "blake3:revoked", &gone_id, "acme/web", "forged after revocation").unwrap();
 
         let resp = substrate_view(
             axum::extract::State(app.clone()),
@@ -7057,11 +7076,16 @@ mod tests {
         assert_eq!(v["enabled"], true);
         assert_eq!(v["ref"]["commit"], "blake3:tip", "ref reads back from the relay");
         let prov = v["provenance"].as_array().unwrap();
-        assert_eq!(prov.len(), 1, "one verified attestation; got {prov:?}");
-        assert_eq!(prov[0]["change"], "blake3:tip");
-        assert_eq!(prov[0]["verified"], true);
-        assert_eq!(prov[0]["accountable"], true, "human author chains to a human → accountable");
-        assert_eq!(prov[0]["authorized"], true, "author is a member of the owning account");
+
+        let good = prov.iter().find(|p| p["change"] == "blake3:good").expect("author's row");
+        assert_eq!(good["signatures_valid"], true);
+        assert_eq!(good["accountable"], true, "live human member is accountable");
+        assert_eq!(good["authorized"], true, "member of the owning account is authorized");
+
+        let bad = prov.iter().find(|p| p["change"] == "blake3:revoked").expect("revoked member's row is present");
+        assert_eq!(bad["signatures_valid"], true, "the signature really is valid (attacker holds the key)");
+        assert_eq!(bad["accountable"], false, "but a REVOKED actor must not read as accountable");
+        assert_eq!(bad["authorized"], false, "and therefore not authorized");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
