@@ -4100,8 +4100,10 @@ async fn substrate_view(State(app): State<App>, Path((tenant, repo)): Path<(Stri
 /// (this one plus the configured peers) says the branch points at, read back from the relays. Each
 /// entry is transport-signed by that instance's own nostr key, so a relay can't forge a peer's ref;
 /// trust is explicit (an instance appears only if this instance lists it as a peer) and non-transitive.
-/// `diverged` is true when the instances don't agree on a single commit — the signal that one host has
-/// history the others don't (a fork, a stale mirror, or a censored/rewritten ref).
+/// `diverged` is true when the RESPONDING instances don't agree on a single commit — the signal that one
+/// host has history the others don't (a fork, a stale mirror, or a censored/rewritten ref). It says
+/// nothing about instances that didn't answer: `missing` lists configured instances that returned no ref
+/// (never published, offline, or a relay suppressed them), so a client can tell silence from consensus.
 async fn federation_view(State(app): State<App>, Path((tenant, repo)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Response {
     if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
         return r;
@@ -4119,12 +4121,29 @@ async fn federation_view(State(app): State<App>, Path((tenant, repo)): Path<(Str
         .iter()
         .map(|p| json!({ "instance": p.pubkey, "commit": p.commit, "self": p.is_self }))
         .collect();
+    // Configured set = self (if the instance key is valid) + peers. Anything configured but not in the
+    // responses is reported as missing, so diverged=false can't be read as "everyone agrees" when peers
+    // were simply silent or suppressed.
+    let responded: std::collections::HashSet<&str> = peer_refs.iter().map(|p| p.pubkey.as_str()).collect();
+    let mut expected: Vec<String> = Vec::new();
+    if let Some(own) = refs.own_pubkey() {
+        expected.push(own);
+    }
+    for p in refs.peers() {
+        if !expected.contains(p) {
+            expected.push(p.clone());
+        }
+    }
+    let missing: Vec<&String> = expected.iter().filter(|e| !responded.contains(e.as_str())).collect();
     Json(json!({
         "enabled": true,
         "branch": branch,
         "relays": refs.relays(),
         "peers": refs.peers(),
         "instances": instances,
+        "responded": peer_refs.len(),
+        "expected": expected.len(),
+        "missing": missing,
         "diverged": distinct.len() > 1,
     }))
     .into_response()
@@ -7172,9 +7191,11 @@ mod tests {
         let self_sk = "0000000000000000000000000000000000000000000000000000000000000001";
         let peer_sk = "0000000000000000000000000000000000000000000000000000000000000002";
         let stranger_sk = "0000000000000000000000000000000000000000000000000000000000000003";
+        // a fourth instance we trust but which never publishes → it should show up as `missing`.
+        let silent_pub = crate::nostr::pubkey_of("0000000000000000000000000000000000000000000000000000000000000004").unwrap();
         let peer_pub = crate::nostr::pubkey_of(peer_sk).unwrap();
         app.nostr_refs = Some(std::sync::Arc::new(
-            crate::nostr::NostrRefs::new(self_sk.into(), vec![url.clone()]).with_peers(vec![peer_pub.clone()]),
+            crate::nostr::NostrRefs::new(self_sk.into(), vec![url.clone()]).with_peers(vec![peer_pub.clone(), silent_pub.clone()]),
         ));
         setup_org_repo(&app, "acme", "web", false, &[]).await;
 
@@ -7202,6 +7223,12 @@ mod tests {
         assert_eq!(peer["commit"], "blake3:theirs");
         assert_eq!(peer["instance"], peer_pub);
         assert!(inst.iter().all(|i| i["commit"] != "blake3:stranger"), "an unlisted instance is not federated");
+        // silence is distinguishable from agreement: the trusted-but-silent peer is reported missing.
+        assert_eq!(v["responded"], 2, "self + the one peer that published");
+        assert_eq!(v["expected"], 3, "self + two configured peers");
+        let missing = v["missing"].as_array().unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], silent_pub, "the configured peer that published nothing");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
