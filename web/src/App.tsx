@@ -55,7 +55,14 @@ async function apiError(res: Response): Promise<string> {
   const text = await res.text().catch(() => "");
   return text.trim() || "Something went wrong.";
 }
-const sanitizeHandle = (s: string) => s.replace(/\s+/g, "_");
+// Mirror the backend `sanitize_handle` (crates/hull-server/src/lib.rs): keep only `[A-Za-z0-9._-]`,
+// map any run of other characters (whitespace, punctuation, non-ASCII, emoji) to a single `_`,
+// collapse `..` (no path traversal), and strip leading dots/underscores. The result satisfies the
+// server's `safe_segment`, so a create-org/create-repo input can't show or submit an invalid handle.
+// A trailing separator the user is still typing is intentionally kept (the backend strips it on
+// submit) so multi-word handles like "new org" -> "new_org" type through naturally.
+const sanitizeHandle = (s: string) =>
+  s.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/\.\.+/g, "_").replace(/^[._]+/, "");
 
 // Compact relative time ("3h ago") from a unix seconds timestamp.
 const timeAgo = (unix: number) => {
