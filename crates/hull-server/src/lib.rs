@@ -348,7 +348,7 @@ async fn normalize_account_handles(store: &dyn Store) {
             continue;
         }
         let base = sanitize_handle(&acct.handle);
-        let base = if base.is_empty() { format!("org-{}", &acct.id) } else { base };
+        let base = if base.is_empty() { format!("org-{}", acct.id) } else { base };
         // Free the old (invalid) handle from the taken set so it doesn't block its own replacement.
         taken.remove(&acct.handle.to_lowercase());
         let mut candidate = base.clone();
