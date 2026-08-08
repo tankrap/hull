@@ -2069,6 +2069,28 @@ export function App() {
               </button>
             )}
           </>
+        ) : orgHandle && !authPage ? (
+          <>
+            {/* Inside an org, the sidebar becomes the org (group) nav — GitLab's pattern. */}
+            <button className="w-full flex items-center gap-1.5 px-2.5 h-7 rounded-ctl text-[12.5px] text-muted hover:text-ink hover:bg-surface transition-colors" onClick={() => navigate("/")}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-none"><polyline points="15 18 9 12 15 6" /></svg><span>Your work</span>
+            </button>
+            <div className="flex items-center gap-2 px-2.5 pt-2 pb-2 min-w-0">
+              <span className="w-7 h-7 rounded-ctl bg-brass-wash text-brass-text grid place-items-center text-[11px] font-bold uppercase flex-none">{orgHandle.slice(0, 2)}</span>
+              <span className="min-w-0"><span className="block text-[13.5px] font-semibold truncate leading-tight">{orgHandle}</span><span className="block text-[11px] text-faint truncate leading-tight">organization</span></span>
+            </div>
+            <button className={sideCls(orgTab === "overview")} onClick={() => setOrgTab("overview")}>
+              <SIco d="M3 21h18M6 21V7l6-4 6 4v14M10 9h.01M14 9h.01M10 13h.01M14 13h.01M10 17h4" /><span>Overview</span>
+            </button>
+            <button className={sideCls(orgTab === "repos")} onClick={() => setOrgTab("repos")}>
+              <SIco d="M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4zM20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z" /><span>Repositories</span>
+            </button>
+            {myAccounts.includes(orgHandle) && (
+              <button className={sideCls(orgTab === "people")} onClick={() => setOrgTab("people")}>
+                <SIco d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" /><span>Members &amp; settings</span>
+              </button>
+            )}
+          </>
         ) : (
           <>
             <div className="px-2.5 pt-1 pb-2 text-[15px] font-semibold tracking-tight">Your work</div>
@@ -2671,14 +2693,17 @@ export function App() {
           {/* Stat tiles — the signature GitLab dashboard row. */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-7">
             {[
-              { label: "Reviews", n: homePrs.length, sub: "Pull requests waiting on you", to: "" },
-              { label: "Issues", n: homeIssues.length, sub: "Assigned to you", to: "" },
-              { label: "Repositories", n: activeRepos.length, sub: "Active right now", to: "/me" },
-              { label: "Organizations", n: myAccounts.length, sub: "You're a member of", to: "/me" },
+              { label: "Reviews", n: homePrs.length, sub: "Pull requests waiting on you", to: "", d: "M6 9v6M6 21a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM6 9a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM18 6a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM18 6v6a3 3 0 0 1-3 3H8" },
+              { label: "Issues", n: homeIssues.length, sub: "Assigned to you", to: "", d: "M12 22a10 10 0 1 1 0-20 10 10 0 0 1 0 20zM12 14a2 2 0 1 1 0-4 2 2 0 0 1 0 4z" },
+              { label: "Repositories", n: activeRepos.length, sub: "Active right now", to: "/me", d: "M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4zM20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z" },
+              { label: "Organizations", n: myAccounts.length, sub: "You're a member of", to: "/me", d: "M3 21h18M6 21V7l6-4 6 4v14M10 9h.01M14 9h.01M10 13h.01M14 13h.01M10 17h4" },
             ].map((t) => (
               <button key={t.label} onClick={() => t.to && navigate(t.to)} className="text-left bg-surface border border-rule rounded-card px-4 py-3.5 hover:border-dim transition-colors">
-                <div className="text-[12.5px] text-muted">{t.label}</div>
-                <div className="text-[30px] font-semibold tracking-tight mt-1.5 leading-none tabular-nums">{t.n}</div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[12.5px] text-muted">{t.label}</span>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className="text-faint flex-none"><path d={t.d} /></svg>
+                </div>
+                <div className="text-[30px] font-semibold tracking-tight mt-2 leading-none tabular-nums">{t.n}</div>
                 <div className="text-[12.5px] text-body mt-1.5 truncate">{t.sub}</div>
               </button>
             ))}
@@ -2988,8 +3013,8 @@ export function App() {
                 </div>
               </div>
 
-              {/* Org tabs — same shape as the profile page. People is members-only. */}
-              <div className="border-b border-rule2 -mt-1">
+              {/* Org tabs — desktop uses the contextual sidebar; this is the mobile fallback. */}
+              <div className="md:hidden border-b border-rule2 -mt-1">
                 <HTabs items={["Overview", `Repositories ${oRepos.length}`, ...(acct ? ["Settings"] : [])]} value={orgTab === "overview" ? 0 : orgTab === "repos" ? 1 : 2} onChange={(i: number) => setOrgTab(i === 0 ? "overview" : i === 1 ? "repos" : "people")} />
               </div>
 
