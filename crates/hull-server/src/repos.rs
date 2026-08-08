@@ -667,6 +667,17 @@ pub struct ChangedFile {
     pub status: String, // added | modified | deleted
 }
 
+/// One blob of a change's tree with BOTH content addresses: `id` = its local keel object id (hex,
+/// blake3 of the encoded blob, what the tree references) and `sha256` = its Blossom address (hex, sha256
+/// of the raw bytes, what a blob server stores it under). See [`RepoHost::change_blob_index`].
+pub struct BlobEntry {
+    pub path: String,
+    pub id: String,
+    pub sha256: String,
+    pub size: usize,
+    pub bytes: Vec<u8>,
+}
+
 /// The keel session behind a change (task/reasoning/operations) — populated when the change was
 /// committed with `--session` / `keel capture`. Absent for a plain `git push`.
 #[derive(serde::Serialize)]
@@ -982,6 +993,16 @@ impl RepoHost {
     /// the cap are dropped and the `bool` returns `true`) and skipping any blob over `max_bytes`. For
     /// mirroring a landed change's content to an external blob store.
     pub fn change_blobs(&self, tenant: &str, repo: &str, hex: &str, max_files: usize, max_bytes: usize) -> (Vec<(String, Vec<u8>)>, bool) {
+        let (entries, over_cap) = self.change_blob_index(tenant, repo, hex, max_files, max_bytes);
+        (entries.into_iter().map(|e| (e.path, e.bytes)).collect(), over_cap)
+    }
+
+    /// Like [`change_blobs`](Self::change_blobs) but carries both of each blob's addresses: its local
+    /// keel object id (blake3 of the encoded blob — what the tree references) AND its Blossom address
+    /// (sha256 of the raw bytes — what a blob server is keyed by). The pair is the substrate's addressing
+    /// bridge: the mirror uploads by sha256, the manifest records id→sha256, and a restorer re-derives
+    /// the id from fetched bytes to verify. Same bounds as `change_blobs`.
+    pub fn change_blob_index(&self, tenant: &str, repo: &str, hex: &str, max_files: usize, max_bytes: usize) -> (Vec<BlobEntry>, bool) {
         let Ok(Some(store)) = self.store(tenant, repo, false) else { return (Vec::new(), false) };
         let Some(cid) = ObjectId::from_hex(hex) else { return (Vec::new(), false) };
         let tree = match store.get(&cid).ok().flatten() {
@@ -997,11 +1018,45 @@ impl RepoHost {
         for (path, blob) in entries.into_iter().take(max_files) {
             if let Ok(Some(Object::Blob(bytes))) = store.get(&blob) {
                 if bytes.len() <= max_bytes {
-                    out.push((path, bytes));
+                    let sha256 = crate::blossom::BlossomClient::sha256_hex(&bytes);
+                    out.push(BlobEntry { path, id: blob.to_hex(), sha256, size: bytes.len(), bytes });
                 }
             }
         }
         (out, over_cap)
+    }
+
+    /// Blob object ids (hex) referenced by change `hex`'s tree that are ABSENT from the local store —
+    /// the set a restore needs to refetch. Empty in the normal case (everything present), and empty if
+    /// the change or its tree objects themselves can't be read (nothing to enumerate against).
+    pub fn missing_blobs(&self, tenant: &str, repo: &str, hex: &str) -> Vec<String> {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return Vec::new() };
+        let Some(cid) = ObjectId::from_hex(hex) else { return Vec::new() };
+        let tree = match store.get(&cid).ok().flatten() {
+            Some(Object::Change(c)) => c.tree,
+            _ => return Vec::new(),
+        };
+        let mut map = HashMap::new();
+        flatten_tree(&store, tree, "", &mut map, 0);
+        let mut missing: Vec<String> = map.into_values().filter(|blob| matches!(store.get(blob), Ok(None))).map(|b| b.to_hex()).collect();
+        missing.sort();
+        missing.dedup();
+        missing
+    }
+
+    /// Restore one blob's bytes into the local store, but ONLY if they hash to `id_hex`. The bytes came
+    /// from an untrusted blob server, so re-derive the keel object id (blake3 of the encoded blob) and
+    /// refuse anything that doesn't match — a lying server or a bogus manifest can never inject content
+    /// under an id the tree references. Returns true if the blob is now present. The id is computed
+    /// BEFORE the write, so a mismatch stores nothing.
+    pub fn restore_blob(&self, tenant: &str, repo: &str, id_hex: &str, bytes: Vec<u8>) -> bool {
+        let Ok(Some(store)) = self.store(tenant, repo, true) else { return false };
+        let Some(want) = ObjectId::from_hex(id_hex) else { return false };
+        let obj = Object::Blob(bytes);
+        if obj.id() != want {
+            return false;
+        }
+        store.put(&obj).is_ok()
     }
 
     /// Expand the keel change `hex` in a hosted repo: its intent/author and the files it changed vs
@@ -2333,6 +2388,29 @@ impl RepoHost {
         let _ = std::fs::remove_dir_all(&dir);
         id.to_hex()
     }
+
+    /// Test-only: copy `change`'s Change + tree objects from one repo into another, WITHOUT its blob
+    /// bytes — reproducing the state a restore recovers (a store that has the change's structure but not
+    /// its content). There is no delete API, so this is how tests create a genuinely-missing blob.
+    pub(crate) fn test_copy_change_without_blobs(&self, src_t: &str, src_r: &str, dst_t: &str, dst_r: &str, change: &str) {
+        fn copy_trees(src: &Store, dst: &Store, tree: ObjectId) {
+            if let Some(Object::Tree(t)) = src.get(&tree).ok().flatten() {
+                dst.put(&Object::Tree(t.clone())).unwrap();
+                for e in &t.entries {
+                    if e.mode == MODE_DIR {
+                        copy_trees(src, dst, e.id);
+                    }
+                }
+            }
+        }
+        let src = self.store(src_t, src_r, false).unwrap().unwrap();
+        let dst = self.store(dst_t, dst_r, true).unwrap().unwrap();
+        let cid = ObjectId::from_hex(change).unwrap();
+        if let Some(Object::Change(c)) = src.get(&cid).ok().flatten() {
+            copy_trees(&src, &dst, c.tree);
+            dst.put(&Object::Change(c)).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2359,6 +2437,62 @@ mod tests {
         std::fs::create_dir_all(tmp.join("acme/not-a-repo")).unwrap(); // no .keel/store → skipped
         let host = RepoHost::new(&tmp);
         assert_eq!(host.list(), vec!["acme/api".to_string(), "acme/web".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn blob_index_missing_detection_and_restore() {
+        let tmp = std::env::temp_dir().join(format!("hull-blobrestore-{}-{}", std::process::id(), SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let host = RepoHost::new(&tmp);
+        let change = host.test_commit("acme", "src", "add", None, &[("a.txt", "alpha\n"), ("dir/b.txt", "beta\n")]);
+
+        // change_blob_index carries both addresses; the id is the recomputable keel object id.
+        let (entries, over) = host.change_blob_index("acme", "src", &change, 64, 1 << 20);
+        assert!(!over);
+        assert_eq!(entries.len(), 2);
+        let a = entries.iter().find(|e| e.path == "a.txt").unwrap();
+        let b = entries.iter().find(|e| e.path == "dir/b.txt").unwrap();
+        assert_eq!(a.sha256, crate::blossom::BlossomClient::sha256_hex(b"alpha\n"));
+        assert_eq!(a.size, 6);
+        assert_eq!(a.id, Object::Blob(b"alpha\n".to_vec()).id().to_hex());
+        // a complete repo has nothing missing.
+        assert!(host.missing_blobs("acme", "src", &change).is_empty());
+
+        // Simulate a store that needs restore: copy the change graph (change + trees) into a fresh repo
+        // WITHOUT its blobs — there's no delete API, so build the missing-blob state directly.
+        fn copy_trees(src: &Store, dst: &Store, tree: ObjectId) {
+            if let Some(Object::Tree(t)) = src.get(&tree).ok().flatten() {
+                dst.put(&Object::Tree(t.clone())).unwrap();
+                for e in &t.entries {
+                    if e.mode == MODE_DIR {
+                        copy_trees(src, dst, e.id);
+                    }
+                }
+            }
+        }
+        let src = host.store("acme", "src", false).unwrap().unwrap();
+        let dst = host.store("acme", "mirror", true).unwrap().unwrap();
+        let cid = ObjectId::from_hex(&change).unwrap();
+        let Some(Object::Change(c)) = src.get(&cid).ok().flatten() else { panic!("change missing") };
+        copy_trees(&src, &dst, c.tree);
+        dst.put(&Object::Change(c)).unwrap();
+
+        // the mirror now lacks exactly the two blobs.
+        let mut missing = host.missing_blobs("acme", "mirror", &change);
+        missing.sort();
+        let mut want = vec![a.id.clone(), b.id.clone()];
+        want.sort();
+        assert_eq!(missing, want, "both blobs report missing in the mirror");
+
+        // restore one with the right bytes → present; reject wrong bytes for the other (integrity gate).
+        assert!(host.restore_blob("acme", "mirror", &a.id, b"alpha\n".to_vec()), "correct bytes restore");
+        assert!(!host.restore_blob("acme", "mirror", &b.id, b"WRONG".to_vec()), "bytes that don't hash to the id are rejected");
+        assert_eq!(host.missing_blobs("acme", "mirror", &change), vec![b.id.clone()], "only the un-restored blob is still missing");
+        // and the rejected blob left nothing behind
+        assert!(host.restore_blob("acme", "mirror", &b.id, b"beta\n".to_vec()), "correct bytes for b restore");
+        assert!(host.missing_blobs("acme", "mirror", &change).is_empty(), "all blobs restored");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

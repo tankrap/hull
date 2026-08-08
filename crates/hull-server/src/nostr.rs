@@ -263,6 +263,10 @@ fn fetch_events_gated(relays: &[String], filter: serde_json::Value, authors: Opt
 /// Regular (append-only) provenance attestation event kind.
 pub const KIND_PROV: u16 = 1900;
 
+/// Blob manifest event kind: maps a change's blob object ids → Blossom sha256 addresses (the restore
+/// bridge). Regular/append-only; the newest manifest per change wins on read.
+pub const KIND_BLOB_MANIFEST: u16 = 1901;
+
 /// The actor's claim about a landed change. Field order is the canonical signing order — the Ed25519
 /// signature is over `serde_json::to_string(claim)`, and a verifier recomputes the same string.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -473,6 +477,52 @@ impl NostrRefs {
             .filter_map(|ev| serde_json::from_str::<SignedProvenance>(&ev.content).ok())
             .filter(|sp| sp.claim.repo == repo) // trust the SIGNED repo, not the relay-supplied tag/filter
             .collect()
+    }
+
+    /// Publish a signed manifest mapping a change's blob object ids → Blossom sha256 addresses, so a
+    /// peer that holds the change's tree but not its blob bytes knows where to fetch each one. `entries`
+    /// = (id_hex, sha256_hex, size). Instance schnorr-signed for transport ONLY: integrity does NOT rest
+    /// on this signature — a restorer re-hashes the fetched bytes against BOTH addresses, so a forged or
+    /// wrong manifest can at worst make a restore fail, never inject content. Best-effort.
+    pub fn publish_blob_manifest(&self, change: &str, entries: &[(String, String, usize)]) -> Option<Event> {
+        let created_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let blobs: Vec<serde_json::Value> = entries.iter().map(|(id, sha, size)| serde_json::json!([id, sha, size])).collect();
+        let content = serde_json::json!({ "change": change, "blobs": blobs }).to_string();
+        let tags = vec![
+            vec!["change".to_string(), change.to_string()],
+            vec!["t".to_string(), "keel-blobmap".to_string()],
+        ];
+        let ev = build_event(&self.secret_hex, created_at, KIND_BLOB_MANIFEST, tags, &content)?;
+        publish(&self.relays, &ev);
+        Some(ev)
+    }
+
+    /// Fetch the blob manifest for `change`: a map of blob object id (hex) → Blossom sha256 (hex). The
+    /// newest manifest wins per id (events sorted newest-first). ANY author's manifest is accepted —
+    /// integrity is enforced downstream when the fetched bytes are re-hashed against the id, so a bogus
+    /// mapping can only fail a restore, not corrupt the store. The SIGNED `change` field must match (we
+    /// don't trust the relay-supplied tag).
+    pub fn fetch_blob_manifest(&self, change: &str) -> std::collections::HashMap<String, String> {
+        let filter = serde_json::json!({ "kinds": [KIND_BLOB_MANIFEST], "#change": [change] });
+        let mut events = fetch_events(&self.relays, filter);
+        events.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id))); // newest first
+        let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for ev in &events {
+            if ev.kind != KIND_BLOB_MANIFEST {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&ev.content) else { continue };
+            if v.get("change").and_then(|c| c.as_str()) != Some(change) {
+                continue; // trust the signed content, not the mutable tag
+            }
+            let Some(blobs) = v.get("blobs").and_then(|b| b.as_array()) else { continue };
+            for entry in blobs {
+                if let (Some(id), Some(sha)) = (entry.get(0).and_then(|x| x.as_str()), entry.get(1).and_then(|x| x.as_str())) {
+                    out.entry(id.to_string()).or_insert_with(|| sha.to_string()); // newest-first ⇒ first seen wins
+                }
+            }
+        }
+        out
     }
 
     /// Read the newest published commit for `repo`'s `branch` back from the relays (own-authored refs).
@@ -872,6 +922,25 @@ mod tests {
         let claim = ProvenanceClaim { v: 1, change: "blake3:c1".into(), actor: "abcd".into(), repo: "acme/web".into(), intent: "hello".into(), ts: 1_700_000_000 };
         let expected = "hull-provenance:v1\nchange=blake3:c1\nactor=abcd\nrepo=acme/web\nintent_sha256=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\nts=1700000000";
         assert_eq!(claim.signing_bytes(), expected);
+    }
+
+    #[test]
+    fn blob_manifest_round_trips_through_a_relay() {
+        let url = spawn_loopback_relay();
+        let refs = NostrRefs::new(SK.into(), vec![url]);
+        // nothing published → empty map
+        assert!(refs.fetch_blob_manifest("blake3:c1").is_empty());
+        // publish a manifest, read it back as id → sha256
+        let entries = vec![
+            ("id_aaa".to_string(), "sha_aaa".to_string(), 6usize),
+            ("id_bbb".to_string(), "sha_bbb".to_string(), 12usize),
+        ];
+        refs.publish_blob_manifest("blake3:c1", &entries).expect("publish");
+        let map = refs.fetch_blob_manifest("blake3:c1");
+        assert_eq!(map.get("id_aaa").map(String::as_str), Some("sha_aaa"));
+        assert_eq!(map.get("id_bbb").map(String::as_str), Some("sha_bbb"));
+        // a manifest for a different change isn't returned
+        assert!(refs.fetch_blob_manifest("blake3:other").is_empty());
     }
 
     #[test]

@@ -646,6 +646,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/labels", get(repo_labels))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
         .route("/api/repos/:tenant/:repo/change/:id/provenance", post(submit_provenance))
+        .route("/api/repos/:tenant/:repo/change/:id/restore", post(restore_change))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
@@ -4649,12 +4650,24 @@ async fn perform_merge(
         // Read the blobs from the ANNOUNCED change's own tree — not `read_file`, which reads the `main`
         // ref and would mirror stale/missing content when protection is off, the default branch isn't
         // `main`, or a concurrent land moved the ref.
-        let (blobs, over_cap) = app.repos.change_blobs(tenant, repo, &announced, MAX_FILES, MAX_FILE);
+        let (entries, over_cap) = app.repos.change_blob_index(tenant, repo, &announced, MAX_FILES, MAX_FILE);
         if over_cap {
             eprintln!("blossom: {key} change has >{MAX_FILES} files; mirroring the first {MAX_FILES}");
         }
-        if !blobs.is_empty() {
-            let bytes: Vec<Vec<u8>> = blobs.into_iter().map(|(_, b)| b).collect();
+        if !entries.is_empty() {
+            // Publish the id→sha256 manifest so a peer holding the change's tree but not its blobs can
+            // find and restore each from Blossom. Signed by the instance for transport (integrity is the
+            // restorer's re-hash, not this signature). Blocking tungstenite → its own thread.
+            if let Some(refs) = app.nostr_refs.clone() {
+                let manifest: Vec<(String, String, usize)> = entries.iter().map(|e| (e.id.clone(), e.sha256.clone(), e.size)).collect();
+                let change = announced.clone();
+                std::thread::spawn(move || {
+                    if refs.publish_blob_manifest(&change, &manifest).is_some() {
+                        eprintln!("nostr: published blob manifest for {change} ({} blobs)", manifest.len());
+                    }
+                });
+            }
+            let bytes: Vec<Vec<u8>> = entries.into_iter().map(|e| e.bytes).collect();
             tokio::spawn(async move {
                 let mut ok = 0usize;
                 for b in bytes {
@@ -6057,6 +6070,49 @@ async fn submit_provenance(
     Json(json!({ "stored": true, "change": id, "actor": sp.claim.actor })).into_response()
 }
 
+/// Restore a change's missing blob content from the substrate (`POST …/change/:id/restore`) — the
+/// recovery half of the Blossom mirror. For each blob the change's tree references but the local store
+/// lacks, look up its Blossom sha256 in the published manifest, fetch the bytes, and store them ONLY if
+/// they re-hash to the referenced object id (a lying server or manifest can't inject content). This is
+/// how a fresh/rebuilt instance re-materializes a repo's file content from public infra. Owner/admin
+/// only (it writes to the store and hits external servers); needs nostr + Blossom configured.
+async fn restore_change(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    let actor = match require_actor(&app, &headers, "").await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_repo_admin(&app, &tenant, &repo, &actor.id).await {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin can restore content").into_response();
+    }
+    let missing = app.repos.missing_blobs(&tenant, &repo, &id);
+    if missing.is_empty() {
+        return Json(json!({ "restored": 0, "missing": 0, "still_missing": [] })).into_response();
+    }
+    let (Some(refs), Some(blossom)) = (app.nostr_refs.clone(), app.blossom.clone()) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "substrate not configured (needs HULL_NOSTR_* and HULL_BLOSSOM_SERVERS)").into_response();
+    };
+    // Manifest read is blocking relay I/O — keep it off the async runtime.
+    let (rf, change) = (refs.clone(), id.clone());
+    let map = tokio::task::spawn_blocking(move || rf.fetch_blob_manifest(&change)).await.unwrap_or_default();
+    let mut restored = 0usize;
+    let mut still_missing: Vec<String> = Vec::new();
+    for blob_id in &missing {
+        let ok = match map.get(blob_id) {
+            Some(sha) => match blossom.get(sha).await {
+                Some(bytes) => app.repos.restore_blob(&tenant, &repo, blob_id, bytes),
+                None => false,
+            },
+            None => false,
+        };
+        if ok {
+            restored += 1;
+        } else {
+            still_missing.push(blob_id.clone());
+        }
+    }
+    Json(json!({ "restored": restored, "missing": missing.len(), "still_missing": still_missing })).into_response()
+}
+
 /// Open a PR (`POST /api/repos/:tenant/:repo/prs`). It proposes real keel changes: `changes` may be
 /// given explicitly, else it anchors to the repo's current HEAD change (content-addressed). Author
 /// is gated by the accountability rule. Verification mirrors keel and starts Unverified.
@@ -7357,6 +7413,49 @@ mod tests {
         assert_eq!(picked[0].claim.change, "blake3:authored");
         // wrong repo key selects nothing (defense against a cross-repo stored bundle)
         assert!(sovereign_bundles_to_publish(&pr, "other/repo").is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_change_recovers_missing_blobs_from_the_substrate() {
+        let (mut app, tmp) = build_test_app("restore");
+        let relay = crate::nostr::spawn_loopback_relay();
+        let blossom_url = crate::blossom::spawn_blossom().await;
+        let sk = "0000000000000000000000000000000000000000000000000000000000000001";
+        app.nostr_refs = Some(std::sync::Arc::new(crate::nostr::NostrRefs::new(sk.into(), vec![relay])));
+        app.blossom = Some(std::sync::Arc::new(crate::blossom::BlossomClient::new(reqwest::Client::new(), vec![blossom_url], sk.into())));
+        app.store.put_actor(actor("boss", ActorKind::Human)).await;
+        setup_org_repo(&app, "acme", "src", false, &[("boss", Role::Owner)]).await;
+        mint_token(&app, "tok", "boss");
+
+        // A change with a file; mirror its blob to Blossom and publish the id→sha256 manifest.
+        let change = app.repos.test_commit("acme", "src", "add", None, &[("a.txt", "alpha\n")]);
+        let (entries, _) = app.repos.change_blob_index("acme", "src", &change, 64, 1 << 20);
+        let (refs, blossom) = (app.nostr_refs.clone().unwrap(), app.blossom.clone().unwrap());
+        for e in &entries {
+            blossom.upload(e.bytes.clone()).await.expect("blossom upload");
+        }
+        let manifest: Vec<(String, String, usize)> = entries.iter().map(|e| (e.id.clone(), e.sha256.clone(), e.size)).collect();
+        refs.publish_blob_manifest(&change, &manifest).expect("publish manifest");
+
+        // A mirror repo that holds the change's structure but not its blob bytes.
+        setup_org_repo(&app, "acme", "mirror", false, &[("boss", Role::Owner)]).await;
+        app.repos.test_copy_change_without_blobs("acme", "src", "acme", "mirror", &change);
+        assert!(!app.repos.missing_blobs("acme", "mirror", &change).is_empty(), "the mirror starts out missing the blob");
+
+        // The endpoint pulls the manifest + Blossom bytes and re-materializes the content.
+        let resp = restore_change(State(app.clone()), axum::extract::Path(("acme".to_string(), "mirror".to_string(), change.clone())), bearer("tok")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v["restored"], 1);
+        assert_eq!(v["still_missing"].as_array().unwrap().len(), 0);
+        assert!(app.repos.missing_blobs("acme", "mirror", &change).is_empty(), "content is restored");
+
+        // A non-admin can't trigger a restore.
+        app.store.put_actor(actor("rando", ActorKind::Human)).await;
+        mint_token(&app, "tok2", "rando");
+        let resp = restore_change(State(app.clone()), axum::extract::Path(("acme".to_string(), "mirror".to_string(), change)), bearer("tok2")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "restore is owner/admin only");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
