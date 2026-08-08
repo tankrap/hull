@@ -363,7 +363,7 @@ function LabelEditor({ labels, onChange }: { labels: RepoLabel[]; onChange: (l: 
           <button type="button" onClick={() => setDraft((d) => ({ ...d, color: randomHexColor() }))} className="h-7 px-2 rounded-ctl border border-rule text-[12px] text-dim hover:text-ink hover:border-dim inline-flex items-center gap-1.5"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="3" /><circle cx="8.5" cy="8.5" r="1" fill="currentColor" /><circle cx="15.5" cy="15.5" r="1" fill="currentColor" /><circle cx="15.5" cy="8.5" r="1" fill="currentColor" /><circle cx="8.5" cy="15.5" r="1" fill="currentColor" /></svg>random</button>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[180px]" placeholder="label name" value={draft.name} onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
+          <input className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[13px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint w-[180px]" placeholder="label name" value={draft.name} onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
           {draft.name.trim() && <Label name={draft.name.trim()} color={draft.color} icon={draft.icon} />}
           <Button size="sm" className="ml-auto" disabled={!draft.name.trim()} onClick={add}>Add label</Button>
         </div>
@@ -400,7 +400,7 @@ function CodeOwnersEditor({ rules, actors, handleOf, onSave }: { rules: OwnerRul
       {draft.map((r, i) => (
         <div key={i} className="grid gap-2 border border-rule2 rounded-ctl p-3 bg-paper/40">
           <div className="flex items-center gap-2">
-            <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-mono text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint flex-1 min-w-0" placeholder="path glob, e.g. crates/** or *.rs" value={r.glob} onChange={(e) => setRow(i, { glob: e.target.value })} />
+            <input className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-mono text-[12.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint flex-1 min-w-0" placeholder="path glob, e.g. crates/** or *.rs" value={r.glob} onChange={(e) => setRow(i, { glob: e.target.value })} />
             <button className="text-muted hover:text-fault-text cursor-pointer px-1 flex-none" title="remove rule" onClick={() => setDraft((d) => d.filter((_, j) => j !== i))}>×</button>
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
@@ -416,7 +416,7 @@ function CodeOwnersEditor({ rules, actors, handleOf, onSave }: { rules: OwnerRul
         </div>
       ))}
       <div className="flex items-center gap-2 flex-wrap border-t border-rule3 pt-3">
-        <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-mono text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint w-[220px]" placeholder="add a rule: path glob…" value={newGlob} onChange={(e) => setNewGlob(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addRow(); }} />
+        <input className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-mono text-[12.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint w-[220px]" placeholder="add a rule: path glob…" value={newGlob} onChange={(e) => setNewGlob(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addRow(); }} />
         <div className="w-[200px]"><Picker size="sm" block value={newOwner} placeholder="owner (optional)…" onChange={setNewOwner} options={actors.map(actorOption)} /></div>
         <Button size="sm" variant="secondary" disabled={!newGlob.trim()} onClick={addRow}>Add rule</Button>
         <Button size="sm" className="ml-auto" disabled={!dirty || saving} onClick={save}>{saving ? "Saving…" : "Save code owners"}</Button>
@@ -611,7 +611,7 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
                   </li>
                   <li className="flex items-center gap-2.5">
                     <span className="w-5 h-5 flex-none grid place-items-center rounded-full bg-rule2 text-[11px] font-semibold text-muted tabular-nums">2</span>
-                    <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="paste code here" autoFocus className="box-border flex-1 min-w-[200px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" onKeyDown={(e) => { if (e.key === "Enter") completeAgentLogin(); }} />
+                    <input value={code} onChange={(e) => setCode(e.target.value)} placeholder="paste code here" autoFocus className="box-border flex-1 min-w-[200px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint" onKeyDown={(e) => { if (e.key === "Enter") completeAgentLogin(); }} />
                     <Button size="sm" disabled={!code.trim() || busy} onClick={completeAgentLogin}>{busy ? "Verifying…" : "Finish"}</Button>
                     <button onClick={cancelAgentLogin} className="text-[12px] text-muted hover:text-fault-text">Cancel</button>
                   </li>
@@ -641,8 +641,8 @@ function AiConnections({ accountId, authHeaders, scopeLabel }: { accountId: stri
             <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">Or add an API key</span>
             <div className="flex flex-wrap items-end gap-2">
               <div className="w-[180px]"><Picker size="sm" block value={provider} onChange={setProvider} options={PROVIDERS} /></div>
-              <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="label (optional)" className="box-border h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint w-[160px]" />
-              <input value={key} onChange={(e) => setKey(e.target.value)} type="password" placeholder="API key" className="box-border flex-1 min-w-[180px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" />
+              <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="label (optional)" className="box-border h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint w-[160px]" />
+              <input value={key} onChange={(e) => setKey(e.target.value)} type="password" placeholder="API key" className="box-border flex-1 min-w-[180px] h-ctl-sm px-2.5 rounded-ctl-sm border border-ctl bg-surface text-[13px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint" />
               <Button size="sm" disabled={!key.trim() || busy} onClick={add}>{busy ? "Connecting…" : "Connect"}</Button>
             </div>
           </div>
@@ -670,6 +670,13 @@ const Module = ({ title, children, tone = "" }: { title: string; children: React
     <div className="px-4 py-3.5 grid gap-2.5 text-[13px]">{children}</div>
   </div>
 );
+// GitLab panel header bar: a titled strip with a bottom rule, for full-width list cards.
+const PanelHead = ({ title, right }: { title: React.ReactNode; right?: React.ReactNode }) => (
+  <div className="flex items-center justify-between gap-3 px-5 h-[46px] border-b border-rule2">
+    <span className="text-[13.5px] font-semibold text-ink">{title}</span>
+    {right != null && right !== "" && <span className="text-[12.5px] text-muted tabular-nums">{right}</span>}
+  </div>
+);
 // label-left / value-right stat line inside a Module.
 const Stat = ({ k, v }: { k: React.ReactNode; v: React.ReactNode }) => (
   <div className="flex items-baseline justify-between gap-3">
@@ -688,8 +695,8 @@ function ModalShell({ title, onClose, children, width = 480 }: { title: string; 
   }, [onClose]);
   return (
     <>
-      <div className="fixed inset-0 z-40 bg-ink/40 animate-bd-in" onClick={onClose} />
-      <div style={{ width }} className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-[93vw] max-h-[88vh] overflow-auto bg-surface rounded-card shadow-modal animate-ov-in">
+      <div aria-hidden="true" className="fixed inset-0 z-40 bg-[rgba(0,0,0,0.68)] animate-bd-in" onClick={onClose} />
+      <div role="dialog" aria-modal="true" style={{ width }} className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-[93vw] max-h-[88vh] overflow-auto bg-surface border border-rule rounded-card shadow-modal animate-ov-in">
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-rule2 sticky top-0 bg-surface">
           <h2 className="text-[15px] font-semibold">{title}</h2>
           <button onClick={onClose} className="w-6 h-6 grid place-items-center rounded-ctl text-muted hover:text-ink hover:bg-paper" aria-label="close"><IcoX size={15} /></button>
@@ -706,7 +713,7 @@ const Field = ({ label, hint, children }: { label: string; hint?: string; childr
     {children}
   </div>
 );
-const modalInput = "w-full box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint";
+const modalInput = "w-full box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint";
 
 // New repository modal: owner/name shown inline (owner ∕ name), a live name-availability check like
 // org handles, a Public/Unlisted/Private dropdown, and the default branch.
@@ -836,7 +843,7 @@ function SearchableList<T>({ items, renderItem, searchOf, initial = 15, searchTh
       {items.length >= searchThreshold && (
         <div className="relative">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="absolute left-2 top-1/2 -translate-y-1/2 text-faint pointer-events-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={placeholder} className="w-full box-border h-ctl-sm pl-7 pr-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[12.5px] text-ink outline-none focus:border-body placeholder:text-faint" />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={placeholder} className="w-full box-border h-ctl-sm pl-7 pr-2.5 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[12.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint" />
         </div>
       )}
       <div className="grid gap-1">{shown.map(renderItem)}</div>
@@ -1946,8 +1953,8 @@ export function App() {
   }, [view, tenant, issueRepo, isTenantOwner]);
   const shortcutsNode = showShortcuts ? (
     <>
-      <div onClick={() => setShowShortcuts(false)} className="fixed inset-0 z-40 bg-ink/30 animate-bd-in" />
-      <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[440px] max-w-[92vw] bg-surface rounded-[13px] shadow-modal border border-rule animate-ov-in overflow-hidden">
+      <div onClick={() => setShowShortcuts(false)} className="fixed inset-0 z-40 bg-[rgba(0,0,0,0.62)] animate-bd-in" />
+      <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[440px] max-w-[92vw] bg-surface border border-rule rounded-card shadow-modal border border-rule animate-ov-in overflow-hidden">
         <div className="px-5 py-3.5 border-b border-rule2 flex items-center justify-between">
           <span className="text-[14.5px] font-semibold">Keyboard shortcuts</span>
           <button type="button" aria-label="Close" onClick={() => setShowShortcuts(false)} className="text-muted hover:text-ink"><IcoX size={16} /></button>
@@ -2031,9 +2038,153 @@ export function App() {
     </>
   );
 
+  // ── left nav sidebar (chrome) — GitLab-style: global nav lives here, the top bar keeps search + user.
+  // Defined here (before the authPage short-circuit) so the post-auth pages reuse the exact same nav. ──
+  const sideCls = (active: boolean) =>
+    `w-full flex items-center gap-2.5 px-2.5 h-8 rounded-ctl text-[13.5px] transition-colors ${active ? "bg-surface text-ink font-medium" : "text-body hover:bg-surface hover:text-ink"}`;
+  const SIco = ({ d }: { d: string }) => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className="flex-none text-muted"><path d={d} /></svg>
+  );
+  const sidebar = (
+    <aside className="w-[228px] shrink-0 bg-shell hidden md:flex flex-col">
+      <nav className="flex-1 overflow-y-auto px-3 pt-3 grid gap-0.5 content-start">
+        {view === "repo" && !authPage && issueRepo ? (
+          <>
+            {/* Inside a project, the sidebar becomes the project nav — GitLab's pattern. */}
+            <button className="w-full flex items-center gap-1.5 px-2.5 h-7 rounded-ctl text-[12.5px] text-muted hover:text-ink hover:bg-surface transition-colors" onClick={() => navigate("/")}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-none"><polyline points="15 18 9 12 15 6" /></svg><span>Your work</span>
+            </button>
+            <div className="flex items-center gap-2 px-2.5 pt-2 pb-2 min-w-0">
+              <span className="w-7 h-7 rounded-ctl bg-steel-wash text-steel-text grid place-items-center text-[11px] font-bold uppercase flex-none">{issueRepo.slice(0, 2)}</span>
+              <span className="min-w-0"><span className="block text-[13.5px] font-semibold truncate leading-tight">{issueRepo}</span><span className="block text-[11px] text-faint truncate leading-tight">{tenant}</span></span>
+            </div>
+            <button className={sideCls(tab === "issues")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}`)}>
+              <SIco d="M12 22a10 10 0 1 1 0-20 10 10 0 0 1 0 20zM12 14a2 2 0 1 1 0-4 2 2 0 0 1 0 4z" /><span>Issues</span>
+            </button>
+            <button className={sideCls(tab === "prs")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/voyages`)}>
+              <SIco d="M6 9v6M6 21a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM6 9a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM18 6a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM18 6v6a3 3 0 0 1-3 3H8" /><span>Merge requests</span>
+            </button>
+            <button className={sideCls(tab === "files")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/files`)}>
+              <SIco d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6" /><span>Files</span>
+            </button>
+            <button className={sideCls(tab === "graph")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/graph`)}>
+              <SIco d="M18 20V10M12 20V4M6 20v-7" /><span>Graph</span>
+            </button>
+            {isTenantOwner && (
+              <button className={sideCls(tab === "settings")} onClick={() => navigate(`/${encodeURIComponent(tenant)}/${encodeURIComponent(issueRepo)}/settings`)}>
+                <SIco d="M4 21v-6M4 11V3M12 21v-9M12 7V3M20 21v-4M20 13V3M1 15h6M9 9h6M17 15h6" /><span>Settings</span>
+              </button>
+            )}
+          </>
+        ) : orgHandle && !authPage ? (
+          <>
+            {/* Inside an org, the sidebar becomes the org (group) nav — GitLab's pattern. */}
+            <button className="w-full flex items-center gap-1.5 px-2.5 h-7 rounded-ctl text-[12.5px] text-muted hover:text-ink hover:bg-surface transition-colors" onClick={() => navigate("/")}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-none"><polyline points="15 18 9 12 15 6" /></svg><span>Your work</span>
+            </button>
+            <div className="flex items-center gap-2 px-2.5 pt-2 pb-2 min-w-0">
+              <span className="w-7 h-7 rounded-ctl bg-brass-wash text-brass-text grid place-items-center text-[11px] font-bold uppercase flex-none">{orgHandle.slice(0, 2)}</span>
+              <span className="min-w-0"><span className="block text-[13.5px] font-semibold truncate leading-tight">{orgHandle}</span><span className="block text-[11px] text-faint truncate leading-tight">organization</span></span>
+            </div>
+            <button className={sideCls(orgTab === "overview")} onClick={() => setOrgTab("overview")}>
+              <SIco d="M3 21h18M6 21V7l6-4 6 4v14M10 9h.01M14 9h.01M10 13h.01M14 13h.01M10 17h4" /><span>Overview</span>
+            </button>
+            <button className={sideCls(orgTab === "repos")} onClick={() => setOrgTab("repos")}>
+              <SIco d="M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4zM20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z" /><span>Repositories</span>
+            </button>
+            {myAccounts.includes(orgHandle) && (
+              <button className={sideCls(orgTab === "people")} onClick={() => setOrgTab("people")}>
+                <SIco d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" /><span>Members &amp; settings</span>
+              </button>
+            )}
+          </>
+        ) : (
+          <>
+            <div className="px-2.5 pt-1 pb-2 text-[15px] font-semibold tracking-tight">Your work</div>
+            <button className={sideCls(view === "home" && !orgHandle && !authPage)} onClick={() => navigate("/")}>
+              <SIco d="M3 10.5 12 3l9 7.5M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5" /><span>Home</span>
+            </button>
+            {me && (
+              <button className={sideCls(authPage === "profile")} onClick={() => navigate("/me")}>
+                <SIco d="M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4zM20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z" /><span>Your repositories</span>
+              </button>
+            )}
+            {me && (
+              <>
+                <div className="px-2.5 pt-4 pb-1.5 text-[10.5px] font-semibold uppercase tracking-[0.09em] text-faint">Organizations</div>
+                {myAccounts.length === 0 && <div className="px-2.5 pb-1 text-[12.5px] text-faint">none yet</div>}
+                {myAccounts.map((h) => (
+                  <button key={h} className={sideCls(!!orgHandle && orgHandle === h)} onClick={() => navigate(`/orgs/${encodeURIComponent(h)}`)}>
+                    <SIco d="M3 21h18M6 21V7l6-4 6 4v14M10 9h.01M14 9h.01M10 13h.01M14 13h.01M10 17h4" /><span className="truncate">{h}</span>
+                  </button>
+                ))}
+              </>
+            )}
+            {!me && (
+              <button className={sideCls(false)} onClick={() => navigate("/login")}>
+                <SIco d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" /><span>Log in</span>
+              </button>
+            )}
+          </>
+        )}
+      </nav>
+      <div className="px-3 py-3 border-t border-rule2 grid gap-0.5">
+        <button className={sideCls(authPage === "account")} onClick={() => me ? navigate("/settings") : setTheme(theme === "dark" ? "light" : "dark")}>
+          {me
+            ? <SIco d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            : theme === "dark" ? <SIco d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z" /> : <SIco d="M12 3v2M12 19v2M5 5l1.5 1.5M17.5 17.5 19 19M3 12h2M19 12h2M5 19l1.5-1.5M17.5 6.5 19 5M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" />}
+          <span>{me ? "Account settings" : theme === "dark" ? "Light mode" : "Dark mode"}</span>
+        </button>
+        {me && (
+          <button className={sideCls(false)} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+            {theme === "dark" ? <SIco d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z" /> : <SIco d="M12 3v2M12 19v2M5 5l1.5 1.5M17.5 17.5 19 19M3 12h2M19 12h2M5 19l1.5-1.5M17.5 6.5 19 5M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" />}
+            <span>{theme === "dark" ? "Light mode" : "Dark mode"}</span>
+          </button>
+        )}
+        <a className={sideCls(false)} href="https://github.com/tankrap/hull" target="_blank" rel="noreferrer">
+          <SIco d="M9 18c-4.5 1.5-4.5-2.5-6-3m12 6v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.3 4.3 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6 0C7.3 1.3 6.3 1.6 6.3 1.6a4.3 4.3 0 0 0-.1 3.2A4.6 4.6 0 0 0 5 8c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V20" /><span>Docs</span>
+        </a>
+      </div>
+    </aside>
+  );
+
   if (authPage) {
-    const shell = (title: string, children: React.ReactNode, wide = false) => (
-      <div className="bg-paper min-h-screen text-ink">
+    // Pre-auth (login / signup) stays a clean centered page; once signed in, profile + account
+    // settings render inside the SAME sidebar shell as the rest of the app.
+    const shell = (title: string, children: React.ReactNode, wide = false) => {
+      const inner = (
+        <div className={`mx-auto px-6 py-10 ${wide ? "max-w-[860px]" : "max-w-[560px]"}`}>
+          {title && <h1 className="text-[24px] font-semibold tracking-tight mb-6">{title}</h1>}
+          {children}
+        </div>
+      );
+      if (me) {
+        return (
+          <div className="bg-shell h-dvh flex flex-col text-ink overflow-hidden">
+            {uiModalNode}{cmdNode}{shortcutsNode}{createModalsNode}
+            <header className="h-14 shrink-0 bg-shell flex items-center gap-5 px-6">
+              <button className="flex items-center gap-2.5 cursor-pointer shrink-0" onClick={() => navigate("/")}>
+                <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
+                <span className="text-[19px] font-extrabold tracking-tight">hull</span>
+              </button>
+              <button onClick={() => setCmdOpen(true)} className="flex-1 max-w-[440px] mx-auto flex items-center gap-2 h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] hover:border-dim transition-colors cursor-pointer text-left">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
+                <span className="flex-1 text-[13.5px] text-faint">Search or jump to…</span>
+                <span className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-[5px] py-0.5 bg-paper flex-none">⌘K</span>
+              </button>
+              <div className="w-[120px] shrink-0" />
+            </header>
+            <div className="flex flex-1 min-h-0">
+              {sidebar}
+              <main className="flex-1 min-w-0 overflow-y-auto overflow-x-clip bg-paper rounded-tl-[16px] border-l border-t border-rule2/70">
+                {inner}
+              </main>
+            </div>
+          </div>
+        );
+      }
+      return (
+      <div className="bg-shell min-h-screen text-ink">
         {uiModalNode}
         {cmdNode}
         {shortcutsNode}
@@ -2051,6 +2202,7 @@ export function App() {
         </div>
       </div>
     );
+    };
     const errBox = authError ? <div className="text-[13px] text-fault-text bg-fault-wash border border-fault/30 rounded-ctl px-3 py-2 mb-3">{authError}</div> : null;
 
     if (authPage === "signup") {
@@ -2060,14 +2212,14 @@ export function App() {
             {errBox}
             <div className="grid gap-1.5">
               <label className="text-[12.5px] font-semibold text-body">username</label>
-              <input className={`box-border h-ctl px-2.5 rounded-ctl border bg-surface font-sans text-[13.5px] text-ink outline-none placeholder:text-faint transition-colors ${usernameAvail && !usernameAvail.available ? "border-fault" : "border-ctl focus:border-body"}`} placeholder="e.g. mira" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} autoFocus />
+              <input className={`box-border h-ctl px-3 rounded-ctl border bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none placeholder:text-faint transition-colors ${usernameAvail && !usernameAvail.available ? "border-fault" : "border-[var(--field-border)] focus:border-steel focus:ring-[3px] focus:ring-steel/25"}`} placeholder="e.g. mira" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} autoFocus />
               {authForm.username.trim() && usernameAvail && (
                 <div className={`text-[12px] ${usernameAvail.available ? "text-clear-text" : "text-fault-text"}`}><span className="inline-flex items-center gap-1.5">{usernameAvail.available ? <><IcoCheck size={12} />{`${authForm.username} is available`}</> : <><IcoX size={12} />that username is taken</>}</span></div>
               )}
             </div>
             <div className="grid gap-1.5">
               <label className="text-[12.5px] font-semibold text-body">email</label>
-              <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="you@example.com" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value.trim() })} onKeyDown={(e) => e.key === "Enter" && signupPasskey()} />
+              <input className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint" placeholder="you@example.com" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value.trim() })} onKeyDown={(e) => e.key === "Enter" && signupPasskey()} />
             </div>
             {!sovereignMode ? (
               <>
@@ -2079,7 +2231,7 @@ export function App() {
               <>
                 <div className="grid gap-1.5">
                   <label className="text-[12.5px] font-semibold text-body">passphrase</label>
-                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="a strong passphrase you'll remember" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signupSovereign()} />
+                  <input type="password" className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint" placeholder="a strong passphrase you'll remember" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signupSovereign()} />
                 </div>
                 <Button disabled={authBusy || (!!usernameAvail && !usernameAvail.available)} onClick={signupSovereign}>{authBusy ? "generating your key…" : "Create sovereign account"}</Button>
                 <p className="text-[12.5px] text-muted leading-[1.55]">Your Ed25519 key is generated in this browser and encrypted with your passphrase — Hull only ever stores the public key and the encrypted bundle, and can never sign for you. There is no reset: lose the passphrase and the account is unrecoverable.</p>
@@ -2099,7 +2251,7 @@ export function App() {
             {errBox}
             <div className="grid gap-1.5">
               <label className="text-[12.5px] font-semibold text-body">username</label>
-              <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="your username" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} onKeyDown={(e) => e.key === "Enter" && loginPasskey(authForm.username)} autoFocus />
+              <input className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint" placeholder="your username" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} onKeyDown={(e) => e.key === "Enter" && loginPasskey(authForm.username)} autoFocus />
             </div>
             {!sovereignMode ? (
               <>
@@ -2110,7 +2262,7 @@ export function App() {
               <>
                 <div className="grid gap-1.5">
                   <label className="text-[12.5px] font-semibold text-body">passphrase</label>
-                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="your passphrase" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && loginSovereign()} />
+                  <input type="password" className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint" placeholder="your passphrase" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && loginSovereign()} />
                 </div>
                 <Button disabled={authBusy} onClick={loginSovereign}>{authBusy ? "unlocking your key…" : "Log in with your passphrase"}</Button>
                 <p className="text-[12.5px] text-muted leading-[1.55]">Your key is decrypted in this browser; Hull never sees your passphrase.</p>
@@ -2122,7 +2274,7 @@ export function App() {
               <details className="text-[12.5px]">
                 <summary className="text-muted cursor-pointer">Advanced: key login</summary>
                 <div className="grid gap-2 mt-2.5">
-                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="ed25519 secret key (hex)" value={secretInput} onChange={(e) => setSecretInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signIn()} />
+                  <input type="password" className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[13px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint" placeholder="ed25519 secret key (hex)" value={secretInput} onChange={(e) => setSecretInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signIn()} />
                   <div className="flex gap-2 items-center">
                     <Button size="sm" variant="secondary" onClick={signIn}>Sign in with key</Button>
                     <LinkButton onClick={registerAndSignIn}>new raw identity</LinkButton>
@@ -2157,7 +2309,7 @@ export function App() {
               <div className="mt-4 max-w-[560px]">
                 {bioDraft !== null ? (
                   <div className="grid gap-2">
-                    <textarea autoFocus value={bioDraft} onChange={(e) => setBioDraft(e.target.value.slice(0, 280))} rows={2} placeholder="Tell people what you work on…" className="w-full box-border px-2.5 py-2 rounded-ctl border border-ctl bg-surface font-sans text-[14px] text-ink outline-none focus:border-body resize-y" />
+                    <textarea autoFocus value={bioDraft} onChange={(e) => setBioDraft(e.target.value.slice(0, 280))} rows={2} placeholder="Tell people what you work on…" className="w-full box-border px-2.5 py-2 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[14px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 resize-y" />
                     <div className="flex items-center gap-2"><Button size="sm" onClick={() => saveBio(bioDraft)}>Save</Button><LinkButton onClick={() => setBioDraft(null)}>cancel</LinkButton><span className="text-[12px] text-faint ml-auto">{bioDraft.length}/280</span></div>
                   </div>
                 ) : (profileStats?.bio || "").trim() ? (
@@ -2281,11 +2433,11 @@ export function App() {
                 <div className="px-6 py-5 grid gap-4 max-w-[420px]">
                   <div className="grid gap-1.5">
                     <label className="text-[12.5px] font-semibold text-body">username</label>
-                    <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body" value={account.username} onChange={(e) => setAccount({ ...account, username: e.target.value })} />
+                    <input className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25" value={account.username} onChange={(e) => setAccount({ ...account, username: e.target.value })} />
                   </div>
                   <div className="grid gap-1.5">
                     <label className="text-[12.5px] font-semibold text-body">email</label>
-                    <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body" value={account.email} onChange={(e) => setAccount({ ...account, email: e.target.value })} />
+                    <input className="box-border h-ctl px-3 rounded-ctl border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-[13.5px] text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25" value={account.email} onChange={(e) => setAccount({ ...account, email: e.target.value })} />
                   </div>
                   <div><Button size="sm" onClick={() => saveAccount({ username: account.username, email: account.email })}>Save</Button></div>
                 </div>
@@ -2342,7 +2494,7 @@ export function App() {
 
   // ── shared chrome (top bar + notifications drawer) ────────────────────────
   const topBar = (
-    <header className="h-14 bg-shell flex items-center gap-5 px-6 sticky top-0 z-40">
+    <header className="h-14 shrink-0 bg-shell flex items-center gap-5 px-6 z-30">
       <button className="flex items-center gap-2.5 cursor-pointer shrink-0" onClick={() => navigate("/")} title="situation room">
         <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
         <span className="text-[19px] font-extrabold tracking-tight">hull</span>
@@ -2355,7 +2507,7 @@ export function App() {
         </div>
       )}
       <div className="flex-1 max-w-[440px] mx-auto">
-        <button onClick={() => setCmdOpen(true)} className="w-full flex items-center gap-2 h-ctl px-2.5 rounded-ctl border border-ctl bg-surface hover:border-[oklch(0.6_0.015_250)] transition-colors cursor-pointer text-left">
+        <button onClick={() => setCmdOpen(true)} className="w-full flex items-center gap-2 h-ctl px-3 rounded-ctl border border-ctl bg-surface hover:border-[oklch(0.6_0.015_250)] transition-colors cursor-pointer text-left">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
           <span className="flex-1 text-[13.5px] text-faint">Search or jump to…</span>
           <span className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-[5px] py-0.5 bg-paper flex-none">⌘K</span>
@@ -2405,7 +2557,7 @@ export function App() {
         <span className="w-px h-6 bg-rule2 mx-0.5" aria-hidden />
         {me ? (
           <Popover align="right" width={240} trigger={(open) => (
-            <span className={`flex items-center gap-1.5 h-ctl px-2.5 rounded-ctl border bg-surface cursor-pointer text-[13px] transition-colors ${open ? "border-body" : "border-ctl hover:border-dim"}`} title={me.handle}>
+            <span className={`flex items-center gap-1.5 h-ctl px-3 rounded-ctl border bg-surface cursor-pointer text-[13px] transition-colors ${open ? "border-body" : "border-ctl hover:border-dim"}`} title={me.handle}>
               <Avatar id={me.id} handle={me.handle} kind={me.kind} size={18} />
               <span className="font-medium">{me.handle}</span>
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`text-muted transition-transform ${open ? "rotate-180" : ""}`}><polyline points="6 9 12 15 18 9" /></svg>
@@ -2505,7 +2657,7 @@ export function App() {
   const currentPr = openPr != null ? prs.find((p) => p.number === openPr) ?? null : null;
 
   return (
-    <div className="bg-shell min-h-screen text-ink">
+    <div className="bg-shell h-dvh flex flex-col text-ink overflow-hidden">
       {uiModalNode}
       {cmdNode}
       {shortcutsNode}
@@ -2514,9 +2666,11 @@ export function App() {
       {topBar}
       {notifDrawer}
 
-      {/* The content sits in an inset, rounded "well" one shade darker than the chrome around it —
-          the GitLab app-shell look: lighter frame (top bar / edges), darker work surface. */}
-      <main className="bg-paper rounded-t-[14px] mx-2 min-h-[calc(100dvh-3.5rem)] overflow-x-clip border-x border-t border-rule2/70">
+      {/* GitLab app-shell: lighter chrome (top bar + left sidebar) frames a darker content "well"
+          that is inset and rounded at the inner corner and scrolls on its own. */}
+      <div className="flex flex-1 min-h-0">
+        {sidebar}
+        <main className="flex-1 min-w-0 overflow-y-auto overflow-x-clip bg-paper rounded-tl-[16px] border-l border-t border-rule2/70">
 
       {/* ── HOME · your work ──────────────────────────────────────────────── */}
       {view === "home" && !orgHandle && !me && (
@@ -2535,24 +2689,42 @@ export function App() {
         const activeRepos = repos.filter((r) => r.score > 0);
         return (
         <div className="max-w-[1180px] mx-auto px-6 sm:px-8 py-9">
-          <div className="flex flex-wrap items-end justify-between gap-4 mb-8">
-            <div>
-              <h1 className="text-[27px] font-semibold tracking-tight leading-none">Your work</h1>
-              <p className="text-[13.5px] text-muted mt-2.5">
-                {activeRepos.length} active {activeRepos.length === 1 ? "repo" : "repos"} · {homePrs.length + homeIssues.length} {homePrs.length + homeIssues.length === 1 ? "item" : "items"} needing you
-              </p>
+          {/* Greeting header — GitLab "Your work" dashboard style. */}
+          <div className="flex items-center gap-4 mb-7">
+            <Avatar id={me.id} handle={me.handle} kind={me.kind} size={52} />
+            <div className="min-w-0">
+              <h1 className="text-[22px] font-semibold tracking-tight leading-tight truncate">{me.handle}</h1>
+              <p className="text-[13.5px] text-muted mt-1">Hey there — here's the work across your organizations.</p>
             </div>
+          </div>
+          {/* Stat tiles — the signature GitLab dashboard row. */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-7">
+            {[
+              { label: "Reviews", n: homePrs.length, sub: "Pull requests waiting on you", to: "", d: "M6 9v6M6 21a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM6 9a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM18 6a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM18 6v6a3 3 0 0 1-3 3H8" },
+              { label: "Issues", n: homeIssues.length, sub: "Assigned to you", to: "", d: "M12 22a10 10 0 1 1 0-20 10 10 0 0 1 0 20zM12 14a2 2 0 1 1 0-4 2 2 0 0 1 0 4z" },
+              { label: "Repositories", n: activeRepos.length, sub: "Active right now", to: "/me", d: "M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4zM20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z" },
+              { label: "Organizations", n: myAccounts.length, sub: "You're a member of", to: "/me", d: "M3 21h18M6 21V7l6-4 6 4v14M10 9h.01M14 9h.01M10 13h.01M14 13h.01M10 17h4" },
+            ].map((t) => (
+              <button key={t.label} onClick={() => t.to && navigate(t.to)} className="text-left bg-surface border border-rule rounded-card px-4 py-3.5 hover:border-dim transition-colors">
+                <div className="flex items-center justify-between">
+                  <span className="text-[12.5px] text-muted">{t.label}</span>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className="text-faint flex-none"><path d={t.d} /></svg>
+                </div>
+                <div className="text-[30px] font-semibold tracking-tight mt-2 leading-none tabular-nums">{t.n}</div>
+                <div className="text-[12.5px] text-body mt-1.5 truncate">{t.sub}</div>
+              </button>
+            ))}
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-x-12 gap-y-9">
             <section className="min-w-0 grid gap-8 content-start">
               {(homePrs.length > 0 || homeIssues.length > 0) && (
-                <div className="bg-surface border border-rule rounded-card p-5">
-                  <Eyebrow label="Needs your attention" right={`${homePrs.length + homeIssues.length}`} />
+                <div className="bg-surface border border-rule rounded-card overflow-hidden">
+                  <PanelHead title="Needs your attention" right={`${homePrs.length + homeIssues.length}`} />
                   <div className="[&>button:last-child]:border-b-0">
                     {homePrs.map((p) => (
                       <button key={`pr-${p.tenant}/${p.repo}#${p.number}`} onClick={() => navigate(`/${encodeURIComponent(p.tenant)}/${encodeURIComponent(p.repo)}/voyages/${p.number}`)} className="group w-full text-left block border-b border-rule2">
-                        <div className="flex items-start gap-3 py-3 -mx-3 px-3 rounded-ctl group-hover:bg-shell transition-colors">
+                        <div className="flex items-start gap-3 px-5 py-3 group-hover:bg-shell transition-colors">
                           <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-clear-text mt-0.5 flex-none"><path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354Z" /></svg>
                           <div className="flex-1 min-w-0">
                             <div className="text-[14px] font-medium group-hover:text-steel-text transition-colors truncate">{p.title}</div>
@@ -2563,7 +2735,7 @@ export function App() {
                     ))}
                     {homeIssues.map((it) => (
                       <button key={`is-${it.tenant}/${it.repo}#${it.number}`} onClick={() => navigate(`/${encodeURIComponent(it.tenant)}/${encodeURIComponent(it.repo)}/issues/${it.number}`)} className="group w-full text-left block border-b border-rule2">
-                        <div className="flex items-start gap-3 py-3 -mx-3 px-3 rounded-ctl group-hover:bg-shell transition-colors">
+                        <div className="flex items-start gap-3 px-5 py-3 group-hover:bg-shell transition-colors">
                           <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-clear-text mt-0.5 flex-none"><path d="M8 9.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" /><path fillRule="evenodd" d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0ZM1.5 8a6.5 6.5 0 1 1 13 0 6.5 6.5 0 0 1-13 0Z" /></svg>
                           <div className="flex-1 min-w-0">
                             <div className="text-[14px] font-medium group-hover:text-steel-text transition-colors truncate">{it.title}</div>
@@ -2575,10 +2747,10 @@ export function App() {
                   </div>
                 </div>
               )}
-              <div className="bg-surface border border-rule rounded-card p-5">
-              <Eyebrow label="Active repositories" right="by live activity" />
+              <div className="bg-surface border border-rule rounded-card overflow-hidden">
+              <PanelHead title="Active repositories" right="by live activity" />
               {activeRepos.length === 0 && (
-                <div className="py-8 text-[13px] text-muted">
+                <div className="px-5 py-8 text-[13px] text-muted">
                   {repos.length === 0
                     ? <>No repos yet. Create one, import from GitHub, or <code className="text-body">git push http://localhost:8930/&lt;org&gt;/&lt;repo&gt; main</code>.</>
                     : <>No active repositories right now — <button className="text-steel-text hover:underline" onClick={() => navigate("/me")}>see all {repos.length} on your profile →</button></>}
@@ -2587,7 +2759,7 @@ export function App() {
               <div className="[&>button:last-child>div]:border-b-0">
                 {activeRepos.map((r) => (
                   <button key={`${r.tenant}/${r.repo}`} onClick={() => navigate(`/${encodeURIComponent(r.tenant)}/${encodeURIComponent(r.repo)}`)} className="group w-full text-left block">
-                    <div className="flex items-start gap-4 py-4 -mx-3 px-3 rounded-ctl border-b border-rule2 group-hover:bg-shell transition-colors">
+                    <div className="flex items-start gap-4 px-5 py-4 border-b border-rule2 group-hover:bg-shell transition-colors">
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2.5">
                           <span className="text-[16px] font-medium group-hover:text-steel-text transition-colors"><span className="text-faint font-normal">{r.tenant}/</span>{r.repo}</span>
@@ -2616,7 +2788,7 @@ export function App() {
                 ))}
               </div>
               {repos.length > 0 && (
-                <button onClick={() => navigate("/me")} className="mt-3 inline-flex items-center gap-1.5 text-[13px] font-medium text-steel-text hover:underline">
+                <button onClick={() => navigate("/me")} className="px-5 py-3 inline-flex items-center gap-1.5 text-[13px] font-medium text-steel-text hover:underline">
                   All {repos.length} {repos.length === 1 ? "repository" : "repositories"} on your profile
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg>
                 </button>
@@ -2649,7 +2821,7 @@ export function App() {
               {issueRepo} · issues
             </button>
             <div className="group flex items-center gap-3 flex-wrap mb-1.5">
-              <StatusBadge kind={it.status.state === "open" ? "running" : "queued"}>{it.status.state === "open" ? "open" : it.status.reason ?? "closed"}</StatusBadge>
+              <StatusBadge kind={it.status.state === "open" ? "open" : (it.status.reason === "completed" || !it.status.reason) ? "merged" : "closed"}>{it.status.state === "open" ? "open" : it.status.reason ?? "closed"}</StatusBadge>
               {editingIssue === it.number
                 ? <input autoFocus value={issueTitleDraft} onChange={(e) => setIssueTitleDraft(e.target.value)} placeholder="Issue title" className={`${modalInput} flex-1 min-w-[240px] !text-[20px] !h-auto py-1.5 font-semibold tracking-tight`} />
                 : <h1 className="text-[24px] font-semibold tracking-tight">{it.title}</h1>}
@@ -2712,10 +2884,9 @@ export function App() {
               <aside className="grid gap-5 content-start">
                 <Module title="Details">
                   <Stat k="status" v={
-                    <span className={`inline-flex items-center gap-1 text-[12px] font-medium px-1.5 py-[2px] rounded-badge ${it.status.state === "open" ? "bg-clear-wash text-clear-text" : it.status.reason === "completed" || !it.status.reason ? "bg-steel-wash text-steel-text" : "bg-rule2 text-dim"}`}>
-                      <span className={`w-1.5 h-1.5 rounded-full ${it.status.state === "open" ? "bg-clear" : it.status.reason === "completed" || !it.status.reason ? "bg-steel" : "bg-muted"}`} />
+                    <StatusBadge kind={it.status.state === "open" ? "open" : (it.status.reason === "completed" || !it.status.reason) ? "merged" : "closed"}>
                       {it.status.state === "open" ? "open" : it.status.reason ?? "closed"}
-                    </span>
+                    </StatusBadge>
                   } />
                   <Stat k="author" v={handleOf(it.author)} />
                   <div className="grid gap-1.5 pt-1">
@@ -2848,8 +3019,8 @@ export function App() {
                 </div>
               </div>
 
-              {/* Org tabs — same shape as the profile page. People is members-only. */}
-              <div className="border-b border-rule2 -mt-1">
+              {/* Org tabs — desktop uses the contextual sidebar; this is the mobile fallback. */}
+              <div className="md:hidden border-b border-rule2 -mt-1">
                 <HTabs items={["Overview", `Repositories ${oRepos.length}`, ...(acct ? ["Settings"] : [])]} value={orgTab === "overview" ? 0 : orgTab === "repos" ? 1 : 2} onChange={(i: number) => setOrgTab(i === 0 ? "overview" : i === 1 ? "repos" : "people")} />
               </div>
 
@@ -2962,7 +3133,7 @@ export function App() {
                   </Card>
                 </div>
                 <div>
-                  <Eyebrow label="Teams" right={amAdmin ? <span className="flex gap-2 items-center"><input className="box-border h-ctl-sm px-2 rounded-ctl-sm border border-ctl bg-surface font-sans text-xs text-ink outline-none focus:border-body placeholder:text-faint" placeholder="new team…" value={teamDraft} onChange={(e) => setTeamDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { createTeam(acct.id, teamDraft); setTeamDraft(""); } }} /><Button size="sm" onClick={() => { createTeam(acct.id, teamDraft); setTeamDraft(""); }}>Create</Button></span> : undefined} />
+                  <Eyebrow label="Teams" right={amAdmin ? <span className="flex gap-2 items-center"><input className="box-border h-ctl-sm px-2 rounded-ctl-sm border border-[var(--field-border)] bg-[var(--field-bg)] font-sans text-xs text-ink outline-none focus:border-steel focus:ring-[3px] focus:ring-steel/25 placeholder:text-faint" placeholder="new team…" value={teamDraft} onChange={(e) => setTeamDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { createTeam(acct.id, teamDraft); setTeamDraft(""); } }} /><Button size="sm" onClick={() => { createTeam(acct.id, teamDraft); setTeamDraft(""); }}>Create</Button></span> : undefined} />
                   {teams.length === 0 && <div className="text-[13px] text-muted py-4">no teams yet</div>}
                   <div className="grid gap-4">
                     {teams.map((t) => (
@@ -3013,7 +3184,8 @@ export function App() {
             </div>
           </div>
 
-          <div className="flex items-end justify-between gap-4 border-b border-rule2 mb-7">
+          {/* Desktop navigates the repo via the contextual sidebar; the tab bar is the mobile fallback. */}
+          <div className="md:hidden flex items-end justify-between gap-4 border-b border-rule2 mb-7">
             <HTabs
               items={[`Issues ${openIssues}`, `Pull requests ${prs.length}`, "Files", "Graph", ...(isTenantOwner ? ["Settings"] : [])]}
               value={tab === "issues" ? 0 : tab === "prs" ? 1 : tab === "files" ? 2 : tab === "graph" ? 3 : 4}
@@ -3328,7 +3500,8 @@ export function App() {
           })()}
         </div>
       )}
-      </main>
+        </main>
+      </div>
     </div>
   );
 }
@@ -3887,7 +4060,7 @@ function ReviewPage({
       {/* Full-task overlay — the session summary shows a clipped task; this is the whole thing. */}
       {taskModal && change?.session && createPortal(
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={() => setTaskModal(false)}>
-          <div className="absolute inset-0 bg-ink/40" />
+          <div className="absolute inset-0 bg-[rgba(0,0,0,0.68)]" />
           <div className="relative bg-surface border border-rule rounded-card shadow-modal max-w-[680px] w-full max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-rule2">
               <span className="text-[13.5px] font-semibold text-ink">Agent task</span>
