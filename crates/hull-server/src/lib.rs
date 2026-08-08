@@ -12,6 +12,7 @@ pub mod agentlogin;
 pub mod agentsession;
 pub mod artifacts;
 pub mod autonomy;
+pub mod blossom;
 pub mod ci;
 pub mod ci_sandbox;
 pub mod connections;
@@ -236,6 +237,10 @@ struct App {
     /// published as a signed event (kind 31900) each time it lands, so history isn't hostage to one
     /// host. `None` unless configured (OSS default is off).
     nostr_refs: Option<Arc<nostr::NostrRefs>>,
+    /// Blob content mirror: if `HULL_BLOSSOM_SERVERS` is set, a landed change's blob content is
+    /// mirrored to those Blossom servers (sha256-addressed), so the content lives off this host too.
+    /// `None` unless configured.
+    blossom: Option<Arc<blossom::BlossomClient>>,
 }
 
 impl repos::HasRepoHost for App {
@@ -292,6 +297,11 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         eprintln!("nostr: ref transport enabled → {} relay(s)", r.relays().len());
         Arc::new(r)
     });
+    // Blob content mirror: push a landed change's blobs to Blossom servers (sha256-addressed).
+    let blossom = blossom::BlossomClient::from_env(build_http_client()).map(|b| {
+        eprintln!("blossom: blob mirror enabled → {} server(s)", b.servers().len());
+        Arc::new(b)
+    });
     App {
         store,
         hub,
@@ -313,6 +323,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         connections: Arc::new(connections::ForgeConnections::from_env()),
         number_lock: Arc::new(tokio::sync::Mutex::new(())),
         nostr_refs,
+        blossom,
     }
 }
 
@@ -4077,6 +4088,7 @@ async fn substrate_view(State(app): State<App>, Path((tenant, repo)): Path<(Stri
     Json(json!({
         "enabled": true,
         "relays": refs.relays(),
+        "blob_servers": app.blossom.as_ref().map(|b| b.servers()).unwrap_or_default(),
         "ref": commit.map(|c| json!({ "branch": default_branch, "commit": c, "source": "nostr" })),
         "provenance": prov,
     }))
@@ -4503,6 +4515,38 @@ async fn perform_merge(
                 if let Some(ev) = refs.publish_provenance(&secret, &change, &author, &repo_key, &intent) {
                     eprintln!("nostr: published provenance for {change} by {}… ({}…)", &author[..author.len().min(12)], &ev.id[..12]);
                 }
+            });
+        }
+    }
+    // Mirror the landed change's blob content to Blossom (sha256-addressed) so the content lives off
+    // this host too, not just its refs/provenance. Gather bounded bytes synchronously, upload off-task
+    // — best-effort, never blocks or fails the merge. No-op unless Blossom is configured.
+    if let (Some(blossom), false) = (app.blossom.clone(), announced.is_empty()) {
+        const MAX_FILE: usize = 2 * 1024 * 1024;
+        const MAX_FILES: usize = 64;
+        let files: Vec<String> =
+            app.repos.change_info(tenant, repo, &announced).map(|i| i.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
+        let total = files.len();
+        let mut blobs: Vec<Vec<u8>> = Vec::new();
+        for path in files.into_iter().take(MAX_FILES) {
+            if let Some(bytes) = app.repos.read_file(tenant, repo, &path) {
+                if bytes.len() <= MAX_FILE {
+                    blobs.push(bytes);
+                }
+            }
+        }
+        if total > MAX_FILES {
+            eprintln!("blossom: mirroring first {MAX_FILES} of {total} changed files for {key}");
+        }
+        if !blobs.is_empty() {
+            tokio::spawn(async move {
+                let mut ok = 0usize;
+                for b in blobs {
+                    if blossom.upload(b).await.is_some() {
+                        ok += 1;
+                    }
+                }
+                eprintln!("blossom: mirrored {ok} blob(s)");
             });
         }
     }
