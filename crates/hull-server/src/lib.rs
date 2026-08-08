@@ -686,11 +686,25 @@ pub async fn run(opts: Options, register_plugins: impl FnOnce(&mut Registry)) {
     // unbounded `with_graceful_shutdown` would block until the orchestrator SIGKILLs us and the final
     // flush would never run. Cap the drain at 20s, then flush unconditionally whether it completed or
     // hit the cap.
-    let server = axum::serve(listener, router).with_graceful_shutdown(shutdown_signal());
-    if tokio::time::timeout(Duration::from_secs(20), server).await.is_err() {
-        eprintln!("hull-server: drain cap (20s) hit — some connections still open; flushing anyway");
-    } else {
-        eprintln!("hull-server: draining complete — flushing activity hub before exit");
+    // The 20s cap bounds ONLY the drain — it starts when a shutdown signal fires, not at boot. (A
+    // previous version wrapped the whole `server` future in `timeout(20s, …)`, which killed every
+    // server 20s after startup, since `with_graceful_shutdown` only resolves after a signal.)
+    let draining = std::sync::Arc::new(tokio::sync::Notify::new());
+    let draining_signal = draining.clone();
+    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        draining_signal.notify_one(); // a signal arrived → the drain begins now
+    });
+    let drain_cap = async move {
+        draining.notified().await; // block until a shutdown signal has actually fired…
+        tokio::time::sleep(Duration::from_secs(20)).await; // …then cap the drain at 20s
+    };
+    tokio::select! {
+        r = server => match r {
+            Ok(()) => eprintln!("hull-server: draining complete — flushing activity hub before exit"),
+            Err(e) => eprintln!("hull-server: serve error: {e} — flushing activity hub before exit"),
+        },
+        _ = drain_cap => eprintln!("hull-server: drain cap (20s) hit — some connections still open; flushing anyway"),
     }
     hub_shutdown.flush();
 }
