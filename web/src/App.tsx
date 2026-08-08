@@ -1770,19 +1770,46 @@ export function App() {
   }, [token]);
 
   // Live event stream over SSE, scoped to the user's accounts — drives live refresh of the open lists.
+  // SSE can't send an auth header, so we first mint a short-lived ticket (authenticated POST) and pass
+  // it on the EventSource URL; the server streams only the caller's member accounts. On any drop or
+  // ticket expiry we re-mint and reconnect (this replaces EventSource's native reconnect, which would
+  // reuse the stale ticket).
   useEffect(() => {
     if (myAccounts.length === 0) return;
-    const es = new EventSource(`/api/feed?accounts=${encodeURIComponent(myAccounts.join(","))}`);
-    feedRef.current = es;
-    es.onmessage = (m) => {
+    let es: EventSource | null = null;
+    let closed = false;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    const open = async () => {
+      if (closed) return;
       try {
-        const ev = JSON.parse(m.data) as ActivityEvent;
-        if (ev.kind === "issue") loadIssues(); // reflect new issues live
+        const r = await fetch("/api/feed/ticket", { method: "POST", headers: authHeaders() });
+        if (!r.ok) throw new Error("ticket");
+        const { ticket } = await r.json();
+        if (closed) return;
+        es = new EventSource(`/api/feed?accounts=${encodeURIComponent(myAccounts.join(","))}&ticket=${encodeURIComponent(ticket)}`);
+        feedRef.current = es;
+        es.onmessage = (m) => {
+          try {
+            const ev = JSON.parse(m.data) as ActivityEvent;
+            if (ev.kind === "issue") loadIssues(); // reflect new issues live
+          } catch {
+            /* ignore keep-alives */
+          }
+        };
+        es.onerror = () => {
+          es?.close();
+          if (!closed && !retry) retry = setTimeout(() => { retry = null; open(); }, 3000);
+        };
       } catch {
-        /* ignore keep-alives */
+        if (!closed && !retry) retry = setTimeout(() => { retry = null; open(); }, 3000);
       }
     };
-    return () => es.close();
+    open();
+    return () => {
+      closed = true;
+      if (retry) clearTimeout(retry);
+      es?.close();
+    };
   }, [myAccounts.join(",")]);
 
   // ── full-screen auth / account pages ──────────────────────────────────────

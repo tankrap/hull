@@ -176,6 +176,9 @@ const SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60; // 30 days
 /// pruned on the next insert into the same map, so an unauthenticated `.../start` loop cannot grow the
 /// flow maps without bound. 5 minutes, matching the login-challenge TTL.
 const CEREMONY_TTL_SECS: u64 = 300;
+/// TTL for a feed ticket. Short (the browser mints one right before opening the stream) but long
+/// enough to survive EventSource's auto-reconnect; the client re-mints on expiry.
+const FEED_TICKET_TTL_SECS: u64 = 300;
 
 /// Login challenges (nonce → issue time) and issued session tokens (token → (actor id, issued time)).
 /// In-memory (crash-only); a hosted deployment would back this with the domain store / a cache.
@@ -193,6 +196,10 @@ struct AuthState {
     /// authed admin of that account, single-use, so the setup callback can connect the installation
     /// WITHOUT the browser redirect carrying a session — and nobody can connect an org they don't admin.
     gh_pending: HashMap<String, (String, u64)>,
+    /// Short-lived tickets for the SSE `/api/feed` stream (which can't carry an Authorization header):
+    /// ticket → (actor id, issued-at). Minted by the authenticated `POST /api/feed/ticket`; the feed
+    /// resolves the ticket to the actor and streams only that actor's member accounts.
+    feed_tickets: HashMap<String, (String, u64)>,
 }
 
 #[derive(Clone)]
@@ -522,6 +529,7 @@ fn make_router(app: App) -> Router {
     let api = Router::new()
         .route("/health", get(health))
         .route("/api/home", get(home))
+        .route("/api/feed/ticket", post(feed_ticket))
         .route("/api/actors", get(actors_list).post(register_actor))
         .route("/api/capabilities", get(capabilities))
         .route("/api/actors/:id/revoke", post(revoke_actor))
@@ -5884,17 +5892,51 @@ async fn plugins_list(State(app): State<App>) -> Json<Value> {
 
 /// SSE: stream live activity for one tenant — `GET /api/feed?tenant=acme` (defaults to `local`).
 /// Events for other tenants are filtered out, so a subscriber only ever sees its own fleet.
+/// `POST /api/feed/ticket` — mint a short-lived ticket the browser passes to the SSE `/api/feed`
+/// stream, which cannot carry an Authorization header. Bound to the signed-in actor; the feed then
+/// restricts events to that actor's member accounts. Reusable within its TTL so EventSource's
+/// auto-reconnect keeps working.
+async fn feed_ticket(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    let Some(a) = authed_actor(&app, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, "not signed in").into_response();
+    };
+    let ticket = identity::random_hex(24);
+    {
+        let mut auth = app.auth.lock().unwrap();
+        auth.feed_tickets.retain(|_, (_, iss)| now().saturating_sub(*iss) < FEED_TICKET_TTL_SECS);
+        auth.feed_tickets.insert(ticket.clone(), (a.id.clone(), now()));
+    }
+    Json(json!({ "ticket": ticket, "ttl": FEED_TICKET_TTL_SECS })).into_response()
+}
+
+/// Resolve a feed ticket to its actor id, pruning expired tickets. `None` if unknown/expired.
+fn resolve_feed_ticket(app: &App, ticket: &str) -> Option<String> {
+    let mut auth = app.auth.lock().unwrap();
+    auth.feed_tickets.retain(|_, (_, iss)| now().saturating_sub(*iss) < FEED_TICKET_TTL_SECS);
+    auth.feed_tickets.get(ticket).map(|(aid, _)| aid.clone())
+}
+
 async fn feed(
     State(app): State<App>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    // Scoped to the caller's accounts (`?accounts=a,b,c`), falling back to a single `?tenant=` for
-    // compatibility. Empty → no events (a logged-out viewer sees nothing personal).
+    // SSE can't send an Authorization header, so the browser passes a short-lived `?ticket=` minted by
+    // the authenticated `POST /api/feed/ticket`. Resolve it to the caller's actor, then restrict the
+    // requested accounts (`?accounts=a,b,c`, or a single `?tenant=`) to the ones that actor is a member
+    // of. No/expired ticket → nobody → an empty stream. This stops anyone streaming another org's live
+    // coordination activity (which `/api/home` already gates but the feed did not).
+    let allowed: std::collections::HashSet<String> = match q.get("ticket").and_then(|t| resolve_feed_ticket(&app, t)) {
+        Some(aid) => member_accounts(&app, &aid).await.into_iter().map(|a| a.handle).collect(),
+        None => std::collections::HashSet::new(),
+    };
     let tenants: Vec<String> = q
         .get("accounts")
         .map(|s| s.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect())
         .or_else(|| q.get("tenant").map(|t| vec![t.clone()]))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| allowed.contains(t))
+        .collect();
     let stream = BroadcastStream::new(app.hub.subscribe()).filter_map(move |ev| {
         let te = ev.ok()?;
         if !tenants.contains(&te.tenant) {
@@ -6545,6 +6587,31 @@ mod tests {
         let mut h = axum::http::HeaderMap::new();
         h.insert(axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
         h
+    }
+
+    #[tokio::test]
+    async fn feed_ticket_requires_auth_binds_to_actor_and_expires() {
+        // The SSE feed is gated by a short-lived ticket (SSE can't send an auth header). Minting
+        // requires auth; the ticket resolves to the minting actor and stops resolving once expired.
+        // Regression: `/api/feed` was fully unauthenticated — anyone could stream any org's activity.
+        let (app, tmp) = build_test_app("feed-ticket");
+        app.store.put_actor(actor("member", ActorKind::Human)).await;
+        mint_token(&app, "tok", "member");
+        // Unauthenticated mint → 401.
+        let resp = feed_ticket(axum::extract::State(app.clone()), axum::http::HeaderMap::new()).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED, "no session → no ticket");
+        // Authenticated mint → 200, and the ticket resolves to that actor.
+        let resp = feed_ticket(axum::extract::State(app.clone()), bearer("tok")).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let ticket = app.auth.lock().unwrap().feed_tickets.keys().next().cloned().unwrap();
+        assert_eq!(resolve_feed_ticket(&app, &ticket).as_deref(), Some("member"), "ticket → minting actor");
+        assert_eq!(resolve_feed_ticket(&app, "bogus"), None, "unknown ticket → nobody");
+        // Backdate past the TTL → no longer resolves (and is pruned).
+        for v in app.auth.lock().unwrap().feed_tickets.values_mut() {
+            v.1 = now().saturating_sub(FEED_TICKET_TTL_SECS + 1);
+        }
+        assert_eq!(resolve_feed_ticket(&app, &ticket), None, "expired ticket → nobody");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]

@@ -115,7 +115,16 @@ impl ActivityHub {
 
     /// Ingest an event for `tenant`: update that tenant's ranking and fan out on the bus.
     pub fn publish(&self, tenant: &str, ev: ActivityEvent) {
-        self.rankers.write().unwrap().entry(tenant.to_string()).or_default().observe(&ev);
+        {
+            let mut rankers = self.rankers.write().unwrap();
+            // Cap the number of distinct tenants ranked. The ingress is anonymous by default, so an
+            // attacker could otherwise open many connections with unique tenant headers and grow this
+            // map (which is periodically flushed to disk) without bound. A brand-new tenant beyond the
+            // cap is not ranked; the event still broadcasts to live subscribers below.
+            if rankers.contains_key(tenant) || rankers.len() < MAX_RANKED_TENANTS {
+                rankers.entry(tenant.to_string()).or_default().observe(&ev);
+            }
+        }
         let _ = self.tx.send(TenantEvent { tenant: tenant.to_string(), event: ev }); // no subscribers is fine
     }
 
@@ -131,6 +140,11 @@ impl Default for ActivityHub {
     }
 }
 
+/// Upper bounds on the ranker maps, so the (anonymous-by-default) ingress can't grow them without
+/// limit. Generous — a real deployment has far fewer tenants/repos; these only stop an abuse flood.
+const MAX_RANKED_TENANTS: usize = 4096;
+const MAX_RANKED_REPOS_PER_TENANT: usize = 1024;
+
 /// Decaying activity accounting. Each event adds weight to its repo; `ranked()` orders by score.
 /// (Scaffold uses simple accumulation + recency; M3 adds time-decay tied to wall clock.)
 #[derive(Default, Serialize, Deserialize)]
@@ -140,6 +154,12 @@ struct Ranker {
 
 impl Ranker {
     fn observe(&mut self, ev: &ActivityEvent) {
+        // Cap distinct repos per tenant for the same reason `publish` caps tenants: a flood of unique
+        // repo names must not grow this map without bound. A new repo beyond the cap is skipped.
+        let repo = ev.repo();
+        if !self.repos.contains_key(repo) && self.repos.len() >= MAX_RANKED_REPOS_PER_TENANT {
+            return;
+        }
         let entry = self.repos.entry(ev.repo().to_string()).or_insert_with(|| RepoActivity {
             repo: ev.repo().to_string(),
             score: 0.0,
@@ -194,6 +214,24 @@ mod tests {
             task: "t".into(),
             ts: 1,
         }
+    }
+
+    #[test]
+    fn ranker_caps_distinct_tenants() {
+        let hub = ActivityHub::new();
+        for i in 0..(MAX_RANKED_TENANTS + 25) {
+            hub.publish(&format!("t{i}"), brief("r"));
+        }
+        assert_eq!(hub.rankers.read().unwrap().len(), MAX_RANKED_TENANTS, "tenant map stops growing at the cap");
+    }
+
+    #[test]
+    fn ranker_caps_distinct_repos_per_tenant() {
+        let hub = ActivityHub::new();
+        for i in 0..(MAX_RANKED_REPOS_PER_TENANT + 25) {
+            hub.publish("solo", brief(&format!("repo{i}")));
+        }
+        assert_eq!(hub.rankers.read().unwrap().get("solo").unwrap().repos.len(), MAX_RANKED_REPOS_PER_TENANT, "per-tenant repo map capped");
     }
 
     #[test]
