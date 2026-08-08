@@ -49,13 +49,24 @@ export function unwrapSecret(bundle: string, passphrase: string): string {
 
 // ── off-main-thread KDF ─────────────────────────────────────────────────────────────────────────
 // The Argon2id step takes ~1s and would jank the UI if run inline. wrapSecretAsync/unwrapSecretAsync
-// offload it to a worker; if Workers are unavailable (or the worker fails to load) they fall back to
-// the sync path, which still works — it just blocks. Results are byte-identical either way.
+// offload it to a worker; if Workers are unavailable OR the worker fails to run for ANY reason, they
+// fall back to the sync path (which still works, it just blocks). Results are byte-identical either
+// way, so a broken worker degrades performance, never correctness — a wrong passphrase still surfaces
+// as a genuine decrypt throw, not a worker error.
+type Op = "wrap" | "unwrap";
+const runSync = (op: Op, a: string, b: string): string => (op === "wrap" ? wrapSecret(a, b) : unwrapSecret(a, b));
 let _worker: Worker | null = null;
+let _workerBroken = false; // once the worker fails to load, stop trying it and go straight to sync
 let _seq = 0;
-const _pending = new Map<number, { resolve: (v: string) => void; reject: (e: unknown) => void }>();
+type Pending = { op: Op; a: string; b: string; resolve: (v: string) => void; reject: (e: unknown) => void };
+const _pending = new Map<number, Pending>();
+// Re-drive a pending call on the sync KDF (used when the worker dies or times out) so the caller still
+// gets a real result instead of a hang or a spurious failure.
+const settleSync = (p: Pending) => {
+  try { p.resolve(runSync(p.op, p.a, p.b)); } catch (e) { p.reject(e); }
+};
 function kdfWorker(): Worker | null {
-  if (typeof Worker === "undefined") return null;
+  if (_workerBroken || typeof Worker === "undefined") return null;
   if (_worker) return _worker;
   try {
     const w = new Worker(new URL("./sovereign.worker.ts", import.meta.url), { type: "module" });
@@ -67,24 +78,42 @@ function kdfWorker(): Worker | null {
       ok ? p.resolve(result as string) : p.reject(new Error(error));
     };
     w.onerror = () => {
-      // The worker itself failed to run — reject anything in flight and drop it so the next call falls
-      // back to the sync path instead of hanging forever on a dead worker.
-      for (const { reject } of _pending.values()) reject(new Error("kdf worker error"));
-      _pending.clear();
+      // The worker failed to RUN (CSP/worker-src, a 404 on the chunk, a load/import error) — this fires
+      // asynchronously, after construction succeeded. Disable it for good and re-drive every in-flight
+      // call on the sync path so callers succeed; future calls then take the sync path directly.
+      _workerBroken = true;
       _worker = null;
+      const inflight = [..._pending.values()];
+      _pending.clear();
+      inflight.forEach(settleSync);
     };
     _worker = w;
     return w;
   } catch {
+    _workerBroken = true;
     return null;
   }
 }
-function runOnWorker(op: "wrap" | "unwrap", a: string, b: string): Promise<string> {
+function runOnWorker(op: Op, a: string, b: string): Promise<string> {
   const w = kdfWorker();
-  if (!w) return Promise.resolve(op === "wrap" ? wrapSecret(a, b) : unwrapSecret(a, b));
-  return new Promise((resolve, reject) => {
+  if (!w) {
+    try { return Promise.resolve(runSync(op, a, b)); } catch (e) { return Promise.reject(e); }
+  }
+  return new Promise<string>((resolve, reject) => {
     const id = ++_seq;
-    _pending.set(id, { resolve, reject });
+    // Watchdog: if the worker loads but never posts back and never errors, don't hang the UI forever —
+    // fall back to sync. Generous (30s) so a slow device's legitimately-running KDF isn't pre-empted.
+    const timer = setTimeout(() => {
+      const p = _pending.get(id);
+      if (!p) return;
+      _pending.delete(id);
+      settleSync(p);
+    }, 30_000);
+    _pending.set(id, {
+      op, a, b,
+      resolve: (v) => { clearTimeout(timer); resolve(v); },
+      reject: (e) => { clearTimeout(timer); reject(e); },
+    });
     w.postMessage({ id, op, a, b });
   });
 }

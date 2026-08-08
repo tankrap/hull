@@ -1257,7 +1257,14 @@ export function App() {
       if (!w.ok) { setAuthError("no sovereign account with that username"); return; }
       const { actor, wrapped_key } = await w.json();
       let secret: string;
-      try { secret = await unwrapSecretAsync(wrapped_key, authPass); } catch { setAuthError("wrong passphrase"); return; }
+      try {
+        secret = await unwrapSecretAsync(wrapped_key, authPass);
+      } catch (e: any) {
+        // A decrypt failure is a wrong passphrase; a bad/unsupported bundle is something else — don't
+        // send a user with the correct passphrase into the "there is no reset" panic over an infra issue.
+        setAuthError(String(e?.message || "").includes("unsupported") ? "this account's key bundle is unsupported" : "wrong passphrase");
+        return;
+      }
       const ch = await fetch("/api/auth/challenge");
       const { nonce } = await ch.json();
       const signature = await signMessage(secret, `hull-login:${nonce}`);
