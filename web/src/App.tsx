@@ -2031,9 +2031,98 @@ export function App() {
     </>
   );
 
+  // ── left nav sidebar (chrome) — GitLab-style: global nav lives here, the top bar keeps search + user.
+  // Defined here (before the authPage short-circuit) so the post-auth pages reuse the exact same nav. ──
+  const sideCls = (active: boolean) =>
+    `w-full flex items-center gap-2.5 px-2.5 h-8 rounded-ctl text-[13.5px] transition-colors ${active ? "bg-surface text-ink font-medium" : "text-body hover:bg-surface hover:text-ink"}`;
+  const SIco = ({ d }: { d: string }) => (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className="flex-none text-muted"><path d={d} /></svg>
+  );
+  const sidebar = (
+    <aside className="w-[228px] shrink-0 bg-shell hidden md:flex flex-col">
+      <nav className="flex-1 overflow-y-auto px-3 pt-4 grid gap-0.5 content-start">
+        <button className={sideCls(view === "home" && !orgHandle && !authPage)} onClick={() => navigate("/")}>
+          <SIco d="M3 10.5 12 3l9 7.5M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5" /><span>Home</span>
+        </button>
+        {me && (
+          <button className={sideCls(authPage === "profile")} onClick={() => navigate("/me")}>
+            <SIco d="M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4zM20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z" /><span>Your repositories</span>
+          </button>
+        )}
+        {me && (
+          <>
+            <div className="px-2.5 pt-4 pb-1.5 text-[10.5px] font-semibold uppercase tracking-[0.09em] text-faint">Organizations</div>
+            {myAccounts.length === 0 && <div className="px-2.5 pb-1 text-[12.5px] text-faint">none yet</div>}
+            {myAccounts.map((h) => (
+              <button key={h} className={sideCls(!!orgHandle && orgHandle === h)} onClick={() => navigate(`/orgs/${encodeURIComponent(h)}`)}>
+                <SIco d="M3 21h18M6 21V7l6-4 6 4v14M10 9h.01M14 9h.01M10 13h.01M14 13h.01M10 17h4" /><span className="truncate">{h}</span>
+              </button>
+            ))}
+          </>
+        )}
+        {!me && (
+          <button className={sideCls(false)} onClick={() => navigate("/login")}>
+            <SIco d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" /><span>Log in</span>
+          </button>
+        )}
+      </nav>
+      <div className="px-3 py-3 border-t border-rule2 grid gap-0.5">
+        <button className={sideCls(authPage === "account")} onClick={() => me ? navigate("/settings") : setTheme(theme === "dark" ? "light" : "dark")}>
+          {me
+            ? <SIco d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            : theme === "dark" ? <SIco d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z" /> : <SIco d="M12 3v2M12 19v2M5 5l1.5 1.5M17.5 17.5 19 19M3 12h2M19 12h2M5 19l1.5-1.5M17.5 6.5 19 5M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" />}
+          <span>{me ? "Account settings" : theme === "dark" ? "Light mode" : "Dark mode"}</span>
+        </button>
+        {me && (
+          <button className={sideCls(false)} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+            {theme === "dark" ? <SIco d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z" /> : <SIco d="M12 3v2M12 19v2M5 5l1.5 1.5M17.5 17.5 19 19M3 12h2M19 12h2M5 19l1.5-1.5M17.5 6.5 19 5M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" />}
+            <span>{theme === "dark" ? "Light mode" : "Dark mode"}</span>
+          </button>
+        )}
+        <a className={sideCls(false)} href="https://github.com/tankrap/hull" target="_blank" rel="noreferrer">
+          <SIco d="M9 18c-4.5 1.5-4.5-2.5-6-3m12 6v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.3 4.3 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6 0C7.3 1.3 6.3 1.6 6.3 1.6a4.3 4.3 0 0 0-.1 3.2A4.6 4.6 0 0 0 5 8c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V20" /><span>Docs</span>
+        </a>
+      </div>
+    </aside>
+  );
+
   if (authPage) {
-    const shell = (title: string, children: React.ReactNode, wide = false) => (
-      <div className="bg-paper min-h-screen text-ink">
+    // Pre-auth (login / signup) stays a clean centered page; once signed in, profile + account
+    // settings render inside the SAME sidebar shell as the rest of the app.
+    const shell = (title: string, children: React.ReactNode, wide = false) => {
+      const inner = (
+        <div className={`mx-auto px-6 py-10 ${wide ? "max-w-[860px]" : "max-w-[560px]"}`}>
+          {title && <h1 className="text-[24px] font-semibold tracking-tight mb-6">{title}</h1>}
+          {children}
+        </div>
+      );
+      if (me) {
+        return (
+          <div className="bg-shell h-dvh flex flex-col text-ink overflow-hidden">
+            {uiModalNode}{cmdNode}{shortcutsNode}{createModalsNode}
+            <header className="h-14 shrink-0 bg-shell flex items-center gap-5 px-6">
+              <button className="flex items-center gap-2.5 cursor-pointer shrink-0" onClick={() => navigate("/")}>
+                <span className="w-[22px] h-[22px] rounded-chip bg-brass" aria-hidden />
+                <span className="text-[19px] font-extrabold tracking-tight">hull</span>
+              </button>
+              <button onClick={() => setCmdOpen(true)} className="flex-1 max-w-[440px] mx-auto flex items-center gap-2 h-ctl px-2.5 rounded-ctl border border-ctl bg-surface hover:border-dim transition-colors cursor-pointer text-left">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
+                <span className="flex-1 text-[13.5px] text-faint">Search or jump to…</span>
+                <span className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-[5px] py-0.5 bg-paper flex-none">⌘K</span>
+              </button>
+              <div className="w-[120px] shrink-0" />
+            </header>
+            <div className="flex flex-1 min-h-0">
+              {sidebar}
+              <main className="flex-1 min-w-0 overflow-y-auto overflow-x-clip bg-paper rounded-tl-[16px] border-l border-t border-rule2/70">
+                {inner}
+              </main>
+            </div>
+          </div>
+        );
+      }
+      return (
+      <div className="bg-shell min-h-screen text-ink">
         {uiModalNode}
         {cmdNode}
         {shortcutsNode}
@@ -2051,6 +2140,7 @@ export function App() {
         </div>
       </div>
     );
+    };
     const errBox = authError ? <div className="text-[13px] text-fault-text bg-fault-wash border border-fault/30 rounded-ctl px-3 py-2 mb-3">{authError}</div> : null;
 
     if (authPage === "signup") {
@@ -2503,54 +2593,6 @@ export function App() {
 
   const currentIssue = openIssue != null ? issues.find((i) => i.number === openIssue) ?? null : null;
   const currentPr = openPr != null ? prs.find((p) => p.number === openPr) ?? null : null;
-
-  // ── left nav sidebar (chrome) — GitLab-style: global nav lives here, the top bar keeps search + user ──
-  const sideCls = (active: boolean) =>
-    `w-full flex items-center gap-2.5 px-2.5 h-8 rounded-ctl text-[13.5px] transition-colors ${active ? "bg-surface text-ink font-medium" : "text-body hover:bg-surface hover:text-ink"}`;
-  const SIco = ({ d }: { d: string }) => (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" className="flex-none text-muted"><path d={d} /></svg>
-  );
-  const sidebar = (
-    <aside className="w-[228px] shrink-0 bg-shell hidden md:flex flex-col">
-      <nav className="flex-1 overflow-y-auto px-3 pt-4 grid gap-0.5 content-start">
-        <button className={sideCls(view === "home" && !orgHandle)} onClick={() => navigate("/")}>
-          <SIco d="M3 10.5 12 3l9 7.5M5 9.5V20a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V9.5" /><span>Home</span>
-        </button>
-        {me && (
-          <button className={sideCls(false)} onClick={() => navigate("/me")}>
-            <SIco d="M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4zM20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z" /><span>Your repositories</span>
-          </button>
-        )}
-        {me && (
-          <>
-            <div className="px-2.5 pt-4 pb-1.5 text-[10.5px] font-semibold uppercase tracking-[0.09em] text-faint">Organizations</div>
-            {myAccounts.length === 0 && <div className="px-2.5 pb-1 text-[12.5px] text-faint">none yet</div>}
-            {myAccounts.map((h) => (
-              <button key={h} className={sideCls(!!orgHandle && orgHandle === h)} onClick={() => navigate(`/orgs/${encodeURIComponent(h)}`)}>
-                <SIco d="M3 21h18M6 21V7l6-4 6 4v14M10 9h.01M14 9h.01M10 13h.01M14 13h.01M10 17h4" /><span className="truncate">{h}</span>
-              </button>
-            ))}
-          </>
-        )}
-        {!me && (
-          <button className={sideCls(false)} onClick={() => navigate("/login")}>
-            <SIco d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" /><span>Log in</span>
-          </button>
-        )}
-      </nav>
-      <div className="px-3 py-3 border-t border-rule2 grid gap-0.5">
-        <button className={sideCls(false)} onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
-          {theme === "dark"
-            ? <SIco d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z" />
-            : <SIco d="M12 3v2M12 19v2M5 5l1.5 1.5M17.5 17.5 19 19M3 12h2M19 12h2M5 19l1.5-1.5M17.5 6.5 19 5M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" />}
-          <span>{theme === "dark" ? "Light mode" : "Dark mode"}</span>
-        </button>
-        <a className={sideCls(false)} href="https://github.com/tankrap/hull" target="_blank" rel="noreferrer">
-          <SIco d="M9 18c-4.5 1.5-4.5-2.5-6-3m12 6v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.3 4.3 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6 0C7.3 1.3 6.3 1.6 6.3 1.6a4.3 4.3 0 0 0-.1 3.2A4.6 4.6 0 0 0 5 8c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V20" /><span>Docs</span>
-        </a>
-      </div>
-    </aside>
-  );
 
   return (
     <div className="bg-shell h-dvh flex flex-col text-ink overflow-hidden">
