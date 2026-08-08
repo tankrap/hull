@@ -4524,24 +4524,18 @@ async fn perform_merge(
     if let (Some(blossom), false) = (app.blossom.clone(), announced.is_empty()) {
         const MAX_FILE: usize = 2 * 1024 * 1024;
         const MAX_FILES: usize = 64;
-        let files: Vec<String> =
-            app.repos.change_info(tenant, repo, &announced).map(|i| i.files.into_iter().map(|f| f.path).collect()).unwrap_or_default();
-        let total = files.len();
-        let mut blobs: Vec<Vec<u8>> = Vec::new();
-        for path in files.into_iter().take(MAX_FILES) {
-            if let Some(bytes) = app.repos.read_file(tenant, repo, &path) {
-                if bytes.len() <= MAX_FILE {
-                    blobs.push(bytes);
-                }
-            }
-        }
-        if total > MAX_FILES {
-            eprintln!("blossom: mirroring first {MAX_FILES} of {total} changed files for {key}");
+        // Read the blobs from the ANNOUNCED change's own tree — not `read_file`, which reads the `main`
+        // ref and would mirror stale/missing content when protection is off, the default branch isn't
+        // `main`, or a concurrent land moved the ref.
+        let (blobs, over_cap) = app.repos.change_blobs(tenant, repo, &announced, MAX_FILES, MAX_FILE);
+        if over_cap {
+            eprintln!("blossom: {key} change has >{MAX_FILES} files; mirroring the first {MAX_FILES}");
         }
         if !blobs.is_empty() {
+            let bytes: Vec<Vec<u8>> = blobs.into_iter().map(|(_, b)| b).collect();
             tokio::spawn(async move {
                 let mut ok = 0usize;
-                for b in blobs {
+                for b in bytes {
                     if blossom.upload(b).await.is_some() {
                         ok += 1;
                     }

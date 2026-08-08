@@ -77,6 +77,8 @@ impl BlossomClient {
     /// MUST match `sha` — a blob server is never trusted to return the right content (content-address
     /// integrity). `None` if no server has it or every candidate failed the hash check.
     pub async fn get(&self, sha: &str) -> Option<Vec<u8>> {
+        // Cap the body so a hostile server can't OOM us by streaming gigabytes before the hash check.
+        const MAX_BLOB: u64 = 64 * 1024 * 1024;
         let auth = self.auth_header("get", sha);
         for base in &self.servers {
             let url = format!("{base}/{sha}");
@@ -85,14 +87,25 @@ impl BlossomClient {
                 req = req.header("Authorization", a);
             }
             if let Ok(r) = req.send().await {
-                if r.status().is_success() {
-                    if let Ok(b) = r.bytes().await {
-                        let bytes = b.to_vec();
-                        if Self::sha256_hex(&bytes) == sha {
-                            return Some(bytes);
-                        }
-                        eprintln!("blossom: {url} returned bytes that don't match {sha} — rejected");
+                if !r.status().is_success() {
+                    continue;
+                }
+                // A declared oversize body is refused up front; a lying/omitted length is still bounded
+                // below after the read (buffered, but reqwest's request timeout caps how much arrives).
+                if r.content_length().is_some_and(|n| n > MAX_BLOB) {
+                    eprintln!("blossom: {url} body too large ({:?}) — skipped", r.content_length());
+                    continue;
+                }
+                if let Ok(b) = r.bytes().await {
+                    if b.len() as u64 > MAX_BLOB {
+                        eprintln!("blossom: {url} body exceeded {MAX_BLOB} bytes — rejected");
+                        continue;
                     }
+                    let bytes = b.to_vec();
+                    if Self::sha256_hex(&bytes) == sha {
+                        return Some(bytes);
+                    }
+                    eprintln!("blossom: {url} returned bytes that don't match {sha} — rejected");
                 }
             }
         }
@@ -114,10 +127,28 @@ mod tests {
     async fn spawn_blossom() -> String {
         type Store = Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>;
         let store: Store = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        async fn up(State(s): State<Store>, body: axum::body::Bytes) -> String {
+        async fn up(State(s): State<Store>, headers: axum::http::HeaderMap, body: axum::body::Bytes) -> Result<String, axum::http::StatusCode> {
+            // Validate the BUD-01 auth: `Authorization: Nostr <base64(kind:24242 event)>`, verified,
+            // with t=upload and x=<sha of the body>. This asserts the client's auth_header is well-formed.
+            let unauth = axum::http::StatusCode::UNAUTHORIZED;
+            let hdr = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let b64 = hdr.strip_prefix("Nostr ").ok_or(unauth)?;
+            let json = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .ok_or(unauth)?;
+            let ev = serde_json::from_str::<serde_json::Value>(&json).ok().as_ref().and_then(crate::nostr::Event::from_json).ok_or(unauth)?;
             let sha = BlossomClient::sha256_hex(&body);
+            let ok = ev.verify()
+                && ev.kind == 24242
+                && ev.tags.iter().any(|t| t.len() == 2 && t[0] == "t" && t[1] == "upload")
+                && ev.tags.iter().any(|t| t.len() == 2 && t[0] == "x" && t[1] == sha);
+            if !ok {
+                return Err(unauth);
+            }
             s.lock().unwrap().insert(sha.clone(), body.to_vec());
-            sha
+            Ok(sha)
         }
         async fn dl(State(s): State<Store>, Path(hash): Path<String>) -> Result<Vec<u8>, axum::http::StatusCode> {
             s.lock().unwrap().get(&hash).cloned().ok_or(axum::http::StatusCode::NOT_FOUND)

@@ -976,6 +976,34 @@ fn git_identity(author: &str) -> String {
 }
 
 impl RepoHost {
+    /// The blob content of change `hex`'s OWN tree (`path` → bytes), read straight from the change —
+    /// NOT from any branch ref — so it always reflects that exact change regardless of where `main`
+    /// points or whether the branch was advanced. Sorted by path, capped at `max_files` (files beyond
+    /// the cap are dropped and the `bool` returns `true`) and skipping any blob over `max_bytes`. For
+    /// mirroring a landed change's content to an external blob store.
+    pub fn change_blobs(&self, tenant: &str, repo: &str, hex: &str, max_files: usize, max_bytes: usize) -> (Vec<(String, Vec<u8>)>, bool) {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return (Vec::new(), false) };
+        let Some(cid) = ObjectId::from_hex(hex) else { return (Vec::new(), false) };
+        let tree = match store.get(&cid).ok().flatten() {
+            Some(Object::Change(c)) => c.tree,
+            _ => return (Vec::new(), false),
+        };
+        let mut map = HashMap::new();
+        flatten_tree(&store, tree, "", &mut map, 0);
+        let over_cap = map.len() > max_files;
+        let mut entries: Vec<(String, ObjectId)> = map.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut out = Vec::new();
+        for (path, blob) in entries.into_iter().take(max_files) {
+            if let Ok(Some(Object::Blob(bytes))) = store.get(&blob) {
+                if bytes.len() <= max_bytes {
+                    out.push((path, bytes));
+                }
+            }
+        }
+        (out, over_cap)
+    }
+
     /// Expand the keel change `hex` in a hosted repo: its intent/author and the files it changed vs
     /// its first parent (keel-native — "what does this change touch"). `None` if not found.
     pub fn change_info(&self, tenant: &str, repo: &str, hex: &str) -> Option<ChangeInfo> {
