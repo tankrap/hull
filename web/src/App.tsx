@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 // Code-split the heavy Shiki-powered @pierre viewers into their own chunk (kept out of the initial bundle).
 const PierrePatch = lazy(() => import("@pierre/diffs/react").then((m) => ({ default: m.PatchDiff })));
 import * as ed from "@noble/ed25519";
+import { generateIdentity, wrapSecret, unwrapSecret, signMessage } from "./sovereign";
 import { Button, LinkButton } from "./ui/Button";
 import { HTabs, Segmented } from "./ui/Tabs";
 import { SearchInput, Switch, TextField } from "./ui/Field";
@@ -1139,6 +1140,8 @@ export function App() {
   const [authForm, setAuthForm] = useState({ username: "", email: "" });
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
+  const [authPass, setAuthPass] = useState(""); // sovereign-account passphrase (never leaves the browser)
+  const [sovereignMode, setSovereignMode] = useState(false); // toggle passkey ⇄ sovereign on the auth pages
   // Live username availability on the signup form.
   const [usernameAvail, setUsernameAvail] = useState<{ available: boolean } | null>(null);
   useEffect(() => {
@@ -1193,6 +1196,66 @@ export function App() {
       navigate("/");
     } catch (e: any) {
       setAuthError(e?.message || "passkey login was cancelled");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+  // ── SOVEREIGN (non-custodial) accounts: the Ed25519 key is generated + kept in THIS browser, and
+  // wrapped under the passphrase before it's sent. Hull stores only the public key + the encrypted
+  // bundle and can never sign for you — the browser signs delegations itself. ──
+  const signupSovereign = async () => {
+    setAuthError("");
+    const u = sanitizeHandle(authForm.username);
+    if (!u) { setAuthError("username is required"); return; }
+    if (authPass.length < 10) { setAuthError("use a passphrase of at least 10 characters — it's the only thing protecting your key"); return; }
+    setAuthBusy(true);
+    try {
+      const id = await generateIdentity();
+      const wrapped = wrapSecret(id.secret, authPass); // Argon2id + XChaCha20, in-browser
+      const signature = await signMessage(id.secret, `hull-sovereign:v1\nusername=${u}\npubkey=${id.pub}`);
+      const res = await fetch("/api/auth/sovereign/register", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: u, email: authForm.email, pubkey: id.pub, wrapped_key: wrapped, signature }),
+      });
+      if (!res.ok) { setAuthError((await res.text()) || `request failed (${res.status}) — is the server running?`); return; }
+      const { token: t } = await res.json();
+      finishSession(t);
+      sessionSecret.current = id.secret; // keep the key in memory so agent delegations can be signed this session
+      setAuthForm({ username: "", email: "" }); setAuthPass("");
+      navigate("/");
+    } catch (e: any) {
+      setAuthError(e?.message || "could not create the sovereign account");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+  const loginSovereign = async () => {
+    setAuthError("");
+    const u = sanitizeHandle(authForm.username);
+    if (!u || !authPass) { setAuthError("username and passphrase are required"); return; }
+    setAuthBusy(true);
+    try {
+      // fetch the (passphrase-protected) key bundle, decrypt it here, then sign the login challenge.
+      const w = await fetch(`/api/auth/sovereign/wrapped?username=${encodeURIComponent(u)}`);
+      if (!w.ok) { setAuthError("no sovereign account with that username"); return; }
+      const { actor, wrapped_key } = await w.json();
+      let secret: string;
+      try { secret = unwrapSecret(wrapped_key, authPass); } catch { setAuthError("wrong passphrase"); return; }
+      const ch = await fetch("/api/auth/challenge");
+      const { nonce } = await ch.json();
+      const signature = await signMessage(secret, `hull-login:${nonce}`);
+      const res = await fetch("/api/auth/login", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ actor, nonce, signature }),
+      });
+      if (!res.ok) { setAuthError((await res.text()) || `login failed (${res.status})`); return; }
+      const { token: t } = await res.json();
+      finishSession(t);
+      sessionSecret.current = secret;
+      setAuthPass("");
+      navigate("/");
+    } catch (e: any) {
+      setAuthError(e?.message || "sovereign login failed");
     } finally {
       setAuthBusy(false);
     }
@@ -1998,8 +2061,23 @@ export function App() {
               <label className="text-[12.5px] font-semibold text-body">email</label>
               <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="you@example.com" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value.trim() })} onKeyDown={(e) => e.key === "Enter" && signupPasskey()} />
             </div>
-            <Button disabled={authBusy || (!!usernameAvail && !usernameAvail.available)} onClick={signupPasskey}>{authBusy ? "waiting for passkey…" : "Create account with a passkey"}</Button>
-            <p className="text-[12.5px] text-muted leading-[1.55]">No passwords. Your device (Touch ID, Windows Hello, a security key, or your phone) creates a passkey and that is your login.</p>
+            {!sovereignMode ? (
+              <>
+                <Button disabled={authBusy || (!!usernameAvail && !usernameAvail.available)} onClick={signupPasskey}>{authBusy ? "waiting for passkey…" : "Create account with a passkey"}</Button>
+                <p className="text-[12.5px] text-muted leading-[1.55]">No passwords. Your device (Touch ID, Windows Hello, a security key, or your phone) creates a passkey and that is your login. Hull holds your signing key so it can act for you after login.</p>
+                <LinkButton onClick={() => { setAuthError(""); setSovereignMode(true); }}>Or create a sovereign account — you hold the key →</LinkButton>
+              </>
+            ) : (
+              <>
+                <div className="grid gap-1.5">
+                  <label className="text-[12.5px] font-semibold text-body">passphrase</label>
+                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="a strong passphrase you'll remember" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && signupSovereign()} />
+                </div>
+                <Button disabled={authBusy || (!!usernameAvail && !usernameAvail.available)} onClick={signupSovereign}>{authBusy ? "generating your key…" : "Create sovereign account"}</Button>
+                <p className="text-[12.5px] text-muted leading-[1.55]">Your Ed25519 key is generated in this browser and encrypted with your passphrase — Hull only ever stores the public key and the encrypted bundle, and can never sign for you. There is no reset: lose the passphrase and the account is unrecoverable.</p>
+                <LinkButton onClick={() => { setAuthError(""); setSovereignMode(false); }}>← Back to passkey signup</LinkButton>
+              </>
+            )}
             <div className="text-[13px] text-muted pt-1 border-t border-rule2">Already have an account? <LinkButton onClick={() => { setAuthError(""); navigate("/login"); }}>Log in</LinkButton></div>
           </div>
         </Card>
@@ -2015,7 +2093,22 @@ export function App() {
               <label className="text-[12.5px] font-semibold text-body">username</label>
               <input className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="your username" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: sanitizeHandle(e.target.value) })} onKeyDown={(e) => e.key === "Enter" && loginPasskey(authForm.username)} autoFocus />
             </div>
-            <Button disabled={authBusy} onClick={() => loginPasskey(authForm.username)}>{authBusy ? "waiting for passkey…" : "Continue with a passkey"}</Button>
+            {!sovereignMode ? (
+              <>
+                <Button disabled={authBusy} onClick={() => loginPasskey(authForm.username)}>{authBusy ? "waiting for passkey…" : "Continue with a passkey"}</Button>
+                <LinkButton onClick={() => { setAuthError(""); setSovereignMode(true); }}>Log in to a sovereign account (passphrase) →</LinkButton>
+              </>
+            ) : (
+              <>
+                <div className="grid gap-1.5">
+                  <label className="text-[12.5px] font-semibold text-body">passphrase</label>
+                  <input type="password" className="box-border h-ctl px-2.5 rounded-ctl border border-ctl bg-surface font-sans text-[13.5px] text-ink outline-none focus:border-body placeholder:text-faint" placeholder="your passphrase" value={authPass} onChange={(e) => setAuthPass(e.target.value)} onKeyDown={(e) => e.key === "Enter" && loginSovereign()} />
+                </div>
+                <Button disabled={authBusy} onClick={loginSovereign}>{authBusy ? "unlocking your key…" : "Log in with your passphrase"}</Button>
+                <p className="text-[12.5px] text-muted leading-[1.55]">Your key is decrypted in this browser; Hull never sees your passphrase.</p>
+                <LinkButton onClick={() => { setAuthError(""); setSovereignMode(false); }}>← Back to passkey login</LinkButton>
+              </>
+            )}
             <div className="text-[13px] text-muted pt-1 border-t border-rule2">New here? <LinkButton onClick={() => { setAuthError(""); navigate("/signup"); }}>Create an account</LinkButton></div>
             {import.meta.env.DEV && (
               <details className="text-[12.5px]">
