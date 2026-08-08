@@ -2030,7 +2030,7 @@ fn resolve_path_in_tree(store: &Store, tree: ObjectId, path: &str) -> Option<Obj
 }
 
 /// A repo/tenant path segment must be a plain name — no traversal, separators, or dotfiles.
-fn safe_segment(s: &str) -> bool {
+pub(crate) fn safe_segment(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
