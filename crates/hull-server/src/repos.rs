@@ -667,6 +667,10 @@ pub struct ChangedFile {
     pub status: String, // added | modified | deleted
 }
 
+/// A structural (non-blob) keel object of a change — `(object id hex, encoded bytes)`. Carried inline
+/// in a change bundle so a peer can rebuild the Change + Trees. See [`RepoHost::change_objects`].
+pub type StructuralObject = (String, Vec<u8>);
+
 /// One blob of a change's tree with BOTH content addresses: `id` = its local keel object id (hex,
 /// blake3 of the encoded blob, what the tree references) and `sha256` = its Blossom address (hex, sha256
 /// of the raw bytes, what a blob server stores it under). See [`RepoHost::change_blob_index`].
@@ -1054,6 +1058,61 @@ impl RepoHost {
         let Some(want) = ObjectId::from_hex(id_hex) else { return false };
         let obj = Object::Blob(bytes);
         if obj.id() != want {
+            return false;
+        }
+        store.put(&obj).is_ok()
+    }
+
+    /// The STRUCTURAL objects of change `hex` — the Change plus every Tree in its snapshot, each as
+    /// `(id_hex, encoded bytes)`, but NOT its blobs (those go to Blossom by sha256). Small enough to
+    /// carry inline in a signed nostr "change bundle", so a peer that has neither the change nor its
+    /// trees can rebuild the structure, then restore the blobs. Bounded by `max_objs`/`max_bytes`; the
+    /// bool is true if the cap truncated the set. `None` if the change can't be read.
+    pub fn change_objects(&self, tenant: &str, repo: &str, hex: &str, max_objs: usize, max_bytes: usize) -> Option<(Vec<StructuralObject>, bool)> {
+        let store = self.store(tenant, repo, false).ok()??;
+        let cid = ObjectId::from_hex(hex)?;
+        let Object::Change(c) = store.get(&cid).ok()?? else { return None };
+        let root = c.tree;
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        let cbytes = Object::Change(c).encode();
+        let mut total = cbytes.len();
+        out.push((cid.to_hex(), cbytes));
+        let mut over = false;
+        fn walk(store: &Store, tree: ObjectId, out: &mut Vec<(String, Vec<u8>)>, total: &mut usize, max_objs: usize, max_bytes: usize, over: &mut bool) {
+            if out.len() >= max_objs || *total > max_bytes {
+                *over = true;
+                return;
+            }
+            let Some(Object::Tree(t)) = store.get(&tree).ok().flatten() else { return };
+            let bytes = Object::Tree(t.clone()).encode();
+            *total += bytes.len();
+            out.push((tree.to_hex(), bytes));
+            for e in &t.entries {
+                if e.mode == MODE_DIR {
+                    walk(store, e.id, out, total, max_objs, max_bytes, over);
+                }
+            }
+        }
+        walk(&store, root, &mut out, &mut total, max_objs, max_bytes, &mut over);
+        Some((out, over))
+    }
+
+    /// True if object `id_hex` is present in the local store (presence only, no decode).
+    pub fn has_object(&self, tenant: &str, repo: &str, id_hex: &str) -> bool {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return false };
+        let Some(id) = ObjectId::from_hex(id_hex) else { return false };
+        matches!(store.has(&id), Ok(true))
+    }
+
+    /// Restore a STRUCTURAL object (Change/Tree) from bundle bytes, but ONLY if it decodes AND re-derives
+    /// to `id_hex` — like [`restore_blob`](Self::restore_blob), untrusted bytes are verified before the
+    /// write, so a forged bundle can't inject an object under a referenced id. Blobs are refused here
+    /// (they come via Blossom, not the bundle). Returns true if the object is now present.
+    pub fn restore_object(&self, tenant: &str, repo: &str, id_hex: &str, bytes: &[u8]) -> bool {
+        let Ok(Some(store)) = self.store(tenant, repo, true) else { return false };
+        let Some(want) = ObjectId::from_hex(id_hex) else { return false };
+        let Ok(obj) = Object::decode(bytes) else { return false };
+        if matches!(obj, Object::Blob(_)) || obj.id() != want {
             return false;
         }
         store.put(&obj).is_ok()
