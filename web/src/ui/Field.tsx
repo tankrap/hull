@@ -1,7 +1,9 @@
 // keel/hull form controls — Tailwind. Focus = border darkens to ink. NO focus rings.
 
 const cx = (...a: (string | false | null | undefined)[]) => a.filter(Boolean).join(' ');
-const FIELD = 'w-full box-border h-ctl px-2.5 rounded-ctl border bg-surface font-sans text-[13.5px] text-ink outline-none transition-colors duration-150';
+// Inputs sink INTO the surface (bg-paper is a step below the card) — the mirror of the raised
+// control-fill on buttons/selects. Focus lifts the border to GitLab blue with a soft ring.
+const FIELD = 'w-full box-border h-ctl px-2.5 rounded-ctl border bg-paper font-sans text-[13.5px] text-ink placeholder:text-faint outline-none transition-colors duration-150';
 const Label = ({ children }: { children?: React.ReactNode }) => <div className="text-[12.5px] font-semibold text-body mb-1.5">{children}</div>;
 
 type TextFieldProps = React.InputHTMLAttributes<HTMLInputElement> & {
@@ -23,12 +25,12 @@ export function TextField({ label, help, error, className, ...rest }: TextFieldP
 // Search input with leading icon and trailing shortcut chip.
 export function SearchInput({ shortcut = '⌘K', ...rest }: React.InputHTMLAttributes<HTMLInputElement> & { shortcut?: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-2 h-ctl px-2.5 rounded-ctl border border-ctl bg-surface transition-colors duration-150 focus-within:border-steel focus-within:ring-2 focus-within:ring-steel/30">
+    <div className="flex items-center gap-2 h-ctl px-2.5 rounded-ctl border border-ctl bg-paper transition-colors duration-150 focus-within:border-steel focus-within:ring-2 focus-within:ring-steel/30">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-muted flex-none">
         <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
       </svg>
       <input className="flex-1 min-w-0 border-none outline-none bg-transparent font-sans text-[13.5px] text-ink placeholder:text-faint" {...rest} />
-      {shortcut && <span className="text-[11px] font-semibold text-dim border border-rule rounded-[5px] px-[5px] py-0.5 bg-paper flex-none">{shortcut}</span>}
+      {shortcut && <span className="text-[11px] font-semibold text-dim border border-rule rounded-ctl-sm px-[5px] py-0.5 bg-surface flex-none">{shortcut}</span>}
     </div>
   );
 }

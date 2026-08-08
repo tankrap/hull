@@ -23,6 +23,7 @@ module.exports = {
         rule2: a('var(--rule2)'),
         rule3: a('var(--rule3)'),
         ctl: a('var(--ctl-border)'),
+        ctlfill: { DEFAULT: a('var(--ctl-fill)'), hover: a('var(--ctl-fill-hover)') },
         ink: a('var(--ink)'),
         body: a('var(--body)'),
         dim: a('var(--dim)'),
@@ -37,8 +38,8 @@ module.exports = {
       borderRadius: {
         // GitLab/Pajamas radii: 4px default control, 8px for cards/panels — crisp, not pillowy.
         card: '8px',    // cards, alerts, modals
-        ctl: '6px',     // controls (buttons / inputs)
-        'ctl-sm': '4px',
+        ctl: '4px',     // controls (buttons / inputs) — GitLab's crisp 4px
+        'ctl-sm': '3px',
         chip: '4px',    // selection chips
         badge: '4px',   // lozenge radius
         frame: '10px',  // chart frames / content-well corner

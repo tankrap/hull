@@ -21,6 +21,8 @@
   --rule2: #ECECEF;       /* neutral-50 subtle border */
   --rule3: #F3F2F3;
   --ctl-border: #BFBFC3;  /* neutral-200 input outline */
+  --ctl-fill: #FFFFFF;        /* default/secondary button + select face */
+  --ctl-fill-hover: #ECECEF;  /* its hover */
   --ink: #1F1E24;         /* neutral-950 text */
   --body: #4F4D54;        /* neutral-700 paragraph */
   --dim: #626168;         /* neutral-600 */
@@ -50,6 +52,8 @@
   --rule2: #2C2B33;
   --rule3: #242229;
   --ctl-border: #46454F;  /* neutral-600 outline */
+  --ctl-fill: #333139;        /* neutral-800 — default button face, a step ABOVE the card */
+  --ctl-fill-hover: #403E48;  /* neutral-750 — its hover */
   --ink: #ECECEF;         /* neutral-50 */
   --body: #C3C2C8;        /* neutral-200 */
   --dim: #A6A5AC;         /* neutral-300 */

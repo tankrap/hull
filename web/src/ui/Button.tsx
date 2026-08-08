@@ -7,12 +7,14 @@ const BASE = 'inline-flex items-center justify-center gap-1.5 font-medium cursor
 const PRESS = 'transition-[transform,box-shadow,background-color,border-color,color,filter] duration-150 active:translate-y-px active:scale-[0.99]';
 
 const VARIANT = {
-  // GitLab "confirm": solid blue, white label, subtle press. The brand accent, not ink-contrast.
-  primary: 'bg-steel text-white border border-steel font-semibold shadow-[0_1px_2px_rgba(0,0,0,0.16)] hover:brightness-[1.08] active:brightness-95 active:shadow-none',
-  // ADS default: translucent-neutral fill with a hairline for crispness.
-  secondary: 'bg-surface text-body border border-ctl hover:bg-rule3 hover:border-dim active:bg-rule2',
+  // GitLab "confirm": solid blue, white label, a darker-blue hairline for a crisp edge on any ground.
+  primary: 'bg-steel text-white border border-[color-mix(in_oklab,var(--steel)_78%,black)] font-semibold shadow-[0_1px_2px_rgba(0,0,0,0.16)] hover:brightness-[1.08] active:brightness-95 active:shadow-none',
+  // GitLab "default": a SOLID neutral face (a step above the card) with a defined border — reads as a
+  // tactile control, not a flat label. Fills lighter on hover.
+  secondary: 'bg-ctlfill text-ink border border-ctl shadow-[0_1px_1px_rgba(0,0,0,0.06)] hover:bg-ctlfill-hover hover:border-dim active:bg-ctlfill-hover active:shadow-none',
   ghost: 'bg-transparent text-steel-text border border-transparent hover:bg-steel-wash active:bg-steel-wash/80',
-  destructive: 'bg-surface text-fault-text border border-fault/45 hover:bg-fault-wash hover:border-fault/70 active:bg-fault-wash',
+  // GitLab "danger (secondary)": the neutral control face, red label + red-tinted border.
+  destructive: 'bg-ctlfill text-fault-text border border-fault/50 shadow-[0_1px_1px_rgba(0,0,0,0.06)] hover:bg-fault-wash hover:border-fault/75 active:bg-fault-wash active:shadow-none',
 };
 
 const SIZE = {
@@ -29,7 +31,7 @@ type ButtonProps = React.ButtonHTMLAttributes<HTMLButtonElement> & {
 export function Button({ variant = 'primary', size = 'md', className, disabled, children, ...rest }: ButtonProps) {
   if (disabled) {
     return (
-      <button disabled className={cx(BASE, 'bg-ink/[0.05] text-faint border border-ink/[0.05] cursor-not-allowed shadow-none', SIZE[size], className)} {...rest}>
+      <button disabled className={cx(BASE, 'bg-ctlfill/50 text-faint border border-ctl/60 cursor-not-allowed shadow-none', SIZE[size], className)} {...rest}>
         {children}
       </button>
     );
