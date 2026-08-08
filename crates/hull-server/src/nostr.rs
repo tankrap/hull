@@ -111,6 +111,149 @@ pub fn publish(relays: &[String], event: &Event) -> usize {
     sent
 }
 
+// ── ref transport: publish a repo's branch pointer as a signed event, and read it back ────────────
+//
+// This is the decentralization substrate's first rung: a repo's refs live on public relays as signed
+// events, so history isn't hostage to one host (the design's "give-away-able substrate"). Refs are
+// **parameterized-replaceable** events (kind 31900): relays keep only the newest per (author, kind,
+// `d`-tag), so `repo#branch` resolves to the latest commit. Signed by the INSTANCE key (transport
+// authenticity); the Ed25519 keel-provenance bundle is a later layer.
+
+/// Parameterized-replaceable ref event kind (NIP-01 30000–39999: latest-wins per `d`-tag).
+pub const KIND_REF: u16 = 31900;
+
+/// Build a signed ref event: `repo`'s `branch` now points at `commit` (with optional `prev`). The
+/// `d`-tag `repo#branch` is what relays key the replaceable on. `None` if the secret is invalid.
+pub fn ref_event(secret_hex: &str, repo: &str, branch: &str, commit: &str, prev: Option<&str>, created_at: u64) -> Option<Event> {
+    let mut tags = vec![
+        vec!["d".to_string(), format!("{repo}#{branch}")],
+        vec!["repo".to_string(), repo.to_string()],
+        vec!["ref".to_string(), branch.to_string()],
+    ];
+    if let Some(p) = prev {
+        tags.push(vec!["prev".to_string(), p.to_string()]);
+    }
+    let content = serde_json::json!({ "commit": commit, "prev": prev, "repo": repo, "ref": branch }).to_string();
+    build_event(secret_hex, created_at, KIND_REF, tags, &content)
+}
+
+impl Event {
+    /// Parse a relay's event JSON object into an [`Event`] (the inverse of [`to_json`](Self::to_json)).
+    pub fn from_json(v: &serde_json::Value) -> Option<Event> {
+        Some(Event {
+            id: v.get("id")?.as_str()?.to_string(),
+            pubkey: v.get("pubkey")?.as_str()?.to_string(),
+            created_at: v.get("created_at")?.as_u64()?,
+            kind: v.get("kind")?.as_u64()? as u16,
+            tags: serde_json::from_value(v.get("tags")?.clone()).ok()?,
+            content: v.get("content")?.as_str()?.to_string(),
+            sig: v.get("sig")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// The newest event's `commit` (parameterized-replaceable = latest-wins by `created_at`) — so a set of
+/// ref events for the same `repo#branch` collapses to the current commit. Pure; the client resolves
+/// latest-wins itself rather than trusting a single relay's collapse.
+pub fn newest_commit(events: &[Event]) -> Option<String> {
+    events
+        .iter()
+        .max_by_key(|e| e.created_at)
+        .and_then(|e| serde_json::from_str::<serde_json::Value>(&e.content).ok())
+        .and_then(|c| c.get("commit").and_then(|x| x.as_str()).map(str::to_string))
+}
+
+/// Subscribe (NIP-01 `REQ`) for events matching `filter` across `relays`, collecting until `EOSE` or a
+/// short timeout, returning every VERIFIED event (deduped by id). This is the read half the notifier
+/// never needed — it's what makes refs on relays actually readable back.
+pub fn fetch_events(relays: &[String], filter: serde_json::Value) -> Vec<Event> {
+    use std::time::Duration;
+    let req = serde_json::json!(["REQ", "hull-ref", filter]).to_string();
+    let mut out: Vec<Event> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for url in relays {
+        let Ok((mut ws, _)) = tungstenite::connect(url) else { continue };
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(4)));
+            let _ = s.set_write_timeout(Some(Duration::from_secs(4)));
+        }
+        if ws.send(tungstenite::Message::Text(req.clone())).is_err() {
+            let _ = ws.close(None);
+            continue;
+        }
+        loop {
+            match ws.read() {
+                Ok(tungstenite::Message::Text(t)) => {
+                    let Ok(val) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
+                    let empty = Vec::new();
+                    let arr = val.as_array().unwrap_or(&empty);
+                    match arr.first().and_then(|x| x.as_str()) {
+                        // ["EVENT", <sub>, <event>] — verify before trusting a relay-supplied event.
+                        Some("EVENT") => {
+                            if let Some(ev) = arr.get(2).and_then(Event::from_json) {
+                                if ev.verify() && seen.insert(ev.id.clone()) {
+                                    out.push(ev);
+                                }
+                            }
+                        }
+                        Some("EOSE") => break, // end of stored events for this sub
+                        _ => {}
+                    }
+                }
+                Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+        let _ = ws.close(None);
+    }
+    out
+}
+
+/// Publishes/reads repo refs as signed nostr events (kind 31900), decoupled from the notifier. Same
+/// env config as [`NostrNotifier`] (`HULL_NOSTR_SECRET` + `HULL_NOSTR_RELAYS`); signed by the instance
+/// key for transport authenticity. The Ed25519 keel-provenance bundle is a later increment.
+#[derive(Clone)]
+pub struct NostrRefs {
+    secret_hex: String,
+    relays: Vec<String>,
+}
+
+impl NostrRefs {
+    pub fn from_env() -> Option<Self> {
+        let secret_hex = std::env::var("HULL_NOSTR_SECRET").ok()?;
+        pubkey_of(&secret_hex)?;
+        let relays: Vec<String> = std::env::var("HULL_NOSTR_RELAYS")
+            .ok()?
+            .split([',', ' '])
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        (!relays.is_empty()).then_some(Self { secret_hex, relays })
+    }
+
+    pub fn new(secret_hex: String, relays: Vec<String>) -> Self {
+        Self { secret_hex, relays }
+    }
+    pub fn relays(&self) -> &[String] {
+        &self.relays
+    }
+
+    /// Publish `repo`'s `branch` → `commit` (best-effort across relays). Returns the signed event.
+    pub fn publish_ref(&self, repo: &str, branch: &str, commit: &str, prev: Option<&str>) -> Option<Event> {
+        let created_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let ev = ref_event(&self.secret_hex, repo, branch, commit, prev, created_at)?;
+        publish(&self.relays, &ev);
+        Some(ev)
+    }
+
+    /// Read the newest published commit for `repo`'s `branch` back from the relays (own-authored refs).
+    pub fn fetch_ref(&self, repo: &str, branch: &str) -> Option<String> {
+        let author = pubkey_of(&self.secret_hex)?;
+        let filter = serde_json::json!({ "kinds": [KIND_REF], "authors": [author], "#d": [format!("{repo}#{branch}")] });
+        newest_commit(&fetch_events(&self.relays, filter))
+    }
+}
+
 /// A [`Notifier`] that publishes Hull notifications to nostr relays, `p`-tagging each recipient who
 /// opted in with a [`nostr_pubkey`](hull_core::Actor::nostr_pubkey). Config-gated (off unless a
 /// publisher key + relays are set), so the OSS default stays the log notifier.
@@ -243,5 +386,87 @@ mod tests {
         let ev = build_event(SK, 1_700_000_000, 1, vec![], "x").unwrap();
         let expect: [u8; 32] = Sha256::digest(super::serialize_for_id(&ev.pubkey, 1_700_000_000, 1, &[], "x").as_bytes()).into();
         assert_eq!(ev.id, hex::encode(expect));
+    }
+
+    #[test]
+    fn ref_event_is_a_verifiable_replaceable_with_the_right_d_tag() {
+        let ev = ref_event(SK, "tankrap/hull", "main", "commitABC", Some("commitPREV"), 1_700_000_000).unwrap();
+        assert_eq!(ev.kind, KIND_REF);
+        assert!(ev.verify(), "ref event must verify its own id + schnorr sig");
+        // the parameterized-replaceable key is `repo#branch`
+        assert!(ev.tags.contains(&vec!["d".to_string(), "tankrap/hull#main".to_string()]));
+        assert!(ev.tags.contains(&vec!["ref".to_string(), "main".to_string()]));
+        assert!(ev.tags.contains(&vec!["prev".to_string(), "commitPREV".to_string()]));
+        // the commit is carried in content
+        let c: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
+        assert_eq!(c["commit"], "commitABC");
+    }
+
+    #[test]
+    fn newest_commit_and_from_json_round_trip() {
+        // latest-wins by created_at across a set of same-ref events
+        let older = ref_event(SK, "r", "main", "old", None, 1_700_000_000).unwrap();
+        let newer = ref_event(SK, "r", "main", "new", Some("old"), 1_700_000_100).unwrap();
+        assert_eq!(newest_commit(&[older.clone(), newer.clone()]).as_deref(), Some("new"));
+        assert_eq!(newest_commit(&[newer, older]).as_deref(), Some("new"), "order-independent");
+        assert_eq!(newest_commit(&[]), None);
+        // to_json → from_json preserves everything (and the event still verifies)
+        let ev = ref_event(SK, "r", "dev", "xyz", None, 1_700_000_000).unwrap();
+        let back = Event::from_json(&ev.to_json()).unwrap();
+        assert_eq!((back.id.clone(), back.content.clone()), (ev.id.clone(), ev.content.clone()));
+        assert!(back.verify());
+    }
+
+    // A minimal in-process NIP-01 relay: stores EVENTs, answers a REQ with all stored events + EOSE.
+    // Enough to prove the publish → relay → REQ → read-back → verify → parse path end to end. Serves
+    // connections sequentially (the test publishes on one connection, then fetches on another), with a
+    // store shared across connections so a published ref is visible to a later REQ.
+    fn spawn_loopback_relay() -> String {
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let store: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let Ok(mut ws) = tungstenite::accept(stream) else { continue };
+                while let Ok(msg) = ws.read() {
+                    let tungstenite::Message::Text(t) = msg else {
+                        break; // Close / non-text → this connection is done
+                    };
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
+                    let a = v.as_array().cloned().unwrap_or_default();
+                    match a.first().and_then(|x| x.as_str()) {
+                        Some("EVENT") => {
+                            if let Some(ev) = a.get(1) {
+                                store.lock().unwrap().push(ev.clone());
+                            }
+                        }
+                        Some("REQ") => {
+                            let sub = a.get(1).and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            for ev in store.lock().unwrap().iter() {
+                                let _ = ws.send(tungstenite::Message::Text(serde_json::json!(["EVENT", sub, ev]).to_string()));
+                            }
+                            let _ = ws.send(tungstenite::Message::Text(serde_json::json!(["EOSE", sub]).to_string()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn publish_then_fetch_ref_round_trips_through_a_relay() {
+        let url = spawn_loopback_relay();
+        let refs = NostrRefs::new(SK.into(), vec![url]);
+        // nothing published yet → no ref
+        assert_eq!(refs.fetch_ref("tankrap/hull", "main"), None);
+        // publish a ref, then read the commit back over a fresh connection
+        let ev = refs.publish_ref("tankrap/hull", "main", "deadbeefcommit", None).expect("publish builds an event");
+        assert!(ev.verify());
+        assert_eq!(refs.fetch_ref("tankrap/hull", "main").as_deref(), Some("deadbeefcommit"), "the published commit reads back");
     }
 }

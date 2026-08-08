@@ -232,6 +232,10 @@ struct App {
     /// be handed the same number. One global async lock is ample for this single-process server's
     /// create volume; the `UNIQUE(repo, number)` index is the database-level backstop.
     number_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Decentralized ref transport: if a nostr key + relays are configured, a repo's branch pointer is
+    /// published as a signed event (kind 31900) each time it lands, so history isn't hostage to one
+    /// host. `None` unless configured (OSS default is off).
+    nostr_refs: Option<Arc<nostr::NostrRefs>>,
 }
 
 impl repos::HasRepoHost for App {
@@ -283,6 +287,11 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         eprintln!("nostr: code-owner notifications enabled → {} relay(s)", n.relays().len());
         registry.add_notifier(Arc::new(n));
     }
+    // Decentralized ref transport: publish each landed branch pointer as a signed kind:31900 event.
+    let nostr_refs = nostr::NostrRefs::from_env().map(|r| {
+        eprintln!("nostr: ref transport enabled → {} relay(s)", r.relays().len());
+        Arc::new(r)
+    });
     App {
         store,
         hub,
@@ -303,6 +312,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         repo_settings: Arc::new(reposettings::RepoSettingsStore::from_env()),
         connections: Arc::new(connections::ForgeConnections::from_env()),
         number_lock: Arc::new(tokio::sync::Mutex::new(())),
+        nostr_refs,
     }
 }
 
@@ -4401,6 +4411,17 @@ async fn perform_merge(
         tenant,
         ActivityEvent::Push { actor: actor.handle.clone(), repo: repo.to_string(), change: announced.clone(), ts: now() },
     );
+    // Decentralized ref transport: publish the new branch tip as a signed nostr event so the repo's
+    // history lives on public relays, not just this host. Best-effort + off-thread — a relay must never
+    // block or fail a merge. No-op unless nostr ref transport is configured.
+    if let (Some(refs), false) = (app.nostr_refs.clone(), announced.is_empty()) {
+        let (repo_key, branch, commit) = (key.clone(), default_branch.clone(), announced.clone());
+        std::thread::spawn(move || {
+            if let Some(ev) = refs.publish_ref(&repo_key, &branch, &commit, None) {
+                eprintln!("nostr: published ref {repo_key}#{branch} → {}… ({}…)", &commit[..commit.len().min(12)], &ev.id[..12]);
+            }
+        });
+    }
     // Outbound mirror on change-land — guarded by loop prevention + idempotency.
     if let Some(change) = landed_change.as_ref().or_else(|| pr.changes.first()) {
         mirror_out(app, tenant, repo, change).await;
