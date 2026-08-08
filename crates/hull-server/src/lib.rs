@@ -2146,6 +2146,13 @@ async fn import_repo_handler(State(app): State<App>, Path(id): Path<String>, hea
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| source.rsplit('/').next().unwrap_or(&source).to_string());
+    // Sanitize the destination name exactly like `create_repo_handler`: it becomes a filesystem path
+    // segment (the import shells `git` into `{tenant}/{name}`) and a store key, so an unsanitized
+    // `..`/`/`/dotfile name would bypass the safe-segment guarantee every other create path enforces.
+    let name = sanitize_handle(&name);
+    if name.is_empty() || !repos::safe_segment(&name) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "invalid repository name").into_response();
+    }
     let tenant = acct.handle.clone();
     if app.store.repos().await.iter().any(|r| r.owner == acct.id && r.name.eq_ignore_ascii_case(&name)) {
         return (StatusCode::CONFLICT, "a repo with that name already exists").into_response();
@@ -4377,6 +4384,17 @@ async fn mirror_github_webhook(
         return Json(json!({ "pong": true })).into_response();
     }
     let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+    // Bind the delivery to THIS repo's connection. The App's webhook secret is global (one per App),
+    // so a validly-signed delivery for one tenant's repo could otherwise be replayed to another
+    // tenant's `.../mirror/github` endpoint and force an unrelated re-sync. Require the payload's
+    // installation id to match the GitHub connection registered for the repo's owning account (which
+    // also rejects deliveries for a repo that was never connected).
+    let payload_inst = v.get("installation").and_then(|i| i.get("id")).and_then(Value::as_i64).map(|n| n.to_string());
+    let conn_inst = repo_owner_account(&app, &tenant, &repo).await.and_then(|acct| app.connections.get(&acct.id)).map(|c| c.installation);
+    match (conn_inst, payload_inst) {
+        (Some(want), Some(got)) if !want.is_empty() && want == got => {}
+        _ => return (StatusCode::FORBIDDEN, "webhook installation does not match this repo's GitHub connection").into_response(),
+    }
     let git_ref = v.get("ref").and_then(Value::as_str).unwrap_or("");
     let after = v.get("after").and_then(Value::as_str).unwrap_or("").to_string();
     let login = v.get("sender").and_then(|s| s.get("login")).and_then(Value::as_str).unwrap_or("").to_string();
@@ -6587,6 +6605,26 @@ mod tests {
         let mut h = axum::http::HeaderMap::new();
         h.insert(axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
         h
+    }
+
+    #[tokio::test]
+    async fn import_rejects_a_name_that_sanitizes_to_empty() {
+        // The GitHub import destination name becomes a filesystem segment + store key, so it runs
+        // through `sanitize_handle` like every other create path; a name that sanitizes to empty
+        // (here ".") is rejected with 422 before any git shelling.
+        let (app, tmp) = build_test_app("import-name");
+        setup_org_repo(&app, "acme", "web", false, &[("owner", Role::Owner)]).await;
+        app.store.put_actor(actor("owner", ActorKind::Human)).await;
+        mint_token(&app, "tok", "owner");
+        app.connections.set("acct-acme", crate::connections::Connection { provider: "github".into(), installation: "1".into(), login: "acme".into(), connected_unix: 0 });
+        let resp = import_repo_handler(
+            axum::extract::State(app.clone()),
+            axum::extract::Path("acct-acme".to_string()),
+            bearer("tok"),
+            axum::Json(serde_json::json!({ "source": "evil/x", "name": "." })),
+        ).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY, "an unsafe/empty destination name is refused");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
