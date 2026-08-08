@@ -216,6 +216,11 @@ struct App {
     repo_settings: Arc<reposettings::RepoSettingsStore>,
     /// Per-account forge connections (GitHub App installations).
     connections: Arc<connections::ForgeConnections>,
+    /// Serializes issue/PR number allocation (the `MAX(number)+1` read-then-insert in `create_issue`,
+    /// `create_pr`, and the review auto-triage path) so two concurrent creates in the same repo can't
+    /// be handed the same number. One global async lock is ample for this single-process server's
+    /// create volume; the `UNIQUE(repo, number)` index is the database-level backstop.
+    number_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl repos::HasRepoHost for App {
@@ -286,6 +291,7 @@ fn build_app(mut registry: Registry, hub: Arc<ActivityHub>, store: Arc<dyn Store
         webauthn: Arc::new(passkey::build()),
         repo_settings: Arc::new(reposettings::RepoSettingsStore::from_env()),
         connections: Arc::new(connections::ForgeConnections::from_env()),
+        number_lock: Arc::new(tokio::sync::Mutex::new(())),
     }
 }
 
@@ -5212,6 +5218,7 @@ async fn perform_auto_review(
                 .into_iter()
                 .any(|i| i.labels.iter().any(|l| l == "from-review") && i.linked_prs.contains(&pr.id) && matches!(i.status, IssueStatus::Open));
             if !already {
+                let alloc_guard = app.number_lock.lock().await;
                 let inum = app.store.issues(&key).await.iter().map(|i| i.number).max().unwrap_or(0) + 1;
                 let body = blockers.iter().map(|f| format!("- {} ({})", f.note, f.path)).collect::<Vec<_>>().join("\n");
                 let issue = Issue {
@@ -5233,6 +5240,7 @@ async fn perform_auto_review(
                     edited_unix: None,
                 };
                 app.store.put_issue(issue).await;
+                drop(alloc_guard); // number persisted; release before notify/publish
                 app.registry.notify(&NotifyEvent {
                     kind: "issue_triaged".into(),
                     to: vec![pr.author.clone()],
@@ -5513,6 +5521,10 @@ async fn create_pr(
     if changes.is_empty() {
         return (StatusCode::UNPROCESSABLE_ENTITY, "no changes to propose (unknown commit or empty repo?)").into_response();
     }
+    // Hold the allocation lock across the read-max-then-insert (`put_pr` below) so a concurrent
+    // create can't be handed the same number. The intervening code-owner resolution/notify runs
+    // under the lock too; on this single-process, low-create-rate server that contention is trivial.
+    let alloc_guard = app.number_lock.lock().await;
     let number = app.store.prs(&key).await.iter().map(|p| p.number).max().unwrap_or(0) + 1;
     // Code owners: resolve the owners of any file this change touches — they become requested
     // reviewers and get notified.
@@ -5554,6 +5566,7 @@ async fn create_pr(
         }).await;
     }
     app.store.put_pr(pr.clone()).await;
+    drop(alloc_guard); // number persisted; release before the remaining link/publish work
     // Link the issues this PR closes (from `fixes #N` in the title, or an explicit `closes` list) so
     // they show the incoming PR now and auto-close when it merges.
     let explicit: Vec<u64> = body.get("closes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
@@ -5659,6 +5672,9 @@ async fn create_issue(
             }
         }
     }
+    // Hold the allocation lock across the read-max-then-insert so a concurrent create can't be handed
+    // the same number (the read and the `put_issue` below must be one critical section).
+    let alloc_guard = app.number_lock.lock().await;
     let number = app.store.issues(&key).await.iter().map(|i| i.number).max().unwrap_or(0) + 1;
     let author = actor.id.clone();
     let issue = Issue {
@@ -5680,6 +5696,7 @@ async fn create_issue(
         edited_unix: None,
     };
     app.store.put_issue(issue.clone()).await;
+    drop(alloc_guard); // number is persisted; release before the (unrelated) notify/publish work
     if !issue.assignees.is_empty() {
         app.registry.notify(&NotifyEvent {
             kind: "issue_assigned".into(),
@@ -6466,6 +6483,38 @@ mod tests {
         let mut h = axum::http::HeaderMap::new();
         h.insert(axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
         h
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_issue_creates_get_distinct_contiguous_numbers() {
+        // The number is allocated as MAX(number)+1 then inserted; without a lock across that
+        // read-then-insert, concurrent creates can be handed the same number. Fire many at once and
+        // assert every issue got a distinct, contiguous number (1..=N) — deterministic once the
+        // allocation is serialized.
+        let (app, tmp) = build_test_app("concurrent-issues");
+        setup_org_repo(&app, "acme", "web", false, &[("member", Role::Write)]).await;
+        app.store.put_actor(actor("member", ActorKind::Human)).await;
+        mint_token(&app, "tok", "member");
+        const N: u64 = 24;
+        let mut tasks = Vec::new();
+        for i in 0..N {
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move {
+                create_issue(
+                    axum::extract::State(app),
+                    axum::extract::Path(("acme".to_string(), "web".to_string())),
+                    bearer("tok"),
+                    axum::Json(serde_json::json!({ "title": format!("issue {i}") })),
+                ).await.status()
+            }));
+        }
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), axum::http::StatusCode::CREATED, "each create succeeds");
+        }
+        let mut nums: Vec<u64> = app.store.issues("acme/web").await.iter().map(|i| i.number).collect();
+        nums.sort_unstable();
+        assert_eq!(nums, (1..=N).collect::<Vec<_>>(), "N concurrent creates → distinct, contiguous numbers");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
