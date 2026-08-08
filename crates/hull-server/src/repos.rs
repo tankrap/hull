@@ -2113,7 +2113,7 @@ pub async fn upload_pack<S: HasRepoHost + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let body = maybe_gunzip(&headers, body.to_vec());
+    let body = maybe_gunzip(&headers, body.to_vec(), git_max_body_bytes());
     let store = match app.repo_host().store(&tenant, &repo, false) {
         Ok(Some(s)) => s,
         Ok(None) => return (StatusCode::NOT_FOUND, "no such repo").into_response(),
@@ -2133,7 +2133,7 @@ pub async fn receive_pack<S: HasRepoHost + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let body = maybe_gunzip(&headers, body.to_vec());
+    let body = maybe_gunzip(&headers, body.to_vec(), git_max_body_bytes());
     let store = match app.repo_host().store(&tenant, &repo, true) {
         Ok(Some(s)) => s,
         Ok(None) => return (StatusCode::BAD_REQUEST, "invalid repo name").into_response(),
@@ -2169,9 +2169,20 @@ fn server_error(e: io::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("git error: {e}")).into_response()
 }
 
+/// Maximum accepted git request-body size (raw and, after `maybe_gunzip`, decompressed), in bytes.
+/// A git push carries a packfile, so this is generous; `HULL_GIT_MAX_BODY_MB` (default 512) tunes it.
+/// Used both to build the git routes' `RequestBodyLimitLayer` and to bound gzip decompression.
+pub(crate) fn git_max_body_bytes() -> usize {
+    let mb: usize = std::env::var("HULL_GIT_MAX_BODY_MB").ok().and_then(|v| v.parse().ok()).filter(|&m| m > 0).unwrap_or(512);
+    mb.saturating_mul(1024 * 1024)
+}
+
 /// Decompress the body if the request declares `Content-Encoding: gzip` (git's default for the
-/// upload-pack POST). On any decode failure fall back to the raw bytes.
-pub(crate) fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>) -> Vec<u8> {
+/// upload-pack POST). The decompressed size is capped at `max` bytes (callers pass
+/// [`git_max_body_bytes`]) so a gzip bomb (small input, huge inflation) can't exhaust memory: on
+/// over-cap OR any decode failure we hand back the raw bytes, which the git pkt-line parser then
+/// rejects — a bounded, safe failure rather than an OOM.
+pub(crate) fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>, max: usize) -> Vec<u8> {
     let is_gzip = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -2181,10 +2192,11 @@ pub(crate) fn maybe_gunzip(headers: &HeaderMap, body: Vec<u8>) -> Vec<u8> {
         return body;
     }
     use std::io::Read;
+    // Read one byte past the cap so `out.len() > max` unambiguously signals overflow.
     let mut out = Vec::new();
-    match flate2::read::GzDecoder::new(&body[..]).read_to_end(&mut out) {
-        Ok(_) => out,
-        Err(_) => body,
+    match flate2::read::GzDecoder::new(&body[..]).take(max as u64 + 1).read_to_end(&mut out) {
+        Ok(_) if out.len() <= max => out,
+        _ => body,
     }
 }
 
@@ -2320,6 +2332,28 @@ mod tests {
         let host = RepoHost::new(&tmp);
         assert_eq!(host.list(), vec!["acme/api".to_string(), "acme/web".to_string()]);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn maybe_gunzip_caps_decompressed_size() {
+        use std::io::Write;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        // A gzip bomb: 8 MiB of zeros compresses to a few KiB.
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&vec![0u8; 8 * 1024 * 1024]).unwrap();
+        let bomb = enc.finish().unwrap();
+        assert!(bomb.len() < 256 * 1024, "the bomb is small compressed ({} bytes)", bomb.len());
+        // With a 1 MiB cap the 8 MiB inflation is refused → raw (still-compressed) bytes handed back,
+        // never the 8 MiB buffer. The git parser then rejects the raw bytes (bounded, safe failure).
+        assert_eq!(maybe_gunzip(&headers, bomb.clone(), 1024 * 1024), bomb, "over-cap → raw bytes");
+        // A within-cap payload decompresses normally.
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"hello git").unwrap();
+        let small = enc.finish().unwrap();
+        assert_eq!(maybe_gunzip(&headers, small, 1024 * 1024), b"hello git", "within-cap decompresses");
+        // A non-gzip body is passed through untouched regardless of cap.
+        assert_eq!(maybe_gunzip(&HeaderMap::new(), b"plain".to_vec(), 4), b"plain");
     }
 
     #[test]
