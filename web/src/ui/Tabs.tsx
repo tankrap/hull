@@ -12,9 +12,10 @@ export function HTabs({ items, value, onChange }: {
   return (
     <div className="flex gap-5 text-[13.5px]">
       {items.map((label, i) => (
-        <span key={label} onClick={() => onChange?.(i)} className="flex flex-col gap-1 pt-1.5 cursor-pointer group">
+        <span key={label} onClick={() => onChange?.(i)} className="flex flex-col gap-1.5 pt-1.5 cursor-pointer group">
           <span className={cx('transition-colors duration-150', value === i ? 'font-semibold text-ink' : 'text-dim group-hover:text-ink')}>{label}</span>
-          <span className={cx('h-[3px] rounded-sm transition-colors duration-150', value === i ? 'bg-steel' : 'bg-transparent')} />
+          {/* GitLab: active tab underline is a 2px high-contrast NEUTRAL bar (not blue); hover shows a faint one. */}
+          <span className={cx('h-[2px] transition-colors duration-150', value === i ? 'bg-ink' : 'bg-transparent group-hover:bg-rule')} />
         </span>
       ))}
     </div>

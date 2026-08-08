@@ -82,16 +82,16 @@ export function Picker({ value, onChange, options, placeholder = "Select…", wi
       <div className="py-1 max-h-[280px] overflow-y-auto overflow-x-hidden">
         {filtered.length === 0 && <div className="px-3 py-1.5 text-[12.5px] text-muted">{ql ? "no matches" : "none available"}</div>}
         {filtered.map((o) => (rich ? (
-          <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:bg-rule2 ${o.value === value ? "bg-steel-wash" : ""}`}>
+          <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-2.5 py-1.5 flex items-center gap-2.5 hover:bg-rule2 ${o.value === value ? "bg-rule" : ""}`}>
             {o.avatar ? <span className="flex-none">{o.avatar}</span> : null}
             <span className="min-w-0 flex-1">
               <span className={`block text-[13px] truncate ${o.value === value ? "font-medium text-ink" : "text-body"}`}>{o.label}</span>
               {o.sub && <span className="block text-[11.5px] text-muted truncate">{o.sub}</span>}
             </span>
-            {o.value === value && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-steel-text flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
+            {o.value === value && <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-ink flex-none"><polyline points="20 6 9 17 4 12" /></svg>}
           </button>
         ) : (
-          <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-3 py-1.5 text-[13px] truncate hover:bg-rule2 ${o.value === value ? "bg-steel-wash font-medium text-ink" : "text-body"}`}>{o.label}</button>
+          <button key={o.value} type="button" title={o.label} onClick={() => onChange(o.value)} className={`w-full text-left px-3 py-1.5 text-[13px] truncate hover:bg-rule2 ${o.value === value ? "bg-rule font-medium text-ink" : "text-body"}`}>{o.label}</button>
         )))}
       </div>
     </Popover>
