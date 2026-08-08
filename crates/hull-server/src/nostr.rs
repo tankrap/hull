@@ -864,10 +864,11 @@ mod tests {
     }
 
     #[test]
-    fn provenance_signing_bytes_are_stable_cross_language() {
-        // The browser signer (web/src/sovereign.ts provenanceSigningBytes) must reproduce this string
-        // byte-for-byte, or a sovereign author's client signature won't verify server-side. Pin it so a
-        // Rust-side format change fails here instead of silently breaking sovereign provenance.
+    fn provenance_signing_bytes_are_pinned() {
+        // The browser signer (web/src/sovereign.ts provenanceSigningBytes) pins the SAME literal in
+        // web/src/sovereign.test.ts. Both must agree, or a sovereign author's client signature won't
+        // verify server-side; a format change on either side fails one of the two pins instead of
+        // silently shipping broken signatures.
         let claim = ProvenanceClaim { v: 1, change: "blake3:c1".into(), actor: "abcd".into(), repo: "acme/web".into(), intent: "hello".into(), ts: 1_700_000_000 };
         let expected = "hull-provenance:v1\nchange=blake3:c1\nactor=abcd\nrepo=acme/web\nintent_sha256=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\nts=1700000000";
         assert_eq!(claim.signing_bytes(), expected);

@@ -60,7 +60,7 @@ export type SignedProvenance = { claim: ProvenanceClaim; ed_sig: string };
 /** The exact bytes the actor signs — must byte-match Rust `ProvenanceClaim::signing_bytes`: a flat,
  *  domain-separated form (NOT JSON, which serde and JSON.stringify serialize differently), with the
  *  free-text intent folded to its SHA-256 so newlines/unicode can't break the line structure. */
-function provenanceSigningBytes(c: ProvenanceClaim): string {
+export function provenanceSigningBytes(c: ProvenanceClaim): string {
   const intentSha = bytesToHex(sha256(utf8(c.intent)));
   return `hull-provenance:v1\nchange=${c.change}\nactor=${c.actor}\nrepo=${c.repo}\nintent_sha256=${intentSha}\nts=${c.ts}`;
 }
