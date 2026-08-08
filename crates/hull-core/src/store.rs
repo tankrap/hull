@@ -475,6 +475,14 @@ impl FileStore {
         let write_durably = || -> std::io::Result<()> {
             use std::io::Write;
             let f = std::fs::File::create(&tmp)?;
+            // The snapshot holds secrets (User.secret_key, AiConnection api_key), so restrict it to the
+            // owner (0600) like the sealed agent bundles — File::create otherwise applies the process
+            // umask, which is world-readable by default on many systems.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
             {
                 let mut w = std::io::BufWriter::new(&f);
                 w.write_all(&bytes)?;
@@ -1481,6 +1489,21 @@ mod tests {
         FileStore::open(&path).put_issue(it).await;
         let reopened = FileStore::open(&path).issues("r").await;
         assert!(matches!(reopened[0].status, IssueStatus::Closed { reason: CloseReason::Completed }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_file_is_owner_only_0600() {
+        // The snapshot holds secrets (User.secret_key, AiConnection api_key), so it must not be
+        // world-readable like a default-umask file.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hull-store-perms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("store.json");
+        FileStore::open(&path).put_issue(issue("r", 1, "x")).await;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "snapshot must be 0600, got {mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
