@@ -3722,6 +3722,21 @@ function ReviewPage({
   const [attesting, setAttesting] = useState(false);
   const [attested, setAttested] = useState<boolean>(() => !!(changeId && pr?.sovereign_provenance?.[changeId]));
   const [attestErr, setAttestErr] = useState<string | null>(null);
+  // keel authorship: cryptographic attestations a keel CLI signed for this change and relayed to the
+  // substrate, read back verified + accountability-annotated (empty unless the substrate is configured
+  // and someone attested). Distinct from sovereign browser signing above.
+  type KeelAuthor = { actor: string; actor_handle?: string | null; human_root?: string | null; ts: number; signature_valid: boolean; accountable: boolean; authorized: boolean };
+  const [keelAuthors, setKeelAuthors] = useState<KeelAuthor[]>([]);
+  useEffect(() => {
+    setKeelAuthors([]); // clear the previous change's rows so they don't linger during the fetch
+    if (!changeId) return;
+    let ignore = false; // drop a slow response if the change switched under us
+    fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}/keel-provenance`, { headers: authHeaders() })
+      .then((r) => (r.ok ? r.json() : { authorship: [] }))
+      .then((d) => { if (!ignore) setKeelAuthors(d.authorship ?? []); })
+      .catch(() => { if (!ignore) setKeelAuthors([]); });
+    return () => { ignore = true; };
+  }, [changeId, tenant, repo]);
   const loadChange = () => {
     if (!changeId) return;
     fetch(`/api/repos/${encodeURIComponent(tenant)}/${repo}/change/${changeId}`, { headers: authHeaders() })
@@ -4236,6 +4251,37 @@ function ReviewPage({
             <span className="text-[12px] text-muted">
               {attestErr ? attestErr : attested ? "your signature will be published to the substrate when this lands" : "sign this change with your sovereign key — non-repudiable, embedded at land"}
             </span>
+          </div>
+        )}
+
+        {/* keel authorship: attestations a keel CLI signed for this change, read back from the substrate,
+            verified and annotated with local accountability. Renders only when present. */}
+        {keelAuthors.length > 0 && (
+          <div className="rounded-ctl border border-ctl bg-surface">
+            <div className="px-4 py-2.5 border-b border-rule2 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">keel authorship</div>
+            <div>
+              {keelAuthors.map((k, i) => {
+                // Trust cascade (backend guarantees authorized ⇒ accountable): authorized = a live
+                // in-repo principal; accountable-but-not = a real actor who isn't a member here;
+                // neither = an unknown/unaccountable key. Precise labels so a valid signature from a
+                // non-member/unknown key can't read as endorsement.
+                const tone = k.authorized ? "bg-clear-wash text-clear-text" : k.accountable ? "bg-brass-wash text-brass-text" : "bg-fault-wash text-fault-text";
+                const dot = k.authorized ? "bg-clear" : k.accountable ? "bg-brass" : "bg-fault";
+                const label = k.authorized ? "authorized" : k.accountable ? "not a repo member" : "unaccountable key";
+                return (
+                  <div key={`${k.actor}:${i}`} className="flex items-center gap-2 px-4 py-2.5 border-b border-rule2 last:border-0 text-[13px]">
+                    <span className="font-medium text-body">{k.actor_handle || k.actor.slice(0, 10)}</span>
+                    {k.human_root && k.human_root !== k.actor && <span className="text-[12px] text-muted">(for {handleOf(k.human_root)})</span>}
+                    {k.signature_valid ? (
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium px-1.5 py-[2px] rounded-badge bg-clear-wash text-clear-text"><span className="w-1.5 h-1.5 rounded-full bg-clear" />signature valid</span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 text-[11px] font-medium px-1.5 py-[2px] rounded-badge bg-fault-wash text-fault-text"><span className="w-1.5 h-1.5 rounded-full bg-fault" />signature invalid</span>
+                    )}
+                    <span className={`inline-flex items-center gap-1 text-[11px] font-medium px-1.5 py-[2px] rounded-badge ${tone}`}><span className={`w-1.5 h-1.5 rounded-full ${dot}`} />{label}</span>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
 
