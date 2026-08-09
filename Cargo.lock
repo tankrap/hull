@@ -1424,7 +1424,7 @@ dependencies = [
 [[package]]
 name = "keel-git"
 version = "0.1.0"
-source = "git+https://github.com/tankrap/keel?rev=6827a3443de3c9be2e66887c8038310e32dddc37#6827a3443de3c9be2e66887c8038310e32dddc37"
+source = "git+https://github.com/tankrap/keel?rev=72ec45cedd6a29b99133246dc477b3e3f418b4e9#72ec45cedd6a29b99133246dc477b3e3f418b4e9"
 dependencies = [
  "keel-store",
  "miniz_oxide",
@@ -1434,7 +1434,7 @@ dependencies = [
 [[package]]
 name = "keel-net"
 version = "0.1.0"
-source = "git+https://github.com/tankrap/keel?rev=6827a3443de3c9be2e66887c8038310e32dddc37#6827a3443de3c9be2e66887c8038310e32dddc37"
+source = "git+https://github.com/tankrap/keel?rev=72ec45cedd6a29b99133246dc477b3e3f418b4e9#72ec45cedd6a29b99133246dc477b3e3f418b4e9"
 dependencies = [
  "keel-store",
  "quinn",
@@ -1446,13 +1446,14 @@ dependencies = [
 [[package]]
 name = "keel-store"
 version = "0.1.0"
-source = "git+https://github.com/tankrap/keel?rev=6827a3443de3c9be2e66887c8038310e32dddc37#6827a3443de3c9be2e66887c8038310e32dddc37"
+source = "git+https://github.com/tankrap/keel?rev=72ec45cedd6a29b99133246dc477b3e3f418b4e9#72ec45cedd6a29b99133246dc477b3e3f418b4e9"
 dependencies = [
  "blake3",
  "heed",
  "ignore",
  "libc",
  "miniz_oxide",
+ "ring",
 ]
 
 [[package]]
