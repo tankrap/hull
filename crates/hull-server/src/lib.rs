@@ -649,6 +649,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/change/:id/provenance", post(submit_provenance))
         .route("/api/repos/:tenant/:repo/change/:id/keel-provenance", get(keel_provenance_view).post(submit_keel_provenance))
         .route("/api/repos/:tenant/:repo/change/:id/restore", post(restore_change))
+        .route("/api/repos/:tenant/:repo/change/:id/reconstruct", post(reconstruct_history))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
         .route("/api/plugins", get(plugins_list))
@@ -6204,64 +6205,55 @@ async fn keel_provenance_view(State(app): State<App>, Path((tenant, repo, id)): 
 /// content under a referenced id — it can only make a restore fail. This is how a fresh/wiped instance
 /// re-materializes a repo's content from public infra. Owner/admin only (writes the store, hits external
 /// servers). Needs nostr configured; Blossom is needed only when blobs are missing.
-async fn restore_change(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
-    let actor = match require_actor(&app, &headers, "").await {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-    if !is_repo_admin(&app, &tenant, &repo, &actor.id).await {
-        return (StatusCode::FORBIDDEN, "only a repo owner/admin can restore content").into_response();
-    }
-    let Some(refs) = app.nostr_refs.clone() else {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "substrate not configured (needs HULL_NOSTR_*)").into_response();
-    };
-    // 1. Structure: rebuild the Change + Trees from the bundle (blocking relay read off the runtime).
-    // Each id may have several candidate byte-strings (a hostile relay can publish a bundle carrying a
-    // real id with garbage) — try each until one re-derives to the id.
-    let (rf, change) = (refs.clone(), id.clone());
-    let bundle = tokio::task::spawn_blocking(move || rf.fetch_change_bundle(&change)).await.unwrap_or_default();
+/// The outcome of restoring a SINGLE change from the substrate.
+struct OneRestore {
+    objects_restored: usize,
+    blobs_restored: usize,
+    structure_complete: bool,
+    still_missing: Vec<String>,
+}
+
+/// Restore one change from the substrate: structure (Change + Trees) from the change bundle, then its
+/// blobs from Blossom. Idempotent — already-present objects/blobs are skipped. Shared by the single-
+/// change endpoint and the deep-history walk. Every restored object is verified by re-derived id, so a
+/// forged bundle/manifest or lying blob server can only make a restore fail, never inject content.
+async fn restore_one_change(app: &App, tenant: &str, repo: &str, id: &str, refs: &nostr::NostrRefs, blossom: Option<&blossom::BlossomClient>) -> OneRestore {
+    // 1. Structure. Each id may carry several candidate byte-strings (a hostile relay can publish a
+    // bundle with a real id + garbage) — try each until one re-derives to the id.
+    let (rf, ch) = (refs.clone(), id.to_string());
+    let bundle = tokio::task::spawn_blocking(move || rf.fetch_change_bundle(&ch)).await.unwrap_or_default();
     let mut objects_restored = 0usize;
     for (oid, candidates) in &bundle {
-        if app.repos.has_object(&tenant, &repo, oid) {
+        if app.repos.has_object(tenant, repo, oid) {
             continue;
         }
         for bytes in candidates {
-            if app.repos.restore_object(&tenant, &repo, oid, bytes) {
+            if app.repos.restore_object(tenant, repo, oid, bytes) {
                 objects_restored += 1;
                 break;
             }
         }
     }
-    // If the structure isn't fully present after phase 1 (bundle missing, incomplete, flooded, or
-    // poisoned), STOP: missing_blobs silently returns nothing when the change/a tree is absent, so
-    // proceeding would report a clean success over a repo that wasn't actually reconstructed.
-    if !app.repos.structure_present(&tenant, &repo, &id) {
-        return Json(json!({
-            "structure_complete": false,
-            "objects_restored": objects_restored,
-            "blobs_restored": 0,
-            "note": "change structure could not be fully reconstructed from the bundle — blob restore skipped",
-        }))
-        .into_response();
+    // missing_blobs silently returns nothing when the change/a tree is absent, so a missing/poisoned
+    // bundle must short-circuit here rather than report a clean restore over an unreconstructed change.
+    if !app.repos.structure_present(tenant, repo, id) {
+        return OneRestore { objects_restored, blobs_restored: 0, structure_complete: false, still_missing: Vec::new() };
     }
-    // 2. Blobs: with the structure present, enumerate what's still missing and pull it from Blossom.
-    let missing = app.repos.missing_blobs(&tenant, &repo, &id);
+    // 2. Blobs.
+    let missing = app.repos.missing_blobs(tenant, repo, id);
     let mut blobs_restored = 0usize;
     let mut still_missing: Vec<String> = Vec::new();
     if !missing.is_empty() {
-        let Some(blossom) = app.blossom.clone() else {
-            // Structure was restored, but without Blossom the blobs can't be fetched.
-            return Json(json!({ "structure_complete": true, "objects_restored": objects_restored, "blobs_restored": 0, "missing_blobs": missing.len(), "still_missing": missing })).into_response();
+        let Some(blossom) = blossom else {
+            return OneRestore { objects_restored, blobs_restored: 0, structure_complete: true, still_missing: missing };
         };
-        let (rf2, change2) = (refs.clone(), id.clone());
-        let map = tokio::task::spawn_blocking(move || rf2.fetch_blob_manifest(&change2)).await.unwrap_or_default();
+        let (rf2, ch2) = (refs.clone(), id.to_string());
+        let map = tokio::task::spawn_blocking(move || rf2.fetch_blob_manifest(&ch2)).await.unwrap_or_default();
         for blob_id in &missing {
-            // Try each candidate sha256 (own-authored first) until one fetches bytes that re-hash to the
-            // id. restore_blob rejects any that don't, so a poisoned mapping just moves to the next.
             let mut ok = false;
             for sha in map.get(blob_id).map(Vec::as_slice).unwrap_or(&[]) {
                 if let Some(bytes) = blossom.get(sha).await {
-                    if app.repos.restore_blob(&tenant, &repo, blob_id, bytes) {
+                    if app.repos.restore_blob(tenant, repo, blob_id, bytes) {
                         ok = true;
                         break;
                     }
@@ -6274,7 +6266,97 @@ async fn restore_change(State(app): State<App>, Path((tenant, repo, id)): Path<(
             }
         }
     }
-    Json(json!({ "structure_complete": true, "objects_restored": objects_restored, "blobs_restored": blobs_restored, "missing_blobs": missing.len(), "still_missing": still_missing })).into_response()
+    OneRestore { objects_restored, blobs_restored, structure_complete: true, still_missing }
+}
+
+async fn restore_change(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    let actor = match require_actor(&app, &headers, "").await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_repo_admin(&app, &tenant, &repo, &actor.id).await {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin can restore content").into_response();
+    }
+    let Some(refs) = app.nostr_refs.clone() else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "substrate not configured (needs HULL_NOSTR_*)").into_response();
+    };
+    let r = restore_one_change(&app, &tenant, &repo, &id, &refs, app.blossom.as_deref()).await;
+    if !r.structure_complete {
+        return Json(json!({
+            "structure_complete": false,
+            "objects_restored": r.objects_restored,
+            "blobs_restored": 0,
+            "note": "change structure could not be fully reconstructed from the bundle — blob restore skipped",
+        }))
+        .into_response();
+    }
+    let missing_blobs = r.blobs_restored + r.still_missing.len();
+    Json(json!({ "structure_complete": true, "objects_restored": r.objects_restored, "blobs_restored": r.blobs_restored, "missing_blobs": missing_blobs, "still_missing": r.still_missing })).into_response()
+}
+
+/// Deep reconstruction (`POST …/change/:id/reconstruct`): rebuild `:id` AND its whole ancestry from the
+/// substrate — walk parent changes, restoring each one's structure + blobs, so a fresh/wiped instance
+/// can recover an entire branch's history, not just the tip. Bounded by MAX_CHANGES. Owner/admin only,
+/// needs nostr configured. Restores are idempotent, so an already-complete change is walked (for its
+/// parents) but not re-fetched.
+async fn reconstruct_history(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    let actor = match require_actor(&app, &headers, "").await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_repo_admin(&app, &tenant, &repo, &actor.id).await {
+        return (StatusCode::FORBIDDEN, "only a repo owner/admin can reconstruct history").into_response();
+    }
+    let Some(refs) = app.nostr_refs.clone() else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "substrate not configured (needs HULL_NOSTR_*)").into_response();
+    };
+    let blossom = app.blossom.clone();
+    const MAX_CHANGES: usize = 1000;
+    let mut queue = vec![id.clone()];
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reconstructed = 0usize;
+    let mut incomplete: Vec<String> = Vec::new();
+    let (mut total_objects, mut total_blobs) = (0usize, 0usize);
+    let mut capped = false;
+    while let Some(cid) = queue.pop() {
+        if !visited.insert(cid.clone()) {
+            continue;
+        }
+        if visited.len() > MAX_CHANGES {
+            capped = true;
+            break;
+        }
+        // Only restore what isn't already fully present; a pre-complete change is still walked for parents.
+        let complete = app.repos.structure_present(&tenant, &repo, &cid) && app.repos.missing_blobs(&tenant, &repo, &cid).is_empty();
+        if !complete {
+            let r = restore_one_change(&app, &tenant, &repo, &cid, &refs, blossom.as_deref()).await;
+            total_objects += r.objects_restored;
+            total_blobs += r.blobs_restored;
+            if r.structure_complete && r.still_missing.is_empty() {
+                reconstructed += 1;
+            } else {
+                incomplete.push(cid.clone());
+            }
+        }
+        // Walk parents once the change is present (restored or pre-existing) — its Change object is now
+        // readable, so change_parents returns the ancestry to continue from.
+        if app.repos.structure_present(&tenant, &repo, &cid) {
+            for p in app.repos.change_parents(&tenant, &repo, &cid) {
+                if !visited.contains(&p) {
+                    queue.push(p);
+                }
+            }
+        }
+    }
+    Json(json!({
+        "changes_reconstructed": reconstructed,
+        "changes_incomplete": incomplete,
+        "objects_restored": total_objects,
+        "blobs_restored": total_blobs,
+        "walked": visited.len(),
+        "capped": capped,
+    }))
+    .into_response()
 }
 
 /// Open a PR (`POST /api/repos/:tenant/:repo/prs`). It proposes real keel changes: `changes` may be
@@ -7640,6 +7722,56 @@ mod tests {
         mint_token(&app, "tok2", &rando.actor.id);
         let r = submit_keel_provenance(State(app.clone()), path(), bearer("tok2"), Json(kp(&change, &intent_sha, &sig))).await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN, "only a repo member may relay authorship");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn reconstruct_history_rebuilds_an_entire_branch() {
+        let (mut app, tmp) = build_test_app("reconstruct");
+        let relay = crate::nostr::spawn_loopback_relay();
+        let blossom_url = crate::blossom::spawn_blossom().await;
+        let sk = "0000000000000000000000000000000000000000000000000000000000000001";
+        app.nostr_refs = Some(std::sync::Arc::new(crate::nostr::NostrRefs::new(sk.into(), vec![relay])));
+        app.blossom = Some(std::sync::Arc::new(crate::blossom::BlossomClient::new(reqwest::Client::new(), vec![blossom_url], sk.into())));
+        app.store.put_actor(actor("boss", ActorKind::Human)).await;
+        setup_org_repo(&app, "acme", "src", false, &[("boss", Role::Owner)]).await;
+        mint_token(&app, "tok", "boss");
+
+        // A 3-change chain (c1 ← c2 ← c3), each adding a file.
+        let c1 = app.repos.test_commit("acme", "src", "one", None, &[("a.txt", "1\n")]);
+        let c2 = app.repos.test_commit("acme", "src", "two", Some(&c1), &[("a.txt", "1\n"), ("b.txt", "2\n")]);
+        let c3 = app.repos.test_commit("acme", "src", "three", Some(&c2), &[("a.txt", "1\n"), ("b.txt", "2\n"), ("c.txt", "3\n")]);
+        // Publish the full substrate for each change: structural bundle + blob manifest + blob bytes.
+        let (refs, blossom) = (app.nostr_refs.clone().unwrap(), app.blossom.clone().unwrap());
+        for c in [&c1, &c2, &c3] {
+            let (objs, _) = app.repos.change_objects("acme", "src", c, 256, 256 * 1024).unwrap();
+            refs.publish_change_bundle(c, &objs).unwrap();
+            let (entries, _) = app.repos.change_blob_index("acme", "src", c, 64, 1 << 20);
+            for e in &entries {
+                blossom.upload(e.bytes.clone()).await.unwrap();
+            }
+            let manifest: Vec<(String, String, usize)> = entries.iter().map(|e| (e.id.clone(), e.sha256.clone(), e.size)).collect();
+            refs.publish_blob_manifest(c, &manifest).unwrap();
+        }
+
+        // An EMPTY mirror repo — reconstruct the whole branch from just the tip c3.
+        setup_org_repo(&app, "acme", "mirror", false, &[("boss", Role::Owner)]).await;
+        assert!(!app.repos.has_object("acme", "mirror", &c3), "mirror starts empty");
+        let resp = reconstruct_history(State(app.clone()), axum::extract::Path(("acme".to_string(), "mirror".to_string(), c3.clone())), bearer("tok")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(v["changes_reconstructed"], 3, "the tip and both ancestors were rebuilt: {v}");
+        assert_eq!(v["changes_incomplete"].as_array().unwrap().len(), 0);
+        for c in [&c1, &c2, &c3] {
+            assert!(app.repos.has_object("acme", "mirror", c), "change {c} present after reconstruct");
+            assert!(app.repos.missing_blobs("acme", "mirror", c).is_empty(), "blobs of {c} present after reconstruct");
+        }
+
+        // Owner/admin only.
+        app.store.put_actor(actor("rando", ActorKind::Human)).await;
+        mint_token(&app, "tok2", "rando");
+        let resp = reconstruct_history(State(app.clone()), axum::extract::Path(("acme".to_string(), "mirror".to_string(), c3)), bearer("tok2")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "reconstruct is owner/admin only");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
