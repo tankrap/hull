@@ -539,8 +539,16 @@ impl NostrRefs {
     /// `actor` is the caller's job. Deduped by (actor, sig).
     pub fn fetch_keel_provenance(&self, change: &str) -> Vec<KeelProvenance> {
         let filter = serde_json::json!({ "kinds": [KIND_KEEL_PROV], "#change": [change] });
+        // Gate on trusted RELAYING instances (self + peers): the event is schnorr-signed by whichever
+        // instance relayed it, so a hostile relay can't flood junk kind-1903 events under throwaway keys
+        // to starve the read before honest ones are seen (same defense refs/bundles use). The attestation
+        // itself is still Ed25519-verified below — this only bounds which relays we'll read from.
+        let mut authors: std::collections::HashSet<String> = self.peers.iter().cloned().collect();
+        if let Some(own) = self.own_pubkey() {
+            authors.insert(own);
+        }
         let mut seen = std::collections::HashSet::new();
-        fetch_events(&self.relays, filter)
+        fetch_events_gated(&self.relays, filter, Some(&authors))
             .iter()
             .filter_map(|ev| serde_json::from_str::<KeelProvenance>(&ev.content).ok())
             .filter(|kp| kp.change == change && verify_keel_provenance(kp).is_some())
@@ -1066,6 +1074,26 @@ mod tests {
             bytes,
             "keel-provenance:v1\nchange=blake3:c1\nactor=abcd\nintent_sha256=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\nts=1700000000"
         );
+    }
+
+    #[test]
+    fn keel_provenance_accepts_a_real_ring_signature() {
+        // Cross-language interop: this signature was produced by keel's `ring` Ed25519 over the pinned
+        // signing bytes (seed 0x..01, change=blake3:c1, intent="hello", ts=1700000000). If hull's dalek
+        // `verify_strict` ever stopped accepting ring's canonical RFC-8032 sigs, this fails — where the
+        // dalek→dalek round-trip test below would not.
+        let kp = KeelProvenance {
+            change: "blake3:c1".into(),
+            actor: "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29".into(),
+            intent_sha256: crate::blossom::BlossomClient::sha256_hex(b"hello"),
+            ts: 1_700_000_000,
+            sig: "b96648931123256370b97f8728aac4f3f25c8c49c169ca1a197d993965b3b6f4b8c3d3c21a7cd23190c91ab78e0fa2ee8d4c9319df92a309f7e4067c1f7de601".into(),
+        };
+        assert_eq!(verify_keel_provenance(&kp).as_deref(), Some(kp.actor.as_str()), "a real ring signature verifies under dalek verify_strict");
+        // flipping one byte of the sig breaks it
+        let mut bad = kp.clone();
+        bad.sig.replace_range(0..2, "00");
+        assert!(verify_keel_provenance(&bad).is_none());
     }
 
     #[test]
