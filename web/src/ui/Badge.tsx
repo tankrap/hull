@@ -40,7 +40,9 @@ export function StatusBadge({ kind, children }: { kind: string; children?: React
 const OP: Record<string, string> = {
   rename: V.info,
   signature: V.warning,
-  behavior: V.danger,
+  // "behavior" is the normal category for most changed files — amber ("scrutinize"), not danger red,
+  // so a routine diff isn't a wall of alarm-red.
+  behavior: V.warning,
   chart: V.success,
 };
 export function OpBadge({ kind }: { kind: string }) {
