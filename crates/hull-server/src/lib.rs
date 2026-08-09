@@ -628,6 +628,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/reviews", get(reviews).post(create_review))
         .route("/api/repos/:tenant/:repo/artifacts/:id", get(get_artifact))
         .route("/api/repos/:tenant/:repo/comments/:id", axum::routing::patch(edit_comment).delete(delete_comment))
+        .route("/api/repos/:tenant/:repo/commit/:sha/change", get(change_for_commit_view))
         .route("/api/repos/:tenant/:repo/change/:id", get(change_info))
         .route("/api/repos/:tenant/:repo/change/:id/diff", get(change_diff))
         .route("/api/repos/:tenant/:repo/change/:id/file", get(change_file))
@@ -6093,6 +6094,21 @@ async fn submit_provenance(
     Json(json!({ "stored": true, "change": id, "actor": sp.claim.actor })).into_response()
 }
 
+/// Resolve a pushed git commit to its keel change id + intent (`GET …/commit/:sha/change`). After a
+/// push, an agent uses this to learn the HULL change id (which differs from keel's local change id) and
+/// the exact bridged intent, so it can `keel provenance attest --change <id> --intent <intent>` and
+/// submit the signature to `/keel-provenance`. Repo-read gated; `sha` is a 40-hex git commit id.
+async fn change_for_commit_view(State(app): State<App>, Path((tenant, repo, sha)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
+        return r;
+    }
+    let Some(change) = app.repos.change_for_commit(&tenant, &repo, &sha) else {
+        return (StatusCode::NOT_FOUND, "no keel change for that commit").into_response();
+    };
+    let intent = app.repos.change_info(&tenant, &repo, &change).map(|i| i.intent);
+    Json(json!({ "change": change, "intent": intent })).into_response()
+}
+
 /// Ingest a keel CLI's authorship attestation for a landed change (`POST …/change/:id/keel-provenance`
 /// with a `KeelProvenance` body `{change, actor, intent_sha256, ts, sig}`). This is the hull side of
 /// keel-signed provenance: the keel CLI signs a repo-INDEPENDENT authorship claim with the author's
@@ -7561,6 +7577,20 @@ mod tests {
         assert_eq!(picked[0].claim.change, "blake3:authored");
         // wrong repo key selects nothing (defense against a cross-repo stored bundle)
         assert!(sovereign_bundles_to_publish(&pr, "other/repo").is_empty());
+    }
+
+    #[tokio::test]
+    async fn change_for_commit_view_404s_on_unknown_commit() {
+        let (app, tmp) = build_test_app("c4c");
+        setup_org_repo(&app, "acme", "web", false, &[]).await; // public → readable without auth
+        let resp = change_for_commit_view(
+            State(app.clone()),
+            axum::extract::Path(("acme".to_string(), "web".to_string(), "0".repeat(40))),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "a commit with no bridged change resolves to 404");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]

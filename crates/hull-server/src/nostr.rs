@@ -511,7 +511,14 @@ impl NostrRefs {
     /// repo — is the CALLER's job (it needs the actor store); this only guarantees the signatures.
     pub fn fetch_provenance(&self, repo: &str) -> Vec<SignedProvenance> {
         let filter = serde_json::json!({ "kinds": [KIND_PROV], "#repo": [repo] });
-        fetch_events(&self.relays, filter)
+        // Gate on the trusted relaying-instance set (self + peers): the event is schnorr-signed by
+        // whichever instance relayed it, so a hostile relay can't flood junk kind-1900 events to starve
+        // the read before honest ones are seen. The embedded Ed25519 actor sig is still verified below.
+        let mut authors: std::collections::HashSet<String> = self.peers.iter().cloned().collect();
+        if let Some(own) = self.own_pubkey() {
+            authors.insert(own);
+        }
+        fetch_events_gated(&self.relays, filter, Some(&authors))
             .iter()
             .filter(|ev| verify_prov_event(ev).is_some()) // schnorr + Ed25519 both valid
             .filter_map(|ev| serde_json::from_str::<SignedProvenance>(&ev.content).ok())
@@ -1063,6 +1070,23 @@ mod tests {
         let claim = ProvenanceClaim { v: 1, change: "blake3:c1".into(), actor: "abcd".into(), repo: "acme/web".into(), intent: "hello".into(), ts: 1_700_000_000 };
         let expected = "hull-provenance:v1\nchange=blake3:c1\nactor=abcd\nrepo=acme/web\nintent_sha256=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\nts=1700000000";
         assert_eq!(claim.signing_bytes(), expected);
+    }
+
+    #[test]
+    fn fetch_provenance_is_gated_to_trusted_instances() {
+        const SK2: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+        let url = spawn_loopback_relay();
+        let actor = hull_core::identity::mint_human("agent");
+        // An UNTRUSTED instance (SK2) relays a validly actor-signed provenance to the same relay.
+        NostrRefs::new(SK2.into(), vec![url.clone()])
+            .publish_provenance(&actor.secret_key, "blake3:c1", &actor.actor.id, "tankrap/hull", "x")
+            .unwrap();
+        // Our instance (SK), with no peers, must NOT see it — it was relayed by an untrusted instance key.
+        let refs = NostrRefs::new(SK.into(), vec![url.clone()]);
+        assert!(refs.fetch_provenance("tankrap/hull").is_empty(), "provenance relayed by an untrusted instance is gated out");
+        // Trusting SK2 as a peer lets its relayed provenance through.
+        let trusting = NostrRefs::new(SK.into(), vec![url]).with_peers(vec![pubkey_of(SK2).unwrap()]);
+        assert_eq!(trusting.fetch_provenance("tankrap/hull").len(), 1, "a trusted peer's relayed provenance is included");
     }
 
     #[test]
