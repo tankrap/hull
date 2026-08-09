@@ -6197,14 +6197,6 @@ async fn keel_provenance_view(State(app): State<App>, Path((tenant, repo, id)): 
     Json(json!({ "enabled": true, "authorship": out })).into_response()
 }
 
-/// Reconstruct a change from the substrate (`POST …/change/:id/restore`) — the recovery half of the
-/// mirror. First rebuild the STRUCTURE (Change + Trees) from the signed change bundle so blob
-/// enumeration can proceed (a missing tree hides the blobs beneath it), then for each still-missing
-/// blob look up its Blossom sha256 in the manifest and fetch it. Every restored object is verified by
-/// re-deriving its keel id from the bytes, so a lying server or forged bundle/manifest can never inject
-/// content under a referenced id — it can only make a restore fail. This is how a fresh/wiped instance
-/// re-materializes a repo's content from public infra. Owner/admin only (writes the store, hits external
-/// servers). Needs nostr configured; Blossom is needed only when blobs are missing.
 /// The outcome of restoring a SINGLE change from the substrate.
 struct OneRestore {
     objects_restored: usize,
@@ -6307,11 +6299,22 @@ async fn reconstruct_history(State(app): State<App>, Path((tenant, repo, id)): P
     if !is_repo_admin(&app, &tenant, &repo, &actor.id).await {
         return (StatusCode::FORBIDDEN, "only a repo owner/admin can reconstruct history").into_response();
     }
+    // Reconstruct fans out to many relay/Blossom round-trips; rate-limit it per actor so a self-serve
+    // repo owner can't turn one endpoint into a sustained amplification/DoS. It's a rare recovery op.
+    if !app.rate.check(&format!("reconstruct:{}", actor.id), 3, 60, now()) {
+        return (StatusCode::TOO_MANY_REQUESTS, "reconstruct is rate limited — try again shortly").into_response();
+    }
     let Some(refs) = app.nostr_refs.clone() else {
         return (StatusCode::UNPROCESSABLE_ENTITY, "substrate not configured (needs HULL_NOSTR_*)").into_response();
     };
     let blossom = app.blossom.clone();
-    const MAX_CHANGES: usize = 1000;
+    // Bound the EXPENSIVE (relay + Blossom) work per call by both a wall-clock budget (stay well under
+    // the request timeout) and a hard count. Already-present changes are walked for free, so a capped
+    // call is RESUMABLE: call again and it skips the done prefix and continues from the frontier.
+    const RESTORE_BUDGET: usize = 400;
+    let time_budget = std::time::Duration::from_secs(20);
+    let start = std::time::Instant::now();
+    let mut spent = 0usize;
     let mut queue = vec![id.clone()];
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut reconstructed = 0usize;
@@ -6322,13 +6325,15 @@ async fn reconstruct_history(State(app): State<App>, Path((tenant, repo, id)): P
         if !visited.insert(cid.clone()) {
             continue;
         }
-        if visited.len() > MAX_CHANGES {
-            capped = true;
-            break;
-        }
         // Only restore what isn't already fully present; a pre-complete change is still walked for parents.
         let complete = app.repos.structure_present(&tenant, &repo, &cid) && app.repos.missing_blobs(&tenant, &repo, &cid).is_empty();
         if !complete {
+            // Budget only the I/O-spending restores (not the free walk of already-present changes).
+            if spent >= RESTORE_BUDGET || start.elapsed() > time_budget {
+                capped = true;
+                break;
+            }
+            spent += 1;
             let r = restore_one_change(&app, &tenant, &repo, &cid, &refs, blossom.as_deref()).await;
             total_objects += r.objects_restored;
             total_blobs += r.blobs_restored;
