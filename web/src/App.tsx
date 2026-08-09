@@ -4074,7 +4074,7 @@ function ReviewPage({
 
 
   return (
-    <div className="bg-paper min-h-screen text-ink">
+    <div className="bg-paper min-h-full text-ink">
       {/* Highlight-to-comment tooltip — a small pill at the selection with a comment button (or press c).
           Only shows for an actual highlight (a drag), never a plain line click. */}
       {selRange && !commenting && (
@@ -4088,7 +4088,7 @@ function ReviewPage({
           </div>
         </div>
       )}
-      <header className="h-[52px] border-b border-rule2 bg-surface flex items-center gap-3 px-6 sticky top-14 z-20">
+      <header className="h-[52px] border-b border-rule2 bg-surface flex items-center gap-3 px-6 sticky top-0 z-20">
         <button className="flex items-center gap-1.5 text-[13px] font-medium text-dim hover:text-ink cursor-pointer flex-none" onClick={onBack}>
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
           <span className="hidden sm:inline">{repo} · pull requests</span>
@@ -4651,7 +4651,7 @@ function ReviewPage({
                   <div>
                     {/* Always-reachable hide bar — sticks to the top of the diff so you can collapse it
                         without scrolling to the bottom of a long file. */}
-                    <div className="sticky top-0 z-[2] flex items-center justify-between gap-2 mb-1.5 px-3 py-1.5 rounded-ctl bg-paper border border-rule2">
+                    <div className="sticky top-[52px] z-[2] flex items-center justify-between gap-2 mb-1.5 px-3 py-1.5 rounded-ctl bg-paper border border-rule2">
                       {focused
                         ? <button onClick={() => setDiffFocus((s) => { const n = { ...s }; delete n[f.path]; return n; })} className="text-[12px] font-medium text-steel-text hover:underline inline-flex items-center gap-1"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>Showing one change · show all {f.hunks.length} in this file</button>
                         : <span className="text-[12px] text-muted tabular-nums">{f.hunks.length} change{f.hunks.length === 1 ? "" : "s"} · highlight code to comment</span>}
