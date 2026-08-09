@@ -1596,9 +1596,11 @@ export function App() {
       setProv(({ [key]: _drop, ...rest }) => rest);
       return;
     }
+    // Guard the response: a non-OK/HTML body must not throw an unhandled rejection out of the toggle
+    // (the endpoint can 403/500 for an inaccessible path). Fall back to an empty list.
     const d = await fetch(
       `/api/repos/${encodeURIComponent(tenant)}/${issueRepo}/why?path=${encodeURIComponent(path)}`,
-    ).then((r) => r.json());
+    ).then((r) => (r.ok ? r.json() : { provenance: [] })).catch(() => ({ provenance: [] }));
     setProv((p) => ({ ...p, [key]: d.provenance ?? [] }));
   };
   const loadIssues = () =>
