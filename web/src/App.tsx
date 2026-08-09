@@ -1583,7 +1583,10 @@ export function App() {
   const [prFilter, setPrFilter] = useState<StateFilter>("open");
   const [openIssue, setOpenIssue] = useState<number | null>(() => parseRoute(location.pathname).openIssue);
   // Default the issues/PRs repo to whatever's actually active, so it's never stuck on a stale name.
+  // BUT never override an explicit repo route: deep-linking to a repo you can view but don't own
+  // (e.g. another tenant's public repo / voyage) must not get clobbered back to your first repo.
   useEffect(() => {
+    if (parseRoute(location.pathname).issueRepo) return;
     if (repos.length && !repos.some((r) => r.repo === issueRepo)) setIssueRepo(repos[0].repo);
   }, [repos]);
 
