@@ -1136,6 +1136,17 @@ impl RepoHost {
         store.put(&obj).is_ok()
     }
 
+    /// The parent change ids (hex) of change `hex` — empty if the change can't be read (e.g. not yet
+    /// reconstructed). Used to walk history during deep reconstruction.
+    pub fn change_parents(&self, tenant: &str, repo: &str, hex: &str) -> Vec<String> {
+        let Ok(Some(store)) = self.store(tenant, repo, false) else { return Vec::new() };
+        let Some(cid) = ObjectId::from_hex(hex) else { return Vec::new() };
+        match store.get(&cid) {
+            Ok(Some(Object::Change(c))) => c.parents.iter().map(|p| p.to_hex()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Expand the keel change `hex` in a hosted repo: its intent/author and the files it changed vs
     /// its first parent (keel-native — "what does this change touch"). `None` if not found.
     pub fn change_info(&self, tenant: &str, repo: &str, hex: &str) -> Option<ChangeInfo> {
