@@ -2235,7 +2235,12 @@ export function App() {
       </div>
     );
     };
-    const errBox = authError ? <div className="text-[13px] text-fault-text bg-fault-wash border border-fault/30 rounded-ctl px-3 py-2 mb-3">{authError}</div> : null;
+    const errBox = authError ? (
+      <div role="alert" className="flex items-start gap-2 text-[13px] text-fault-text bg-fault-wash border border-fault/30 rounded-ctl px-3 py-2 mb-3">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" className="text-fault mt-[1px] flex-none" aria-hidden><path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0Zm0 4a.9.9 0 0 0-.9.98l.3 3.5a.6.6 0 0 0 1.2 0l.3-3.5A.9.9 0 0 0 8 4Zm0 6.6a.95.95 0 1 0 0 1.9.95.95 0 0 0 0-1.9Z" /></svg>
+        <span className="leading-snug">{authError}</span>
+      </div>
+    ) : null;
 
     if (authPage === "signup") {
       return shell("Create your hull account", (
@@ -3265,7 +3270,16 @@ export function App() {
                   {filterOpen && <div className="sm:hidden -mt-3 mb-5"><SearchInput placeholder="Filter issues" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>}
                   {issueView === "list" ? (
                     <div>
-                      {issues.length === 0 && <div className="py-8 text-[13px] text-muted">no issues yet — open one with the New issue button</div>}
+                      {issues.length === 0 && <div className="py-12 text-center text-[13px] text-muted">No issues yet — open one with the <b className="text-body">New issue</b> button.</div>}
+                      {issues.length > 0 && issues.filter((it) => issueFilter === "all" || (issueFilter === "open" ? it.status.state === "open" : it.status.state !== "open")).filter((it) => matchQ(`${it.title} ${it.body} #${it.number} ${it.labels.join(" ")}`)).length === 0 && (
+                        <div className="py-12 text-center text-[13px] text-muted">
+                          {q.trim()
+                            ? <>No issues match “{q.trim()}”.</>
+                            : issueFilter === "open"
+                              ? <>No open issues.{issues.length - openIssues > 0 && <> <button className="text-steel-text hover:underline" onClick={() => setIssueFilter("closed")}>View {issues.length - openIssues} closed →</button></>}</>
+                              : issueFilter === "closed" ? <>No closed issues.</> : <>No issues here.</>}
+                        </div>
+                      )}
                       {[...issues]
                         .filter((it) => issueFilter === "all" || (issueFilter === "open" ? it.status.state === "open" : it.status.state !== "open"))
                         .filter((it) => matchQ(`${it.title} ${it.body} #${it.number} ${it.labels.join(" ")}`))
@@ -3359,7 +3373,16 @@ export function App() {
                   </div>
                   {filterOpen && <div className="sm:hidden -mt-3 mb-5"><SearchInput placeholder="Filter pull requests" shortcut="" value={q} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setQ(e.target.value)} /></div>}
                   <div>
-                    {prs.length === 0 && <div className="py-8 text-[13px] text-muted">no pull requests yet — agents open these when they push a change for review</div>}
+                    {prs.length === 0 && <div className="py-12 text-center text-[13px] text-muted">No pull requests yet — agents open these when they push a change for review.</div>}
+                    {prs.length > 0 && prs.filter((p) => prFilter === "all" || (prFilter === "open" ? p.state === "open" : p.state !== "open")).filter((p) => matchQ(`${p.title} #${p.number}`)).length === 0 && (
+                      <div className="py-12 text-center text-[13px] text-muted">
+                        {q.trim()
+                          ? <>No pull requests match “{q.trim()}”.</>
+                          : prFilter === "open"
+                            ? <>No open pull requests.{prs.filter((p) => p.state !== "open").length > 0 && <> <button className="text-steel-text hover:underline" onClick={() => setPrFilter("closed")}>View {prs.filter((p) => p.state !== "open").length} closed →</button></>}</>
+                            : prFilter === "closed" ? <>No closed pull requests.</> : <>No pull requests here.</>}
+                      </div>
+                    )}
                     {[...prs].filter((p) => prFilter === "all" || (prFilter === "open" ? p.state === "open" : p.state !== "open")).filter((p) => matchQ(`${p.title} #${p.number}`)).sort((a, b) => b.number - a.number).map((p) => {
                       const prReviews = reviews.filter((r) => r.target === `pr:${p.number}`);
                       return (
@@ -4223,7 +4246,7 @@ function ReviewPage({
             verdict, and what — if anything — needs a human. The claims + diff fold beneath it, so the
             reviewer meets a verdict, not a wall. */}
         {(() => {
-          const loz = "inline-flex items-center text-[11px] font-bold uppercase tracking-[0.03em] leading-none px-1.5 py-[3px] rounded-badge";
+          const loz = "inline-flex items-center gap-1 text-[12px] font-normal leading-4 px-1.5 py-[2px] rounded-badge"; // gl-badge geometry (normal-case)
           // Prefer an agent reviewer's prose (the AI layer's own summary) over raw commit text; skip the
           // templated mechanical reconciliation line — we want a real summary, not "N claims supported".
           const aiSummary = [...reviews]
