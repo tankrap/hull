@@ -272,6 +272,12 @@ pub const KIND_BLOB_MANIFEST: u16 = 1901;
 /// in here (they go to Blossom by sha256). Regular/append-only.
 pub const KIND_CHANGE_BUNDLE: u16 = 1902;
 
+/// keel-authorship event kind: a keel CLI's REPO-INDEPENDENT authorship attestation (the
+/// `keel-provenance:v1` domain), signed by the author's Ed25519 key at commit time and relayed here.
+/// Distinct from KIND_PROV (which binds a repo): a keel signature says "actor authored change C", and a
+/// host applies its own repo-authority check on top. Regular/append-only, keyed by `#change`.
+pub const KIND_KEEL_PROV: u16 = 1903;
+
 /// The actor's claim about a landed change. Field order is the canonical signing order — the Ed25519
 /// signature is over `serde_json::to_string(claim)`, and a verifier recomputes the same string.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -328,6 +334,35 @@ pub fn sign_provenance(actor_secret_hex: &str, claim: ProvenanceClaim) -> Option
 /// primitive only.
 pub fn verify_provenance(sp: &SignedProvenance) -> Option<String> {
     hull_core::identity::verify_strict(&sp.claim.actor, sp.claim.signing_bytes().as_bytes(), &sp.ed_sig).then(|| sp.claim.actor.clone())
+}
+
+/// A keel CLI's authorship attestation for a change (the `keel-provenance:v1` domain). Repo-INDEPENDENT:
+/// authorship is a property of (actor, change, intent), not of the host repo it's pushed to. `sig` is
+/// the actor's Ed25519 signature over [`keel_provenance_signing_bytes`]. This is the wire form the keel
+/// CLI produces (see keel-store::provenance) — the fields and signing bytes byte-match across languages.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KeelProvenance {
+    pub change: String,
+    pub actor: String,
+    pub intent_sha256: String,
+    pub ts: u64,
+    pub sig: String,
+}
+
+/// The exact bytes a keel identity signs — MUST byte-match keel-store::provenance::signing_bytes:
+/// repo-independent, flat, domain-separated, with the intent folded to its SHA-256.
+pub fn keel_provenance_signing_bytes(change: &str, actor: &str, intent_sha256: &str, ts: u64) -> String {
+    format!("keel-provenance:v1\nchange={change}\nactor={actor}\nintent_sha256={intent_sha256}\nts={ts}")
+}
+
+/// Verify a keel attestation's Ed25519 signature (STRICT — rejects small-order/non-canonical keys).
+/// Returns the attested actor iff valid. Proves ONLY that `kp.actor` signed this claim — NOT that the
+/// actor is accountable or authorized over any repo (the consumer resolves that, as with hull provenance).
+/// The keel CLI signs with `ring` and hull verifies with the dalek-based `verify_strict`; both are
+/// RFC 8032 Ed25519 over the identical signing bytes, so a real keel signature verifies here.
+pub fn verify_keel_provenance(kp: &KeelProvenance) -> Option<String> {
+    let msg = keel_provenance_signing_bytes(&kp.change, &kp.actor, &kp.intent_sha256, kp.ts);
+    hull_core::identity::verify_strict(&kp.actor, msg.as_bytes(), &kp.sig).then(|| kp.actor.clone())
 }
 
 /// Build a kind:1900 provenance event: the actor-signed bundle in `content`, schnorr-signed by the
@@ -481,6 +516,43 @@ impl NostrRefs {
             .filter(|ev| verify_prov_event(ev).is_some()) // schnorr + Ed25519 both valid
             .filter_map(|ev| serde_json::from_str::<SignedProvenance>(&ev.content).ok())
             .filter(|sp| sp.claim.repo == repo) // trust the SIGNED repo, not the relay-supplied tag/filter
+            .collect()
+    }
+
+    /// Relay a keel CLI's authorship attestation (kind 1903): the actor's Ed25519 signature was produced
+    /// by keel at commit time (the instance never holds the key), so this only wraps the pre-signed claim
+    /// in the instance's schnorr transport event. `None` if the attestation's own signature doesn't
+    /// verify (we never relay an invalid one) or the instance key is bad. Best-effort.
+    pub fn publish_keel_provenance(&self, kp: &KeelProvenance) -> Option<Event> {
+        verify_keel_provenance(kp)?; // refuse to relay an unverifiable attestation
+        let created_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let content = serde_json::to_string(kp).ok()?;
+        let tags = vec![vec!["change".to_string(), kp.change.clone()], vec!["t".to_string(), "keel-authorship".to_string()]];
+        let ev = build_event(&self.secret_hex, created_at, KIND_KEEL_PROV, tags, &content)?;
+        publish(&self.relays, &ev);
+        Some(ev)
+    }
+
+    /// Read back keel authorship attestations for `change`: each returned one passed the schnorr
+    /// (transport) check via [`fetch_events`] AND its own Ed25519 signature via [`verify_keel_provenance`],
+    /// and its SIGNED `change` matches (we trust the signed field, not the relay tag). Accountability of
+    /// `actor` is the caller's job. Deduped by (actor, sig).
+    pub fn fetch_keel_provenance(&self, change: &str) -> Vec<KeelProvenance> {
+        let filter = serde_json::json!({ "kinds": [KIND_KEEL_PROV], "#change": [change] });
+        // Gate on trusted RELAYING instances (self + peers): the event is schnorr-signed by whichever
+        // instance relayed it, so a hostile relay can't flood junk kind-1903 events under throwaway keys
+        // to starve the read before honest ones are seen (same defense refs/bundles use). The attestation
+        // itself is still Ed25519-verified below — this only bounds which relays we'll read from.
+        let mut authors: std::collections::HashSet<String> = self.peers.iter().cloned().collect();
+        if let Some(own) = self.own_pubkey() {
+            authors.insert(own);
+        }
+        let mut seen = std::collections::HashSet::new();
+        fetch_events_gated(&self.relays, filter, Some(&authors))
+            .iter()
+            .filter_map(|ev| serde_json::from_str::<KeelProvenance>(&ev.content).ok())
+            .filter(|kp| kp.change == change && verify_keel_provenance(kp).is_some())
+            .filter(|kp| seen.insert((kp.actor.clone(), kp.sig.clone())))
             .collect()
     }
 
@@ -991,6 +1063,64 @@ mod tests {
         let claim = ProvenanceClaim { v: 1, change: "blake3:c1".into(), actor: "abcd".into(), repo: "acme/web".into(), intent: "hello".into(), ts: 1_700_000_000 };
         let expected = "hull-provenance:v1\nchange=blake3:c1\nactor=abcd\nrepo=acme/web\nintent_sha256=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\nts=1700000000";
         assert_eq!(claim.signing_bytes(), expected);
+    }
+
+    #[test]
+    fn keel_provenance_signing_bytes_are_pinned_cross_repo() {
+        // MUST equal keel-store::provenance::signing_bytes for the same inputs — a keel signature only
+        // verifies here if both sides build the identical bytes. intent "hello" → its sha256.
+        let bytes = keel_provenance_signing_bytes("blake3:c1", "abcd", &crate::blossom::BlossomClient::sha256_hex(b"hello"), 1_700_000_000);
+        assert_eq!(
+            bytes,
+            "keel-provenance:v1\nchange=blake3:c1\nactor=abcd\nintent_sha256=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\nts=1700000000"
+        );
+    }
+
+    #[test]
+    fn keel_provenance_accepts_a_real_ring_signature() {
+        // Cross-language interop: this signature was produced by keel's `ring` Ed25519 over the pinned
+        // signing bytes (seed 0x..01, change=blake3:c1, intent="hello", ts=1700000000). If hull's dalek
+        // `verify_strict` ever stopped accepting ring's canonical RFC-8032 sigs, this fails — where the
+        // dalek→dalek round-trip test below would not.
+        let kp = KeelProvenance {
+            change: "blake3:c1".into(),
+            actor: "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29".into(),
+            intent_sha256: crate::blossom::BlossomClient::sha256_hex(b"hello"),
+            ts: 1_700_000_000,
+            sig: "b96648931123256370b97f8728aac4f3f25c8c49c169ca1a197d993965b3b6f4b8c3d3c21a7cd23190c91ab78e0fa2ee8d4c9319df92a309f7e4067c1f7de601".into(),
+        };
+        assert_eq!(verify_keel_provenance(&kp).as_deref(), Some(kp.actor.as_str()), "a real ring signature verifies under dalek verify_strict");
+        // flipping one byte of the sig breaks it
+        let mut bad = kp.clone();
+        bad.sig.replace_range(0..2, "00");
+        assert!(verify_keel_provenance(&bad).is_none());
+    }
+
+    #[test]
+    fn keel_provenance_verify_and_relay_round_trip() {
+        // The keel CLI signs the repo-independent claim with the ACTOR's own Ed25519 key; hull verifies
+        // and relays it. Here we sign with identity::sign (same RFC-8032 Ed25519 as keel's ring).
+        let author = hull_core::identity::mint_human("agent");
+        let intent_sha = crate::blossom::BlossomClient::sha256_hex(b"did the thing");
+        let msg = keel_provenance_signing_bytes("blake3:c9", &author.actor.id, &intent_sha, 1_700_000_000);
+        let sig = hull_core::identity::sign(&author.secret_key, msg.as_bytes()).unwrap();
+        let kp = KeelProvenance { change: "blake3:c9".into(), actor: author.actor.id.clone(), intent_sha256: intent_sha, ts: 1_700_000_000, sig };
+        assert_eq!(verify_keel_provenance(&kp).as_deref(), Some(author.actor.id.as_str()));
+        // tamper: a different actor claim doesn't verify
+        let mut forged = kp.clone();
+        forged.actor = hull_core::identity::mint_human("other").actor.id;
+        assert!(verify_keel_provenance(&forged).is_none(), "sig is for the original actor, not the swapped one");
+
+        // relay + read back over a loopback relay
+        let url = spawn_loopback_relay();
+        let refs = NostrRefs::new(SK.into(), vec![url]);
+        assert!(refs.fetch_keel_provenance("blake3:c9").is_empty());
+        refs.publish_keel_provenance(&kp).expect("relay a valid attestation");
+        let got = refs.fetch_keel_provenance("blake3:c9");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].actor, author.actor.id);
+        // an invalid attestation is never relayed
+        assert!(refs.publish_keel_provenance(&forged).is_none());
     }
 
     #[test]

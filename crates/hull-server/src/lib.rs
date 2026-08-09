@@ -646,6 +646,7 @@ fn make_router(app: App) -> Router {
         .route("/api/repos/:tenant/:repo/labels", get(repo_labels))
         .route("/api/repos/:tenant/:repo/change/:id/verify", post(verify_change))
         .route("/api/repos/:tenant/:repo/change/:id/provenance", post(submit_provenance))
+        .route("/api/repos/:tenant/:repo/change/:id/keel-provenance", get(keel_provenance_view).post(submit_keel_provenance))
         .route("/api/repos/:tenant/:repo/change/:id/restore", post(restore_change))
         .route("/api/repos/:tenant/:repo/change/:id/session", post(ingest_session))
         .route("/api/scan", post(scan))
@@ -6092,6 +6093,93 @@ async fn submit_provenance(
     Json(json!({ "stored": true, "change": id, "actor": sp.claim.actor })).into_response()
 }
 
+/// Ingest a keel CLI's authorship attestation for a landed change (`POST …/change/:id/keel-provenance`
+/// with a `KeelProvenance` body `{change, actor, intent_sha256, ts, sig}`). This is the hull side of
+/// keel-signed provenance: the keel CLI signs a repo-INDEPENDENT authorship claim with the author's
+/// Ed25519 key at commit time; hull verifies it here and relays it onto the repo's nostr substrate. Hull
+/// never signs — it only checks: the claim binds to THIS change, its Ed25519 signature verifies, and the
+/// signed intent digest matches the change's ACTUAL intent (so an attestation can't claim a different
+/// intent than the change has). Caller must be a repo member. Needs nostr configured.
+async fn submit_keel_provenance(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    let actor = match require_actor(&app, &headers, "").await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    if !is_repo_member(&app, &tenant, &repo, &actor.id).await {
+        return (StatusCode::FORBIDDEN, "must be a repo member to relay authorship to its substrate").into_response();
+    }
+    let kp: nostr::KeelProvenance = match serde_json::from_value(body) {
+        Ok(k) => k,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("expected a KeelProvenance attestation: {e}")).into_response(),
+    };
+    if kp.change != id {
+        return (StatusCode::BAD_REQUEST, "attestation change must match the URL").into_response();
+    }
+    if nostr::verify_keel_provenance(&kp).is_none() {
+        return (StatusCode::BAD_REQUEST, "authorship signature does not verify for the actor").into_response();
+    }
+    // Bind to the change's ACTUAL intent (the change must be one hull actually has, and the signed
+    // intent digest must match its real intent — so provenance can't be filed for a change hull lacks or
+    // claim an intent the change doesn't have).
+    let Some(info) = app.repos.change_info(&tenant, &repo, &id) else {
+        return (StatusCode::NOT_FOUND, "no such change on this repo").into_response();
+    };
+    if kp.intent_sha256 != crate::blossom::BlossomClient::sha256_hex(info.intent.as_bytes()) {
+        return (StatusCode::BAD_REQUEST, "intent digest does not match this change's intent").into_response();
+    }
+    let Some(refs) = app.nostr_refs.clone() else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "substrate not configured (needs HULL_NOSTR_*)").into_response();
+    };
+    let attested = kp.actor.clone();
+    // Relay is blocking I/O — keep it off the async runtime.
+    let published = tokio::task::spawn_blocking(move || refs.publish_keel_provenance(&kp).is_some()).await.unwrap_or(false);
+    Json(json!({ "ok": true, "actor": attested, "published": published })).into_response()
+}
+
+/// Read a change's keel authorship attestations (`GET …/change/:id/keel-provenance`), signature-verified
+/// and annotated with LOCAL accountability + repo authority — the same split the substrate consumer
+/// uses: `signature_valid` means "a valid keel signature", `accountable`/`authorized` say whether that
+/// actor is a live, in-repo principal. A valid signature from a non-member or revoked actor reads as
+/// such, not as trustworthy.
+async fn keel_provenance_view(State(app): State<App>, Path((tenant, repo, id)): Path<(String, String, String)>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = require_repo_read(&app, &headers, &tenant, &repo).await {
+        return r;
+    }
+    let Some(refs) = app.nostr_refs.clone() else {
+        return Json(json!({ "enabled": false })).into_response();
+    };
+    let ch = id.clone();
+    let attestations = tokio::task::spawn_blocking(move || refs.fetch_keel_provenance(&ch)).await.unwrap_or_default();
+    let mut out: Vec<Value> = Vec::new();
+    for kp in attestations {
+        let actor = app.store.actor(&kp.actor).await;
+        let human = actor.as_ref().and_then(|a| a.human_principal().cloned());
+        let acct_ok = match &actor {
+            Some(a) => accountable(&app, a).await.is_ok(),
+            None => false,
+        };
+        let authorized = acct_ok
+            && (is_repo_member(&app, &tenant, &repo, &kp.actor).await
+                || match &human {
+                    Some(h) => is_repo_member(&app, &tenant, &repo, h).await,
+                    None => false,
+                });
+        out.push(json!({
+            "change": kp.change,
+            "actor": kp.actor,
+            "actor_handle": actor.as_ref().map(|a| a.handle.clone()),
+            "human_root": human,
+            "ts": kp.ts,
+            // fetch_keel_provenance only returns signature-verified attestations.
+            "signature_valid": true,
+            "accountable": acct_ok,
+            "authorized": authorized,
+        }));
+    }
+    out.sort_by(|a, b| b["ts"].as_u64().cmp(&a["ts"].as_u64()));
+    Json(json!({ "enabled": true, "authorship": out })).into_response()
+}
+
 /// Reconstruct a change from the substrate (`POST …/change/:id/restore`) — the recovery half of the
 /// mirror. First rebuild the STRUCTURE (Change + Trees) from the signed change bundle so blob
 /// enumeration can proceed (a missing tree hides the blobs beneath it), then for each still-missing
@@ -7473,6 +7561,56 @@ mod tests {
         assert_eq!(picked[0].claim.change, "blake3:authored");
         // wrong repo key selects nothing (defense against a cross-repo stored bundle)
         assert!(sovereign_bundles_to_publish(&pr, "other/repo").is_empty());
+    }
+
+    #[tokio::test]
+    async fn keel_provenance_ingest_verify_and_read_back() {
+        let (mut app, tmp) = build_test_app("keelprov");
+        let relay = crate::nostr::spawn_loopback_relay();
+        app.nostr_refs = Some(std::sync::Arc::new(crate::nostr::NostrRefs::new("0000000000000000000000000000000000000000000000000000000000000001".into(), vec![relay])));
+        // an accountable repo member = the author (their keel identity)
+        let author = hull_core::identity::mint_human("nomad");
+        app.store.put_actor(author.actor.clone()).await;
+        setup_org_repo(&app, "acme", "web", false, &[(&author.actor.id, Role::Write)]).await;
+        mint_token(&app, "tok", &author.actor.id);
+        let change = app.repos.test_commit("acme", "web", "add the widget", None, &[("f.txt", "hi\n")]);
+
+        // The keel CLI would sign this repo-independent claim over the change + its intent digest.
+        let intent_sha = crate::blossom::BlossomClient::sha256_hex(b"add the widget");
+        let msg = crate::nostr::keel_provenance_signing_bytes(&change, &author.actor.id, &intent_sha, 1_700_000_000);
+        let sig = hull_core::identity::sign(&author.secret_key, msg.as_bytes()).unwrap();
+        let kp = |change: &str, intent_sha: &str, sig: &str| {
+            json!({ "change": change, "actor": author.actor.id, "intent_sha256": intent_sha, "ts": 1_700_000_000u64, "sig": sig })
+        };
+        let path = || axum::extract::Path(("acme".to_string(), "web".to_string(), change.clone()));
+
+        // happy path: verified + relayed
+        let r = submit_keel_provenance(State(app.clone()), path(), bearer("tok"), Json(kp(&change, &intent_sha, &sig))).await;
+        assert_eq!(r.status(), StatusCode::OK, "a valid keel attestation for this change is accepted");
+
+        // read it back, annotated: valid signature, and the actor is an accountable repo member.
+        let resp = keel_provenance_view(State(app.clone()), path(), axum::http::HeaderMap::new()).await;
+        let v: Value = serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let rows = v["authorship"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["actor"], author.actor.id);
+        assert_eq!(rows[0]["signature_valid"], true);
+        assert_eq!(rows[0]["accountable"], true);
+        assert_eq!(rows[0]["authorized"], true);
+
+        // negatives: intent digest mismatch, and a claim bound to a different change.
+        let r = submit_keel_provenance(State(app.clone()), path(), bearer("tok"), Json(kp(&change, &crate::blossom::BlossomClient::sha256_hex(b"a lie"), &sig))).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "intent digest must match the change's real intent");
+        let r = submit_keel_provenance(State(app.clone()), path(), bearer("tok"), Json(kp("blake3:elsewhere", &intent_sha, &sig))).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "claim.change must match the URL");
+
+        // a non-member can't relay to the repo's substrate.
+        let rando = hull_core::identity::mint_human("rando");
+        app.store.put_actor(rando.actor.clone()).await;
+        mint_token(&app, "tok2", &rando.actor.id);
+        let r = submit_keel_provenance(State(app.clone()), path(), bearer("tok2"), Json(kp(&change, &intent_sha, &sig))).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "only a repo member may relay authorship");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
